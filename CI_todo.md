@@ -28,6 +28,15 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - Core package imports and the Skill materializer passed on Node 18.20.8 and
   22.18.0. Materializer tests cover overwrite protection, traversal, junctions,
   manifest symlinks, exact-version mismatch and a version upgrade.
+- Final local Skill fixture: `efad812eda59a6b713d0b355e6b3ba2bfbeb4b7a`,
+  version `0.5.0`, tarball SHA-256
+  `6e0b54a9c0f51af95a657894293b82b51b22dc93876a041aeed3ab29c08ea359`.
+  Its exact 99-file package contract and security scan passed. With this installed
+  tarball, `tests/hook-cloud.test.mjs` and `tests/session-sync-cloud.test.mjs`
+  passed 2/2 (no skips); `.github/scripts/skill-fixture.test.mjs` passed 3/3.
+  These are isolated cross-repository checks, not production acceptance. The
+  release URL remains unpublished pending UI permission; clean remote `npm ci`
+  and final GitHub Required are still incomplete.
 - [ ] SPLIT-LICENSE-01: Resolve the Ready-derived loading animation/atlas
   attribution and permission before publishing the separate UI package.
 - [ ] SPLIT-DEPLOY-01: Verify the systemd templates on Linux, writable business
