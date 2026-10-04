@@ -99,3 +99,20 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   Core `1.0.0` is unchanged. Both shared packages and the exact 100-file Skill
   artifact passed package safety scans. Remote download, final full CI and
   installed production acceptance are separate pending gates.
+
+- SPLIT-EOL-01: Windows browser acceptance found the vendored Marked module
+  differed from the locked upstream by CRLF conversion (74094 vs 71905 bytes).
+  Preserve the exact-byte assertion. Both repositories now enforce LF for text
+  and retain binary PNGs; only working-tree line endings were normalized.
+  Repacked Core/UI SHA256 values are
+  `0c8e9ea03f78c8c3d0ee8349c4ba071283072f1f86213200cc5a5b6cf4c04711`
+  and `fb122e9014f25834fe0dc98fd9b24e874bb2f83d819c1ffd18bbbaf8d645143b`.
+  Earlier package hashes above identify earlier inputs, not these artifacts.
+  Final fixture pin, clean reproduction and browser/full acceptance remain pending.
+
+- Final LF Skill fixture: `f6637d74c6c2231fd8718dacedc926a2ae3cb4ce`,
+  SHA256 `55a065ee5bdece9210f6219c00d602edd3add768498c7e4a0f06e9efcdfb351c`.
+  Independent Slack suite on supported Node 24.19.0 passed 131/131 without
+  skips (run `acd0d5`); Windows source `dc433f1` plus LF-only attributes, Store
+  SHA256 `590bbb04577f9bb56784907a718d3aa69df5c7136d2b36a86beb1a891a328ba5`.
+  This does not establish Linux durability or real Slack delivery.
