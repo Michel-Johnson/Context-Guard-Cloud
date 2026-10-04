@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 import { createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
+import { memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
 const { startServer } = await skillImport('scripts/workbench/server.mjs');
 const { resolveProject } = await skillImport('scripts/workbench/project.mjs');
 const { sessionMemoryDir } = await skillImport('scripts/workbench/memory.mjs');
@@ -60,19 +61,30 @@ try {
     protocolConfig: { repositories: [{ slug: 'example/repo', repositoryId: '123', projectId: 'context-guard' }] } });
   const project = await resolveProject(root);
   await atomicWrite(path.join(project.sharedDir, 'memory-client.json'), encode({ url: cloud.url, projectId: 'context-guard', token: 'project-memory-token' }));
-  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
   const baseline = await request(`${cloud.url}/v1/projects/context-guard/sessions/browser-baseline`, {
     method: 'POST', headers: headers('project-memory-token'),
-    body: JSON.stringify({ operationId: 'browser-sync-baseline', baseVersion: null, baseMainVersion: null, sourceCommit, memory: { map: document, records: {} } }),
+    body: JSON.stringify({ operationId: 'browser-sync-baseline', baseVersion: null, baseMainVersion: null, sourceCommit: fixtureSha, memory: { map: document, records: {} } }),
   });
   const published = await request(`${cloud.url}/v1/projects/context-guard/publish`, {
     method: 'POST', headers: headers('project-memory-token'),
-    body: JSON.stringify({ operationId: 'browser-sync-main', baseVersion: null, sessionId: 'browser-baseline', sessionVersion: baseline.snapshot.version, expectedMainSha: sourceCommit }),
+    body: JSON.stringify({ operationId: 'browser-sync-main', baseVersion: null, sessionId: 'browser-baseline', sessionVersion: baseline.snapshot.version, expectedMainSha: fixtureSha }),
   });
+  // A Session whose source already belongs to Main is automatically published.
+  // Keep this synchronization fixture on a genuine unmerged feature commit.
+  execFileSync('git', ['switch', '-c', 'fixture-session'], { cwd: root, stdio: 'ignore', windowsHide: true });
+  await fs.writeFile(path.join(root, 'README.md'), '# unmerged sync fixture\n');
+  execFileSync('git', ['add', 'README.md'], { cwd: root, windowsHide: true });
+  execFileSync('git', ['commit', '-m', 'unmerged Session fixture'], { cwd: root, stdio: 'ignore', windowsHide: true });
+  const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).trim();
+  assert.notEqual(sourceCommit, fixtureSha);
   await request(`${cloud.url}/v1/projects/context-guard/sessions/${sessionId}`, {
     method: 'POST', headers: headers('project-memory-token'),
     body: JSON.stringify({ operationId: 'browser-sync-seed', baseVersion: null, baseMainVersion: published.snapshot.version, sourceCommit, memory: { map: document, records: {} } }),
   });
+  const publication = await memoryPublicationStatus(memoryConfig, 'context-guard', sessionId);
+  assert.equal(publication.status, 'waiting');
+  assert.equal(publication.mainSha, fixtureSha);
+  assert.equal(publication.sourceCommit, sourceCommit);
 
   const delivered = [];
   local = await startServer({ root, port: 0, messageQueue: async input => delivered.push(input), repositoryLookup: async () => ({ repositoryId: '123', slug: 'example/repo' }) });
@@ -121,16 +133,42 @@ try {
   await localPage.waitForFunction(() => window.__cloudSyncCycle?.done, undefined, { timeout: 25000 });
   await cloudPage.waitForFunction(() => document.querySelector('.node[data-id="T0"]')?.textContent?.includes('本地写入 Cloud'), undefined, { timeout: 25000 });
 
+  const cloudPurpose = 'Cloud 编辑后本地实时可见';
+  assert.equal(new URL(cloudPage.url()).searchParams.get('session'), sessionId, 'Cloud edit stays in the selected Session');
+  await cloudPage.locator('.node[data-id="T0"]').click();
+  assert.equal((await cloudPage.locator('#detail [data-ed="purpose"]').textContent()).trim(), '双向同步测试');
+  await cloudPage.locator('#detail [data-ed="purpose"]').fill(cloudPurpose);
+  await cloudPage.locator('#detail [data-ed="purpose"]').blur();
+  // Prove live Cloud-to-local delivery before either page is refreshed.
+  await localPage.waitForFunction(value => document.querySelector('#detail [data-ed="purpose"]')?.textContent?.trim() === value, cloudPurpose, { timeout: 25000 });
+  await localPage.waitForSelector('#cloud-sync-status.synced', { state: 'attached' });
+  const liveDisk = JSON.parse(await fs.readFile(path.join(sessionMemoryDir(project, sessionId), 'map.json'), 'utf8'));
+  assert.equal(liveDisk.root.title, '本地写入 Cloud');
+  assert.equal(liveDisk.root.purpose, cloudPurpose, 'Cloud edit is committed to the local Session file before refresh');
+
   await Promise.all([localPage.reload(), cloudPage.reload()]);
   await localPage.waitForFunction(id => document.querySelector('#cg-sync-session')?.value === id, sessionId);
   for (const page of [localPage, cloudPage]) {
     assert.match(await page.locator('.node[data-id="T0"]').textContent(), /本地写入 Cloud/);
     await page.locator('.node[data-id="T0"]').click();
-    assert.equal((await page.locator('#detail [data-ed="purpose"]').textContent()).trim(), '双向同步测试');
+    assert.equal((await page.locator('#detail [data-ed="purpose"]').textContent()).trim(), cloudPurpose);
   }
   const disk = JSON.parse(await fs.readFile(path.join(sessionMemoryDir(project, sessionId), 'map.json'), 'utf8'));
   assert.equal(disk.root.title, '本地写入 Cloud');
-  assert.equal(disk.root.purpose, '双向同步测试');
+  assert.equal(disk.root.purpose, cloudPurpose);
+  const cloudSession = await request(`${cloud.url}/v1/projects/context-guard/sessions/${sessionId}`, { headers: headers('project-memory-token') });
+  assert.equal(cloudSession.snapshot.memory.map.root.title, '本地写入 Cloud');
+  assert.equal(cloudSession.snapshot.memory.map.root.purpose, cloudPurpose);
+  const main = await request(`${cloud.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') });
+  assert.equal(main.snapshot.version, published.snapshot.version, 'Session edits must not publish a new Main version');
+  assert.deepEqual(main.snapshot.memory.map, published.snapshot.memory.map, 'bidirectional Session edits leave Main unchanged');
+  const finalPublication = await memoryPublicationStatus(memoryConfig, 'context-guard', sessionId);
+  assert.equal(finalPublication.status, 'waiting', 'the unmerged Session remains open after bidirectional edits');
+  assert.equal(finalPublication.mainSha, fixtureSha);
+  assert.equal(finalPublication.sourceCommit, sourceCommit);
+  for (const ref of ['refs/heads/main', 'refs/remotes/origin/main']) {
+    assert.equal(execFileSync('git', ['rev-parse', ref], { cwd: root, encoding: 'utf8', windowsHide: true }).trim(), fixtureSha);
+  }
   const changes = await request(`${cloud.url}/v1/projects/context-guard/sessions/${sessionId}/changes?after=0`, { headers: headers('project-memory-token') });
   assert.ok(changes.events.length >= 3);
   for (const event of changes.events) assert.equal(event.at, new Date(event.at).toISOString());
@@ -138,7 +176,7 @@ try {
   await fs.mkdir(output, { recursive: true });
   await localPage.screenshot({ path: path.join(output, 'local.png'), fullPage: true });
   await cloudPage.screenshot({ path: path.join(output, 'cloud.png'), fullPage: true });
-  await fs.writeFile(path.join(output, 'result.json'), encode({ passed: true, checks: ['no-manual-session-assignment-control', 'local-to-cloud', 'refresh-persistence', 'server-timestamps'] }));
+  await fs.writeFile(path.join(output, 'result.json'), encode({ passed: true, checks: ['no-manual-session-assignment-control', 'local-to-cloud', 'cloud-to-local', 'local-disk-persistence', 'refresh-persistence', 'main-isolation', 'server-timestamps'] }));
   passed = true;
 } finally {
   if (!passed) {

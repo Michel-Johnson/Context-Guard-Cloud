@@ -116,3 +116,72 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   skips (run `acd0d5`); Windows source `dc433f1` plus LF-only attributes, Store
   SHA256 `590bbb04577f9bb56784907a718d3aa69df5c7136d2b36a86beb1a891a328ba5`.
   This does not establish Linux durability or real Slack delivery.
+
+- Latest tested Skill fixture: `6973d1829334c0818ab66de89f7bdb553cac5cb1`,
+  SHA256 `af1acb460b61189a258bcd451e81ea448869386a37e089a5cf513d9c629e8dd4`.
+  It adds the verified same-value three-way reconciliation fix. Skill Windows
+  `npm test` passed 382/382 plus 39 security and 29 installation checks; browser
+  and journal recovery suites exited 0. Exact 100-file tarball safety scan passed.
+  Cloud's installed fixture source matches its SHA256; strict fixture tests
+  passed 3/3. This local tarball installation did not change the locked release
+  URL and does not establish remote download or production acceptance.
+
+- Final local regression on Windows / Node 24.19.0: `npm test` exited 0,
+  348 passed / 0 failed / 2 existing separate-suite skips (274.81 seconds).
+  Browser device approval BDA-012 subsequently passed; the live provider call
+  remains untested. Slack passed 131/131, security passed 39 checks, and the full
+  browser command exited 0 before the additional reverse-direction assertions.
+  Logs: `temp/local-ci-cloud-{merge,slack,security,browser-merge}-final-20261005.log`.
+  Exact 90-file Cloud service package scan passed, SHA256
+  `5ec9ed57652809c833dbfd8f2ba2c45c373f7d0b718aba3b104955ab61784262`.
+  These results do not satisfy remote Required or production deployment gates.
+
+- [ ] SPLIT-PUBLICATION-01: Existing premature-publication risk, found by the
+  reverse UI acceptance. A normal Session can start with an already-merged HEAD;
+  later Map uploads retain that old sourceCommit. The ancestry gate returns ready,
+  and no workflow tasks means the additional task gate allows publication.
+  The browser can publish and switch to Main immediately; the server also has an
+  automatic publisher. Static review: `sync-coordinator.mjs` creation/flush,
+  `memory.mjs` mergeStatus/commitSessionMap, `server.mjs` taskPublicationReady,
+  and `workbench-sync.mjs` refreshAccessNow. A readiness reproduction confirms
+  Main HEAD is ready but a real unmerged feature commit is waiting; the exact
+  publishing request in the failed UI run was not captured. Follow-up needs a
+  completion proof tied to the current generation, Session version and delivery
+  SHA at the common publication boundary. Keep Git, workflow and version gates;
+  do not fix only the frontend or treat corrected fixtures as a product fix.
+
+- [x] SPLIT-SYNC-E2E-01: Independent Tester adds the missing Cloud-to-local UI
+  direction to `tests/cloud-sync-browser.mjs`: edit purpose in the Cloud Session,
+  observe the local page without refreshing, verify the local Session file, then
+  refresh both pages and verify durable Cloud/Local content and unchanged Main.
+  Preserve the original title, safety and timestamp checks and 12/25-second limits.
+  Added against Cloud `754b922c7b5cf0093fc6a5c4e8196fb2321d0720` with pinned Skill
+  `6973d1829334c0818ab66de89f7bdb553cac5cb1`. Earlier browser
+  success covered local-to-Cloud and refresh only, not this reverse UI path.
+  First independent Node 24.19.0 execution failed (session `38111`, exit 1)
+  before the reverse edit: line 125 expected URL Session `browser-session-sync`
+  but observed `null` after local-to-Cloud delivery. The retained Cloud screenshot
+  shows the Main/work Sessions chip and the local edit; the test did not silently
+  select another Session or write into Main. Evidence:
+  `output/playwright/browser-ci/session-sync-1791135863226-9b6e3872-8cd4-430d-9552-03a438b9a90e/`.
+  Reverse UI delivery, disk persistence and Main-isolation acceptance remain
+  incomplete; investigate fixture publication/Session lifecycle before retrying.
+  Minimal isolated diagnostic `temp/publication-fixture-diagnostic.mjs` (run
+  `202617`, exit 0) confirmed `sourceCommit == mainSha` yields `ready`, while
+  a real feature commit with the same unchanged Main yields `waiting`; its
+  three-field observations are retained in `temp/publication-fixture-diagnostic-result.json`.
+  This confirms the old fixture was eligible for automatic publication, rather
+  than proving a premature-publication product defect. The formal fixture now
+  publishes the Main baseline first, commits an unmerged `fixture-session`
+  branch, and asserts `waiting` plus unchanged Main refs before/after UI edits.
+  Automatic publication and all original timeouts remain enabled.
+  Corrected-fixture rerun passed on Windows / Node 24.19.0 (session `44675`,
+  exit 0). Exact test SHA256:
+  `b68272126991dcb963762bdbf7adf797f4ac0bb7f4a004e2dcb7c27e7688bfd8`.
+  Evidence directory:
+  `output/playwright/browser-ci/session-sync-1791136228767-7fdd7eec-b223-47fd-9b20-21e2f7135cbe/`.
+  `result.json` records local-to-Cloud, Cloud-to-local, local disk persistence,
+  both-page refresh persistence, Main isolation and the retained original checks.
+  This is real Chromium against isolated local Cloud/backend and the installed
+  pinned Skill artifact, not production-domain or Slack acceptance. The earlier
+  failure and diagnostic evidence remain retained; no product code was changed.
