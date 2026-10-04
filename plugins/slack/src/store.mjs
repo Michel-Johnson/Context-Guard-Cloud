@@ -6,8 +6,8 @@ export const digest = value => createHash('sha256').update(typeof value === 'str
 export const threadKey = (team, channel, ts) => `${team}:${channel}:${ts}`;
 const empty = () => ({ version: 1, inbox: {}, threads: {}, channels: {}, preferences: {}, drafts: {}, outgoing: {} });
 
-// A single process owns this file. Every acknowledgement follows an fsync and
-// atomic rename, so restart replays gateway operations with their original IDs.
+// A single process owns this file. Every acknowledgement follows a file fsync
+// and atomic rename; Unix also flushes the directory before acknowledging.
 export class Store {
   constructor(directory) { this.directory = directory; this.file = path.join(directory, 'state.json'); this.tail = Promise.resolve(); }
   async open() {
@@ -24,8 +24,11 @@ export class Store {
       const handle = await fs.open(temporary, 'wx', 0o600);
       try { await handle.writeFile(JSON.stringify(next)); await handle.sync(); } finally { await handle.close(); }
       await fs.rename(temporary, this.file);
-      const directory = await fs.open(this.directory, 'r');
-      try { await directory.sync(); } finally { await directory.close(); }
+      // Windows does not support directory fsync. File fsync remains mandatory.
+      if (process.platform !== 'win32') {
+        const directory = await fs.open(this.directory, 'r');
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
       this.data = next;
       return result;
     });
