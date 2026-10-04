@@ -28,6 +28,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/context-guard-cloud
+ReadWritePaths=/var/lib/context-guard-projects
 
 [Install]
 WantedBy=multi-user.target

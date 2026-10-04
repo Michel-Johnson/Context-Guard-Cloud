@@ -14,3 +14,23 @@ source revision. No item below is a claim of completed acceptance.
 
 Known limits retained: Slack journal growth and model response latency are not
 resolved by this repository split. Source tests do not establish real Slack E2E.
+
+## Split verification evidence (not production acceptance)
+
+- Authorization: `tests/authorization-boundary.test.mjs` and external-tool HTTP
+  positive cases passed 14 checks. Fixed descendant deletion/move, misleading
+  node aliases, restricted file writes, inbox leakage and project/caller scope
+  intersection. No live project data was used.
+- GitHub run `37207741737`: security, Slack, browser and three package checks
+  passed. Node 18/22 failed because the old Skill fixture lacks the new
+  `scripts/workbench/sync.mjs`; replacing it with the fixed new Skill artifact is
+  required. Do not remove those tests or count this run as Required success.
+- Core package imports and the Skill materializer passed on Node 18.20.8 and
+  22.18.0. Materializer tests cover overwrite protection, traversal, junctions,
+  manifest symlinks, exact-version mismatch and a version upgrade.
+- [ ] SPLIT-LICENSE-01: Resolve the Ready-derived loading animation/atlas
+  attribution and permission before publishing the separate UI package.
+- [ ] SPLIT-DEPLOY-01: Verify the systemd templates on Linux, writable business
+  mirrors, existing reverse-proxy bind, Slack readiness and data invariants.
+  A deployed business mirror currently occupies the intended Cloud checkout
+  location: migrate its reference before replacing that directory.

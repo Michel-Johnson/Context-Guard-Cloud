@@ -5,8 +5,18 @@
   "type": "module",
   "description": "Context Guard Cloud workbench and Coordinator service",
   "repository": "github:Michel-Johnson/Context-Guard-Cloud",
-  "engines": { "node": ">=18" },
-  "files": ["scripts/cloud/**", "scripts/shared/**", "prototype/**", "deploy/**", "licenses/**", "references/**", "THIRD_PARTY_NOTICES.md"],
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "scripts/cloud/**",
+    "scripts/shared/**",
+    "prototype/**",
+    "deploy/**",
+    "licenses/**",
+    "references/**",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "scripts": {
     "start": "node scripts/cloud/server.mjs",
     "test": "node .github/scripts/verify-boundaries.mjs && node .github/scripts/verify-workflows.mjs && node .github/scripts/verify-test-governance.mjs && node .github/scripts/run-node-tests.mjs",
@@ -17,7 +27,7 @@
     "pack:shared": "node scripts/release-shared.mjs"
   },
   "devDependencies": {
-    "@michelj/context-guard": "github:Michel-Johnson/Context-Guard-Skill#4f5cd7de1b611efde7f38d114c965e62a5e6815f",
+    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-8d215551e686132888ad9b248ccb75ab1c2544ed/michelj-context-guard-0.5.0.tgz",
     "marked": "15.0.12",
     "playwright": "1.62.1"
   }

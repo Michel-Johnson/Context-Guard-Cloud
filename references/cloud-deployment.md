@@ -48,6 +48,17 @@ Runtime state and credentials must stay outside the checkout.
 
 ## 2. Protected configuration and project mirrors
 
+Create the writable business-mirror root before starting the system unit:
+
+```bash
+sudo install -d -o context-guard -g context-guard -m 0750 /var/lib/context-guard-projects
+```
+
+The service allows writes to this directory for Git fetches and explicitly
+enabled project-file operations; the Cloud application's own checkout stays
+read-only. Existing mirrors elsewhere need their exact directory in a reviewed
+`ReadWritePaths` override until migrated. Never grant write access to `/opt` or `/`.
+
 Create `/etc/context-guard-cloud/cloud.env` with mode `0600`, root-owned.
 Systemd reads the EnvironmentFile before changing to the service account:
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { validateSkillFixture } from './skill-fixture.mjs';
 
 function walk(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
@@ -23,7 +24,8 @@ for (const file of walk('tests').filter(file => file.endsWith('.mjs'))) {
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 assert.equal(pkg.dependencies?.['@michelj/context-guard'], undefined, 'Skill is a dev-only integration fixture');
 const fixture = pkg.devDependencies?.['@michelj/context-guard'];
-assert.match(fixture || '', /^(?:\d+\.\d+\.\d+(?:-[\w.-]+)?|.+(?:#|\/)[a-f0-9]{40}(?:\.tar\.gz)?)$/, 'Skill fixture must be immutable');
+const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+validateSkillFixture(fixture, lock.packages?.['node_modules/@michelj/context-guard']);
 assert.ok(pkg.files?.length, 'Cloud package requires an explicit files allowlist');
 for (const file of pkg.files) assert.doesNotMatch(file, /(?:tests|\.github|node_modules|^bin|scripts\/(?:workbench|legacy|sync))/);
 console.log('Verified Cloud/client source boundaries and pinned test fixture.');

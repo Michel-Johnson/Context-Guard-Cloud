@@ -1,5 +1,9 @@
 # Context Guard Cloud
 
+Operational references: [deployment](references/cloud-deployment.md),
+[Slack](references/slack-integration.md), [attachments](docs/cloud-attachments.md),
+[Coordinator compaction](docs/coordinator-compaction.md).
+
 Cloud workbench, Coordinator and integrations for Context Guard. The client and
 Skill live in [Context-Guard-Skill](https://github.com/Michel-Johnson/Context-Guard-Skill).
 
