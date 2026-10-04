@@ -37,6 +37,15 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   These are isolated cross-repository checks, not production acceptance. The
   release URL remains unpublished pending UI permission; clean remote `npm ci`
   and final GitHub Required are still incomplete.
+- Skill `efad812` final Windows `npm test` did not complete: the existing
+  900-second runner deadline terminated the run after output through test 246.
+  The named-workbench test process was the remaining test child during diagnosis.
+  Independent bounded reruns passed: the first test took 3.27 seconds, then the
+  entire `tests/named-workbench.test.mjs` passed 17/17 and exited normally in
+  147.5 seconds (180-second per-test limit; SessionStart took 92.6 seconds).
+  No hang or resource leak was reproduced. Buffered file output alone cannot
+  identify the timeout cause; attribution remains open. Retain the failed full
+  run and do not mark full regression green or enlarge its deadline without evidence.
 - [ ] SPLIT-LICENSE-01: Resolve the Ready-derived loading animation/atlas
   attribution and permission before publishing the separate UI package.
 - [ ] SPLIT-DEPLOY-01: Verify the systemd templates on Linux, writable business
