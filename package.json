@@ -1,0 +1,24 @@
+{
+  "name": "@michelj/context-guard-cloud",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Context Guard Cloud workbench and Coordinator service",
+  "repository": "github:Michel-Johnson/Context-Guard-Cloud",
+  "engines": { "node": ">=18" },
+  "files": ["scripts/cloud/**", "scripts/shared/**", "prototype/**", "deploy/**", "licenses/**", "references/**", "THIRD_PARTY_NOTICES.md"],
+  "scripts": {
+    "start": "node scripts/cloud/server.mjs",
+    "test": "node .github/scripts/verify-boundaries.mjs && node .github/scripts/verify-workflows.mjs && node .github/scripts/verify-test-governance.mjs && node .github/scripts/run-node-tests.mjs",
+    "test:slack": "npm test --prefix plugins/slack",
+    "test:browser": "node tests/browser-device-login-runner.mjs && node tests/cloud-workbench-browser.mjs && node tests/cloud-sync-browser.mjs",
+    "security:setup": "node .github/scripts/security-tool.mjs",
+    "security:test": "node .github/scripts/security-checks.test.mjs",
+    "pack:shared": "node scripts/release-shared.mjs"
+  },
+  "devDependencies": {
+    "@michelj/context-guard": "github:Michel-Johnson/Context-Guard-Skill#4f5cd7de1b611efde7f38d114c965e62a5e6815f",
+    "marked": "15.0.12",
+    "playwright": "1.62.1"
+  }
+}

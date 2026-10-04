@@ -1,0 +1,33 @@
+[Unit]
+Description=Context Guard multi-project cloud workbench
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=context-guard
+Group=context-guard
+WorkingDirectory=/opt/context-guard-cloud/repository
+Environment=NODE_ENV=production
+Environment=CONTEXT_GUARD_CLOUD_HOST=127.0.0.1
+Environment=CONTEXT_GUARD_CLOUD_PORT=8788
+Environment=CONTEXT_GUARD_CLOUD_PRIVATE=1
+Environment=CONTEXT_GUARD_CLOUD_SECURE_COOKIES=1
+Environment=CONTEXT_GUARD_CLOUD_DATA=/var/lib/context-guard-cloud
+EnvironmentFile=/etc/context-guard-cloud/cloud.env
+EnvironmentFile=-/etc/context-guard-cloud/public.env
+ExecStart=/usr/bin/node /opt/context-guard-cloud/repository/scripts/cloud/server.mjs
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=45
+UMask=0077
+StateDirectory=context-guard-cloud
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/context-guard-cloud
+
+[Install]
+WantedBy=multi-user.target

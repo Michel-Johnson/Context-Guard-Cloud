@@ -1,0 +1,9 @@
+{
+  "name": "@michelj/context-guard-workbench",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Shared Context Guard Cloud and local workbench UI",
+  "repository": "github:Michel-Johnson/Context-Guard-Cloud",
+  "files": ["*.html", "*.js", "*.mjs", "*.css", "*.png", "vendor/", "LICENSES/"],
+  "engines": { "node": ">=18" }
+}
