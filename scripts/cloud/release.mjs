@@ -17,5 +17,5 @@ export async function releaseIdentity() {
     if (/^[a-f0-9]{40}$/.test(sha)) sourceSha = sha;
   } catch { /* A source archive without Git reports unknown, never a guessed SHA. */ }
   return Object.freeze({ version: manifest.version, sourceSha,
-    messageVersion: 2, capabilities: ['private-map-heads', 'device-memory', 'coordinator-tools', 'split-packages'] });
+    messageVersion: 2, capabilities: ['private-map-heads', 'device-memory', 'coordinator-tools', 'split-packages', 'coordinator-steer', 'session-completion', 'memory-document-ui'] });
 }

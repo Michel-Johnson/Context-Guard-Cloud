@@ -5,7 +5,7 @@ import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.
 import { MapError } from '../shared/map-model.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind',
-  'conversation.state', 'conversation.submit', 'conversation.relevance', 'map.write', 'brief.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.interrupt', 'conversation.relevance', 'map.write', 'brief.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
@@ -91,7 +91,7 @@ export function validateIntegrationCommand(config, input) {
   if (input.type !== 'project.list' || input.projectId !== undefined) {
     if (!config.projectIds.includes(input.projectId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
-  if (['conversation.state', 'conversation.submit', 'brief.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
   return { command: { ...input, payload: input.payload ?? {} }, actor };

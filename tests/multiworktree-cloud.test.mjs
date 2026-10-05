@@ -10,7 +10,7 @@ const { resolveProject, saveMainBinding, bindingStatus } = await skillImport('sc
 const { startServer } = await skillImport('scripts/workbench/server.mjs');
 const { stopServer } = await skillImport('scripts/workbench/cli.mjs');
 
-import { startMemoryServer } from '../scripts/cloud/memory.mjs';
+import { completeSessionMemory, startMemoryServer } from '../scripts/cloud/memory.mjs';
 const { memoryConfigPath, sessionMemoryDir } = await skillImport('scripts/workbench/memory.mjs');
 
 import { readJSON } from '../scripts/shared/io.mjs';
@@ -109,6 +109,7 @@ test('a legacy worktree seed is replaced by the confirmed main baseline without 
   memory = await startMemoryServer(options);
   const saved = await call(memory, '/v1/projects/example/sessions/publisher', options.projects.example.token, { operationId: 'baseline-session', baseVersion: null, baseMainVersion: null, sourceCommit: mainSha, memory: { map: mainMap, records: {} } });
   assert.equal(saved.status, 200, JSON.stringify(saved));
+  await completeSessionMemory(options, 'example', { operationId: 'review-baseline', sessionId: 'publisher', generation: 1, sessionVersion: saved.data.snapshot.version, sourceCommit: mainSha }, { kind: 'human' });
   const published = await call(memory, '/v1/projects/example/publish', options.adminToken, { operationId: 'baseline-publish', baseVersion: null, sessionId: 'publisher', sessionVersion: saved.data.snapshot.version, expectedMainSha: mainSha });
   assert.equal(published.status, 200, JSON.stringify(published));
   const project = await resolveProject(other);
@@ -166,6 +167,11 @@ test('private memory requires authentication, isolates Sessions, verifies merge 
   assert.equal((await call(service, base + 'main', '')).status, 401);
   const input = { operationId: 'save-one', baseVersion: null, baseMainVersion: null, sourceCommit: featureSha, memory };
   const saved = await call(service, base + 'sessions/one', token, input); assert.equal(saved.status, 200);
+  const review = async snapshot => completeSessionMemory(options, 'example', {
+    operationId: `review-${snapshot.sessionId}-${snapshot.version}`, sessionId: snapshot.sessionId,
+    generation: snapshot.generation, sessionVersion: snapshot.version, sourceCommit: snapshot.sourceCommit,
+  }, { kind: 'human' });
+  await review(saved.data.snapshot);
   assert.equal((await call(service, base + 'main', token)).data.snapshot, null);
   assert.equal((await call(service, base + 'sessions/two', token)).data.snapshot, null);
   const publish = { operationId: 'publish-one', baseVersion: null, sessionId: 'one', sessionVersion: saved.data.snapshot.version, expectedMainSha: mainSha };
@@ -184,6 +190,7 @@ test('private memory requires authentication, isolates Sessions, verifies merge 
   assert.equal(reopened.status, 200, JSON.stringify(reopened));
   assert.equal(reopened.data.snapshot.generation, 2);
   assert.equal(reopened.data.snapshot.reopenedFrom, published.data.snapshot.version);
+  await review(reopened.data.snapshot);
   const republished = await call(service, base + 'publish', token, { operationId: 'republish-one', baseVersion: published.data.snapshot.version, sessionId: 'one', sessionVersion: reopened.data.snapshot.version, expectedMainSha: featureSha });
   assert.equal(republished.status, 200, JSON.stringify(republished));
   assert.equal(republished.data.closedSession.generation, 2);
@@ -191,6 +198,7 @@ test('private memory requires authentication, isolates Sessions, verifies merge 
   assert.deepEqual((await call(service, base + 'publish', token, publish)).data, published.data);
   const secondMemory = { map: memory.map, records: { 'sessions/two.md': 'private Session two' } };
   const savedTwo = await call(service, base + 'sessions/two', token, { operationId: 'save-two', baseVersion: null, baseMainVersion: republished.data.snapshot.version, sourceCommit: featureSha, memory: secondMemory });
+  await review(savedTwo.data.snapshot);
   const publishedTwo = await call(service, base + 'publish', token, { operationId: 'publish-two', baseVersion: republished.data.snapshot.version, sessionId: 'two', sessionVersion: savedTwo.data.snapshot.version, expectedMainSha: featureSha });
   assert.equal(publishedTwo.status, 200, JSON.stringify(publishedTwo));
   assert.deepEqual(Object.keys(publishedTwo.data.snapshot.memory.records).sort(), ['sessions/one.md', 'sessions/two.md']);

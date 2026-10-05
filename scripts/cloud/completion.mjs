@@ -64,7 +64,9 @@ export async function verifyTaskCompletion({ project, repositoryId, memory, task
   if (!match) return false;
   const closed = memory.closedSessions?.[task.session.id];
   const archive = (closed?.publications || (closed ? [closed] : [])).find(item =>
-    item.sessionVersion === receipts.archiveReceiptRef && item.sourceCommit === task.sourceSha);
+    item.sessionVersion === receipts.archiveReceiptRef && item.sourceCommit === task.sourceSha &&
+    item.sessionId === task.session.id && Number.isSafeInteger(task.session.generation) &&
+    task.session.generation > 0 && item.generation === task.session.generation);
   if (!archive?.mainSha || !archive.mainVersion) return false;
   let token = '';
   if (policy.tokenFile) {

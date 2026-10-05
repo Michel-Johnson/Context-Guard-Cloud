@@ -101,6 +101,44 @@ function publicationHistory(closed) {
 function nextSessionGeneration(closed) {
   return publicationHistory(closed).reduce((maximum, item) => Math.max(maximum, item.generation || 1), 0) + 1;
 }
+
+export const sessionCompletionMatches = session => !!session?.completion &&
+  session.completion.sessionId === session.sessionId &&
+  session.completion.generation === (session.generation || 1) &&
+  session.completion.sessionVersion === session.version &&
+  session.completion.sourceCommit === session.sourceCommit;
+
+// Only a trusted review path can attest completion. Uploads and heartbeats do
+// not carry authority, even when their source commit is already on Main.
+export async function completeSessionMemory(configuration, projectId, input, actor) {
+  validateOptions(configuration);
+  if (!['human', 'admin', 'coordinator-review'].includes(actor?.kind)) throw new MapError('FORBIDDEN', 'Reviewed completion requires human or trusted review authorization', 403);
+  if (!validSessionId(input?.sessionId) || typeof input?.operationId !== 'string' || !input.operationId || input.operationId.length > 200 ||
+      !Number.isSafeInteger(input.generation) || input.generation < 1 || typeof input.sessionVersion !== 'string' || !input.sessionVersion ||
+      !/^[a-f0-9]{40,64}$/.test(input.sourceCommit || '')) throw new MapError('INVALID_COMPLETION', 'Exact Session, generation, version and source commit required', 400);
+  const committed = await withFileLock(projectMemoryLockFile(configuration.dataDir, projectId), async () => {
+    const state = await readMemoryProject(configuration, projectId);
+    const key = hash(`completion:${input.operationId}`), fingerprint = hash(encode(input));
+    if (state.receipts[key]) {
+      if (state.receipts[key].fingerprint !== fingerprint) throw new MapError('ID_REUSED', 'Operation ID reused for different content', 409);
+      return { result: receiptResult(state, state.receipts[key]), event: null };
+    }
+    const session = state.sessions[input.sessionId];
+    if (!session || session.version !== input.sessionVersion || (session.generation || 1) !== input.generation || session.sourceCommit !== input.sourceCommit)
+      throw new MapError('VERSION_CONFLICT', 'Session changed; review its current generation and version', 409);
+    if (configuration.publicationGate && !await configuration.publicationGate(projectId, session)) throw new MapError('TASK_SOURCE_PENDING', 'Task review or experiment policy blocks completion', 409);
+    const at = new Date().toISOString();
+    session.completion = { sessionId: input.sessionId, generation: input.generation, sessionVersion: input.sessionVersion, sourceCommit: input.sourceCommit, operationId: input.operationId, actor: structuredClone(actor), completedAt: at };
+    state.revision++;
+    const result = { committed: true, projectId, completion: structuredClone(session.completion), revision: state.revision };
+    state.receipts[key] = { fingerprint, result };
+    const event = appendMemoryEvent(state, { projectId, scope: `session:${input.sessionId}`, type: 'session.completed', operationId: input.operationId, baseVersion: session.version, version: session.version, actor, at });
+    await writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
+    return { result, event };
+  });
+  if (committed.event) memoryHub(configuration).emit('event', committed.event);
+  return committed.result;
+}
 export function memoryHub(configuration) {
   let hub = memoryHubs.get(configuration);
   if (!hub) { hub = new EventEmitter(); hub.setMaxListeners(0); memoryHubs.set(configuration, hub); }
@@ -278,6 +316,8 @@ export async function memoryPublicationStatus(configuration, projectId, sessionI
   const mainSha = await gitCommand(project.root, ['rev-parse', '--verify', `${project.ref}^{commit}`]);
   const baseVersion = state.main?.version || null;
   const common = { projectId, sessionId, generation: session.generation || 1, sessionVersion: session.version, baseVersion, baseMainVersion: session.baseMainVersion ?? null, sourceCommit: session.sourceCommit, mainSha };
+  if (!sessionCompletionMatches(session)) return { ...common, status: 'waiting', reason: 'SESSION_COMPLETION_REQUIRED' };
+  if (configuration.publicationGate && !await configuration.publicationGate(projectId, session)) return { ...common, status: 'waiting', reason: 'TASK_SOURCE_PENDING' };
   if (session.baseMainVersion !== baseVersion) return { ...common, status: 'conflict', reason: 'MAIN_MEMORY_ADVANCED' };
   const merge = await mergeStatus(project, session.sourceCommit, mainSha);
   return { ...common, status: merge.ready ? 'ready' : 'waiting', reason: merge.reason };
@@ -300,12 +340,17 @@ export async function publishSessionMemory(configuration, projectId, input, acto
     if (!project.root || !project.ref) throw new MapError('MAIN_BINDING_REQUIRED', 'Configure the server repository mirror and authoritative ref', 409);
     const session = state.sessions[input.sessionId];
     if (!session || session.version !== input.sessionVersion) throw new MapError('VERSION_CONFLICT', 'Session version changed', 409);
+    if (!sessionCompletionMatches(session)) throw new MapError('SESSION_COMPLETION_REQUIRED', 'Review and explicitly complete this Session version before publication', 409);
+    if (configuration.publicationGate && !await configuration.publicationGate(projectId, session)) throw new MapError('TASK_SOURCE_PENDING', 'Task review or experiment policy blocks publication', 409);
     if ((state.main?.version || null) !== input.baseVersion || session.baseMainVersion !== input.baseVersion) throw new MapError('VERSION_CONFLICT', 'Reconcile Session against the published main baseline first', 409);
     if (project.remote) await gitCommand(project.root, ['fetch', '--quiet', project.remote]);
     const mainSha = await gitCommand(project.root, ['rev-parse', '--verify', `${project.ref}^{commit}`]);
     if (mainSha !== input.expectedMainSha) throw new MapError('MAIN_ADVANCED', 'Main changed; review the new commit before publication', 409);
     const merge = await mergeStatus(project, session.sourceCommit, mainSha);
     if (!merge.ready) throw new MapError('NOT_MERGED', 'Session source has not been merged into the authoritative branch', 409, { reason: merge.reason });
+    // Fetch/Git inspection can take seconds. Do not use its earlier task-policy
+    // observation if a review was revoked or the task entered rework meanwhile.
+    if (configuration.publicationGate && !await configuration.publicationGate(projectId, session)) throw new MapError('TASK_SOURCE_PENDING', 'Task review changed during publication', 409);
     const previousVersion = state.main?.version || null;
     const publishedAt = new Date().toISOString();
     const deletedRecordKeys = [...new Set([...(state.main?.deletedRecordKeys || []), ...(session.deletedRecordKeys || [])])].sort();
@@ -331,7 +376,17 @@ export async function publishSessionMemory(configuration, projectId, input, acto
     const result = { committed: true, projectId, snapshot, revision: state.revision, history, closedSession: state.closedSessions[input.sessionId] };
     state.receipts[key] = { fingerprint, result: compactReceiptResult(result) };
     const event = appendMemoryEvent(state, { projectId, scope: 'main', type: 'main.published', operationId: input.operationId, baseVersion: previousVersion, version: snapshot.version, actor, at: publishedAt });
-    await writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
+    // Cloud holds the workflow-store lock through the final policy check and
+    // durable memory write. A read-only gate alone leaves a revoke/commit race.
+    // The memory lock is already held; reverse workflow paths must only read
+    // memory and must not attempt a memory transaction while holding that lock.
+    let publicationWrite;
+    const write = () => publicationWrite ||= writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
+    if (configuration.commitPublication) {
+      await configuration.commitPublication(projectId, structuredClone(session), write);
+      if (!publicationWrite) throw new MapError('MEMORY_UNAVAILABLE', 'Publication policy did not commit memory; Session preserved', 503);
+      await publicationWrite;
+    } else await write();
     return { result, event };
   });
   if (committed.event) memoryHub(configuration).emit('event', committed.event);
@@ -431,6 +486,7 @@ export async function commitSessionMap(configuration, projectId, sessionId, inpu
     const updatedAt = new Date().toISOString();
     const reconciled = reconcileBugRecordDeletions(current, { ...current.memory, map: applied.doc }, current.deletedRecordKeys);
     const snapshot = { ...current, version: hash(encode({ previous: current.version, operationId: input.operationId, map: applied.doc, updatedAt })), ...reconciled, updatedAt };
+    delete snapshot.completion;
     state.sessions[sessionId] = snapshot;
     state.revision++;
     appendHistory(state, { scope: `session:${sessionId}`, action: 'workbench.commit', snapshot, previousVersion: current.version, actor, at: updatedAt });
@@ -461,7 +517,7 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
     };
     const url = new URL(req.url, 'http://localhost');
     const filesystemRoute = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/filesystem\/(main|sessions\/([^/]+))\/(.+)$/);
-    const route = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/(main|preferences|sessions\/([^/]+)(?:\/(map|changes|events))?|publish|history|restore)$/);
+    const route = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/(main|preferences|sessions\/([^/]+)(?:\/(map|changes|events|complete))?|publish|history|restore)$/);
     if (!route && !filesystemRoute) return false;
     try {
       if (filesystemRoute) {
@@ -558,6 +614,11 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
       for await (const chunk of req) { size += chunk.length; if (size > 16 * 1024 * 1024) throw new MapError('BODY_TOO_LARGE', 'Memory batch exceeds 16 MiB', 413); chunks.push(chunk); }
       const input = JSON.parse(Buffer.concat(chunks));
       if (typeof input.operationId !== 'string' || !input.operationId || input.operationId.length > 200) throw new MapError('INVALID_OPERATION', 'Stable operationId required');
+      if (rawSession && sessionAction === 'complete') {
+        if (!admin) throw new MapError('FORBIDDEN', 'Completion requires trusted human review, not an Agent credential', 403);
+        if (input.sessionId !== sessionId) throw new MapError('SESSION_MISMATCH', 'Completion Session does not match the route', 409);
+        return send(200, await completeSessionMemory(configuration, projectId, input, { kind: 'admin' }));
+      }
       if (rawSession && sessionAction === 'map') {
         const result = await commitSessionMap(configuration, projectId, sessionId, input, { kind: admin ? 'admin' : 'agent', sessionId });
         return send(200, result);
@@ -636,6 +697,7 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
             updatedAt: restoredAt,
             restoredFrom: target.version,
           };
+          delete snapshot.completion;
           setScopeValue(state, historyScope, snapshot);
           historyAction = 'restore';
         } else throw new MapError('READ_ONLY_MAIN', 'Publish a verified Session; main cannot be written directly', 403);
@@ -669,11 +731,11 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
   return handler;
 }
 
-export async function startMemoryServer({ dataDir, adminToken, projects = {}, host = '127.0.0.1', port = 0 } = {}) {
+export async function startMemoryServer({ dataDir, adminToken, projects = {}, publicationGate, commitPublication, host = '127.0.0.1', port = 0 } = {}) {
   validateOptions({ dataDir, adminToken });
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) throw new Error('Private memory service must listen on loopback behind an authenticated TLS endpoint');
   await enforceMainHistoryRetention({ dataDir, adminToken, projects });
-  const handler = createMemoryHandler({ dataDir, adminToken, projects });
+  const handler = createMemoryHandler({ dataDir, adminToken, projects, publicationGate, commitPublication });
   const server = http.createServer(async (req, res) => {
     if (!await handler(req, res)) {
       res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });

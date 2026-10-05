@@ -199,6 +199,10 @@ export function conversationFragments(messages, doc = document, { nodes = [], on
     if (workflow || (!message.text && !message.attachments?.length && !message.questions?.length && !visibleAction)) continue;
     const row = doc.createElement('article'); row.className = `coordinator-message ${message.role === 'assistant' ? 'assistant' : 'user'}`;
     const content = doc.createElement('div'); content.className = 'coordinator-markdown';
+    if (message.partial) {
+      const notice = doc.createElement('p'); notice.className = 'coordinator-question-status';
+      notice.textContent = '部分回复（未完成）'; content.append(notice);
+    }
     const cleanText = String(message.text || '').replace(/^\[实验：模拟人工输入\]\n/, '');
     const legacy = !message.questions?.length && message.role === 'assistant' ? legacyQuestionList(cleanText) : null;
     const lead = message.questionOnly ? '' : cleanText;

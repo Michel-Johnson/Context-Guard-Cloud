@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap, commitSessionMap, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readMemoryProject, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readMemoryProject, memoryHeads, memoryHub } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -444,7 +444,7 @@ export async function startCloudServer({
   if (publicOrigin && !allowedOrigin) throw new MapError('INVALID_ORIGIN', 'CONTEXT_GUARD_CLOUD_ORIGIN must be an absolute HTTP(S) origin');
   if (browserPasswordHash && !passwordHashPattern.test(browserPasswordHash)) throw new MapError('INVALID_PASSWORD_HASH', 'Use a Context Guard scrypt password hash');
   if (browserPasswordHash && !browserToken) throw new MapError('WORKBENCH_TOKEN_REQUIRED', 'Password login requires an independent workbench cookie token');
-  const configuredMemory = memoryConfig || (process.env.CONTEXT_GUARD_MEMORY_CONFIG
+  const configuredMemory = (memoryConfig && { ...memoryConfig }) || (process.env.CONTEXT_GUARD_MEMORY_CONFIG
     ? await readJson(path.resolve(process.env.CONTEXT_GUARD_MEMORY_CONFIG), null)
     : null);
   const rawIntegrations = integrationConfig || (process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG
@@ -1054,13 +1054,19 @@ export async function startCloudServer({
     return { ...state, conversationId };
   };
   const submitCoordinator = async (project, conversationId, input, options = {}) => {
-    if (!input || Object.keys(input).some(key => !['id', 'text', 'retry', 'answerTo', 'attachments'].includes(key))) {
+    if (!input || Object.keys(input).some(key => !['id', 'text', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
       protocolFail('INVALID_ARGUMENT', 'Provide a message, stable ID and optional attachment references');
     }
     const service = await coordinatorFor(project, conversationId);
-    if (input.retry && !options.actor) {
+    if (input.retry) {
       const saved = (await service.state()).retryInput;
+      if (options.actor && input.expectedTurnId !== undefined) {
+        if (Object.keys(input).some(key => !['id', 'retry', 'expectedTurnId'].includes(key)) || saved?.id !== input.expectedTurnId) protocolFail('INVALID_RETRY', 'Resume only the exact original turn without replacing its input');
+        input = { id: saved.id, text: saved.text, ...(saved.answerTo ? { answerTo: saved.answerTo } : {}),
+          ...(saved.attachments ? { attachments: saved.attachments } : {}), retry: true };
+      }
       if (saved?.id !== input.id) protocolFail('INVALID_RETRY', 'Retry the original failed turn');
+      if (options.actor && JSON.stringify(saved.actor) !== JSON.stringify(options.actor)) protocolFail('FORBIDDEN', 'Only the original operator can resume this input');
       options = { source: saved.source || 'human', ...(saved.actor ? { actor: saved.actor } : {}) };
     }
     return service.submit(input, options);
@@ -1159,6 +1165,10 @@ export async function startCloudServer({
     await requireManualConversation(project, conversationId);
     if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
     if (type === 'conversation.submit') return submitCoordinator(project, conversationId, { ...payload, id: operationId }, { source: 'slack', actor });
+    if (type === 'conversation.interrupt') {
+      if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');
+      return (await coordinatorFor(project, conversationId)).interrupt({ ...payload, id: operationId }, { source: 'slack', actor });
+    }
     if (type === 'brief.review') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
     if (type === 'prompt.read') return manualBriefsFor(project).prompt(payload.proposalId, conversationId);
     protocolFail('INVALID_ARGUMENT', 'Unsupported integration operation');
@@ -1607,14 +1617,33 @@ export async function startCloudServer({
     }
     return sessions.sort((a, b) => String(b.lastSeen).localeCompare(String(a.lastSeen)));
   };
-  const taskPublicationReady = async (project, sessionId, sourceCommit) => {
+  const taskPublicationReady = async (project, sessionId, sourceCommit, generation) => {
     if (!interfaceConfig?.repositories?.some(item => item.projectId === project.id && /^\d+$/.test(item.repositoryId))) return true;
     const { principal, store } = interfaceProject(project);
     const binding = await store.registeredBinding(principal, sessionId);
-    if (!binding) return true;
-    const tasks = await store.workflowTasks(principal, { id: sessionId, generation: binding.generation });
+    if (!binding) return generation === undefined;
+    if (generation !== undefined && binding.generation !== generation) return false;
+    const tasks = await store.workflowTasks(principal, { id: sessionId, generation: generation ?? binding.generation });
     return taskSessionPublicationReady(tasks, sourceCommit, configuredMemory.projects[project.id]);
   };
+  if (configuredMemory) {
+    const originalGate = configuredMemory.publicationGate;
+    configuredMemory.publicationGate = async (projectId, session) => {
+      const project = projectById(projectId);
+      return !!project && (!originalGate || await originalGate(projectId, session)) &&
+        await taskPublicationReady(project, session.sessionId, session.sourceCommit, session.generation || 1);
+    };
+    configuredMemory.commitPublication = async (projectId, session, write) => {
+      const project = projectById(projectId);
+      const commit = async () => {
+        if (!await configuredMemory.publicationGate(projectId, session)) throw new MapError('TASK_SOURCE_PENDING', 'Task review changed during publication', 409);
+        return write();
+      };
+      if (!interfaceConfig?.repositories?.some(item => item.projectId === projectId && /^\d+$/.test(item.repositoryId))) return commit();
+      const { store } = interfaceProject(project);
+      return withFileLock(`${store.file}.lock`, commit);
+    };
+  }
   const publicationState = async (project, viewId, options = {}) => {
     if (!project || !configuredMemory?.projects?.[project.id]) return { status: 'unavailable', reason: 'MEMORY_NOT_CONFIGURED' };
     if (viewId === 'main') {
@@ -1624,7 +1653,7 @@ export async function startCloudServer({
         : { projectId: project.id, status: 'empty', mainVersion: null };
     }
     const status = await memoryPublicationStatus(configuredMemory, project.id, viewId.slice('session:'.length), options);
-    return status.status === 'ready' && !await taskPublicationReady(project, status.sessionId, status.sourceCommit)
+    return status.status === 'ready' && !await taskPublicationReady(project, status.sessionId, status.sourceCommit, status.generation)
       ? { ...status, status: 'waiting', reason: 'TASK_SOURCE_PENDING' } : status;
   };
   const broadcastWorkbench = async (scope, project, viewId = 'main') => {
@@ -2091,7 +2120,7 @@ export async function startCloudServer({
         const conversationId = url.searchParams.get('conversation') || 'legacy';
         if (viewId !== 'main' && (!project || !viewId.startsWith('session:'))) throw new MapError('UNKNOWN_VIEW', 'Select Main or a project Session', 404);
         const action = workbench[3];
-        if (action === '/bootstrap' && req.method === 'GET') { requirePrivateRead(req, url); return send(res, 200, { root: project ? `cloud:${project.id}` : 'cloud:overview', protocol: 3, apiBase: route.slice(0, -'/bootstrap'.length), authenticated: !!cookieValue(req), interfaceCapabilities: { attachments: !!project && !!configuredMemory?.projects?.[project.id] && !!attachments, taskDispatch: !!project && !!interfaceConfig, humanReview: !!project && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[project?.id]?.coordinator?.enabled } }); }
+        if (action === '/bootstrap' && req.method === 'GET') { requirePrivateRead(req, url); return send(res, 200, { root: project ? `cloud:${project.id}` : 'cloud:overview', protocol: 3, apiBase: route.slice(0, -'/bootstrap'.length), authenticated: !!cookieValue(req), interfaceCapabilities: { sessionCompletion: !!project && !!configuredMemory?.projects?.[project.id], attachments: !!project && !!configuredMemory?.projects?.[project.id] && !!attachments, taskDispatch: !!project && !!interfaceConfig, humanReview: !!project && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[project?.id]?.coordinator?.enabled } }); }
         requireWorkbench(req, url);
         if (action.startsWith('/api/coordinator/attachments/') && project && req.method === 'GET') {
           if (!integrationAttachments) protocolFail('NOT_FOUND', 'Coordinator attachments are unavailable');
@@ -2214,6 +2243,11 @@ export async function startCloudServer({
           }
           if (req.method === 'POST') return send(res, 202, await submitCoordinator(project, conversationId, await requestBody(req)));
         }
+        if (action === '/api/coordinator/interrupt' && project && req.method === 'POST') {
+          const input = await requestBody(req);
+          if (!input || Object.keys(input).some(key => !['id', 'expectedTurnId'].includes(key))) protocolFail('INVALID_ARGUMENT', 'Provide a stable stop ID and active turn identity');
+          return send(res, 202, await (await coordinatorFor(project, conversationId)).interrupt(input));
+        }
         if (action === '/api/coordinator/mount-review' && project && req.method === 'POST') {
           const coordinator = await coordinatorFor(project, conversationId), input = await requestBody(req);
           const result = await coordinator.reviewMount(input, (proposals, operationId) => commitMainMemoryMap(configuredMemory, project.id, {
@@ -2263,7 +2297,10 @@ export async function startCloudServer({
           if (typeof input.reason !== 'string' || !input.reason.trim()) protocolFail('INVALID_ARGUMENT', 'Record the human acceptance result or rejection reason');
           const message = validateMessage({ v: 2, id: input.id, type: 'review.result', session, payload: { kind: 'acceptance', ref: input.ref, version: input.version,
             decision: input.decision, reason: (configuredMemory.projects[project.id].coordinator.simulated ? '[模拟人工验收] ' : '') + input.reason } });
-          return send(res, 200, (await store.handle(principal, message)).data);
+          const result = (await store.handle(principal, message)).data;
+          // CI acceptance does not attest a Map version that the human has not reviewed.
+          // Session completion is a separate, exact-version human action.
+          return send(res, 200, result);
         }
         if (action === '/api/state' && req.method === 'GET') {
           const state = await scopedWorkbenchState(scope, project, viewId);
@@ -2341,6 +2378,12 @@ export async function startCloudServer({
             sessionVersion: status.sessionVersion,
             expectedMainSha: status.mainSha,
           }, { kind: 'automation', sessionId: status.sessionId }));
+        }
+        if (action === '/api/session-completion' && req.method === 'POST') {
+          if (!project || !viewId.startsWith('session:')) throw new MapError('SESSION_REQUIRED', 'Complete the reviewed Session Map', 409);
+          const input = await requestBody(req);
+          if (!input || Object.keys(input).some(key => !['operationId', 'sessionId', 'generation', 'sessionVersion', 'sourceCommit'].includes(key)) || input.sessionId !== viewId.slice('session:'.length)) throw new MapError('INVALID_COMPLETION', 'Completion must target the displayed Session', 400);
+          return send(res, 200, await completeSessionMemory(configuredMemory, project.id, input, { kind: 'human', sessionId: 'cloud-workbench' }));
         }
         if (action === '/api/presence' && req.method === 'POST') {
           const input = await requestBody(req), state = await scopedWorkbenchState(scope, project, viewId);
@@ -2551,7 +2594,7 @@ export async function startCloudServer({
         if (/^\/projects\//.test(route) && !projectById(decodeURIComponent(route.slice('/projects/'.length)))) throw new MapError('NOT_FOUND', 'Project is missing', 404);
         const projectId = /^\/projects\//.test(route) ? decodeURIComponent(route.slice('/projects/'.length)) : null;
         const scope = projectId ? `projects/${encodeURIComponent(projectId)}` : 'overview';
-        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
+        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { sessionCompletion: !!projectId && !!configuredMemory?.projects?.[projectId], attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
         const marker = `<script>window.__CG_SERVER=${config};</script>`;
         const html = workbenchHtml.replace('<!-- CG_SERVER_BOOT -->', marker);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' });

@@ -8,6 +8,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
+import { completeSessionMemory } from '../scripts/cloud/memory.mjs';
 
 const execFileAsync = promisify(execFile);
 const git = async (root, ...args) => (await execFileAsync('git', args, { cwd: root, windowsHide: true })).stdout.trim();
@@ -32,6 +33,9 @@ const mainMap = {
 // A valid legacy item may have no files field. Merely rendering it must not
 // normalize that field into a Main write (B142).
 mainMap.root.children[0].bugs=[{id:'B-readonly',title:'Readonly manual bug',status:'open',executionMode:'manual',sessions:[]}];
+mainMap.root.memories = [{ id: 'M-old-root', text: 'Legacy project evidence <script>window.__legacyExecuted=true</script>', state: 'success',
+  files: [{ path: 'docs/legacy-proof.md' }], proposalEvidence: { reason: 'Historical rationale', basis: 'code', files: ['module.mjs'] } }];
+mainMap.root.children[0].memories = [{ id: 'M-old-node', text: 'Legacy node history', state: 'dirty', custom: { retained: true } }];
 const sessionMap = structuredClone(mainMap);
 sessionMap.root.title = 'Session map';
 sessionMap.root.purpose = 'private working state';
@@ -101,6 +105,7 @@ try {
     body: JSON.stringify({ operationId: 'browser-baseline-session', baseVersion: null, baseMainVersion: null, sourceCommit: baseSha, memory: { map: mainMap, records: {} } }),
   });
   assert.equal(baselineSession.response.status, 200, JSON.stringify(baselineSession.body));
+  await completeSessionMemory(memoryConfig, 'context-guard', { operationId: 'review-browser-baseline', sessionId: 'baseline-session', generation: 1, sessionVersion: baselineSession.body.snapshot.version, sourceCommit: baseSha }, { kind: 'human' });
   const baselinePublication = await request(`${service.url}/v1/projects/context-guard/publish`, {
     method: 'POST',
     headers: headers('project-memory-token'),
@@ -416,6 +421,12 @@ try {
   await page.locator('#session-menu [data-session="session-one"]').click();
   await page.waitForFunction(() => document.querySelector('#cg-sync-session')?.value === 'session-one');
   await synchronized();
+  await page.locator('#btn-settings').click();
+  await page.locator('#cg-sync > summary').click();
+  page.once('dialog', dialog => dialog.accept());
+  const reviewedSession = page.waitForResponse(response => response.url().includes('/api/session-completion'));
+  await page.locator('#cg-session-complete').click();
+  assert.equal((await reviewedSession).status(), 200, 'human completes the exact reviewed map before source merge');
   await git(repository, 'merge', '--ff-only', 'feature');
   await page.reload();
   await page.waitForFunction(() => !new URL(location.href).searchParams.has('session'), undefined, { timeout: 35000 });
@@ -734,6 +745,13 @@ try {
     return result;
   });
   assert.deepEqual(readableItems.assistant.slice(0,3),['静态服务路径越界（工程）','边界回归测试（测试）','空值搜索崩溃']);
+  const partialNotice = await page.evaluate(async () => {
+    const { conversationFragments } = await import('/prototype/coordinator-markdown.mjs');
+    const host = document.createElement('div');
+    host.append(conversationFragments([{ role: 'assistant', text: 'Interrupted text', partial: true }], document).body);
+    return host.textContent;
+  });
+  assert.match(partialNotice, /部分回复（未完成）/);
   assert.equal(readableItems.user[0],'Bug B399679682924：静态服务路径越界（工程）','user-authored text remains verbatim');
   assert.equal(readableItems.code,'- Bug B399679682924: 精确诊断编号');
   assert.ok(readableItems.assistant.includes('B399679682924: 用户要求的编号'),'explicit code IDs remain available for diagnostics');
@@ -1659,6 +1677,16 @@ try {
   await synchronized();
   await page.locator('.node[data-id="T0"]').click();
   const memoryPanel = page.locator('#detail [data-fold="memory-doc"]');
+  assert.equal(await page.locator('#detail [data-fold="mem"], #detail [data-fold="inherited"], #detail [data-act="add-mem"], #detail [data-ed="mem"], #detail [data-ed="inh"]').count(), 0);
+  const historyPanel = page.locator('#detail [data-fold="legacy-memory-preview"]');
+  assert.equal(await historyPanel.getAttribute('open'), null, 'legacy cards stay outside the normal memory view');
+  const previewVersion = await syncVersion();
+  await historyPanel.locator('summary').click();
+  assert.match(await historyPanel.textContent(), /proposalEvidence/);
+  assert.match(await historyPanel.textContent(), /docs\/legacy-proof\.md/);
+  assert.equal(await historyPanel.locator('[contenteditable],textarea,input,button,[data-drop-files]').count(), 0);
+  assert.equal(await page.evaluate(() => window.__legacyExecuted), undefined, 'legacy text is not executable HTML');
+  assert.equal(await syncVersion(), previewVersion, 'opening history is not a Map write');
   if (await memoryPanel.getAttribute('open') === null) await memoryPanel.locator('summary').click();
   const projectMemory = '# Main map · 项目记忆\n\n## 目标\n\n记住项目边界。';
   let memoryVersion = await syncVersion();
@@ -1676,12 +1704,87 @@ try {
   assert.equal(savedMemory.response.status, 200);
   assert.equal(savedMemory.body.snapshot.memory.map.root.memoryDocument, projectMemory);
   assert.equal(savedMemory.body.snapshot.memory.map.root.children[0].memoryDocument, nodeMemory);
+  assert.deepEqual(savedMemory.body.snapshot.memory.map.root.memories, mainMap.root.memories, 'saving a document preserves legacy project evidence');
+  assert.deepEqual(savedMemory.body.snapshot.memory.map.root.children[0].memories, mainMap.root.children[0].memories, 'saving a document preserves legacy node metadata');
+  assert.match(await historyPanel.textContent(), /Legacy node history/);
+  assert.match(await historyPanel.textContent(), /Historical rationale/, 'ancestor evidence is available only through read-only history');
   await page.reload();
   await synchronized();
   await page.locator('.node[data-id="T0"]').click();
   if (await memoryPanel.getAttribute('open') === null) await memoryPanel.locator('summary').click();
   assert.equal(await page.locator('#detail [data-memory-document]').inputValue(), projectMemory);
   record('Human edits project and node memory documents through the versioned Main workbench');
+
+  const partialPresentation = await page.evaluate(async () => {
+    const url = performance.getEntriesByType('resource').map(entry => entry.name)
+      .find(name => new URL(name).pathname.endsWith('/coordinator-markdown.mjs'));
+    const { conversationFragments } = await import(url);
+    const container = document.createElement('div');
+    container.append(conversationFragments([{ role: 'assistant', text: 'Stopped partial <script>unsafe</script>', partial: true }]).body);
+    return { text: container.textContent, scripts: container.querySelectorAll('script').length };
+  });
+  assert.match(partialPresentation.text, /部分回复（未完成）/);
+  assert.equal(partialPresentation.scripts, 0);
+  record('Stopped or superseded Coordinator output is visibly marked partial, not a final answer');
+
+  assert.equal(await page.locator('#cg-session-complete').getAttribute('hidden'), '', 'Main does not offer Session completion');
+  await git(repository, 'switch', '-c', 'completion-feature');
+  await fs.writeFile(path.join(repository, 'completion.txt'), 'unmerged completion UI fixture');
+  await git(repository, 'add', 'completion.txt');
+  await git(repository, 'commit', '-m', 'completion feature');
+  const completionSha = await git(repository, 'rev-parse', 'HEAD');
+  await git(repository, 'switch', 'main');
+  const completionMain = await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') });
+  const completionSeed = await request(`${service.url}/v1/projects/context-guard/sessions/completion-ui`, {
+    method: 'POST', headers: headers('project-memory-token'),
+    body: JSON.stringify({ operationId: 'completion-ui-seed', baseVersion: null,
+      baseMainVersion: completionMain.body.snapshot.version, sourceCommit: completionSha, memory: { map: sessionMap, records: {} } }),
+  });
+  assert.equal(completionSeed.response.status, 200);
+  await page.goto(`${service.url}/projects/context-guard?session=completion-ui`);
+  await synchronized();
+  assert.equal(await page.locator('#cg-session-complete').getAttribute('hidden'), null);
+  await page.locator('.node[data-id="T0"]').click();
+  await page.locator('#detail [data-ed="title"]').fill('Reviewed completion UI');
+  let dialogs = 0;
+  const acceptCompletion = async dialog => { dialogs++; await dialog.accept(); };
+  page.on('dialog', acceptCompletion);
+  await page.locator('#btn-settings').click();
+  await page.locator('#cg-sync > summary').click();
+  await page.locator('#cg-session-complete').click();
+  assert.equal(dialogs, 0, 'unsynchronized edits cannot be attested');
+  await synchronized();
+  const completionRoute = `${service.url}/api/workbench/projects/context-guard/api/session-completion*`;
+  await page.route(completionRoute, async route => {
+    await page.unroute(completionRoute);
+    const body = route.request().postDataJSON();
+    const changed = await request(`${service.url}/api/workbench/projects/context-guard/api/commit?view=session%3Acompletion-ui`, {
+      method: 'POST', headers: headers('browser-token'), body: JSON.stringify({ operationId: 'completion-ui-race',
+        baseVersion: body.sessionVersion, operations: [{ type: 'update', id: 'T0', fields: { purpose: 'Changed after review' } }] }),
+    });
+    assert.equal(changed.response.status, 200);
+    await route.continue();
+  });
+  const staleCompletion = page.waitForResponse(response => response.url().includes('/api/session-completion'));
+  await page.locator('#cg-session-complete').click();
+  assert.equal((await staleCompletion).status(), 409, 'stale reviewed version is rejected');
+  let completionState = await request(`${service.url}/v1/projects/context-guard/sessions/completion-ui`, { headers: headers('project-memory-token') });
+  assert.equal(completionState.body.snapshot.completion, undefined);
+  assert.equal((await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') })).body.snapshot.version,
+    completionMain.body.snapshot.version, 'stale completion does not publish into Main');
+  await synchronized();
+  const acceptedCompletion = page.waitForResponse(response => response.url().includes('/api/session-completion'));
+  await page.locator('#cg-session-complete').click();
+  assert.equal((await acceptedCompletion).status(), 200);
+  completionState = await request(`${service.url}/v1/projects/context-guard/sessions/completion-ui`, { headers: headers('project-memory-token') });
+  assert.equal(completionState.body.snapshot.completion.sessionVersion, completionState.body.snapshot.version);
+  assert.equal(completionState.body.snapshot.completion.generation, 1);
+  assert.equal(completionState.body.snapshot.completion.sourceCommit, completionSha);
+  assert.equal(completionState.body.snapshot.completion.actor.kind, 'human');
+  assert.equal((await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') })).body.snapshot.version,
+    completionMain.body.snapshot.version, 'reviewed but unmerged work remains a Session');
+  page.off('dialog', acceptCompletion);
+  record('Session completion requires synchronized human review and exact current version; stale review preserves Main');
 
   await page.screenshot({ path: path.join(output, 'cloud-session-edit.png'), fullPage: true });
   await fs.writeFile(path.join(output, 'result.json'), `${JSON.stringify({ passed: true, checks }, null, 2)}\n`);

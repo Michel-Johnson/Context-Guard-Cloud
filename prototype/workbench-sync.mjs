@@ -124,6 +124,13 @@ export class WorkbenchSync {
       login.onclick = () => this.openCloudLogin(); this.panel.querySelector('.sync-actions').append(login);
     }
     this.repairButton.onclick = () => this.repair();
+    if (this.config?.root?.startsWith('cloud:') && this.config.interfaceCapabilities?.sessionCompletion) {
+      this.completeButton = document.createElement('button'); this.completeButton.type = 'button';
+      this.completeButton.id = 'cg-session-complete'; this.completeButton.textContent = '确认当前 Session 完成';
+      this.completeButton.hidden = !this.viewId.startsWith('session:');
+      this.completeButton.onclick = () => this.completeSession();
+      this.panel.querySelector('.sync-actions').append(this.completeButton);
+    }
     document.getElementById('settings-menu').append(this.panel);
     this.notice = document.createElement('span'); this.notice.className = 'sync-notice'; this.notice.setAttribute('role', 'status'); this.notice.hidden = true;
     this.cloudIndicator = document.getElementById('cloud-sync-status');
@@ -183,6 +190,29 @@ export class WorkbenchSync {
     return this.cachedDiff.operations;
   }
   dirty() { return !!this.inputDraft || this.composing || !!this.inflight || !!this.pendingRequest || this.operations().length > 0; }
+  async completeSession() {
+    if (!this.completeButton || this.completeButton.disabled) return;
+    this.completeButton.disabled = true;
+    try {
+      if (this.dirty() || !this.ready || !this.viewId.startsWith('session:')) throw new Error('请先同步并审核当前 Session 地图');
+      const viewId = this.viewId;
+      if (this.completionRequest && this.completionRequest.viewId !== viewId) throw new Error('上一 Session 完成请求结果待确认，请先返回该 Session 重试');
+      if (!this.completionRequest) {
+        const publication = await this.call('/api/publication', undefined, 'GET', viewId);
+        if (viewId !== this.viewId || this.dirty() || publication.sessionVersion !== this.version) throw new Error('地图已变化，请重新读取并审核');
+        if (!confirm('已审核当前 Session 地图并确认完成？后续修改将使本次完成证明失效。')) return;
+        this.completionRequest = { viewId, body: { operationId: uniqueId(), sessionId: publication.sessionId,
+          generation: publication.generation, sessionVersion: publication.sessionVersion, sourceCommit: publication.sourceCommit } };
+      }
+      await this.call('/api/session-completion', this.completionRequest.body, 'POST', viewId);
+      this.completionRequest = null;
+      this.setStatus(this.status, '完成已确认；发布仍须通过 Main、CI 和任务门禁');
+      await this.refreshAccess();
+    } catch (error) {
+      if (error.serverResponse) this.completionRequest = null;
+      this.setStatus(this.status, error.message);
+    } finally { this.completeButton.disabled = false; }
+  }
   legacyDeliveryEntries() {
     const prefix = `cg-delivery:${this.config?.root}:`;
     const entries = [];
@@ -644,6 +674,7 @@ export class WorkbenchSync {
     try { return await this.refreshingAccess; } finally { this.refreshingAccess = null; }
   }
   async refreshAccessNow() {
+    if (this.completeButton) this.completeButton.hidden = !this.viewId.startsWith('session:');
     const data = await this.call('/api/access'); const select = this.panel.querySelector('#cg-sync-session');
     this.project = data.project || this.project || null;
     const received = (data.sessions || []).map(item => typeof item === 'string' ? { id: item, name: '', platform: 'unknown', status: 'active', lastSeen: '' } : item);

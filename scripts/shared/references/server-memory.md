@@ -6,7 +6,7 @@ Use this contract only when a project's explicit policy selects a private memory
 server. The Context Guard development repository selects this mode in `RULE.md`;
 other projects do not inherit its server address or binding.
 
-Current design version: [`fs-v2.1`](design-current.md).
+Current design version: [`fs-v2.2`](design-current.md); file projections remain v2.1.
 
 **Status: private service/client implementation, automated acceptance, and the
 production filesystem v2 migration have been verified.** The node/module and
@@ -147,9 +147,22 @@ destructive strategy once a normal ancestor exists.
 Archive invokes sync when configured; failure preserves the local draft and is reported,
 not treated as success.
 
-Main publication is automatic. The Cloud service periodically refreshes the
-configured authoritative ref and publishes a Session generation only after its
-source commit is present on that ref, or after a squash merge leaves every path
+Main publication remains automatic **after reviewed completion**. A trusted human
+or trusted explicit review path completes the exact `{sessionId, generation,
+sessionVersion, sourceCommit}`. Normal uploads, heartbeats and an initial HEAD
+already on Main never create this proof. Any later snapshot, Map edit or restore
+invalidates it. Existing Sessions without proof wait; no migration invents review.
+The browser's authenticated completion action uses the durable helper; task CI
+acceptance alone cannot attest a later Map version. Standalone administrator recovery uses
+`POST /v1/projects/<id>/sessions/<session-id>/complete` with those four fields and
+a stable `operationId`; Agent/device credentials cannot self-approve. The optional
+`memory complete --session <actual-id> --input <private-request>` client merely
+submits this request; it does not run on archive/sync or bypass review. Unsupported
+Cloud versions report a capability error and preserve the Session.
+
+The Cloud service periodically refreshes the configured authoritative ref and
+publishes a completed Session generation only after its source commit is present
+on that ref, or after a squash merge leaves every path
 changed by that Session byte-identical on authoritative Main. Any overlapping
 later change fails closed. Repository policy requires CI to pass before merge, so
 the merged authoritative ref is the publication gate; the browser does not expose
@@ -158,7 +171,8 @@ a manual publish control. The underlying `memory publish --input
 `baseVersion`, `sessionId`, `sessionVersion`, and `expectedMainSha`; it cannot
 submit arbitrary Main content. The server keeps its administrator
 credential private, checks the actual configured mirror/ref, verifies Session
-source ancestry, and requires the Session to be reconciled to the current
+source ancestry, rechecks completion and task/experiment policy in the shared
+publication transaction, and requires the Session to be reconciled to the current
 main-memory version. Authenticated human workbench edits may update the Main Map
 directly. Each edit uses the displayed Main version as an optimistic concurrency
 base and is persisted atomically with its timestamp, event and idempotency receipt.
@@ -172,7 +186,7 @@ the baseline. Workbench refreshes the baseline every 30 seconds and shows stale 
 unavailable status instead of overwriting the last good snapshot. Repositories
 without a configured authoritative ref cannot publish.
 
-The project page reports publication as waiting for Git merge, ready, conflicting,
+The project page reports publication as waiting for reviewed completion or Git merge, ready, conflicting,
 unavailable, or published. Ordinary Agent development changes belong in a Session Map;
 authenticated human edits such as TODOs and project annotations may be saved
 directly to the authoritative Main view.

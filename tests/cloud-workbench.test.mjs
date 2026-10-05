@@ -7,16 +7,39 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { runInNewContext } from 'node:vm';
 import { createHash } from 'node:crypto';
 import { applyCoordinatorAssignments, cloudSessionActivity, cloudSessionConnection, cloudSessionPresence, coordinatorAssignmentKey, createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
 import { createMemoryReadViews } from '../scripts/cloud/memory-read-view.mjs';
-import { commitMainMemoryMap, compactMainHistorySnapshots, memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
+import { commitMainMemoryMap, compactMainHistorySnapshots, completeSessionMemory, memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { atomicWrite, readJSON } from '../scripts/shared/io.mjs';
 const { reconcileMainBaseline, reconcileSessionMap } = await skillImport('scripts/workbench/memory.mjs');
 
 const execFileAsync = promisify(execFile);
 const git = async (root, ...args) => (await execFileAsync('git', args, { cwd: root, windowsHide: true })).stdout.trim();
+
+test('legacy memory preview is escaped, read-only and does not create or mutate memory cards', async () => {
+  const source = await fs.readFile(new URL('../prototype/workbench-app.js', import.meta.url), 'utf8');
+  const preview = source.slice(source.indexOf('function legacyMemoryPreview('), source.indexOf('function findBugHome('));
+  const esc = text => String(text).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+  const render = runInNewContext(`${preview}; legacyMemoryPreview`, { esc });
+  const entries = [{ from: '<img src=x onerror=alert(1)>', mem: { id: 'M1', text: '<script>bad()</script>', state: 'dirty',
+    files: [{ path: 'docs/proof.png' }], proposalEvidence: { reason: 'Keep provenance', basis: 'code', files: ['module.mjs'] }, custom: { retained: true } } }];
+  const original = JSON.stringify(entries);
+  const html = render(entries);
+  assert.equal(JSON.stringify(entries), original);
+  assert.equal(render([]), '');
+  assert.match(html, /历史卡片迁移预览（只读）/);
+  assert.match(html, /proposalEvidence/);
+  assert.match(html, /docs\/proof\.png/);
+  assert.match(html, /retained/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>|<img|<button|data-ed=|data-drop-files/);
+  assert.doesNotMatch(source, /data-act="add-mem"|data-ed="mem"|data-ed="inh"|node\.memories\.push\(|data\.memories\s*=\s*\[\{/);
+  assert.match(source, /node\.memoryDocument = value;\s*persist\(\);/);
+  assert.match(source, /memory=>memory&&memory\.proposalEvidence/);
+});
 
 test('Local-only Session source waits for publication without masking a broken remote', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-unpublished-source-'));
@@ -38,6 +61,7 @@ test('Local-only Session source waits for publication without masking a broken r
     sessions: { developer: { sessionId: 'developer', version: 's1', baseMainVersion: 'm1', sourceCommit: 'a'.repeat(40) } },
     closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
   const configuration = { dataDir, adminToken: 'fixture', projects: { project: { root: mirror, ref: 'refs/heads/main', remote: 'origin' } } };
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-source', sessionId: 'developer', generation: 1, sessionVersion: 's1', sourceCommit: 'a'.repeat(40) }, { kind: 'human' });
   const waiting = await memoryPublicationStatus(configuration, 'project', 'developer');
   assert.equal(waiting.status, 'waiting');
   assert.equal(waiting.reason, 'SOURCE_COMMIT_UNAVAILABLE');
@@ -617,6 +641,19 @@ test('verified Session publication needs no exposed admin token and the authenti
     body: JSON.stringify(sessionSeedInput),
   });
   assert.equal(seeded.response.status, 200, JSON.stringify(seeded.body));
+  const completionPath = '/api/workbench/projects/context-guard/api/session-completion?view=session%3Asession-publish';
+  const completionInput = { operationId: 'review-feature', sessionId: 'session-publish', generation: 1,
+    sessionVersion: seeded.body.snapshot.version, sourceCommit: featureSha };
+  const complete = (input, headers = browserHeaders) => request(service.url, completionPath,
+    { method: 'POST', headers, body: JSON.stringify(input) });
+  assert.equal((await complete(completionInput, projectHeaders)).response.status, 401, 'project sync credentials cannot attest human completion');
+  assert.equal((await complete({ ...completionInput, sessionId: 'another-session' })).response.status, 400, 'completion cannot escape the displayed Session');
+  const staleCompletion = await complete({ ...completionInput, operationId: 'stale-completion', sessionVersion: 'stale' });
+  assert.equal(staleCompletion.response.status, 409);
+  assert.equal(staleCompletion.body.error.code, 'VERSION_CONFLICT');
+  const reviewedCompletion = await complete(completionInput);
+  assert.equal(reviewedCompletion.response.status, 200, JSON.stringify(reviewedCompletion.body));
+  assert.deepEqual((await complete(completionInput)).body, reviewedCompletion.body);
 
   const waiting = await request(service.url, '/api/workbench/projects/context-guard/api/publication?view=session%3Asession-publish', { headers: browserHeaders });
   assert.equal(waiting.body.status, 'waiting');
@@ -677,6 +714,7 @@ test('verified Session publication needs no exposed admin token and the authenti
     method: 'POST', headers: projectHeaders,
     body: JSON.stringify({ operationId: 'advanced-seed', baseVersion: null, baseMainVersion: mainAfterEdit.body.snapshot.version, sourceCommit: featureSha, memory: { map, records: {} } }),
   });
+  await completeSessionMemory(memoryConfig, 'context-guard', { operationId: 'review-advanced', sessionId: 'session-advanced', generation: 1, sessionVersion: second.body.snapshot.version, sourceCommit: featureSha }, { kind: 'human' });
   const advanced = await request(service.url, '/v1/projects/context-guard/publish', {
     method: 'POST', headers: projectHeaders,
     body: JSON.stringify({ operationId: 'advanced-publish', baseVersion: mainAfterEdit.body.snapshot.version, sessionId: 'session-advanced', sessionVersion: second.body.snapshot.version, expectedMainSha: 'f'.repeat(40) }),
@@ -695,7 +733,8 @@ test('verified Session publication needs no exposed admin token and the authenti
   assert.equal(reopened.body.snapshot.generation, 2);
   assert.equal(reopened.body.snapshot.reopenedFrom, main.body.snapshot.version);
   const reopenedStatus = await request(service.url, '/api/workbench/projects/context-guard/api/publication?view=session%3Asession-publish', { headers: browserHeaders });
-  assert.equal(reopenedStatus.body.status, 'ready'); assert.equal(reopenedStatus.body.generation, 2);
+  assert.equal(reopenedStatus.body.status, 'waiting'); assert.equal(reopenedStatus.body.reason, 'SESSION_COMPLETION_REQUIRED'); assert.equal(reopenedStatus.body.generation, 2);
+  await completeSessionMemory(memoryConfig, 'context-guard', { operationId: 'review-reopened', sessionId: 'session-publish', generation: 2, sessionVersion: reopened.body.snapshot.version, sourceCommit: featureSha }, { kind: 'human' });
   const oldWriteReplay = await request(service.url, '/v1/projects/context-guard/sessions/session-publish', { method: 'POST', headers: projectHeaders, body: JSON.stringify(sessionSeedInput) });
   assert.deepEqual(oldWriteReplay.body, seeded.body);
   const oldPublishReplay = await request(service.url, '/v1/projects/context-guard/publish', { method: 'POST', headers: projectHeaders, body: JSON.stringify(publicationInput) });

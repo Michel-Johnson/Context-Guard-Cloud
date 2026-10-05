@@ -9,7 +9,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { buildFilesystemV2 } from '../scripts/shared/filesystem-v2.mjs';
-import { commitMainMemoryMap, commitSessionMap, publishSessionMemory, readMemoryProject, startMemoryServer } from '../scripts/cloud/memory.mjs';
+import { commitMainMemoryMap, commitSessionMap, completeSessionMemory, publishSessionMemory, readMemoryProject, startMemoryServer } from '../scripts/cloud/memory.mjs';
 import { filesystemProjectDirectory, migrateProjectMemoryToFilesystemV2 } from '../scripts/cloud/memory-filesystem.mjs';
 import { validate } from '../scripts/shared/map-model.mjs';
 
@@ -199,6 +199,7 @@ test('deleting a Bug removes its active record and regenerated Markdown without 
     const saved = (await clean.json()).snapshot;
     assert.equal(saved.memory.records['bugs/B1.md'], undefined, 'a new Session cannot revive a deleted legacy Bug record');
     assert.deepEqual(saved.deletedRecordKeys, ['bugs/B1.md', 'fixes/B1.md']);
+    await completeSessionMemory(configuration, projectId, { operationId: 'review-clean-session', sessionId: 's2', generation: saved.generation, sessionVersion: saved.version, sourceCommit }, { kind: 'human' });
     await publishSessionMemory(configuration, projectId, { operationId: 'publish-clean-session', baseVersion: next.main.version,
       sessionId: 's2', sessionVersion: saved.version, expectedMainSha: sourceCommit });
     const published = await readMemoryProject(configuration, projectId);

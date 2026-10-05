@@ -693,7 +693,7 @@ test('Completion verifies GitHub repository, tested SHA, required check issuer a
   const project = { repository: 'example/lab', ref: 'refs/heads/main', completion: { requiredChecks: [{ name: 'Required', appId: 15368 }] } };
   const task = { stage: 'accepted', session: { id: 'developer', generation: 1 }, sourceSha,
     ci: { verdict: 'passed' }, acceptanceReview: { decision: 'approved' }, acceptanceAt: '2026-09-08T01:00:00Z' };
-  const publication = { sessionVersion: 'published-session', sourceCommit: sourceSha, mainSha: mergeSha, mainVersion: 'published-main', publishedAt: '2026-09-08T01:02:00Z' };
+  const publication = { sessionId: 'developer', generation: 1, sessionVersion: 'published-session', sourceCommit: sourceSha, mainSha: mergeSha, mainVersion: 'published-main', publishedAt: '2026-09-08T01:02:00Z' };
   const memory = { closedSessions: { developer: { publications: [publication] } } };
   const receipts = { gitReceiptRef: 'github-pr:7', archiveReceiptRef: 'published-session' };
   const pr = { merged: true, merged_at: '2026-09-08T01:01:00Z', merge_commit_sha: mergeSha,
@@ -803,9 +803,9 @@ test('Explicit temporary billing waiver accepts only GitHub jobs that never star
   const project = { repository: 'example/lab', ref: 'refs/heads/main', completion: {
     requiredChecks: [], checksWaiver: { reason: 'github-actions-billing', expiresAt: '2100-01-01T00:00:00Z' },
   } };
-  const task = { stage: 'accepted', session: { id: 'developer' }, sourceSha,
+  const task = { stage: 'accepted', session: { id: 'developer', generation: 1 }, sourceSha,
     ci: { verdict: 'passed' }, acceptanceReview: { decision: 'approved' }, acceptanceAt: '2026-09-08T01:00:00Z' };
-  const memory = { closedSessions: { developer: { publications: [{ sessionVersion: 'session-v2', sourceCommit: sourceSha,
+  const memory = { closedSessions: { developer: { publications: [{ sessionId: 'developer', generation: 1, sessionVersion: 'session-v2', sourceCommit: sourceSha,
     mainSha: mergeSha, mainVersion: 'main-v2', publishedAt: '2026-09-08T01:02:00Z' }] } } };
   const receipts = { gitReceiptRef: 'github-pr:7', archiveReceiptRef: 'session-v2' };
   const pr = { merged: true, merged_at: '2026-09-08T01:01:00Z', merge_commit_sha: mergeSha,

@@ -1,7 +1,6 @@
 /* ================= 假数据 ================= */
 // Real workbenches receive memory from their Map. Product defaults must not
 // impersonate user-authored records.
-const PINNED = [];
 
 const I18N = {
   zh: {
@@ -375,9 +374,7 @@ let bugPathMode = false;
 let bugFocus = null;
 let bugPathReturn = null;
 let activeWorkPanelKind = "bug";
-let foldInherited = false;
 let foldDormant = false;
-let foldMem = false;
 let foldMemoryDoc = false;
 let foldIdea = false;
 let foldTodo = false;
@@ -1542,7 +1539,6 @@ function emptyFirstUse(){
 function startEmptyRoot(){
   closeOverlay();
   currentRepo().bootstrap = "ready";
-  data.memories = [{text:"绿场项目：只留下根节点。有了真实模块再往下长。", state:"success"}];
   document.getElementById("session-name").textContent = "S-0823 "+t("sessionEmpty");
   renderAll();
   fitView();
@@ -2124,6 +2120,14 @@ function memsAlsoFor(node){
     });
   });
   return rows;
+}
+function legacyMemoryPreview(entries){
+  if(!entries.length) return "";
+  return `<details class="fold" data-fold="legacy-memory-preview">
+    <summary>历史卡片迁移预览（只读） · ${entries.length}</summary>
+    <p>这些是旧格式历史，不是当前记忆。可复制并人工整理到上方记忆文档，再明确保存；预览不会改写或删除历史。</p>
+    ${entries.map(({mem,from})=>`<section><p>来源：${esc(from)}</p><pre>${esc(JSON.stringify(mem,null,2))}</pre></section>`).join("")}
+  </details>`;
 }
 function findBugHome(bugId){
   let found=null;
@@ -3512,21 +3516,15 @@ function renderDetail(){
     return;
   }
 
-  const inherited = [];
+  const legacyMemories = node.memories.map(mem=>({mem,from:node.title}));
   path.slice(0,-1).filter(a=>!isProposed(a)&&!isCancelled(a)).forEach(anc=>{
-    anc.memories.filter(m=>m.state!=="dirty").forEach(m=>inherited.push({mem:m, from:anc.title}));
+    anc.memories.forEach(mem=>legacyMemories.push({mem,from:anc.title}));
   });
-  const alsoMems = memsAlsoFor(node);
-  const inhCount = PINNED.length + inherited.length + alsoMems.length;
+  legacyMemories.push(...memsAlsoFor(node));
   const bugRows = bugsFor(node);
   const openBugs = bugRows.map(r=>r.bug);
   const nodeTodos = node.todos || (node.todos = []);
 
-  const memHtml = node.memories.length
-    ? `<ul class="mem-list">`+node.memories.map((m,i)=>
-        `<li class="${m.state==='dirty'?'dirty-item':''}"><i class="dot ${escAttr(m.state)}"></i><div class="mem-body" data-drop-files data-fk="mem" data-fi="${i}"><span class="txt ed" data-ed="mem" data-i="${i}">${linkifyText(m.text)}</span>${attachHtml("mem", i, m)}</div></li>`
-      ).join("")+`</ul>`
-    : "";
   const ideaHtml = node.ideas.length
     ? `<ul class="mem-list">`+node.ideas.map((m,i)=>
         `<li class="${m.state==='dirty'?'dirty-item':''}"><i class="dot ${escAttr(m.state)}"></i><div class="mem-body" data-drop-files data-fk="idea" data-fi="${i}"><span class="txt ed" data-ed="idea" data-i="${i}">${linkifyText(m.text||"")}</span>${attachHtml("idea", i, m)}${m.id&&workbenchSync?.config?.interfaceCapabilities?.coordinator?`<button type="button" data-coordinator-item="${escAttr(m.id)}" data-coordinator-node="${escAttr(node.id)}" data-coordinator-kind="idea">对话</button>`:""}</div></li>`
@@ -3618,10 +3616,7 @@ function renderDetail(){
       <textarea class="memory-document-editor" data-memory-document maxlength="12000" aria-label="${node.id===data.id?"项目记忆文档":"节点记忆文档"}">${esc(node.memoryDocument||"")}</textarea>
       <button type="button" data-act="save-memory-document">保存记忆</button>
     </details>
-    <details class="fold" data-fold="mem" ${foldMem?"open":""}>
-      <summary><span>${labels.memory}${node.memories.length?" "+node.memories.length:""}</span><button type="button" class="plus-btn" data-act="add-mem" title="${escAttr(t("addMem"))}">＋</button></summary>
-      ${memHtml}
-    </details>
+    ${legacyMemoryPreview(legacyMemories)}
     <section class="sec-block" data-fold="idea">
       <button type="button" class="sec-add" data-act="add-idea" title="${escAttr(t("addIdea"))}">${labels.ideas}${node.ideas.length?" "+node.ideas.length:""} ＋</button>
       ${ideaHtml}
@@ -3634,14 +3629,6 @@ function renderDetail(){
       <button type="button" class="sec-add" data-act="add-bug" title="${escAttr(t("addBug"))}">${labels.bugs}${openBugs.length?" "+openBugs.length:""} ＋</button>
       ${bugHtml}
     </section>
-    <details class="fold" data-fold="inherited" ${foldInherited?"open":""}>
-      <summary>${labels.inherited} ${inhCount}</summary>
-      <ul class="mem-list">
-        ${PINNED.map((t,i)=>`<li><i class="dot success"></i><span class="txt ed" data-ed="pinned" data-i="${i}">${t}</span></li>`).join("")}
-        ${inherited.map((m,i)=>`<li><i class="dot ${escAttr(m.mem.state)}"></i><div class="mem-body"><span class="txt ed" data-ed="inh" data-i="${i}">${linkifyText(m.mem.text)}</span>${(m.mem.files&&m.mem.files.length)?attachHtml("inh", i, m.mem, true):""}</div></li>`).join("")}
-        ${alsoMems.map(m=>`<li><i class="dot ${escAttr(m.mem.state||"success")}"></i><span class="txt">${linkifyText(m.mem.text||"")}</span></li>`).join("")}
-      </ul>
-    </details>
     ${node.dormant.length? `<details class="fold" data-fold="dormant" ${foldDormant?"open":""}>
       <summary>${labels.dormant} ${node.dormant.length}</summary>
       <ul class="dormant-list">
@@ -3666,13 +3653,6 @@ function renderDetail(){
   bindSilent(q('[data-act="delete-keep"]'), ()=> applyDelete(node, false));
   bindSilent(q('[data-act="delete-all"]'), ()=> applyDelete(node, true));
   bindSilent(q('[data-act="delete-abort"]'), ()=>{ deleteAskId = null; renderAll(); });
-  if(q('[data-act="add-mem"]')) q('[data-act="add-mem"]').onclick = (e)=>{
-    e.preventDefault(); e.stopPropagation();
-    foldMem = true;
-    node.memories.push({text:"", state:"dirty", files:[]}); renderAll();
-    const last = el.querySelector('[data-fold="mem"] .mem-list li:last-child .ed');
-    if(last) last.focus();
-  };
   if(q('[data-act="add-idea"]')) q('[data-act="add-idea"]').onclick = (e)=>{
     e.preventDefault(); e.stopPropagation();
     foldIdea = true;
@@ -3708,8 +3688,7 @@ function renderDetail(){
   };
   if(q('[data-act="focus"]'))   q('[data-act="focus"]').onclick   = ()=>{
     focusId = (focusId===node.id? null : node.id); renderAll(); };
-  if(q('[data-act="done"]'))    q('[data-act="done"]').onclick    = ()=>{ node.state="success";
-    node.memories.push({text:t("doneMem"), state:"success", files:[]}); renderAll(); };
+  if(q('[data-act="done"]'))    q('[data-act="done"]').onclick    = ()=>{ node.state="success"; renderAll(); };
   el.querySelectorAll("[data-work-state]").forEach(b=>{
     b.onclick = ()=>{
       node.state = b.dataset.workState;
@@ -3721,18 +3700,14 @@ function renderDetail(){
     d.querySelector(":scope > summary")?.addEventListener("click",e=>{
       if(e.target.closest("button")) return;
       const next = !d.open;
-      if(d.dataset.fold==="inherited") foldInherited = next;
       if(d.dataset.fold==="dormant") foldDormant = next;
-      if(d.dataset.fold==="mem") foldMem = next;
       if(d.dataset.fold==="memory-doc") foldMemoryDoc = next;
       if(d.dataset.fold==="idea") foldIdea = next;
       if(d.dataset.fold==="todo") foldTodo = next;
       if(d.dataset.fold==="bug") foldBug = next;
     });
     d.addEventListener("toggle", ()=>{
-      if(d.dataset.fold==="inherited") foldInherited = d.open;
       if(d.dataset.fold==="dormant") foldDormant = d.open;
-      if(d.dataset.fold==="mem") foldMem = d.open;
       if(d.dataset.fold==="memory-doc") foldMemoryDoc = d.open;
       if(d.dataset.fold==="idea") foldIdea = d.open;
       if(d.dataset.fold==="todo") foldTodo = d.open;
@@ -3752,12 +3727,6 @@ function renderDetail(){
         node.title = v; renderAll(); return;
       }
       if(kind==="purpose"){ node.purpose = v; renderAll(); return; }
-      if(kind==="mem"){
-        const i = +ed.dataset.i;
-        if(!v){ node.memories.splice(i,1); renderAll(); return; }
-        if(node.memories[i].text===v) return;
-        node.memories[i].text = v; persist(); return;
-      }
       if(kind==="idea"){
         const i = +ed.dataset.i;
         if(!v){ node.ideas.splice(i,1); renderAll(); return; }
@@ -3775,14 +3744,6 @@ function renderDetail(){
           setTimeout(()=>finishNewWorkItem(node,todo,"todo"),0);
         }
         persist(); return;
-      }
-      if(kind==="pinned"){
-        const i = +ed.dataset.i;
-        if(v) PINNED[i] = v; return;
-      }
-      if(kind==="inh"){
-        const i = +ed.dataset.i;
-        if(inherited[i] && v) inherited[i].mem.text = v; return;
       }
       if(kind==="bug-title"){
         const b = node.bugs.find(x=>x.id===ed.dataset.bug);
@@ -3835,12 +3796,10 @@ function renderDetail(){
   el.querySelectorAll("button").forEach(button=>button.addEventListener("mousedown",e=>e.preventDefault()));
   hydrateThumbs(el);
   el.onpaste = e=>{
-    const memEd = e.target.closest('[data-ed="mem"]');
     const ideaEd = e.target.closest('[data-ed="idea"]');
     const bugEd = e.target.closest('[data-ed="bug-title"]');
     const drop = e.target.closest("[data-drop-files]");
-    if(memEd) takeAttach(node, "mem", memEd.dataset.i, e);
-    else if(ideaEd) takeAttach(node, "idea", ideaEd.dataset.i, e);
+    if(ideaEd) takeAttach(node, "idea", ideaEd.dataset.i, e);
     else if(bugEd) takeAttach(node, "bug", bugEd.dataset.bug, e);
     else if(drop) takeAttach(node, drop.dataset.fk, drop.dataset.fi, e);
   };
@@ -4514,9 +4473,12 @@ async function installCoordinatorPanel(sync){
   const inputShell=document.createElement('div');inputShell.className='coordinator-input-shell';inputShell.append(input,send);
   const retry=document.createElement('button'); retry.type='button'; retry.className='coordinator-toolbar-action';retry.textContent='↻';retry.hidden=true;
   retry.setAttribute('aria-label','重试原请求');retry.title='重试原请求';
+  const stopTurn=document.createElement('button');stopTurn.type='button';stopTurn.className='coordinator-toolbar-action';stopTurn.textContent='停止';stopTurn.hidden=true;
+  stopTurn.setAttribute('aria-label','停止当前轮次');
+  const stopRequests=new Map();
   const historyToggle=document.createElement('button');historyToggle.type='button';historyToggle.className='coordinator-toolbar-action';historyToggle.textContent='◷';historyToggle.setAttribute('aria-label','历史 Session');historyToggle.title='历史 Session';historyToggle.setAttribute('aria-expanded','false');historyToggle.setAttribute('aria-controls','coordinator-history');
   const creationToggle=document.createElement('button');creationToggle.type='button';creationToggle.className='coordinator-toolbar-action';creationToggle.textContent='＋';creationToggle.setAttribute('aria-label','新建 Coordinator Session');creationToggle.title='新建 Coordinator Session';
-  toolbar.append(heading,historyToggle,retry,creationToggle,typing);form.append(inputShell);
+  toolbar.append(heading,historyToggle,retry,stopTurn,creationToggle,typing);form.append(inputShell);
   const history=document.createElement('section');history.id='coordinator-history';history.className='coordinator-history';history.hidden=true;
   const historyTitle=document.createElement('h3');historyTitle.textContent='历史 Session';
   const historyList=document.createElement('div');historyList.className='coordinator-history-list';
@@ -4832,12 +4794,15 @@ async function installCoordinatorPanel(sync){
   const render=(state,forceFinal=false)=>{
     const renderedConversation=selected;
     latestConversationState=state;
+    stopTurn.hidden=state.status!=='running';stopTurn.disabled=busy;
     // A lost HTTP response is not a lost turn. Reconcile the original request
     // against the server's durable receipt; model retries remain explicit.
     if(pending&&!pending.retry&&state.acceptedRequestIds?.includes(pending.id))confirmSubmitted(selected,pending);
     renderHistory(state);
     consumeNavigationActions(state);
     status.textContent=state.error?'处理暂停：'+state.error.code:reviewFeedback||(pendingError&&pending?'尚未确认提交：'+pendingError:'');
+    if(state.status==='interrupted')status.textContent='本轮已停止，已有操作和部分回复已保留；点击重试可继续';
+    else if(state.pendingInputCount)status.textContent=`已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮`;
     const streamingText=String(state.streamingText||'');
     const lastTextMessage=[...(state.messages||[])].reverse().find(message=>message?.text);
     const streamingCommitted=Boolean(streamingText&&lastTextMessage?.role==='assistant'&&lastTextMessage.text===streamingText);
@@ -4854,9 +4819,9 @@ async function installCoordinatorPanel(sync){
       },onNode:id=>{navigationRun++;void openMapNode(id).catch(error=>{status.textContent='无法定位节点：'+error.message;});}});
     const streamingMessage=messages.querySelector('.coordinator-streaming');
     setTyping((busy&&busyConversation===selected)||state.status==='running'||!!streamingMessage||revealSettling);
-    const stableKey=JSON.stringify([state.messages,state.approvals,state.acceptances,state.nodeReferences,state.status,!!pending,busy]);
+    const stableKey=JSON.stringify([state.messages,state.partialText,state.controlRevision,state.approvals,state.acceptances,state.nodeReferences,state.status,!!pending,busy]);
     const extrasKey=JSON.stringify([state.approvals,state.acceptances,state.projectTasks]);
-    const canFinalizeStreamingInPlace=!forceFinal&&!hasStreaming&&streamingMessage&&lastTextMessage?.role==='assistant'&&lastTextMessage.text.startsWith(streamShown);
+    const canFinalizeStreamingInPlace=!forceFinal&&!hasStreaming&&streamingMessage&&state.status!=='interrupted'&&!lastTextMessage?.partial&&lastTextMessage?.role==='assistant'&&lastTextMessage.text.startsWith(streamShown);
     if(canFinalizeStreamingInPlace){
       const finalize=()=>{
         if(renderedConversation!==selected||!streamingMessage.classList.contains('coordinator-streaming'))return;
@@ -4880,14 +4845,14 @@ async function installCoordinatorPanel(sync){
         canCorrect=state.canCorrect===true&&(!pending||pending.id===state.retryInput?.id);
         if(canCorrect)status.textContent+=' · 可补充纠正意见';
         settleTypingAfterPaint(renderedConversation);
-        setSendBlocked(busy||!!pending&&!canCorrect||state.status==='running'||state.status==='error'&&!canCorrect);
+        setSendBlocked(busy||!!pending&&!canCorrect||['error','interrupted'].includes(state.status)&&!canCorrect);
         setRetryMode(pending?'request':null);retry.disabled=busy||state.status==='running';
         queueMicrotask(()=>{if(renderedConversation===selected)render(latestConversationState||state,true);});
       };
       const finalRevealText=lastTextMessage.text;
       if(streamShown!==finalRevealText){lastStreamingText=finalRevealText;updateStreamingText(streamingMessage,finalRevealText,false,finalize);}else finalize();
       syncActivity(state,true);
-      setSendBlocked(busy||!!pending&&!canCorrect||state.status==='running'||state.status==='error'&&!canCorrect);
+      setSendBlocked(busy||!!pending&&!canCorrect||['error','interrupted'].includes(state.status)&&!canCorrect);
       setRetryMode(pending?'request':null);retry.disabled=busy||state.status==='running';pinTurn();
       return;
     }
@@ -4899,6 +4864,8 @@ async function installCoordinatorPanel(sync){
       pinTurn();
     }else if(stableKey!==lastStableContent||hasStreaming!==Boolean(lastStreamingText)){
     const visibleMessages=[...(state.messages||[])];
+    if(state.status==='interrupted'&&state.partialText&&!visibleMessages.some(message=>message.role==='assistant'&&message.text===state.partialText))
+      visibleMessages.push({role:'assistant',text:state.partialText,partial:true});
     for(const [requestId,entry] of optimisticRequests){
       if(entry.conversationId!==renderedConversation)continue;
       if(visibleMessages.some(message=>messageMatchesRequest(message,entry.request))){optimisticRequests.delete(requestId);continue;}
@@ -5037,7 +5004,7 @@ async function installCoordinatorPanel(sync){
     if(state.retryInput&&!busy&&(!pending||pending.id===state.retryInput.id||pending.retry)) pending={...state.retryInput,retry:true};
     canCorrect=state.canCorrect===true&&(!pending||pending.id===state.retryInput?.id);
     if(canCorrect)status.textContent+=' · 可补充纠正意见';
-    setSendBlocked(busy||!!pending&&!canCorrect||state.status==='running'||state.status==='error'&&!canCorrect);
+    setSendBlocked(busy||!!pending&&!canCorrect||['error','interrupted'].includes(state.status)&&!canCorrect);
     setRetryMode(pending?'request':null); retry.disabled=busy||state.status==='running';
     pinTurn();
   };
@@ -5118,7 +5085,8 @@ async function installCoordinatorPanel(sync){
     if(answeringCard)answeringCard.querySelector('.coordinator-question-status').hidden=false;
     for(const button of messages.querySelectorAll('.coordinator-question button'))button.disabled=true;
     try{
-      const payload=Object.fromEntries(Object.entries(request).filter(([key])=>['id','text','retry','answerTo','attachments'].includes(key)));
+      const payload=Object.fromEntries(Object.entries(request).filter(([key])=>['id','text','retry','answerTo','attachments','followup','expectedTurnId'].includes(key)));
+      if(!payload.retry)payload.followup='steer';
       await sync.call(conversationUrl('/api/coordinator',id),payload,'POST','main');
       confirmSubmitted(id,request);
     }catch(error){
@@ -5140,6 +5108,16 @@ async function installCoordinatorPanel(sync){
   form.addEventListener('submit',event=>{event.preventDefault();if(input.value.trim()&&(!pending||canCorrect)) void submit({id:crypto.randomUUID(),text:input.value.trim()});});
   input.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();if(!send.disabled)form.requestSubmit();}});
   retry.addEventListener('click',()=>{if(pending) void submit(pending);else void refresh();});
+  stopTurn.addEventListener('click',async()=>{
+    const id=selected,turnId=latestConversationState?.activeTurnId;
+    if(!turnId||stopTurn.disabled)return;
+    let request=stopRequests.get(id);
+    if(!request){request={id:crypto.randomUUID(),expectedTurnId:turnId};stopRequests.set(id,request);}
+    stopTurn.disabled=true;
+    try{await sync.call(conversationUrl('/api/coordinator/interrupt',id),request,'POST','main');stopRequests.delete(id);}
+    catch(error){if(id===selected)status.textContent=error.serverResponse?'停止未提交：'+error.message:'停止结果待确认，重试将使用原请求';if(error.serverResponse)stopRequests.delete(id);}
+    finally{stopTurn.disabled=false;await refresh();}
+  });
   window.addEventListener('pagehide',()=>{stopped=true;clearTimeout(timer);setPlanningVisible(false);setTyping(false);});
   window.addEventListener('pageshow',()=>{stopped=false;if(panel.open) void refresh();});
 }

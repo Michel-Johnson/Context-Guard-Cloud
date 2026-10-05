@@ -12,7 +12,7 @@ import http from 'node:http';
 const { MapStore } = await skillImport('scripts/workbench/store.mjs');
 const { MemorySyncCoordinator } = await skillImport('scripts/workbench/sync-coordinator.mjs');
 const { memoryRequest } = await skillImport('scripts/workbench/memory.mjs');
-import { memoryPublicationStatus, readMemoryProject, startMemoryServer } from '../scripts/cloud/memory.mjs';
+import { completeSessionMemory, memoryPublicationStatus, readMemoryProject, startMemoryServer } from '../scripts/cloud/memory.mjs';
 
 import { atomicWrite, encode, pause, readJSON } from '../scripts/shared/io.mjs';
 
@@ -188,6 +188,7 @@ test('Workbench coordinator automatically reopens the same Session after its pri
   t.after(async () => { await coordinator.close().catch(() => {}); await store.close().catch(() => {}); await service.close().catch(() => {}); });
   await coordinator.start();
   await until(() => coordinator.snapshot().status === 'synced');
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-reusable', sessionId: 'reusable-session', generation: 1, sessionVersion: seeded.snapshot.version, sourceCommit: head }, human);
   const published = await memoryRequest(project, 'publish', {
     operationId: 'reusable-publish', baseVersion: null, sessionId: 'reusable-session', sessionVersion: seeded.snapshot.version, expectedMainSha: head,
   });
@@ -198,7 +199,7 @@ test('Workbench coordinator automatically reopens the same Session after its pri
   const reopened = (await memoryRequest(project, 'sessions/reusable-session')).snapshot;
   assert.equal(reopened.generation, 2);
   assert.equal(reopened.reopenedFrom, published.snapshot.version);
-  assert.equal((await memoryPublicationStatus(configuration, 'project', 'reusable-session')).status, 'ready');
+  assert.equal((await memoryPublicationStatus(configuration, 'project', 'reusable-session')).reason, 'SESSION_COMPLETION_REQUIRED');
   assert.equal((await readMemoryProject(configuration, 'project')).closedSessions['reusable-session'].publications.length, 1);
 });
 
@@ -228,6 +229,7 @@ test('Workbench coordinator rebases append-only Session and Main changes and cle
     operationId: 'reopen-first', baseVersion: null, baseMainVersion: null, sourceCommit: firstHead,
     memory: { map: f.doc, records: {} },
   });
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-reopen', sessionId: 'reopen-session', generation: 1, sessionVersion: first.snapshot.version, sourceCommit: firstHead }, human);
   const firstMain = await memoryRequest(project, 'publish', {
     operationId: 'reopen-first-publish', baseVersion: null, sessionId: 'reopen-session',
     sessionVersion: first.snapshot.version, expectedMainSha: firstHead,
@@ -243,6 +245,7 @@ test('Workbench coordinator rebases append-only Session and Main changes and cle
     operationId: 'main-advance', baseVersion: null, baseMainVersion: firstMain.snapshot.version, sourceCommit: project.head,
     memory: { map: mainDoc, records: {} },
   });
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-advance', sessionId: 'main-advance-session', generation: 1, sessionVersion: advancing.snapshot.version, sourceCommit: project.head }, human);
   const advancedMain = await memoryRequest(project, 'publish', {
     operationId: 'main-advance-publish', baseVersion: firstMain.snapshot.version, sessionId: 'main-advance-session',
     sessionVersion: advancing.snapshot.version, expectedMainSha: project.head,
@@ -303,6 +306,7 @@ test('Managed coordinator bootstraps a closed Session and accepts changes alread
     operationId: 'managed-seed', baseVersion: null, baseMainVersion: null, sourceCommit: head,
     memory: { map: publishedDoc, records: {} },
   });
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-managed', sessionId: 'managed-session', generation: 1, sessionVersion: seeded.snapshot.version, sourceCommit: head }, human);
   await memoryRequest(project, 'publish', {
     operationId: 'managed-publish', baseVersion: null, sessionId: 'managed-session',
     sessionVersion: seeded.snapshot.version, expectedMainSha: head,
@@ -382,6 +386,7 @@ test('Workbench coordinator migrates a confirmed legacy main baseline before reo
     operationId: 'legacy-seed', baseVersion: null, baseMainVersion: null, sourceCommit: head,
     memory: { map: f.doc, records: {} },
   });
+  await completeSessionMemory(configuration, 'project', { operationId: 'review-legacy', sessionId: 'legacy-session', generation: 1, sessionVersion: seeded.snapshot.version, sourceCommit: head }, human);
   const published = await memoryRequest(project, 'publish', {
     operationId: 'legacy-publish', baseVersion: null, sessionId: 'legacy-session',
     sessionVersion: seeded.snapshot.version, expectedMainSha: head,
@@ -505,4 +510,3 @@ test('Workbench coordinator preserves local, remote, and base documents on a sam
   assert.equal(store.doc.root.children[0].title, '本地冲突标题', 'conflict must not overwrite the local draft');
   await coordinator.close(); await store.close();
 });
-

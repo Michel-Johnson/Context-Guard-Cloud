@@ -227,9 +227,12 @@ export class CoordinatorModel {
     return body;
   }
 
-  async next({ system, messages, tools = [], maxTokens = this.maxTokens, onText = null, onToolStart = null }) {
+  async next({ system, messages, tools = [], maxTokens = this.maxTokens, onText = null, onToolStart = null, signal = null }) {
     const body = this.prepareRequest({ system, messages, tools, maxTokens });
     const abort = new AbortController();
+    const cancel = () => abort.abort();
+    signal?.addEventListener('abort', cancel, { once: true });
+    if (signal?.aborted) abort.abort();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => abort.abort(), this.timeoutMs);
     try {
@@ -264,16 +267,17 @@ export class CoordinatorModel {
     } catch (error) {
       const timedOut = abort.signal.aborted;
       abort.abort();
+      if (signal?.aborted) throw problem('MODEL_INTERRUPTED', 'Coordinator generation was explicitly stopped');
       if (timedOut) throw problem('MODEL_TIMEOUT', 'Coordinator model timed out; no automatic retry was made');
       if (String(error.code || '').startsWith('MODEL_') || error.code === 'CONTEXT_TOO_LARGE') throw error;
       throw problem('MODEL_UNAVAILABLE', 'Coordinator model connection failed; no automatic retry was made');
-    } finally { clearTimeout(timer); }
+    } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }
   }
 }
 
 // Persist every assistant response and tool receipt through the caller. Stable
 // operation IDs let protocol-backed tools replay a lost response idempotently.
-export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, completePresentations = false }) {
+export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, completePresentations = false, checkpoint = null, signal = null }) {
   if (state.promptVersion && state.promptVersion !== promptVersion) throw problem('PROMPT_CHANGED', 'Resume with the same Coordinator prompt version');
   state.promptVersion = promptVersion;
   state.messages ||= []; state.toolReceipts ||= {};
@@ -288,7 +292,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const started = Date.now();
     let next;
     try {
-      next = await model.next({ system, messages, tools, onText: measurement ? async text => {
+      next = await model.next({ system, messages, tools, signal, onText: measurement ? async text => {
         if (text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
         await onText?.(text);
       } : onText, onToolStart });
@@ -315,20 +319,24 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     await save(state);
   }
   const next = state.pending;
+  let changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
+  if (changed.steered || changed.interrupted) state.messages.at(-1).superseded = true;
   if (next.stop === 'end_turn') {
-    state.status = 'waiting-for-user'; state.pending = null;
+    state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user'; state.pending = null;
     await save(state);
     return state;
   }
   const responses = []; let failed = false, transferred = false;
   const visible = [];
   for (const call of next.content.filter(block => block.type === 'tool_use')) {
+    changed = checkpoint ? await checkpoint() : changed;
     const operationId = `coordinator:${hash(`${turnId}:${call.id}`)}`;
     const fingerprint = hash(JSON.stringify({ name: call.name, input: call.input }));
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
     if (!receipt) {
-      if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
+      if (changed.steered || changed.interrupted) receipt = { fingerprint, ...failedTool(changed.interrupted ? 'TURN_INTERRUPTED' : 'INPUT_SUPERSEDED') };
+      else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
       else if (!tools.some(tool => tool.name === call.name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
       else {
@@ -366,7 +374,13 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
       ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
-  state.status = transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) ? 'waiting-for-user' : 'running';
+  changed = checkpoint ? await checkpoint() : changed;
+  if (changed.steered || changed.interrupted) {
+    const response = state.messages.at(-2);
+    if (response?.role === 'assistant') response.superseded = true;
+  }
+  state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
+    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }

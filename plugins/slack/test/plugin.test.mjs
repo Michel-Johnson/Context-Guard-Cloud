@@ -9,8 +9,15 @@ import { SlackIO, UncertainDelivery } from '../src/slack-io.mjs';
 import { Gateway } from '../src/gateway.mjs';
 import { homeView, formValues, messageBlocks, approvalBlocks } from '../src/views.mjs';
 import { plainText } from '../src/plain-text.mjs';
+import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
+
+test('native current mentions exclude inline code, code blocks and quoted history', () => {
+  assert.deepEqual(activeMentions('> <@UOTHER> quoted\n`<@UINLINE>`\n```\n<@UFENCE>\n```\n<@UACTIVE>'), ['UACTIVE']);
+  assert.equal(explicitlyAddressed({ type: 'app_mention', ts: '123.1', text: `> <@${bot}>` }, bot), false);
+  assert.equal(explicitlyAddressed({ type: 'message', text: `<@${bot}|Coordinator> hi` }, bot), true);
+});
 
 test('Coordinator prose is plain text while links code and identifiers remain readable', () => {
   const source = '# 首页\n\n**定位**：`BLOG-READ-HOME`，_公开首页_。\n\n- [完整 Map](https://map.example.com/a?q=1&x=2)\n- ~~旧描述~~\n\n```js\nconst value = 2 ** 3; // _literal_\n```\n\n| 字段 | 值 |\n| --- | --- |\n| 状态 | 正常 |';
@@ -119,7 +126,7 @@ async function fixture(t) {
     if (type === 'prompt.read') return { text: 'execute login', filename: 'prompt.md' };
     return { accepted: true };
   } };
-  const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; return {}; },
+  const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
     async download() { return { filename: 'screen.png', mimeType: 'image/png', base64: 'aGVsbG8=' }; }, async uploadPrompt(input) { sent.push({ export: input }); } };
   const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, logger: { warn() {}, error() {} } });
   return { plugin, store, gateway, io, calls, sent, directory };
@@ -365,7 +372,7 @@ test('unrelated roots and replies to other people are silent, with no attachment
   await f.plugin.message('unrelated-root', event({ ts: '999.001', text: '午饭去哪吃？', files: [{ name: 'food.png', mimetype: 'image/png' }] }));
   await f.plugin.message('unrelated-reply', event({ ts: '123.002', thread_ts: '123.001', text: '<@UOTHER> 中午去哪吃饭？' }));
   assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance', 'conversation.relevance']);
-  assert.equal(f.sent.some(call => !call.method || call.method !== 'conversations.replies'), false);
+  assert.equal(f.sent.some(call => !call.method || !['conversations.replies', 'users.info'].includes(call.method)), false);
   assert.equal(Object.keys(f.store.data.threads).length, 1);
 });
 test('relevance failure is recorded privately and cannot start a turn or spam a channel', async t => {
@@ -1145,4 +1152,149 @@ test('Block Kit shows literal user text without mentions and emits versioned bri
   assert.equal(blocks[0].text.text, '<@everyone>');
   assert.equal(JSON.parse(approvalBlocks({ id: 'a', brief: { version: 'v' } }, 'thread')[1].elements[0].value).version, 'v');
   assert.deepEqual(formValues({ state: { values: { p: { v: { selected_option: { value: 'lab' } } } } } }), { p: 'lab' });
+});
+
+test('other bot mention is silent even in an existing thread, without models or attachments', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  await f.plugin.message('seed', event()); f.calls.length = 0; f.sent.length = 0;
+  let identityCalls = 0;
+  f.io.call = async method => { assert.equal(method, 'users.info'); identityCalls++; return { user: { id: 'UOTHER', is_bot: true } }; };
+  f.io.download = async () => assert.fail('misaddressed message cannot download files');
+  for (let i = 0; i < 2; i++) await f.plugin.message(`other-${i}`, event({ thread_ts: '123.001', ts: `124.00${i}`, text: '<@UOTHER> fix it', files: [{ id: 'F1' }] }));
+  assert.equal(identityCalls, 1); assert.deepEqual(f.calls, []); assert.deepEqual(f.sent, []);
+  assert.equal(f.store.data.inbox['other-0'].routing.reason, 'addressed-to-other-bot');
+  const reopened = await new Store(f.directory).open(); assert.equal(reopened.data.inbox['other-1'].routing.reason, 'addressed-to-other-bot');
+});
+
+test('own native mention wins when both bots are addressed; identity lookup failure stays silent', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  let lookups = 0;
+  f.io.call = async () => { lookups++; throw new Error('lookup unavailable'); };
+  await f.plugin.message('both', event({ text: `<@UOTHER> <@${bot}> help` }));
+  assert.equal(lookups, 0); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
+  f.calls.length = 0;
+  await f.plugin.message('unknown', event({ text: '<@UUNKNOWN> help', ts: '200.001' }));
+  await f.plugin.message('unknown-again', event({ text: '<@UUNKNOWN> help', ts: '201.001' }));
+  assert.equal(lookups, 1); assert.deepEqual(f.calls, []);
+  assert.equal(f.store.data.inbox.unknown.routing.reason, 'mention-identity-unavailable');
+});
+
+test('identity cache is bounded and quoted own mention still uses relevance', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  for (let i = 0; i < 257; i++) await f.plugin.mentionRoute(`identity-${i}`, event({ text: `<@U${i}>` }));
+  assert.equal(f.plugin.userIdentities.size, 256);
+  await f.plugin.message('quoted', event({ type: 'app_mention', text: `> <@${bot}> historical request\nnow discuss login` }));
+  assert.equal(f.calls[0].type, 'conversation.relevance');
+  const submitted = f.calls.find(call => call.type === 'conversation.submit');
+  assert.equal(submitted.payload.followup, 'steer'); assert.equal(submitted.payload.expectedTurnId, undefined);
+});
+
+test('stop freezes the target turn before delivery and never retargets on retry', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [], live: true });
+  const original = f.gateway.command; let calls = 0;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.state') return { status: 'running', activeTurnId: calls ? 'new-turn' : 'original-turn' };
+    if (type === 'conversation.interrupt') {
+      f.calls.push({ type, ...input }); calls++;
+      const disk = JSON.parse(await fs.readFile(f.store.file, 'utf8'));
+      assert.equal(disk.inbox.stop.interruptTarget.expectedTurnId, 'original-turn');
+      if (calls === 1) throw Object.assign(new Error('network'), { code: 'GATEWAY_ERROR' });
+      return { status: 'interrupted' };
+    }
+    return original(type, input);
+  };
+  const body = { command: '/cg', text: 'stop', channel_id: channel, user_id: user };
+  await assert.rejects(f.plugin.process('stop', { type: 'slash_commands', body }), error => error.code === 'GATEWAY_ERROR');
+  await f.plugin.process('stop', { type: 'slash_commands', body });
+  assert.deepEqual(f.calls[0], f.calls[1]); assert.equal(f.calls[1].payload.expectedTurnId, 'original-turn');
+});
+
+test('stop with multiple threads or another actor never guesses the target', async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 2; i++) await f.store.bind(threadKey(teamId, channel, `${i}.1`), { channel, threadTs: `${i}.1`, projectId: 'lab', conversationId: `chat-${i}`, userId: user, ownRequests: [], live: true });
+  await assert.rejects(f.plugin.stopChat('ambiguous', { channel_id: channel, text: 'stop' }, user), error => error.code === 'AMBIGUOUS_CONVERSATION');
+  await assert.rejects(f.plugin.stopChat('other-actor', { channel_id: channel, text: 'stop chat-0' }, 'UOTHER'), error => error.code === 'AMBIGUOUS_CONVERSATION');
+  assert.deepEqual(f.calls, []);
+});
+
+test('interrupted stream remains partial, does not finalize and does not resume polling', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: [], live: true, awaitingReplyId: 'turn' });
+  await f.store.update(data => { data.threads[key].liveStream = { ts: '55.1', turnId: 'turn', text: 'partial' }; });
+  f.gateway.command = async () => ({ status: 'interrupted', activeTurnId: 'turn', inputRevision: 2, consumedInputRevision: 1, pendingInputCount: 1,
+    messages: [{ role: 'user', requestId: 'turn', text: 'ask' }, { role: 'assistant', requestId: 'turn', text: 'partial' }], acceptedRequestIds: ['turn'] });
+  await f.plugin.mirror(key);
+  assert.equal(f.store.data.threads[key].live, false); assert.equal(f.store.data.threads[key].awaitingReplyId, undefined);
+  assert.equal(f.store.data.threads[key].liveStream.interrupted, true);
+  assert.ok(f.sent.some(item => item.update?.[2].includes('部分回复，非最终答案')));
+  assert.equal(f.store.data.threads[key].pendingInputCount, 1);
+  const firstCount = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, firstCount);
+});
+
+test('pending input is accepted but not complete, and old revision cannot roll mirror back', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: [], awaitingReplyId: 'followup' });
+  let state = { status: 'running', activeTurnId: 'first', inputRevision: 3, consumedInputRevision: 1, pendingInputCount: 2, acceptedRequestIds: ['first', 'followup'], messages: [] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(key);
+  assert.equal(f.store.data.threads[key].awaitingReplyId, 'followup');
+  assert.ok(f.sent.some(item => item.text?.includes('等待纳入')));
+  const sent = f.sent.length;
+  state = { ...state, inputRevision: 2, consumedInputRevision: 1, pendingInputCount: 0, status: 'idle', activeTurnId: null };
+  await f.plugin.mirror(key); assert.equal(f.sent.length, sent); assert.equal(f.store.data.threads[key].inputRevision, 3);
+  state = { ...state, inputRevision: 3, consumedInputRevision: 3, status: 'running', activeTurnId: 'first' };
+  await f.plugin.mirror(key); assert.ok(f.sent.some(item => item.update?.[2].includes('补充已纳入')));
+});
+
+test('resume freezes the original turn and uses a new transport receipt without copying actor or text', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [], status: 'interrupted' });
+  const original = f.gateway.command; let attempts = 0;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.state') return { status: 'interrupted', retryInput: { id: 'original-turn', text: 'original task', actor: { userId: user }, source: 'slack' } };
+    if (type === 'conversation.submit') {
+      f.calls.push({ type, ...input }); attempts++;
+      assert.notEqual(input.id, 'original-turn');
+      assert.deepEqual(input.payload, { retry: true, expectedTurnId: 'original-turn' });
+      const disk = JSON.parse(await fs.readFile(f.store.file, 'utf8'));
+      assert.equal(disk.inbox.resume.resumeTarget.expectedTurnId, 'original-turn');
+      if (attempts === 1) throw Object.assign(new Error('Unavailable'), { code: 'GATEWAY_ERROR' });
+      return { accepted: true };
+    }
+    return original(type, input);
+  };
+  const body = { command: '/cg', text: 'resume', channel_id: channel, user_id: user };
+  await assert.rejects(f.plugin.process('resume', { type: 'slash_commands', body }), error => error.code === 'GATEWAY_ERROR');
+  await f.plugin.process('resume', { type: 'slash_commands', body });
+  assert.deepEqual(f.calls[0], f.calls[1]); assert.equal(f.store.data.threads[key].awaitingReplyId, 'original-turn');
+});
+
+test('Steer partial output retains its slot and the corrected stream uses a new revision slot', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: ['turn'] });
+  await f.store.update(data => { data.threads[key].liveStream = { ts: '55.1', turnId: 'turn', text: 'old partial' };
+    data.threads[key].mirrored['stream:turn:1'] = { ts: '55.1', hash: 'old' }; });
+  f.gateway.command = async () => ({ status: 'running', activeTurnId: 'turn', streamingText: 'corrected partial', inputRevision: 2, consumedInputRevision: 2, pendingInputCount: 0,
+    messages: [{ id: 'u', role: 'user', requestId: 'turn', text: 'ask' }, { id: 'a', role: 'assistant', requestId: 'turn', text: 'old partial', partial: true }] });
+  await f.plugin.mirror(key);
+  assert.equal(f.store.data.threads[key].mirrored.a.ts, '55.1');
+  assert.ok(f.sent.some(item => item.update?.[2].includes('非最终答案')));
+  assert.notEqual(f.store.data.threads[key].liveStream.ts, '55.1');
+  const oldSlotUpdates = f.sent.filter(item => item.update?.[1] === '55.1').length;
+  await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.update?.[1] === '55.1').length, oldSlotUpdates);
+});
+
+test('control revision prevents late running snapshot from reviving an interrupted turn', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: [], live: true });
+  let state = { status: 'interrupted', activeTurnId: 'turn', controlRevision: 1, inputRevision: 2, consumedInputRevision: 2, pendingInputCount: 0, messages: [] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(key); const sent = f.sent.length;
+  state = { ...state, status: 'running', controlRevision: 0, streamingText: 'late old partial' };
+  await f.plugin.mirror(key); assert.equal(f.sent.length, sent); assert.equal(f.store.data.threads[key].live, false);
+  state = { ...state, controlRevision: 2, streamingText: 'explicitly resumed' };
+  await f.plugin.mirror(key); assert.equal(f.store.data.threads[key].live, true);
+  assert.equal(f.store.data.threads[key].controlRevision, 2);
 });

@@ -58,6 +58,37 @@ test('Image turns use a pinned Coordinator vision model and text follow-ups rece
   assert.equal((await service.state()).messages[0].id, firstState.messages[0].id);
 });
 
+test('Steer image follow-ups receive a visual summary and survive later text-only turns', { timeout: 10000 }, async t => {
+  let enter, release;
+  const entered = new Promise(resolve => { enter = resolve; }), held = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  const text = { model: 'text-steer', next: async input => {
+    calls.push({ route: 'text', input });
+    if (calls.length === 1) { enter(); await held; return done('旧回答'); }
+    return done('读取已保存的图片结论');
+  } };
+  const vision = { model: 'vision-steer', next: async input => {
+    calls.push({ route: 'vision', input });
+    return done(calls.filter(call => call.route === 'vision').length === 1 ? '补充图片显示请求超时。' : '依据图片修正后的答案');
+  } };
+  const { options, image } = await fixture(t, { model: text, visionModel: vision });
+  const service = new CoordinatorService(options);
+  t.after(() => service.close());
+  await service.submit({ id: 'text-start', text: '检查连接' });
+  await entered;
+  await service.submit({ id: 'image-steer', text: '补充截图', attachments: [{ id: image.id }], followup: 'steer' });
+  release(); await service.close();
+  const imageMessage = (await service.state()).messages.find(message => message.requestId === 'image-steer');
+  assert.match(imageMessage.visualSummary.text, /请求超时/);
+  assert.deepEqual(imageMessage.visualSummary.attachments, [{ id: image.id, hash: image.hash }]);
+  assert.equal(calls.filter(call => call.route === 'vision').length, 2);
+  assert.ok(calls.filter(call => call.route === 'vision').every(call => JSON.stringify(call.input).includes('"type":"image"')));
+  await service.submit({ id: 'later-text', text: '怎么解决超时？' }); await service.close();
+  assert.equal(calls.at(-1).route, 'text');
+  assert.match(JSON.stringify(calls.at(-1).input), /请求超时/);
+  assert.ok(!JSON.stringify(calls.at(-1).input).includes('base64'));
+});
+
 test('Vision retries across restart preserve model identity, summary and exact attachment hash', async t => {
   let attempts = 0;
   const vision = { model: 'GLM-5.3-Flash', next: async () => {

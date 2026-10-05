@@ -2,9 +2,9 @@
 
 读者：产品角色 Agent 与仓库开发 Agent。
 
-**当前版本：`fs-v2.1`**
+**当前版本：`fs-v2.2`**
 
-现行存储与工作项文件格式是 [Memory Filesystem v2.1](memory-filesystem-v2/README.md)。v2.1 增加版本化的项目和节点 `memory.md`，不改变底层 v2 事务格式与现有单文件接口。Agent 默认只认这一份。下次改设计必须再开新版本，不能在同一份「现行」上悄悄换意思。旧版不留在 main。
+现行存储与工作项文件格式仍是 [Memory Filesystem v2.1](memory-filesystem-v2/README.md)。v2.2 增加 Session 发布完成证明：可信审核路径显式确认 `sessionId`、`generation`、`sessionVersion`、`sourceCommit` 后才可进入既有 Git/任务发布门禁。上传、心跳和初始 HEAD 在 Main 上均不代表完成；后续修改使证明失效。底层 v2 事务格式与现有单文件接口不变。Agent 默认只认这一份。下次改设计必须再开新版本，不能在同一份「现行」上悄悄换意思。旧版不留在 main。
 
 未升格设计草案不是当前版本，也不是已升格的法。没升版之前，实现和 Skill 都不得拿它们当存储、权限或发布协议。
 

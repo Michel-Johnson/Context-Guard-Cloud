@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chromium } from 'playwright';
 import { createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
-import { memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
+import { completeSessionMemory, memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
 const { startServer } = await skillImport('scripts/workbench/server.mjs');
 const { resolveProject } = await skillImport('scripts/workbench/project.mjs');
 const { sessionMemoryDir } = await skillImport('scripts/workbench/memory.mjs');
@@ -61,16 +61,31 @@ try {
     protocolConfig: { repositories: [{ slug: 'example/repo', repositoryId: '123', projectId: 'context-guard' }] } });
   const project = await resolveProject(root);
   await atomicWrite(path.join(project.sharedDir, 'memory-client.json'), encode({ url: cloud.url, projectId: 'context-guard', token: 'project-memory-token' }));
+  // The baseline publisher is a real registered Session, not an unbound ID.
+  // Keep the current-generation workflow gate enabled during fixture setup.
+  const baselineLogin = await fetch(`${cloud.url}/api/v2/messages`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ v: 2, id: 'baseline-device-login', type: 'auth.open',
+      payload: { repository: 'https://github.com/example/repo', clientId: 'baseline-device', password: 'test-only' } }),
+  });
+  assert.equal(baselineLogin.status, 200);
+  const baselineCredential = baselineLogin.headers.get('x-context-guard-credential');
+  assert.ok(baselineCredential);
+  await request(`${cloud.url}/api/v2/messages`, { method: 'POST', headers: headers(baselineCredential),
+    body: JSON.stringify({ v: 2, id: 'baseline-bind', type: 'session.bind',
+      payload: { sessionId: 'browser-baseline', worktreeId: 'baseline-tree', agentId: 'baseline-agent', expectedBindingVersion: '' } }),
+  });
   const baseline = await request(`${cloud.url}/v1/projects/context-guard/sessions/browser-baseline`, {
     method: 'POST', headers: headers('project-memory-token'),
     body: JSON.stringify({ operationId: 'browser-sync-baseline', baseVersion: null, baseMainVersion: null, sourceCommit: fixtureSha, memory: { map: document, records: {} } }),
   });
+  await completeSessionMemory(memoryConfig, 'context-guard', { operationId: 'review-sync-baseline', sessionId: 'browser-baseline', generation: 1, sessionVersion: baseline.snapshot.version, sourceCommit: fixtureSha }, { kind: 'human' });
   const published = await request(`${cloud.url}/v1/projects/context-guard/publish`, {
     method: 'POST', headers: headers('project-memory-token'),
     body: JSON.stringify({ operationId: 'browser-sync-main', baseVersion: null, sessionId: 'browser-baseline', sessionVersion: baseline.snapshot.version, expectedMainSha: fixtureSha }),
   });
-  // A Session whose source already belongs to Main is automatically published.
-  // Keep this synchronization fixture on a genuine unmerged feature commit.
+  // Keep this fixture on genuine unmerged work; neither completion nor Git
+  // merge is implied by exercising live synchronization.
   execFileSync('git', ['switch', '-c', 'fixture-session'], { cwd: root, stdio: 'ignore', windowsHide: true });
   await fs.writeFile(path.join(root, 'README.md'), '# unmerged sync fixture\n');
   execFileSync('git', ['add', 'README.md'], { cwd: root, windowsHide: true });

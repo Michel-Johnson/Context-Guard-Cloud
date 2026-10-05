@@ -1,5 +1,6 @@
 import { digest, threadKey } from './store.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
+import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, section, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
@@ -9,7 +10,7 @@ const hasSlackContent = message => !!(message.text || message.questions?.length 
   message.actions?.some(action => action && !['map-read', 'node-read'].includes(action.kind)));
 const isMessage = event => ['message', 'app_mention'].includes(event?.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share');
 const indirectMessage = (event, botUserId) => isMessage(event) && event.user !== botUserId &&
-  event.channel_type !== 'im' && !event.channel?.startsWith('D') && event.type !== 'app_mention' && !String(event.text || '').includes(`<@${botUserId}>`);
+  event.channel_type !== 'im' && !event.channel?.startsWith('D') && !explicitlyAddressed(event, botUserId);
 const messageLane = (envelope, resume) => {
   const event = resume || (envelope?.type === 'events_api' ? envelope.body?.event : null);
   return isMessage(event) ? `${event.channel}:${event.thread_ts || event.ts}` : null;
@@ -34,6 +35,7 @@ export class SlackPlugin {
     this.classifying = new Set();
     this.messageLanes = new Map();
     this.reactions = new Set();
+    this.userIdentities = new Map();
     this.eventStreams = new Map(); this.eventRetry = new Map(); this.eventTasks = new Set(); this.kickRequested = false;
   }
   async receive({ type, body, envelope_id, ack }) {
@@ -214,6 +216,8 @@ export class SlackPlugin {
     }
     if (type === 'slash_commands') {
       if (body.command !== '/cg') return;
+      if (/^stop(?:\s|$)/.test(body.text?.trim() || '')) return this.stopChat(id, body, userId);
+      if (/^resume(?:\s|$)/.test(body.text?.trim() || '')) return this.resumeChat(id, body, userId);
       const projectId = this.store.data.channels[body.channel_id] || this.store.data.preferences[userId];
       const binding = { channel: body.channel_id, threadTs: null, projectId };
       if (body.text?.trim().startsWith('ask ')) return this.message(id, { type: 'app_mention', user: userId, channel: body.channel_id, ts: `command-${digest(id).slice(0, 12)}`, text: body.text.trim().slice(4) });
@@ -352,7 +356,7 @@ export class SlackPlugin {
       return [key, existing];
     }
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
-    const explicit = event.type === 'app_mention' || String(event.text || '').includes(`<@${this.botUserId}>`);
+    const explicit = explicitlyAddressed(event, this.botUserId);
     if (!direct && !explicit && !this.store.data.inbox[id]?.relevance?.respond) return [];
     const projectId = direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel];
     if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Channel project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
@@ -387,9 +391,41 @@ export class SlackPlugin {
     }
     throw Object.assign(new Error('Recent thread context is unavailable within the bounded read; no relevance decision was made'), { code: 'RELEVANCE_CONTEXT_INCOMPLETE' });
   }
+  async mentionRoute(id, event) {
+    if (this.store.data.inbox[id]?.routing) return false;
+    if (explicitlyAddressed(event, this.botUserId)) return true;
+    const mentions = activeMentions(event.text);
+    if (!mentions.length) return true;
+    let reason = mentions.length > 8 ? 'mention-limit' : null;
+    for (const userId of mentions.slice(0, 8)) {
+      let entry = this.userIdentities.get(userId);
+      if (!entry || entry.expires <= Date.now()) {
+        if (this.userIdentities.size >= 256) this.userIdentities.delete(this.userIdentities.keys().next().value);
+        entry = { expires: Date.now() + 300000 };
+        entry.value = Promise.resolve().then(async () => {
+          try {
+            const result = await this.io.call('users.info', { user: userId });
+            if (result.user?.id !== userId || typeof result.user.is_bot !== 'boolean') throw new Error('Invalid Slack identity');
+            return result.user.is_bot || result.user.is_app_user === true;
+          } catch { entry.expires = Date.now() + 30000; return null; }
+        });
+        this.userIdentities.set(userId, entry);
+      }
+      const bot = await entry.value;
+      if (bot === null) reason ||= 'mention-identity-unavailable';
+      if (bot === true) reason = 'addressed-to-other-bot';
+    }
+    if (!reason) return true;
+    await this.store.update(state => {
+      state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+      state.inbox[id].routing = { reason, mentions, at: Date.now() };
+    });
+    return false;
+  }
   async message(id, event, expectedProjectId = null) {
+    if (!await this.mentionRoute(id, event)) return;
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
-    const explicit = event.type === 'app_mention' || String(event.text || '').includes(`<@${this.botUserId}>`);
+    const explicit = explicitlyAddressed(event, this.botUserId);
     if ((event.files || []).length > 6) throw Object.assign(new Error('每条消息最多 6 个附件'), { silent: !direct && !explicit });
     if (!direct && !explicit) {
       const existing = this.store.data.threads[threadKey(this.teamId, event.channel, event.thread_ts || event.ts)];
@@ -456,7 +492,7 @@ export class SlackPlugin {
       await this.store.update(state => { state.inbox[id] ||= { status: 'done', attempts: 0, at: Date.now(), next: 0 }; state.inbox[id].replyContext = replyContext; });
     }
     await this.store.update(state => { const item = state.threads[key]; if (!item.ownRequests.includes(requestId)) item.ownRequests.push(requestId); item.nextPoll = 0; });
-    await this.command('conversation.submit', binding, event.user, requestId, { text: text || '请阅读附件。', ...(attachments.length ? { attachments } : {}), ...(replyContext?.answerTo ? { answerTo: replyContext.answerTo } : {}) });
+    await this.command('conversation.submit', binding, event.user, requestId, { text: text || '请阅读附件。', followup: 'steer', ...(attachments.length ? { attachments } : {}), ...(replyContext?.answerTo ? { answerTo: replyContext.answerTo } : {}) });
     await this.store.update(state => { state.threads[key].awaitingReplyId = requestId; state.threads[key].nextPoll = 0; });
     if (replyContext?.answerTo) await this.store.update(state => { if (state.threads[key].pendingQuestionId === replyContext.answerTo) delete state.threads[key].pendingQuestionId; });
     if (!event.ts?.startsWith('command-')) this.readReaction(event);
@@ -564,11 +600,57 @@ export class SlackPlugin {
     for (let page = 0; page < 20; page++) { const result = await this.io.call('conversations.members', { channel, limit: 200, ...(cursor ? { cursor } : {}) }); members.push(...(result.members || [])); cursor = result.response_metadata?.next_cursor; if (!cursor) return members; }
     throw new Error('无法核对频道成员，请使用更小的频道');
   }
+  async stopChat(id, body, userId) {
+    let target = this.store.data.inbox[id]?.interruptTarget;
+    if (!target) {
+      const conversationId = body.text.trim().split(/\s+/)[1];
+      const candidates = Object.entries(this.store.data.threads).filter(([, binding]) =>
+        binding.channel === body.channel_id && binding.userId === userId &&
+        (conversationId ? binding.conversationId === conversationId : binding.live || binding.awaitingReplyId));
+      if (candidates.length !== 1) throw Object.assign(new Error(candidates.length ? '当前频道有多个对话，请使用 /cg stop <对话ID>' : '当前频道没有可停止的已关联对话'), { code: 'AMBIGUOUS_CONVERSATION' });
+      const [key, binding] = candidates[0];
+      const state = await this.command('conversation.state', binding, userId, operationId(id, 'stop-state'));
+      if (!state.activeTurnId || state.status === 'interrupted') throw Object.assign(new Error('目标对话当前没有正在执行的轮次'), { code: 'NO_ACTIVE_TURN' });
+      target = { key, projectId: binding.projectId, conversationId: binding.conversationId, expectedTurnId: state.activeTurnId };
+      await this.store.update(data => {
+        data.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+        data.inbox[id].interruptTarget = target;
+      });
+    }
+    const binding = this.store.data.threads[target.key];
+    if (!binding || binding.projectId !== target.projectId || binding.conversationId !== target.conversationId) throw Object.assign(new Error('对话关联已改变，停止请求未转交给其他对话'), { code: 'CONFLICT' });
+    await this.command('conversation.interrupt', binding, userId, operationId(id, 'interrupt'), { expectedTurnId: target.expectedTurnId });
+    await this.store.update(data => { data.threads[target.key].nextPoll = 0; });
+  }
+  async resumeChat(id, body, userId) {
+    let target = this.store.data.inbox[id]?.resumeTarget;
+    if (!target) {
+      const conversationId = body.text.trim().split(/\s+/)[1];
+      const candidates = Object.entries(this.store.data.threads).filter(([, binding]) =>
+        binding.channel === body.channel_id && binding.userId === userId &&
+        (conversationId ? binding.conversationId === conversationId : ['interrupted', 'error'].includes(binding.status)));
+      if (candidates.length !== 1) throw Object.assign(new Error(candidates.length ? '当前频道有多个对话，请使用 /cg resume <对话ID>' : '当前频道没有可恢复的已关联对话'), { code: 'AMBIGUOUS_CONVERSATION' });
+      const [key, binding] = candidates[0];
+      const state = await this.command('conversation.state', binding, userId, operationId(id, 'resume-state'));
+      if (!['interrupted', 'error'].includes(state.status) || !state.retryInput?.id) throw Object.assign(new Error('目标对话没有可恢复的停止轮次'), { code: 'INVALID_RETRY' });
+      target = { key, projectId: binding.projectId, conversationId: binding.conversationId, expectedTurnId: state.retryInput.id };
+      await this.store.update(data => {
+        data.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+        data.inbox[id].resumeTarget = target;
+      });
+    }
+    const binding = this.store.data.threads[target.key];
+    if (!binding || binding.projectId !== target.projectId || binding.conversationId !== target.conversationId) throw Object.assign(new Error('对话关联已改变，恢复请求未转交给其他对话'), { code: 'CONFLICT' });
+    // Cloud restores the original input and trusted actor. A new transport ID
+    // cannot be mistaken for the original successful submit receipt.
+    await this.command('conversation.submit', binding, userId, operationId(id, 'resume'), { retry: true, expectedTurnId: target.expectedTurnId });
+    await this.store.update(data => { data.threads[target.key].awaitingReplyId = target.expectedTurnId; data.threads[target.key].nextPoll = 0; });
+  }
   async answer(id, userId, value) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const requestId = operationId(id, 'answer');
     await this.store.update(state => { if (!state.threads[value.key].ownRequests.includes(requestId)) state.threads[value.key].ownRequests.push(requestId); state.threads[value.key].nextPoll = 0; });
-    await this.command('conversation.submit', binding, userId, requestId, { text: value.text, answerTo: value.questionId });
+    await this.command('conversation.submit', binding, userId, requestId, { text: value.text, answerTo: value.questionId, followup: 'steer' });
     await this.store.update(state => { state.threads[value.key].awaitingReplyId = requestId; state.threads[value.key].nextPoll = 0; });
   }
   async review(id, userId, value, decision, reason) {
@@ -596,6 +678,11 @@ export class SlackPlugin {
     const cached = sameScope ? stream.latest : null;
     if (stream) { stream.latest = null; stream.lastFallbackAt = Date.now(); }
     const state = cached || await this.command('conversation.state', binding, binding.userId, operationId(`${key}:${Date.now()}`, 'state'));
+    if (Number.isSafeInteger(binding.controlRevision) && binding.controlRevision > 0 &&
+        (!Number.isSafeInteger(state.controlRevision) || state.controlRevision < binding.controlRevision)) return;
+    if (Number.isSafeInteger(state.inputRevision) && Number.isSafeInteger(binding.inputRevision) &&
+        (state.inputRevision < binding.inputRevision || state.inputRevision === binding.inputRevision &&
+          Number.isSafeInteger(state.consumedInputRevision) && state.consumedInputRevision < (binding.consumedInputRevision || 0))) return;
     const messages = state.messages || [];
     const userRequestIds = messages.filter(message => message.role === 'user' && message.requestId).map(message => message.requestId);
     const accepted = state.acceptedRequestIds || [];
@@ -619,46 +706,81 @@ export class SlackPlugin {
     });
     for (const { message, index, requestId, id } of entries) {
       if (!hasSlackContent(message)) continue;
+      const partial = message.role === 'assistant' && message.partial === true;
       if (message.role === 'user' && (message.source === 'workflow' || String(message.text || '').trimStart().startsWith('[服务器工作流事件'))) continue;
       if (message.role === 'user' && this.store.data.threads[key].ownRequests.includes(message.requestId)) continue;
-      if (state.status === 'running' && state.streamingText && index === lastAssistant && requestId === state.activeTurnId) continue;
+      if (!partial && state.status === 'running' && state.streamingText && index === lastAssistant && requestId === state.activeTurnId) continue;
       const stream = this.store.data.threads[key].liveStream;
-      const settled = !state.activeTurnId && ['waiting-for-user', 'idle'].includes(state.status);
+      const settled = !state.activeTurnId && ['waiting-for-user', 'idle'].includes(state.status) && !state.pendingInputCount;
       // A model step can save waiting-for-user before the service clears the
       // turn ID. Keep the existing partial message until that durable boundary
       // settles, rather than posting a second final and later updating both.
-      if (stream && message.role === 'assistant' && stream.turnId === requestId && !settled) continue;
-      const blocks = messageBlocks(message, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
+      if (!partial && stream && message.role === 'assistant' && stream.turnId === requestId && !settled) continue;
+      const display = partial ? { ...message, text: `部分回复（已被补充调整，非最终答案）：\n${message.text || ''}` } : message;
+      const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
       const content = digest({ format: 'plain-text-v2', message,
         ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}) }),
         prior = this.store.data.threads[key].mirrored[id];
       // Older versions could append an earlier model step after the stream.
       // Rotate those occupied slots forward until a pending reply consumes the
       // final slot, without deleting Slack history or duplicating the content.
-      const moveEarlier = !!stream && settled && message.role === 'assistant' && stream.turnId === requestId &&
+      const moveEarlier = !partial && !!stream && settled && message.role === 'assistant' && stream.turnId === requestId &&
         !!prior && Number(prior.ts) > Number(stream.ts) && entries.some(entry =>
           entry.message.role === 'assistant' && entry.requestId === stream.turnId &&
           hasSlackContent(entry.message) &&
           !this.store.data.threads[key].mirrored[entry.id]);
       if (prior?.hash === content && !moveEarlier) continue;
-      const text = `${message.role === 'user' ? '工作台用户' : 'Coordinator'}：${message.text || (message.actions?.length ? '节点入口' : '附件')}`;
+      const text = `${message.role === 'user' ? '工作台用户' : 'Coordinator'}：${display.text || (message.actions?.length ? '节点入口' : '附件')}`;
       // The retained placeholder has the earliest Slack timestamp. Finalize
       // it with the first pending reply, then append later model steps in order.
-      const replaceStream = !!stream && (!prior || moveEarlier) && message.role === 'assistant' && settled && stream.turnId === requestId;
-      const existingTs = replaceStream ? stream.ts : prior?.ts;
+      const retainPartial = partial && !!stream && !prior && stream.turnId === requestId;
+      const replaceStream = !partial && !!stream && (!prior || moveEarlier) && message.role === 'assistant' && settled && stream.turnId === requestId;
+      const existingTs = replaceStream || retainPartial ? stream.ts : prior?.ts;
       const ts = existingTs ? (await this.io.update(binding.channel, existingTs, text, blocks), existingTs) : await this.io.post({ id: operationId(`${key}:${id}`, 'mirror'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
       await this.store.update(data => {
         data.threads[key].mirrored[id] = { ts, hash: content };
         if (moveEarlier) data.threads[key].liveStream.ts = prior.ts;
-        else if (replaceStream) delete data.threads[key].liveStream;
+        else if (replaceStream || retainPartial) delete data.threads[key].liveStream;
       });
     }
     if (state.streamingText && state.status === 'running') {
-      const streamId = `stream:${state.activeTurnId}`, prior = this.store.data.threads[key].mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
+      const streamId = `stream:${state.activeTurnId}${Number.isSafeInteger(state.consumedInputRevision) ? `:${state.consumedInputRevision}` : ''}`, prior = this.store.data.threads[key].mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
       if (prior?.hash !== content) {
         const text = `Coordinator：${state.streamingText}`;
         const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text), prior.ts) : await this.io.post({ id: operationId(`${key}:${streamId}`, 'stream'), channel: binding.channel, threadTs: binding.threadTs, text });
-        await this.store.update(data => { data.threads[key].mirrored[streamId] = { ts, hash: content }; data.threads[key].liveStream = { ts, turnId: state.activeTurnId }; });
+        await this.store.update(data => { data.threads[key].mirrored[streamId] = { ts, hash: content }; data.threads[key].liveStream = { ts, turnId: state.activeTurnId, text: state.streamingText }; });
+      }
+    }
+    if (state.status === 'interrupted') {
+      const stream = this.store.data.threads[key].liveStream;
+      if (stream && !stream.interrupted) {
+      const partial = stream.text || state.partialText || state.streamingText;
+        if (partial) await this.io.update(binding.channel, stream.ts, `Coordinator 已停止（部分回复，非最终答案）：\n${partial}`);
+        await this.store.update(data => { data.threads[key].liveStream.interrupted = true; });
+      }
+      const noticeId = `interrupted:${state.activeTurnId || binding.lastStateRequestId}`;
+      if (!this.store.data.threads[key].mirrored[noticeId]) {
+        const ts = await this.io.post({ id: operationId(`${key}:${noticeId}`, 'notice'), channel: binding.channel, threadTs: binding.threadTs,
+          text: '当前轮次已停止。已完成的操作和部分回复保留；未处理的补充仍保留，不会自动继续。' });
+        await this.store.update(data => { data.threads[key].mirrored[noticeId] = { ts }; });
+      }
+    } else if (state.status === 'running' && Number.isSafeInteger(state.inputRevision) && state.inputRevision > 1 &&
+        (state.pendingInputCount > 0 || binding.inputNotice)) {
+      const text = state.pendingInputCount > 0 ? `已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮次。` : '补充已纳入当前轮次，仍在处理。';
+      const prior = binding.inputNotice;
+      if (prior?.text !== text) {
+        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text), prior.ts) :
+          await this.io.post({ id: operationId(`${key}:${state.inputRevision}`, 'input-notice'), channel: binding.channel, threadTs: binding.threadTs, text });
+        await this.store.update(data => { data.threads[key].inputNotice = { ts, text }; });
+      }
+    }
+    if (binding.inputNotice && state.status !== 'running') {
+      const text = state.status === 'interrupted' ? '当前轮次已停止，未处理补充仍保留。' : state.status === 'error' ?
+        '当前轮次失败，补充和操作回执仍保留。' : state.pendingInputCount > 0 ? '补充已保存，尚未全部处理。' :
+        '本轮已结束，请以实际回复和操作回执为准。';
+      if (binding.inputNotice.text !== text) {
+        await this.io.update(binding.channel, binding.inputNotice.ts, text);
+        await this.store.update(data => { data.threads[key].inputNotice.text = text; });
       }
     }
     for (const approval of state.approvals || []) {
@@ -680,13 +802,16 @@ export class SlackPlugin {
     const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer);
     await this.store.update(data => {
       const thread = data.threads[key];
+      thread.status = state.status;
       if (lastRequestId) thread.lastStateRequestId = lastRequestId;
-      thread.live = state.status === 'running' || !!state.activeTurnId && state.status !== 'error';
+      thread.live = state.status === 'running' || !!state.activeTurnId && !['error', 'interrupted'].includes(state.status);
+      for (const field of ['inputRevision', 'consumedInputRevision', 'controlRevision', 'pendingInputCount']) if (Number.isSafeInteger(state[field])) thread[field] = state[field];
       if (!state.activeTurnId && ['waiting-for-user', 'idle'].includes(state.status)) {
         const completed = state.acceptedRequestIds || [];
         thread.settledRequestIds = [...new Set([...(thread.settledRequestIds || []), ...completed])].slice(-100);
       }
-      if (!thread.live && state.acceptedRequestIds?.includes(thread.awaitingReplyId)) delete thread.awaitingReplyId;
+      if (!thread.live && !state.pendingInputCount && state.status !== 'interrupted' && state.acceptedRequestIds?.includes(thread.awaitingReplyId)) delete thread.awaitingReplyId;
+      if (state.status === 'interrupted') delete thread.awaitingReplyId;
       const pending = this.eventStreams.get(key);
       thread.nextPoll = pending?.latest && !pending.controller.signal.aborted && pending.projectId === thread.projectId && pending.conversationId === thread.conversationId
         ? 0 : Date.now() + (thread.live || thread.awaitingReplyId ? this.pollMs : 15000); thread.error = null;

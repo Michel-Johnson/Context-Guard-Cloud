@@ -1,8 +1,86 @@
 # Cloud split acceptance
 
+## Current implementation handoff (2026-10-05)
+
+- [ ] SLACK-ROUTING-STEER-01: Independent Tester verifies only-other-bot silence,
+  self/mixed mentions, 5–10 consecutive inputs, durable Steer, stop/resume,
+  restart/deduplication, stale SSE rejection and partial-reply presentation.
+  Real Slack acceptance requires reauthorization with `users:read`.
+- [x] PUB-COMPLETION-01: Upload/heartbeat cannot complete a Session. Human
+  completion binds Session/generation/version/source commit; edits invalidate it.
+  Verify stale proof, unauthorized completion, replay, review revocation at final
+  publication, existing Git/CI/experiment gates and explicit browser completion.
+- [x] MEMORY-UI-01: Only project/node memory documents are editable; legacy
+  memories remain readable via explicit escaped history preview. Verify no silent
+  deletion/migration, attachments preserved, no extra writes and browser behavior.
+- [ ] RELEASE-RUNTIME-01: Publish fresh immutable Core/UI/Skill artifacts after
+  security checks; update exact dependencies/integrity, generate Skill runtime,
+  verify installed versions, Required checks and production revisions. Existing
+  caches and source tests do not establish deployed or installed acceptance.
+
 Each item remains in this file after completion, with its test names and evidence.
 Executor implements and verifies modules; independent Tester validates the frozen
-source revision. No item below is a claim of completed acceptance.
+source revision. Checked source items do not establish release or production
+acceptance; those remain separate gates below.
+
+### Independent local acceptance, 2026-10-05
+
+Input: Windows, Node 24.19.0; Cloud working tree based on `376aa151`,
+Skill working tree based on `6973d182`. The fixed installed cross-repository
+fixture remains Skill 0.5.0 at `6973d182`; sibling source was not substituted.
+These are source/isolated-browser checks, not release, production or real Slack evidence.
+
+- Slack: `npm test --prefix plugins/slack`, 142/142, no skips.
+  Includes other-bot silence, mixed mentions, frozen stop/resume IDs,
+  partial-reply slots and rejection of older input/control revisions.
+- Security wrapper acceptance: `npm run security:test`, 39 checks passed.
+- Steer: 10 consecutive inputs are consumed exactly once in one continuation;
+  started business tools finish with durable receipts, remaining stale tools
+  do not execute, and explicit resume does not repeat the completed tool.
+  Source suite passed 6/6; multimodal suite passed 11/11, including a Steer
+  image's summary being retained for later text-only turns.
+- HTTP workbench: 36/36. New completion assertions reject project credentials,
+  mismatched displayed Sessions and stale versions, then replay the exact human
+  completion receipt. Publication-lock regression rejects revoked review and
+  requires a durable write before reporting success.
+- Browser: device approval passed; `cloud-workbench-browser.mjs` passed with
+  legacy history escaping/preservation, visible partial marker, Main-hidden
+  completion, dirty-edit rejection, stale-version 409, and exact completion proof.
+  `cloud-sync-browser.mjs` passed both UI directions, disk/refresh persistence and
+  unchanged Main using the fixed installed Skill artifact. The synthetic baseline
+  now enrolls through actual `auth.open` / `session.bind` HTTP calls before
+  publication; workflow-generation validation is not disabled.
+- Skill source: governance passed; relevant existing modules passed 94/94.
+  Added completion module covers mismatch, unbound Session, old Cloud 404,
+  device 403, original-request replay and side-effect-free CLI help. No installed
+  new Skill or remote release was used for this check.
+
+The first aggregate run failed: 356 passed, 2 failed, 2 existing separate-suite
+skips. One old fixture expected `NOT_MERGED` before reviewed completion;
+it now completes its exact synthetic versions without weakening Git gates.
+The other failure was an `archive-session` subprocess timeout. Its isolated
+unchanged-deadline rerun passed (archive 22.4s, completion 24.4/24.5s);
+this did not by itself make the aggregate green. Final aggregate rerun exited 0:
+362 tests, 360 passed, 0 failed, 2 existing separate-suite skips, 353.57 seconds.
+The previously timed-out Hook case passed in this full run (178.0 seconds);
+its original subprocess deadlines and assertions were unchanged.
+
+Logs: `temp/tester-{slack-full,cloud-security,cloud-full,cloud-full-final,
+cloud-workbench-routes,hook-isolated,multimodal,steer-multi}-20261005.log`;
+browser records are under `output/playwright/browser-ci/`. Earlier failures are
+retained, not erased. Production reauthorization with `users:read`, immutable
+artifact publication, remote Required, deployed-version checks and live Slack
+acceptance remain open under RELEASE-RUNTIME-01 / SPLIT-C05 / SPLIT-C06.
+
+Frozen runtime SHA-256:
+
+| File | SHA-256 |
+| --- | --- |
+| `scripts/cloud/coordinator-service.mjs` | `f9e993fe2574cb3b03813f3b4f95579e691e0474a79b1cede9d7b8d4dc279db3` |
+| `scripts/cloud/server.mjs` | `be70a65828dcbcaecb0534bb663f19e1f9872bdb67ee5f7b752a0a60070d6f4b` |
+| `scripts/cloud/memory.mjs` | `e9af4bfbe08cdd8d2bfed3819ec8c89d7ea675c5c1ce9a07adbfb0ed5dceaea5` |
+| `prototype/workbench-sync.mjs` | `1e6db8231cd5fde8b0992b477cc326747e64d57c419417cd5acb7efa4481e1a2` |
+| `plugins/slack/src/plugin.mjs` | `345b5f58b725b27ab999ba50a430a72e67cde602c9a2ac76518226b27e30f1ef` |
 
 - [ ] SPLIT-C01: Main and deployed Slack fixes preserved; external caller grants, pending file recovery, Slack manual items verified.
 - [ ] SPLIT-C02: Core/UI release artifacts contain only their allowlisted public runtime files; Skill consumers use exact versions and integrity hashes.
