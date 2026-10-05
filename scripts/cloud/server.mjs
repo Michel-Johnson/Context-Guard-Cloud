@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readMemoryProject, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -1701,6 +1701,8 @@ export async function startCloudServer({
           }
           const state = await readMemoryProject(configuredMemory, project.id);
           const sessions = Object.values(state.sessions || {})
+            // Candidate filter only; status and the locked write still recheck every gate.
+            .filter(sessionCompletionMatches)
             .sort((left, right) => String(left.updatedAt || '').localeCompare(String(right.updatedAt || '')));
           for (const session of sessions) {
             const status = await publicationState(project, `session:${session.sessionId}`, { refresh: true });

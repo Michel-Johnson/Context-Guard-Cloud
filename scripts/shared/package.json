@@ -1,6 +1,6 @@
 {
   "name": "@michelj/context-guard-core",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "type": "module",
   "description": "Shared Context Guard protocol, map model and runtime primitives",
   "repository": "github:Michel-Johnson/Context-Guard-Cloud",

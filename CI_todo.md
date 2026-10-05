@@ -1,5 +1,38 @@
 # Cloud split acceptance
 
+## Final delivery status (2026-10-05)
+
+- Cloud #1 merged normally into `2b47df759ee567e8d53f569cc56a50c19f616a47`; Skill #449/#450 into `3773aa9` / `4ae1788eb93cc8d0b62e60e376d4387843abce43`. Official npm **0.6.2** CD run `37271755297` succeeded on all three install/upgrade platforms, OIDC and post-publication exact/latest checks. Cloud still pins the distinct immutable GitHub **Skill fixture 0.6.1** at `8f144fb`; shared Core/UI remain 1.1.0 and old release assets were not overwritten.
+- Production Cloud 1.1.0 is running from `/opt/context-guard-cloud/repository` at `2b47df7`, with formal Slack 0.1.14. One formal Cloud and one formal Slack service are active; candidate services are disabled. Business mirror HEAD is `4ae1788`. Both projects' Main/Session/closed/history hashes match before and after deployment; the two-document memory UI is visible in real Edge (`output/cloud-release-1.1.0-proof.jpg`).
+- [x] Read-only Slack state comparison against verified business backup `pre-split-release-20261005T061504215Z.tar`: stateVersion unchanged; inbox 327→327, threads 9→9, channels 2→2, preferences 1→1, drafts 3→3, outgoing 105→105. All old IDs and thread project/conversation bindings remain; no real IDs or content are disclosed. This proves structural retention, not every payload or execution outcome.
+- The inbox/outgoing/channels/preferences/drafts JSON values also match exactly; environment files are byte-identical and memory credential equality was checked as booleans only. Threads have expected post-start control/input/status/poll evolution; their original mirrored receipts and ownRequests sets remain. Full workflow/payload execution acceptance is still not inferred.
+- Codex/Cursor/Claude local Skill copies installed official npm 0.6.2 explicitly with `--no-hooks`; launcher/SKILL.md/Hook-script hashes match the published package and the three host Hook files remain unchanged. Live user bidirectional connection is still unverified: local backends are stopped and this Session is unbound.
+- Real Slack E2E remains open: production probe has `authenticated:true`, `usersRead:false`; token authentication/service-active does not prove other-bot silence, Steer or live conversations. After explicit user confirmation, obsolete candidate source and its disabled unit were removed as recorded under SPLIT-C06; business data and backups were retained.
+
+## SESSION-VIEW-01 · Opt-in other Sessions (2026-10-05)
+
+Fresh immutable release preparation: Cloud/Core/UI manifests are 1.1.1; Skill
+0.6.3 fixes the matching shared-v1.1.1 URLs/integrity. Local exact package scans
+passed (Cloud/Core/UI: 90/44/13 files). Core SHA-256 is
+`508ec89fb050a426c97b6fb83eb131d8fd2f283578d7aa7c77c6c7ec59de6672`, UI
+`2441811b9dfecc6b58e34e5cd7bbef9dfb2902cb8dc1ddaf6b1eb241920811e8`.
+Anonymous public download, PR/Required, client publication/install and production
+delivery remain separately pending here; the old 1.1.0 assets are not replaced.
+
+- [x] Executor: keep the working-only default; add a non-persistent other-Session toggle using the existing authorized view. Closed Sessions stay excluded and stale bindings cannot be selected. Cloud snapshot availability is checked before flushing the current draft; failed switches retain the original map, query, version and recovery state rather than initializing a replacement.
+- [x] Module tests: both added menu/switch tests and syntax/diff checks passed. Formal browser assertions cover real fixture Session selection, return to Main/default, unavailable snapshot with zero commits and stale/closed handling.
+- [x] Independent Tester: frozen formal Cloud browser passed 44 checks, including opt-in actual fixture name/map, return to default Main, missing snapshot with zero commits and retained version/URL/selection. The initial fixture waited for a correctly populated but hidden status panel; normal Settings/Recovery clicks fixed the fixture without force, additional timeout or removed assertions. Original failure is retained. Both modules passed 46/46; final Node 24.19.0 full regression passed 366/368, zero failures (340.15 seconds).
+- [ ] Delivery: fresh shared artifacts, both repositories and the actual installed/Cloud versions remain separate steps; production user-session acceptance is not inferred from source checks.
+- Final independent logs: `temp/tester-other-session-{modules,browser-fixed,full,slack,security}-20261005.log`. Browser approval passed 1/1; fixed installed GitHub Skill fixture 0.6.1 bidirectional sync passed 7 checks; Windows Slack passed 142/142 and security passed 39 checks. Full regression's two existing skips are browser-mode approval (separately passed here) and an unconfigured live model Provider (not exercised). Actual npm 0.6.2 user connection, offline recovery, multi-real-Session isolation and post-deployment CPU measurement remain unverified.
+
+## AUTO-PUB-IDLE-01 · Exact-completion candidate filtering (2026-10-05)
+
+- [x] Executor: the 30-second automatic publisher reads one project view and filters candidates using existing `sessionCompletionMatches` before status/Git inspection. Public status fields, timer cadence, Git/CI/workflow gates, transaction locks and locked rechecks are unchanged; no global cache or Slack-store changes.
+- [x] Module tests: `node --test --test-name-pattern="automatic publication scan" tests/session-publication-completion.test.mjs`, 4/4 passed; final full module `node --test tests/session-publication-completion.test.mjs`, 8/8 passed (19.79 seconds). Actual scan-function tests cover one read/no status or Git-entry calls for absent and four mismatched proof fields, completed merged publication through real memory/Git gates, edit invalidation before status and after ready/before locked write; no Main/closed receipt is written in either race. Existing authority, replay, workflow-revocation lock and durable-write regressions passed unchanged.
+- [x] Independent Tester: frozen-source review and final module/full regression passed. Scan tests extract the actual server function; valid publication and both invalidation races use real memory/Git/locked-write gates. The absent/stale candidate case uses fail-on-call spies. Tests inject the historical reader while the actual server uses its view-reader alias; formal browser and full runtime regressions also exercise the actual service.
+- [ ] Deployment idle measurement: pre-fix production sampling motivated the change, but source passes do not establish the whole CPU root cause or a measured production improvement.
+- Read-only pre-fix production observation: 881.9 seconds between samples, Cloud/Slack process CPU averaged about 14.36%/2.30% of one core. Cloud RSS was 197544→197464 KiB, Slack 129248→133836 KiB; both retained 11 threads and no service restarts. Slack state stayed 1010240 bytes but its mtime advanced. This short baseline neither proves a leak-free long run nor attributes the whole cost to publication; repeat after actual deployment before claiming improvement.
+
 ## Current implementation handoff (2026-10-05)
 
 - [ ] SLACK-ROUTING-STEER-01: Independent Tester verifies only-other-bot silence,
@@ -13,10 +46,12 @@
 - [x] MEMORY-UI-01: Only project/node memory documents are editable; legacy
   memories remain readable via explicit escaped history preview. Verify no silent
   deletion/migration, attachments preserved, no extra writes and browser behavior.
-- [ ] RELEASE-RUNTIME-01: Publish fresh immutable Core/UI/Skill artifacts after
+- [x] RELEASE-RUNTIME-01: Publish fresh immutable Core/UI/Skill artifacts after
   security checks; update exact dependencies/integrity, generate Skill runtime,
   verify installed versions, Required checks and production revisions. Existing
   caches and source tests do not establish deployed or installed acceptance.
+  Final artifact, installed-version and production evidence is recorded above;
+  live Slack/user-connection acceptance remains separately open.
 
 Each item remains in this file after completion, with its test names and evidence.
 Executor implements and verifies modules; independent Tester validates the frozen
@@ -146,18 +181,29 @@ Frozen runtime SHA-256:
 | `plugins/slack/src/plugin.mjs` | `345b5f58b725b27ab999ba50a430a72e67cde602c9a2ac76518226b27e30f1ef` |
 
 - [ ] SPLIT-C01: Main and deployed Slack fixes preserved; external caller grants, pending file recovery, Slack manual items verified.
-- [ ] SPLIT-C02: Core/UI release artifacts contain only their allowlisted public runtime files; Skill consumers use exact versions and integrity hashes.
-- [ ] SPLIT-C03: Cloud builds and starts without a local Skill source checkout; cross-client fixtures are development-only.
+- [x] SPLIT-C02: Core/UI release artifacts contain only their allowlisted public runtime files; Skill consumers use exact versions and integrity hashes. Shared 1.1.0 scans (44/13 files), anonymous downloads and final consumer locks are recorded above.
+- [x] SPLIT-C03: Cloud builds and starts without a local Skill source checkout; cross-client fixtures are development-only. Production standalone checkout/source and active formal services are recorded above.
 - [ ] SPLIT-C04: Local/Cloud edits, disconnect recovery, duplicate delivery and Session isolation pass against the installed Skill artifact.
 - [ ] SPLIT-C05: Real Slack project selection, reply ordering, attachments and manual brief verified without disturbing unrelated conversations.
-- [ ] SPLIT-C06: Production runtime revision verified; one Cloud and one Slack service; old checkout removed only after project mirror references are migrated.
-- [ ] SPLIT-C07: Existing data, queues, receipts and project identities remain intact; rollback source version identified without creating source backup directories.
+- [x] SPLIT-C06: After explicit confirmation, removed only `/opt/context-guard-slack/candidate` and `/run/systemd/system/context-guard-slack-candidate.service`. Rechecked realpaths/inodes, mount/process/config references and that all candidate code was in live Skill Main before fd-safe deletion. Both targets are absent, unit is not-found, formal Cloud/Slack retained their PIDs and active/enabled state; health still reports `2b47df7`. Nine retained directory inodes and 27 runtime/config static-file metadata checks are unchanged. No source backup; deleted code remains recoverable from Git history. Runtime, business mirrors/data, credentials and business backups are untouched.
+- [ ] SPLIT-C07: Existing data, queues, receipts and project identities remain intact; rollback source version identified without creating source backup directories. Recorded Map hashes plus Slack section counts, old IDs and thread bindings are verified above; full payload and execution-effect acceptance is not inferred from structural retention.
 
 Known limits retained: Slack journal growth and model response latency are not
 resolved by this repository split. Source tests do not establish real Slack E2E.
 
-- [ ] SPLIT-SLACK-WIN-01: Independent Tester verifies the exact frozen revision
+- [x] SPLIT-SLACK-WIN-01: Independent Tester verifies the exact frozen revision
   on Windows and Unix after the Slack Store directory-fsync boundary fix.
+  Real Unix follow-up, 2026-10-05: production source at exact Main
+  `2b47df759ee567e8d53f569cc56a50c19f616a47`, Node 22.23.3, passed the formal
+  Store module 5/5 (174.76 ms), using only disposable OS-temp fixtures.
+  Source/test bytes match the Windows-reviewed hashes below. The first case
+  exercised real Linux file/directory fsync, rename, reopen and deduplication;
+  the remaining platform failure cases retain injection and are not relabeled
+  native Windows evidence. No production state/env/messages/services changed.
+  Log: `temp/tester-slack-real-linux-store-20261005.log`. Final frozen Windows
+  Node 24.19.0 full regression passed 366/368 with zero failures, including both
+  named integrations; separate supported-runtime Slack suite passed 142/142
+  with zero skips. These do not prove actual Slack-provider interaction.
   Executor coverage: `plugins/slack/test/store.test.mjs` checks persisted receipts
   and bindings after reopen, Windows file fsync + atomic rename without directory
   fsync, and rejection (no acknowledgement) for file-fsync failure on both platforms
@@ -230,7 +276,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] SPLIT-DEPLOY-01: Verify the systemd templates on Linux, writable business
   mirrors, existing reverse-proxy bind, Slack readiness and data invariants.
   A deployed business mirror currently occupies the intended Cloud checkout
-  location: migrate its reference before replacing that directory.
+  location: migrate its reference before replacing that directory. Final formal
+  checkout, mirror migration, services, proxy-visible UI and recorded data hashes
+  are verified above, including Slack queue/state structural retention; real Slack
+  scope/E2E, full payloads and execution effects remain open rather than inferred
+  from service-active or unchanged record counts.
 
 - Fixed final Skill fixture: `86db8754486f61704c545bf9f1f3fff81ac2a68d`,
   `0.5.0`, SHA256 `4b409bace1ec943ac682c9c662da315bcf7dbe2a245ab68639ca1f6a636282b1`.
@@ -277,7 +327,7 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   `5ec9ed57652809c833dbfd8f2ba2c45c373f7d0b718aba3b104955ab61784262`.
   These results do not satisfy remote Required or production deployment gates.
 
-- [ ] SPLIT-PUBLICATION-01: Existing premature-publication risk, found by the
+- [x] SPLIT-PUBLICATION-01: Existing premature-publication risk, found by the
   reverse UI acceptance. A normal Session can start with an already-merged HEAD;
   later Map uploads retain that old sourceCommit. The ancestry gate returns ready,
   and no workflow tasks means the additional task gate allows publication.
@@ -290,6 +340,9 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   completion proof tied to the current generation, Session version and delivery
   SHA at the common publication boundary. Keep Git, workflow and version gates;
   do not fix only the frontend or treat corrected fixtures as a product fix.
+  Closed by the reviewed completion proof/common-transaction boundary under
+  PUB-COMPLETION-01; the verified Cloud release above deploys that fix. Ordinary
+  upload/heartbeat still cannot complete a Session. Original diagnostic history remains.
 
 - [x] SPLIT-SYNC-E2E-01: Independent Tester adds the missing Cloud-to-local UI
   direction to `tests/cloud-sync-browser.mjs`: edit purpose in the Cloud Session,

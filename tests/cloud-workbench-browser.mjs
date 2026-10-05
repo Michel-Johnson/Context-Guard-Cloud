@@ -191,6 +191,64 @@ try {
   await page.locator('#session-chip').click();
   record('Main is the default view');
 
+  await page.locator('#session-chip').click();
+  await page.locator('#session-menu [data-show-other-sessions]').click();
+  const otherSession = page.locator('#session-menu [data-session="session-one"]');
+  assert.match(await otherSession.textContent(), /修复同步连接/);
+  assert.equal(await otherSession.isDisabled(), false);
+  await otherSession.click();
+  await page.waitForFunction(() => new URL(location.href).searchParams.get('session') === 'session-one'
+    && document.querySelector('.node[data-id="T0"]')?.textContent?.includes('Session map'));
+  await synchronized();
+  assert.match(await page.locator('.node[data-id="T0"]').textContent(), /Session map/);
+  assert.equal(new URL(page.url()).searchParams.get('session'), 'session-one');
+  await page.locator('#session-chip').click();
+  await page.locator('#session-menu [data-session="__all__"]').click();
+  await page.waitForFunction(() => !new URL(location.href).searchParams.has('session')
+    && document.querySelector('.node[data-id="T0"]')?.textContent?.includes('Main map'));
+  await synchronized();
+  await page.locator('#session-chip').click();
+  await page.locator('#session-menu [data-show-other-sessions]').click();
+  assert.equal(await page.locator('#session-menu [data-session="session-one"]').count(), 0);
+  await page.locator('#session-chip').click();
+  record('Opt-in other Session list opens the real map and returns to the working-only Main list');
+
+  const unavailableSession = 'registered-without-snapshot';
+  const otherAccessRoute = '**/api/access?*';
+  await page.route(otherAccessRoute, async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.sessions.push({ id: unavailableSession, name: '尚未同步的会话', platform: 'claude', status: 'offline', bindingState: 'bound' });
+    body.sessions.push({ id: 'other-stale', name: '绑定失效会话', status: 'offline', bindingState: 'stale' });
+    body.sessions.push({ id: 'other-closed', name: '已关闭会话', status: 'closed', bindingState: 'closed' });
+    await route.fulfill({ response, json: body });
+  });
+  await page.reload();
+  await synchronized();
+  const beforeMissingVersion = await syncVersion(), beforeMissingUrl = page.url();
+  let missingSwitchCommits = 0;
+  const countMissingCommits = request => { if (request.method() === 'POST' && request.url().includes('/api/commit')) missingSwitchCommits++; };
+  page.on('request', countMissingCommits);
+  await page.locator('#session-chip').click();
+  await page.locator('#session-menu [data-show-other-sessions]').click();
+  assert.equal(await page.locator('#session-menu [data-session="other-stale"]').isDisabled(), true);
+  assert.equal(await page.locator('#session-menu [data-session="other-closed"]').count(), 0);
+  await page.locator(`#session-menu [data-session="${unavailableSession}"]`).click();
+  await page.locator('#btn-settings').click();
+  if (await page.locator('#cg-sync').getAttribute('open') === null) await page.locator('#cg-sync > summary').click();
+  await page.locator('#cg-sync-status').filter({ hasText: '地图尚未同步' }).waitFor();
+  assert.match(await page.locator('.node[data-id="T0"]').textContent(), /Main map/);
+  assert.equal(await syncVersion(), beforeMissingVersion);
+  assert.equal(page.url(), beforeMissingUrl);
+  assert.equal(await page.locator('#cg-sync-session').inputValue(), '__all__');
+  assert.equal(await page.locator('#cg-sync-initialize').isVisible(), false);
+  assert.equal(missingSwitchCommits, 0);
+  page.off('request', countMissingCommits);
+  await page.unroute(otherAccessRoute);
+  await page.reload();
+  await synchronized();
+  record('A bound Session without a snapshot preserves Main and does not initialize or commit a replacement');
+
   const pendingPage = await context.newPage();
   const lateSessionId = `late-session-${process.pid}-${Date.now()}`;
   await pendingPage.goto(`${service.url}/projects/context-guard?session=${lateSessionId}`);

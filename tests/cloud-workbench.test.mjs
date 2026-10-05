@@ -41,6 +41,69 @@ test('legacy memory preview is escaped, read-only and does not create or mutate 
   assert.match(source, /memory=>memory&&memory\.proposalEvidence/);
 });
 
+test('other Session menu is opt-in and retains the working-only default', async () => {
+  const source = await fs.readFile(new URL('../prototype/workbench-app.js', import.meta.url), 'utf8');
+  const functions = source.slice(source.indexOf('function sessionIdOf('), source.indexOf('function browserCurrentSessionId('));
+  const sessions = [
+    { id: 'active', connection: { state: 'online' }, execution: { status: 'active' } },
+    { id: 'idle', name: '真实空闲会话', connection: { state: 'online' }, execution: { status: 'idle' } },
+    { id: 'offline', connection: { state: 'offline' } },
+    { id: 'interrupted', connection: { state: 'online' }, execution: { status: 'interrupted' } },
+    { id: 'stale', bindingState: 'stale' },
+    ...['closed', 'published', 'expired', 'deleted', 'invalid'].map(status => ({ id: status, status })),
+  ];
+  const sandbox = { workbenchSync: { sessions, activeSession: '__all__' }, showOtherSessions: false };
+  const choices = runInNewContext(`${functions}; visibleSessionChoices`, sandbox);
+  assert.deepEqual(Array.from(choices(), item => item.id), ['active']);
+  sandbox.showOtherSessions = true;
+  assert.deepEqual(Array.from(choices(), item => item.id), ['active', 'idle', 'offline', 'interrupted', 'stale']);
+  sandbox.showOtherSessions = false;
+  sandbox.workbenchSync.activeSession = 'offline';
+  assert.deepEqual(Array.from(choices(), item => item.id), ['active', 'offline']);
+  assert.match(source, /let showOtherSessions = false;/);
+  assert.match(source, /data-show-other-sessions aria-pressed=/);
+});
+
+test('Session switch preflight preserves unsaved Main drafts and failed switches restore query and cache', async () => {
+  const source = await fs.readFile(new URL('../prototype/workbench-sync.mjs', import.meta.url), 'utf8');
+  const method = source.slice(source.indexOf('  async selectSession('), source.indexOf('  isAllSessions('));
+  for (const failure of ['preflight', 'reload', 'after-url']) {
+    const location = { href: 'https://example.invalid/projects/lab?existing=1#node' };
+    const originalUrl = location.href;
+    const select = runInNewContext(`({${method}}).selectSession`, { ALL_SESSIONS: '__all__', copy: structuredClone, URL,
+      location, history: { replaceState: (_state, _title, url) => { location.href = String(url); } }, setTimeout: () => {} });
+    const original = { id: 'T0', title: 'Main draft', children: [] };
+    let tree = structuredClone(original), flushes = 0, reads = 0;
+    const target = { id: 'T0', title: 'Target', children: [] };
+    const sync = { config: { root: 'cloud:lab' }, sessions: [{ id: 'idle', status: 'offline', bindingState: 'connected' }],
+      activeSession: '__all__', viewId: 'main', ready: true, doc: { root: original }, version: 'main-1', revision: 4,
+      captureKey: 'main-draft-key', pendingRequest: { operationId: 'kept' }, inputDraft: { text: 'unfinished' },
+      cachedDiff: { revision: 4, operations: [{ type: 'update' }] }, baseTree: { id: 'T0', title: 'Main' },
+      a: { getRoot: () => tree, apply: doc => { tree = doc.root; } },
+      panel: { querySelector: () => ({ hidden: false }) },
+      dirty: () => failure === 'preflight', flush: async () => { flushes++; },
+      call: async (_route, body, verb, view) => { reads++; assert.equal(body, undefined); assert.equal(verb, 'GET'); assert.equal(view, 'session:idle');
+        if (failure === 'preflight') throw Object.assign(new Error('Session memory is not available'), { code: 'UNKNOWN_VIEW' });
+        return { doc: { root: target } }; },
+      reload: async function () { this.version = 'target-version'; this.cachedDiff = null; this.a.apply({ root: target });
+        if (failure === 'reload') throw Object.assign(new Error('missing during switch'), { code: 'UNKNOWN_VIEW' }); },
+      loadRecovery: () => { throw new Error('Recovery failed after URL changed'); }, recoveryNotice: text => text,
+      connect: () => {}, setStatus: function (status, message) { this.status = status; this.message = message; },
+    };
+    const previous = structuredClone({ pendingRequest: sync.pendingRequest, inputDraft: sync.inputDraft, cachedDiff: sync.cachedDiff });
+    assert.equal(await select.call(sync, 'idle'), false);
+    assert.equal(reads, 1);
+    assert.equal(flushes, 0, 'an unavailable target never commits the current draft');
+    assert.equal(sync.viewId, 'main'); assert.equal(sync.activeSession, '__all__');
+    assert.equal(sync.version, 'main-1'); assert.equal(sync.captureKey, 'main-draft-key');
+    assert.equal(sync.switchingSession, false); assert.equal(location.href, originalUrl);
+    assert.deepEqual(tree, original);
+    assert.deepEqual({ pendingRequest: sync.pendingRequest, inputDraft: sync.inputDraft, cachedDiff: sync.cachedDiff }, previous);
+    assert.match(sync.message, /草稿已保留/);
+    if (failure !== 'after-url') assert.match(sync.message, /地图尚未同步/);
+  }
+});
+
 test('Local-only Session source waits for publication without masking a broken remote', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-unpublished-source-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
