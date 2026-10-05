@@ -63,6 +63,29 @@ and `temp/tester-fixed06-sync-diagnosis-20261005.log`; passing artifacts:
 New 0.6.1 fixed-artifact, remote Required, production and live Slack checks remain
 separate gates; real user permissions/Hooks were not changed by isolated tests.
 
+Final replacement artifact acceptance: public Skill 0.6.1 at
+`8f144fb1de7f0de1fb024cb744fc154ea5ed834f` matched downloaded SHA-256
+`0b3af28b1957a76ae763f26e1660b7c6187bae75272c91dff035f7d26cd9cf8e`
+and the exact SHA-512 in the Cloud lock. Its actual 100-file package/security
+contract passed. Windows Node 18.20.8 and 24.19.0 both passed the official
+isolated global/npx installation and installed startup/health/assets/access
+checks. Separate explicit `install --no-hooks` targets passed the same runtime
+checks and `memory complete` help without creating Hook/configuration files.
+The manual runtime invocation initially omitted the official isolation/ceiling
+environment and was rejected; using the existing isolated environment resolved
+that fixture error, not by changing the product or map assertions.
+
+Cloud installed 0.6.1 using `npm ci --ignore-scripts` from its new exact public
+URL and lock; fixture validation passed 3/3. The existing complete Session sync
+browser entry then passed all seven checks on this installed package, with its
+original 12/25-second budgets and reload Session-selection assertion intact.
+Evidence: `temp/tester061-fixed-fixture-install-20261005.log`,
+`temp/tester061-sync-browser-20261005.log`, and
+`output/playwright/browser-ci/session-sync-1791178932502-cd7996cb-0f2f-443e-be78-20df7fb75d93`.
+The old 0.6.0 Windows failure and first reload timeout remain recorded above;
+public 0.6.0 was not overwritten. Remote Required/production/live Slack remain
+separate completion gates.
+
 ### Earlier frozen-source acceptance
 
 Input: Windows, Node 24.19.0; Cloud working tree based on `376aa151`,
