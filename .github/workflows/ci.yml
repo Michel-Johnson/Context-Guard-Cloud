@@ -1,0 +1,135 @@
+name: Cloud CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['*']
+permissions:
+  contents: read
+concurrency:
+  group: cloud-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: npm run security:setup
+      - run: node .github/scripts/security-scan.mjs ci
+      - run: npm run security:test
+  test:
+    needs: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+  minimum-runtime:
+    needs: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '18'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.9'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+  slack:
+    needs: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: npm ci --prefix plugins/slack --ignore-scripts --no-audit --no-fund
+      - run: npm run test:slack
+  browser:
+    needs: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npx --no-install playwright install --with-deps chromium
+      - run: npm run test:browser
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ !cancelled() }}
+        with:
+          name: cloud-browser-evidence
+          path: |
+            output/playwright/browser-ci/**/results.json
+            output/playwright/browser-ci/**/failure.txt
+            output/playwright/browser-ci/**/*.png
+          if-no-files-found: warn
+          retention-days: 3
+  package:
+    needs: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - run: npm run security:setup
+      - shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npm pack --ignore-scripts --json --pack-destination dist > "$RUNNER_TEMP/cloud-pack.json"
+          artifact=$(node -e "process.stdout.write(require(process.argv[1])[0].filename)" "$RUNNER_TEMP/cloud-pack.json")
+          node .github/scripts/security-scan.mjs package "dist/$artifact"
+          npm run pack:shared
+          core=$(node -p "'michelj-context-guard-core-'+require('./scripts/shared/package.json').version+'.tgz'")
+          ui=$(node -p "'michelj-context-guard-workbench-'+require('./prototype/package.json').version+'.tgz'")
+          node .github/scripts/security-scan.mjs package "dist/$core" core
+          node .github/scripts/security-scan.mjs package "dist/$ui" workbench
+  required:
+    name: Required
+    if: always()
+    needs: [security, test, minimum-runtime, slack, browser, package]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          node -e 'const jobs=JSON.parse(process.env.JOB_RESULTS); if(Object.keys(jobs).length!==6 || Object.values(jobs).some(job=>job.result!=="success")) process.exit(1)'

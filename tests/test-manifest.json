@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "automaticNodeTests": {
+    "roots": [
+      ".github/scripts",
+      "tests"
+    ],
+    "suffix": ".test.mjs",
+    "excluded": [
+      ".github/scripts/security-checks.test.mjs"
+    ]
+  },
+  "standaloneSuites": [
+    {
+      "path": ".github/scripts/security-checks.test.mjs",
+      "command": "npm run security:test",
+      "purpose": "Fail-closed source, history and final artifact secret scanning."
+    },
+    {
+      "path": "tests/browser-device-login-runner.mjs",
+      "command": "npm run test:browser",
+      "purpose": "Real Chromium acceptance with isolated synthetic project data."
+    },
+    {
+      "path": "tests/cloud-workbench-browser.mjs",
+      "command": "npm run test:browser",
+      "purpose": "Real Chromium acceptance with isolated synthetic project data."
+    },
+    {
+      "path": "tests/cloud-sync-browser.mjs",
+      "command": "npm run test:browser",
+      "purpose": "Real Chromium acceptance with isolated synthetic project data."
+    }
+  ],
+  "helpers": [
+    {
+      "path": "tests/helpers/skill.mjs",
+      "usedBy": "tests/interface-events.test.mjs"
+    }
+  ],
+  "separatePackages": [
+    {
+      "root": "plugins/slack"
+    }
+  ],
+  "productFiles": [
+    "tests/attachments.test.mjs",
+    "tests/authorization-boundary.test.mjs",
+    "tests/browser-device-login-runner.mjs",
+    "tests/browser-device-login.test.mjs",
+    "tests/cloud-attachments.test.mjs",
+    "tests/cloud-backup-retention.test.mjs",
+    "tests/cloud-coordinator.test.mjs",
+    "tests/cloud-memory-filesystem.test.mjs",
+    "tests/cloud-shutdown.test.mjs",
+    "tests/cloud-sync-browser.mjs",
+    "tests/cloud-workbench-browser.mjs",
+    "tests/cloud-workbench.test.mjs",
+    "tests/coordinator-file.test.mjs",
+    "tests/coordinator-multimodal.test.mjs",
+    "tests/coordinator-steer.test.mjs",
+    "tests/helpers/skill.mjs",
+    "tests/integration-gateway.test.mjs",
+    "tests/interface-auth.test.mjs",
+    "tests/interface-blobs.test.mjs",
+    "tests/interface-device.test.mjs",
+    "tests/interface-events.test.mjs",
+    "tests/interface-memory-errors.test.mjs",
+    "tests/interface-protocol.test.mjs",
+    "tests/interface-snapshots.test.mjs",
+    "tests/interface-store.test.mjs",
+    "tests/interface-workflow.test.mjs",
+    "tests/memory-filesystem-migration.test.mjs",
+    "tests/multiworktree-cloud.test.mjs",
+    "tests/quark-provider.test.mjs",
+    "tests/slack-cloud.test.mjs",
+    "tests/session-publication-completion.test.mjs",
+    "tests/test-manifest.json",
+    "tests/workbench-cloud-sync.test.mjs",
+    "tests/session-sync-cloud.test.mjs",
+    "tests/hook-cloud.test.mjs"
+  ]
+}
