@@ -10,10 +10,12 @@ const installed = { name: '@michelj/context-guard', version: '0.5.0' };
 
 test('fixed Skill release fixture requires exact URL, version and canonical SHA-512 lock', () => {
   assert.deepEqual(validateSkillFixture(url, locked, installed), { commit, version: '0.5.0', integrity });
-  const nextUrl = url.replace('0.5.0', '0.6.0');
-  const nextLock = { ...locked, resolved: nextUrl, version: '0.6.0' };
-  assert.deepEqual(validateSkillFixture(nextUrl, nextLock, { ...installed, version: '0.6.0' }), { commit, version: '0.6.0', integrity });
-  assert.throws(() => validateSkillFixture(nextUrl, { ...nextLock, version: '0.5.0' }));
+  for (const version of ['0.6.0', '0.6.1']) {
+    const nextUrl = url.replace('0.5.0', version);
+    const nextLock = { ...locked, resolved: nextUrl, version };
+    assert.deepEqual(validateSkillFixture(nextUrl, nextLock, { ...installed, version }), { commit, version, integrity });
+    assert.throws(() => validateSkillFixture(nextUrl, { ...nextLock, version: '0.5.0' }));
+  }
 });
 
 test('Skill fixture rejects local, arbitrary-host, unpinned and ambiguous release sources', () => {
@@ -22,7 +24,7 @@ test('Skill fixture rejects local, arbitrary-host, unpinned and ambiguous releas
     url.replace('github.com/', 'user@github.com/'), url.replace('Michel-Johnson/', 'other-owner/'),
     url.replace('Context-Guard-Skill/', 'another-repo/'), url.replace(commit, 'main'),
     url.replace(commit, 'a'.repeat(39)), url.replace(commit, 'A'.repeat(40)),
-    url.replace('0.5.0', '0.5.1'), url.replace('0.5.0', '0.6.1'), url.replace('0.5.0', '0.7.0'), `${url}?download=1`, `${url}#fragment`, `${url}\n`]) {
+    url.replace('0.5.0', '0.5.1'), url.replace('0.5.0', '0.6.2'), url.replace('0.5.0', '0.7.0'), `${url}?download=1`, `${url}#fragment`, `${url}\n`]) {
     assert.throws(() => validateSkillFixture(value, { ...locked, resolved: value }), undefined, String(value));
   }
 });
