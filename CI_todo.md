@@ -23,7 +23,47 @@ Executor implements and verifies modules; independent Tester validates the froze
 source revision. Checked source items do not establish release or production
 acceptance; those remain separate gates below.
 
-### Independent local acceptance, 2026-10-05
+## Independent acceptance evidence, 2026-10-05
+
+### Independent fixed-artifact/browser follow-up, 2026-10-05
+
+The public Core/UI 1.1.0 tarballs were downloaded anonymously and matched
+SHA-256 `c36415c976c3604607ba169b923f1ea27ff0790dbb56e243a09fa4278a13c51a`
+and `3f041e0f348bf108b7b3d5c355beaa952e631a8273850e9db9191cf604356304`.
+Actual tarball package/security checks passed (44/13 files). Public Skill 0.6.0
+at `18b4e14b85970ad929a3bd1022322c074c3d58b6` matched
+`75eef64293a34ac9ef57da19b41ac8da2691317a9ca98ba01e121a4b4fe0af70` and
+passed its 100-file package/security contract. Node 24 isolated global/npx
+installation and installed runtime passed; a real Windows Node 18 installer
+failure was reported for correction and new immutable Skill 0.6.1 acceptance.
+The successful source checks do not waive this installation failure.
+
+Remote Cloud run 37266926495 failed on the second completion click. The old
+fixture allowed its supposedly dirty edit to finish before clicking and checked
+dialogs before the asynchronous publication request settled. An instrumented
+run observed three completion requests, not the intended two. The repaired
+fixture holds the real edit receipt while proving dirty completion rejection,
+releases it and waits for the exact synchronized version, then tests stale 409
+and accepted completion. Route removal occurs after the rejected response,
+outside its active handler. Ordinary clicks, original budgets and all Main/
+generation/source/authority assertions remain. The final run exited 0, with
+exactly two distinct review requests; no published UI package was changed.
+Evidence: `temp/tester-completion-fixture-fixed-dirty-20261005.log` and
+`output/playwright/browser-ci/cloud-1791178378802-d5d8aa52-c35f-43bf-a016-e5f049b2765f`,
+including `completion-requests.json`. Earlier failed logs/artifacts are retained.
+
+The genuinely installed fixed Skill 0.6.0 passed both browser sync directions,
+disk/refresh persistence, unchanged Main and server timestamps using the existing
+`cloud-sync-browser.mjs` entry. Its first run timed out at the hidden Session
+selector after reload; a diagnostic-only addition and unchanged-budget rerun
+passed without removing that assertion. This isolated rerun does not claim the
+transient timeout's root cause is resolved. Logs: `temp/tester-fixed06-sync-browser-20261005.log`
+and `temp/tester-fixed06-sync-diagnosis-20261005.log`; passing artifacts:
+`output/playwright/browser-ci/session-sync-1791178167683-f87f2ea1-d2e8-4214-934d-53df4dd56e71`.
+New 0.6.1 fixed-artifact, remote Required, production and live Slack checks remain
+separate gates; real user permissions/Hooks were not changed by isolated tests.
+
+### Earlier frozen-source acceptance
 
 Input: Windows, Node 24.19.0; Cloud working tree based on `376aa151`,
 Skill working tree based on `6973d182`. The fixed installed cross-repository

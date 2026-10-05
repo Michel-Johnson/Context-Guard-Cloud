@@ -1745,34 +1745,62 @@ try {
   await synchronized();
   assert.equal(await page.locator('#cg-session-complete').getAttribute('hidden'), null);
   await page.locator('.node[data-id="T0"]').click();
+  const beforeCompletionEdit = await syncVersion();
+  let releaseCompletionEdit, startedCompletionEdit;
+  const completionEditGate = new Promise(resolve => { releaseCompletionEdit = resolve; });
+  const completionEditStarted = new Promise(resolve => { startedCompletionEdit = resolve; });
+  const completionEditRoute = `${service.url}/api/workbench/projects/context-guard/api/commit*`;
+  const holdCompletionEdit = async route => {
+    const response = await route.fetch();
+    startedCompletionEdit();
+    await completionEditGate;
+    await route.fulfill({ response });
+  };
+  await page.route(completionEditRoute, holdCompletionEdit);
   await page.locator('#detail [data-ed="title"]').fill('Reviewed completion UI');
   let dialogs = 0;
   const acceptCompletion = async dialog => { dialogs++; await dialog.accept(); };
   page.on('dialog', acceptCompletion);
   await page.locator('#btn-settings').click();
   await page.locator('#cg-sync > summary').click();
+  await completionEditStarted;
   await page.locator('#cg-session-complete').click();
+  await page.waitForFunction(() => document.querySelector('#cg-session-complete')?.disabled === false);
   assert.equal(dialogs, 0, 'unsynchronized edits cannot be attested');
-  await synchronized();
+  releaseCompletionEdit();
+  await synchronizedAfter(beforeCompletionEdit);
+  await page.unroute(completionEditRoute, holdCompletionEdit);
   const completionRoute = `${service.url}/api/workbench/projects/context-guard/api/session-completion*`;
+  let racedCompletionVersion;
+  const completionRequests = [];
+  const trackCompletion = request => {
+    if (request.method() === 'POST' && request.url().includes('/api/session-completion')) completionRequests.push(request.postDataJSON());
+  };
+  page.on('request', trackCompletion);
   await page.route(completionRoute, async route => {
-    await page.unroute(completionRoute);
     const body = route.request().postDataJSON();
     const changed = await request(`${service.url}/api/workbench/projects/context-guard/api/commit?view=session%3Acompletion-ui`, {
       method: 'POST', headers: headers('browser-token'), body: JSON.stringify({ operationId: 'completion-ui-race',
         baseVersion: body.sessionVersion, operations: [{ type: 'update', id: 'T0', fields: { purpose: 'Changed after review' } }] }),
     });
     assert.equal(changed.response.status, 200);
+    racedCompletionVersion = changed.body.version;
+    assert.ok(racedCompletionVersion && racedCompletionVersion !== body.sessionVersion);
     await route.continue();
   });
   const staleCompletion = page.waitForResponse(response => response.url().includes('/api/session-completion'));
   await page.locator('#cg-session-complete').click();
   assert.equal((await staleCompletion).status(), 409, 'stale reviewed version is rejected');
+  await page.unroute(completionRoute);
   let completionState = await request(`${service.url}/v1/projects/context-guard/sessions/completion-ui`, { headers: headers('project-memory-token') });
   assert.equal(completionState.body.snapshot.completion, undefined);
   assert.equal((await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') })).body.snapshot.version,
     completionMain.body.snapshot.version, 'stale completion does not publish into Main');
-  await synchronized();
+  // Receiving the 409 is earlier than the click handler's finally and the SSE
+  // refresh. A previously synced indicator alone cannot attest the new version.
+  await page.waitForFunction(version => document.querySelector('#cg-sync')?.dataset.status === 'synced'
+    && document.querySelector('#cg-sync-version')?.dataset.version === version
+    && document.querySelector('#cg-session-complete')?.disabled === false, racedCompletionVersion);
   const acceptedCompletion = page.waitForResponse(response => response.url().includes('/api/session-completion'));
   await page.locator('#cg-session-complete').click();
   assert.equal((await acceptedCompletion).status(), 200);
@@ -1781,9 +1809,14 @@ try {
   assert.equal(completionState.body.snapshot.completion.generation, 1);
   assert.equal(completionState.body.snapshot.completion.sourceCommit, completionSha);
   assert.equal(completionState.body.snapshot.completion.actor.kind, 'human');
+  await fs.writeFile(path.join(output, 'completion-requests.json'), `${JSON.stringify(completionRequests, null, 2)}\n`);
+  assert.equal(completionRequests.length, 2, `each reviewed click submits once: ${JSON.stringify(completionRequests)}`);
+  assert.notEqual(completionRequests[0].operationId, completionRequests[1].operationId);
+  assert.equal(completionRequests[1].sessionVersion, racedCompletionVersion);
   assert.equal((await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') })).body.snapshot.version,
     completionMain.body.snapshot.version, 'reviewed but unmerged work remains a Session');
   page.off('dialog', acceptCompletion);
+  page.off('request', trackCompletion);
   record('Session completion requires synchronized human review and exact current version; stale review preserves Main');
 
   await page.screenshot({ path: path.join(output, 'cloud-session-edit.png'), fullPage: true });

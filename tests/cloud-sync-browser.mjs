@@ -196,6 +196,18 @@ try {
 } finally {
   if (!passed) {
     await fs.mkdir(output, { recursive: true }).catch(() => {});
+    for (const [name, page] of [['local', localPage], ['cloud', cloudPage]]) {
+      const diagnosis = await page?.evaluate(() => ({
+        path: location.pathname + location.search,
+        selectedSession: document.querySelector('#cg-sync-session')?.value,
+        sessions: [...(document.querySelector('#cg-sync-session')?.options || [])].map(option => ({ id: option.value, disabled: option.disabled })),
+        syncStatus: document.querySelector('#cg-sync')?.dataset.status,
+        syncMessage: document.querySelector('#cg-sync-status')?.textContent,
+        cloudStatus: document.querySelector('#cloud-sync-status')?.className,
+        cloudMessage: document.querySelector('#cloud-sync-status')?.title,
+      })).catch(() => null);
+      if (diagnosis) await fs.writeFile(path.join(output, `${name}-diagnosis.json`), encode(diagnosis)).catch(() => {});
+    }
     await localPage?.screenshot({ path: path.join(output, 'local-failure.png'), fullPage: true }).catch(() => {});
     await cloudPage?.screenshot({ path: path.join(output, 'cloud-failure.png'), fullPage: true }).catch(() => {});
   }
