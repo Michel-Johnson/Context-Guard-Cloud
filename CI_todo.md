@@ -1,5 +1,54 @@
 # Cloud split acceptance
 
+## FIXTURE-063-01 · Fixed released Skill integration fixture (2026-10-05)
+
+- [x] Executor: update only the development fixture from 0.6.1 to official Skill
+  0.6.3, released from Main `ea386fe216bc292c00b39268559905e9e0126742` after
+  PR #451 and successful official npm CD `37313581463`. The coordinator verified
+  the registry artifact against the CD artifact before this fixture update;
+  631017 bytes, SHA-256
+  `588cef623cc033c1172ef6261498a48a385df908fe7a710c0b06bcb1181e522a`.
+- [x] Executor: npm generated the lock from the immutable public release URL
+  `https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-ea386fe216bc292c00b39268559905e9e0126742/michelj-context-guard-0.6.3.tgz`.
+  Its canonical SHA-512 is
+  `sha512-bM+A3J8pLAEbO/wevL3TP/NUSN6rgIMpiq91OFPHJ3yQJoOLuJibR5knhhWVRVkOtdCl9ppgrfCGFeDipBGKVQ==`.
+  `npm ci --ignore-scripts --no-audit --no-fund` installed that exact package;
+  the helper resolves version 0.6.3 from this repository's node_modules. No
+  local-file fallback, copied client source or postinstall hook changes were used.
+- [x] Executor: `node --test .github/scripts/skill-fixture.test.mjs` passed 3/3;
+  `node .github/scripts/verify-boundaries.mjs` and
+  `node .github/scripts/verify-test-governance.mjs` passed. Approved 0.5.0,
+  0.6.0 and 0.6.1 remain accepted alongside 0.6.3; 0.6.2, 0.6.4, 0.6.30,
+  latest, non-fixed URLs and mismatched locks/installed identities remain rejected.
+  Cloud/Core/UI 1.1.1, all other dependencies and browser tests are unchanged.
+  - [x] Independent Tester: on the frozen five-file diff, verify the installed
+  0.6.3 fixture and lock, then run the unchanged official `npm run test:browser`
+  entry (device authorization, Cloud workbench, cross-product bidirectional sync)
+  with existing budgets and assertions. Record exact Cloud revision, Skill SHA
+    and results. These module checks do not establish browser E2E, live user
+    connection or production deployment acceptance.
+    Independent Windows / Node 24.19.0 verification used Cloud HEAD
+    `29a6c9853d3bb65504757eb7219660be3850df1d` plus exactly the five reviewed
+    fixture/document changes on `codex/skill063-fixture`. Anonymous curl downloaded
+    the public 631017-byte artifact with SHA-256
+    `588cef623cc033c1172ef6261498a48a385df908fe7a710c0b06bcb1181e522a`;
+    its SHA-512 matched the lock. `npm ci --ignore-scripts --no-audit --no-fund`
+    used a new isolated cache and installed version 0.6.3, not a sibling checkout.
+    Independent fixture validation passed 3/3 with zero skips; source boundaries
+    and test governance passed. One unchanged `npm run test:browser` completed
+    with exit 0: BDA-012 1/1, Cloud workbench 44 checks, cross-product sync 7 checks.
+    The roughly 139-second log interval is an observation, not a changed budget.
+    Inputs and both formal browser source hashes stayed unchanged; diff check passed.
+    Browser log: `temp/tester-fixture063-browser-20261005.log`, SHA-256
+    `1eb08c9d7450b9c95da18c1dc7bc649439a3b94f2ff496a0c143daf90875f1ac`.
+    Successful result artifacts:
+    `output/playwright/browser-ci/cloud-1791206654947-75487486-2602-4c1f-bab7-c02c57838c12/result.json`
+    and `output/playwright/browser-ci/session-sync-1791206746014-de582597-5d16-47cb-9b38-c88a3f3474dc/result.json`.
+    These are real Chromium against isolated loopback Cloud/backend using the
+    installed public Skill fixture. No force, skip, local fallback, production
+    mutation, user Hook changes, commit or push was used. Remote Required and
+    actual production/user-device acceptance remain separate pending gates.
+
 ## Final delivery status (2026-10-05)
 
 - Cloud #1 merged normally into `2b47df759ee567e8d53f569cc56a50c19f616a47`; Skill #449/#450 into `3773aa9` / `4ae1788eb93cc8d0b62e60e376d4387843abce43`. Official npm **0.6.2** CD run `37271755297` succeeded on all three install/upgrade platforms, OIDC and post-publication exact/latest checks. Cloud still pins the distinct immutable GitHub **Skill fixture 0.6.1** at `8f144fb`; shared Core/UI remain 1.1.0 and old release assets were not overwritten.
