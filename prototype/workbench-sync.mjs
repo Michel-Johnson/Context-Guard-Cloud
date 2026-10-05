@@ -780,18 +780,26 @@ export class WorkbenchSync {
     if (this.switchingSession) return false;
     if (this.retrying) await this.retrying;
     if (this.switchingSession) return false;
-    if (sessionId !== ALL_SESSIONS && !this.sessions.some(item => item.id === sessionId && item.bindingState !== 'unavailable')) return false;
+    const unavailable = ['unavailable', 'stale', 'closed', 'published', 'expired', 'deleted', 'invalid'];
+    if (sessionId !== ALL_SESSIONS && !this.sessions.some(item => item.id === sessionId && !unavailable.includes(String(item.bindingState || '').toLowerCase()) && !unavailable.includes(String(item.status || '').toLowerCase()))) return false;
+    const privateCloud = this.config?.root?.startsWith('cloud:') && this.config.root !== 'cloud:overview';
+    const nextView = sessionId === ALL_SESSIONS || (!privateCloud && this.project?.kind !== 'git') ? 'main' : `session:${sessionId}`;
+    let previous, previousTree;
+    const previousUrl = location.href;
+    this.switchingSession = true;
+    try {
+    // A missing Cloud snapshot must not flush the current view's private draft.
+    // This read only checks availability; reload still obtains the final baseline.
+    if (privateCloud && nextView.startsWith('session:') && nextView !== this.viewId) {
+      const target = await this.call('/api/state', undefined, 'GET', nextView);
+      if (target.error || target.recovery || !target.doc?.root) throw Object.assign(new Error(target.error?.message || target.recovery?.message || '地图尚未同步'), { code: target.error?.code || (!target.doc?.root ? 'UNKNOWN_VIEW' : undefined) });
+    }
     if (this.dirty()) {
       await this.flush();
       if (this.dirty()) { this.setStatus(this.status, '当前视图仍有未保存内容，暂不能切换'); return false; }
     }
-    if (this.switchingSession) return false;
-    const privateCloud = this.config?.root?.startsWith('cloud:') && this.config.root !== 'cloud:overview';
-    const nextView = sessionId === ALL_SESSIONS || (!privateCloud && this.project?.kind !== 'git') ? 'main' : `session:${sessionId}`;
-    const previous = Object.fromEntries(['activeSession', 'pendingSession', 'manualSession', 'viewId', 'captureKey', 'doc', 'version', 'source', 'baseTree', 'ready', 'initializationRequired', 'pendingRequest', 'inputDraft', 'serverRecovery', 'revision', 'sessionUnavailable'].map(key => [key, this[key]]));
-    const previousTree = copy(this.a.getRoot());
-    this.switchingSession = true;
-    try {
+    previous = Object.fromEntries(['activeSession', 'pendingSession', 'manualSession', 'viewId', 'captureKey', 'doc', 'version', 'source', 'baseTree', 'ready', 'initializationRequired', 'pendingRequest', 'inputDraft', 'serverRecovery', 'recoveryBlocked', 'revision', 'cachedDiff', 'sessionUnavailable'].map(key => [key, this[key]]));
+    previousTree = copy(this.a.getRoot());
     this.activeSession = sessionId;
     this.sessionUnavailable = false;
     this.pendingSession = '';
@@ -809,12 +817,15 @@ export class WorkbenchSync {
     setTimeout(() => this.refreshAccess().catch(error => this.setStatus('error', error.message)), 0);
     return true;
     } catch (error) {
-      Object.assign(this, previous);
-      if (previous.doc) this.a.apply({ ...previous.doc, root: previousTree });
-      this.panel.querySelector('#cg-sync-initialize').hidden = !previous.initializationRequired || (previous.viewId === 'main' && previous.source?.status !== 'local-folder');
-      this.loadGeneration = (this.loadGeneration || 0) + 1;
-      if (!this.sessionUnavailable) this.connect();
-      this.setStatus('error', '无法切换地图：' + error.message);
+      if (previous) {
+        Object.assign(this, previous);
+        history.replaceState(null, '', previousUrl);
+        if (previous.doc) this.a.apply({ ...previous.doc, root: previousTree });
+        this.panel.querySelector('#cg-sync-initialize').hidden = !previous.initializationRequired || (previous.viewId === 'main' && previous.source?.status !== 'local-folder');
+        this.loadGeneration = (this.loadGeneration || 0) + 1;
+        if (!this.sessionUnavailable) this.connect();
+      }
+      this.setStatus('error', error.code === 'UNKNOWN_VIEW' ? '地图尚未同步；原地图和草稿已保留' : '无法切换地图，原地图和草稿已保留：' + error.message);
       return false;
     } finally { this.switchingSession = false; }
   }

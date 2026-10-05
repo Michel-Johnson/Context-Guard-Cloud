@@ -74,7 +74,7 @@ const I18N = {
     remove:"移除", addModule:"接入模块",
     noOpenBugs:"没有 Bug。", unnamedBug:"未命名 Bug", noOpenTodos:"没有 TODO。", unnamedTodo:"未命名 TODO",
     bugSending:"发送中", bugSendFailed:"发送失败", taskQueued:"Cloud 已排队", taskCloudQueued:"等待本地接收", taskBlocked:"等待前序任务完成", taskReceived:"Codex 已收到", taskUncertain:"接收结果待确认", taskInterrupted:"执行中断", taskWaitingReview:"等待 Plan 审核",
-    allSessions:"主工作台 · 工作中 Session", globalSessionView:"仅跟随 Main",
+    allSessions:"主工作台 · 工作中 Session", globalSessionView:"仅跟随 Main", showOtherSessions:"显示其他会话", hideOtherSessions:"仅显示工作中会话",
     projectOverview:"项目总览",
     scopeRequired:"该 Session 尚未获得当前节点权限。确认后将授权当前节点、所有上级和直接关联节点，共 {n} 个新节点。",
     bugWaiting:"待处理", bugProcessing:"处理中", bugHandoff:"待接手",
@@ -178,7 +178,7 @@ const I18N = {
     remove:"Remove", addModule:"Attach module",
     noOpenBugs:"No bugs.", unnamedBug:"Untitled bug", noOpenTodos:"No TODOs.", unnamedTodo:"Untitled TODO",
     bugSending:"Sending", bugSendFailed:"Send failed", taskQueued:"Queued in Cloud", taskCloudQueued:"Waiting for local host", taskReceived:"Received by Codex", taskUncertain:"Receipt uncertain", taskInterrupted:"Interrupted", taskWaitingReview:"Waiting for Plan review",
-    allSessions:"Main workbench · Working sessions", globalSessionView:"Main branch only",
+    allSessions:"Main workbench · Working sessions", globalSessionView:"Main branch only", showOtherSessions:"Show other sessions", hideOtherSessions:"Show working sessions only",
     projectOverview:"Projects",
     scopeRequired:"This session cannot access the current node. Confirm to authorize the node, its ancestors, and direct relations ({n} new nodes).",
     bugWaiting:"Waiting", bugProcessing:"In progress", bugHandoff:"Needs handoff",
@@ -376,6 +376,7 @@ let bugPathReturn = null;
 let activeWorkPanelKind = "bug";
 let foldDormant = false;
 let foldMemoryDoc = false;
+let showOtherSessions = false;
 let foldIdea = false;
 let foldTodo = false;
 let foldBug = false;
@@ -1307,7 +1308,7 @@ function isWorkingSession(meta){
 function visibleSessionChoices(){
   const sessions=normalizeSessions(workbenchSync?.sessions||[]);
   const selected=String(workbenchSync?.activeSession||"__all__");
-  return sessions.filter(meta=>isWorkingSession(meta)||(selected!=="__all__"&&sessionIdOf(meta)===selected));
+  return sessions.filter(meta=>showOtherSessions||isWorkingSession(meta)||(selected!=="__all__"&&sessionIdOf(meta)===selected));
 }
 function browserCurrentSessionId(){
   const id=String(new URLSearchParams(location.search).get("session")||"").trim();
@@ -1469,7 +1470,12 @@ function renderSessionMenu(){
       <span class="session-option-copy"><span class="session-option-name">${esc(label.primary)}</span>${label.secondary?`<span class="session-option-context">${esc(label.secondary)}</span>`:""}</span>
       <span class="session-option-state ${lifecycle.state}">${esc(lifecycle.label)}</span><span class="session-status ${lifecycle.state}" aria-label="${lifecycle.label}"></span>
     </button>`;
-  }).join("");
+  }).join("") + `<button type="button" data-show-other-sessions aria-pressed="${showOtherSessions}">${esc(t(showOtherSessions?"hideOtherSessions":"showOtherSessions"))}</button>`;
+  menu.querySelector('[data-show-other-sessions]').onclick = ()=>{
+    showOtherSessions = !showOtherSessions;
+    syncSessionSelect();
+    renderSessionMenu();
+  };
   menu.querySelectorAll("[data-session]").forEach(button=>{
     button.onclick = async ()=>{
       try {
