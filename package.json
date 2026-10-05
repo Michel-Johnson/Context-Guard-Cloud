@@ -27,7 +27,7 @@
     "pack:shared": "node scripts/release-shared.mjs"
   },
   "devDependencies": {
-    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-6973d1829334c0818ab66de89f7bdb553cac5cb1/michelj-context-guard-0.5.0.tgz",
+    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-18b4e14b85970ad929a3bd1022322c074c3d58b6/michelj-context-guard-0.6.0.tgz",
     "marked": "15.0.12",
     "playwright": "1.62.1"
   }
