@@ -38,9 +38,14 @@ async function fixture(t) {
 }
 test('Cross-device binding rejection identifies the conflict without exposing or mutating the old Session', async t => {
   const { dir, store, bind } = await fixture(t);
-  await store.execute(principal, msg('pending-notice', 'object.put', { kind: 'plan', ref: 'old-plan', baseVersion: '', content: {} }),
-    (_state, _p, _m, emit) => { emit(msg('old-notice', 'sync.event', { latestSeq: 1 })); return {}; });
+  await store.handle(principal, msg('old-object', 'object.put', { kind: 'plan', ref: 'old-plan', baseVersion: '', content: { text: 'Preserve the original plan' } }));
+  await store.handle({ ...principal, role: 'coordinator' }, msg('old-brief', 'brief.submit', { taskId: 'old-task', text: 'Preserve the original task' }));
   const before = await store.transaction(state => state, { readOnly: true });
+  assert.ok(Object.keys(before.tasks).length > 0);
+  assert.ok(Object.keys(before.objects).length > 0);
+  assert.equal(before.tasks[scopedObjectKey(principal, session, 'task:old-task')].session.id, session.id);
+  const plan = before.objects[scopedObjectKey(principal, session, 'old-plan')];
+  assert.equal(plan.versions[plan.latest].content.text, 'Preserve the original plan');
   const original = Object.values(before.bindings)[0];
   const other = { ...principal, deviceId: 'different-device', role: 'device' };
   for (const allowMigration of [false, true]) for (const expectedBindingVersion of ['', 'stale-version', original.version]) {
