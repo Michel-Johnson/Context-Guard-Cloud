@@ -1,5 +1,78 @@
 # Cloud split acceptance
 
+## BINDING-CONFLICT-01 · Preserve Session ownership and explain recovery (2026-10-06)
+
+- [x] Executor: cross-device `session.bind` remains HTTP 409 / `CONFLICT`;
+  details contain only `reason: session-bound-elsewhere`. Binding authorization
+  and Agent checks still run first. Same-device version and explicitly allowed
+  worktree migration semantics remain unchanged. No takeover/migration API,
+  old Session rewrite, queue removal, package bump or production operation.
+- [x] Executor: canonical UI consumes only the agreed safe `/api/cloud-sync`
+  conflict reasons. `session-bound-elsewhere` displays the old-device notice;
+  legacy `binding-conflict` displays the generic notice. Reconnection clears the
+  notice. Retry/login actions remain unchanged; backend message text is not shown.
+- [x] Executor module verification, Windows / Node 22.18.0:
+  `node --test tests/interface-store.test.mjs tests/interface-auth.test.mjs`
+  passed 26/26; `node --test --test-name-pattern="binding conflict UI"
+  tests/cloud-workbench.test.mjs` passed 1/1;
+  `node .github/scripts/verify-test-governance.mjs` and `git diff --check` passed.
+  Each of these four verification commands exited 0.
+  Tests cover sanitized HTTP errors, restart reads, unchanged old binding/queue/
+  existing receipts, permission rejection, owner reuse and same-device migration.
+  The fresh Session in the store regression is a synthetic fixture, not a real
+  Codex-host acceptance result. No full-suite or production acceptance claimed.
+  - [x] Independent Tester, Cloud-side scope: exact initial release revision
+    `f74b07e4085bfb9420a20c8b0c31bdf8912838e3` passed on Windows with Node
+    18.20.8 and 24.19.0. `interface-store` + `interface-auth` passed 26/26 per
+    version, zero skips; the canonical binding-conflict render case passed 1/1
+    per version. Node 18's focused UI report additionally lists 38 name-pattern
+    exclusions, not 39 passing cases. The UI case extracts the actual canonical
+    renderer into a VM; it is not a real local status-endpoint/browser assertion.
+    Static review confirms verification/Agent checks precede conflict reporting,
+    cross-device errors expose only the agreed reason, and same-device migration
+    and version guards remain intact. User/backend message text is not rendered.
+  - [x] Independent Tester: the original preservation fixture had empty task and
+    object collections; do not treat that run as populated-state preservation.
+    Executor strengthened only `interface-store` in
+    `417cb12a255dcdd9e9c1a9509319e09a55de5d5c`, using normal `object.put` and
+    `brief.submit` to seed a nonempty old plan, task and notification, with exact
+    content/Session assertions before rejection. At final revision
+    `f0038fe81d283b3beefc6341dc9168506e4dc7f6`, an independent focused run passed
+    1/1 on Node 18 and 24, retaining the original rejection and deep-equality
+    assertions. Node 18 also reports 14 unrelated name-pattern exclusions.
+    Exact enhanced test SHA-256:
+    `c80955546fac84abae17f308fa3e6b63b9d0e21c18715130af7f5db034f0aa2a`.
+  - [x] Independent Tester: one unchanged formal `npm run test:browser` at
+    `f74b07e` completed with exit 0 on Node 24.19.0: BDA-012 1/1, Cloud workbench
+    44 checks, bidirectional synchronization 7 checks. The approximately
+    171-second log timestamp interval is an observation, not monotonic timing or
+    a changed budget. Runtime/UI/browser inputs remained byte-identical through
+    `f0038fe`; the subsequent changes affect only the stronger store test and
+    excluded interface documentation. Browser log SHA-256:
+    `bfd1f6d89d5cfaa035c9960e75666fbdf519990bec468d06ff96bad5f8c807c9`.
+    Artifacts: `output/playwright/browser-ci/cloud-1791257553630-e4ac845e-8803-492d-a95a-62e6d24861e9/`
+    and `output/playwright/browser-ci/session-sync-1791257652697-c88a5840-fc82-4b42-8600-b3743927dee5/`.
+    This Chromium run uses loopback-only isolated Cloud/backend and the public
+    pinned Skill 0.6.3 fixture; it does not test the still-unreleased new Skill.
+  - [x] Independent Tester: local exact Cloud/Core/UI 1.1.2 packages passed the
+    security/file contract, respectively 90/44/13 files. SHA-256:
+    Cloud `20444a2007c87f1de1541d47c1feb5039fec4312dc66a5ba9017367b14637a18`,
+    Core `a925414081652567050ccf9055d4f7aa4f7513720046e49d2c13c49c5cbd35d8`,
+    UI `eeb67f824ac7f2efe6cd898be256b80a1da99d0cbe5d943266e98c45db0abc81`.
+    Boundaries, test governance, workflow verification and diff check passed.
+    These are local package previews, not public-download or production evidence.
+  - [ ] Independent Tester, client-side integration: test both UI reasons through
+    the local public status endpoint, confirm a failed saved receipt is not
+    retried with a new ID and old queues remain preserved. This requires the
+    separately frozen Skill implementation; renderer-only verification does not
+    close this item. Original assertions/timeouts were not weakened, no force or
+    local fixture fallback was used, and no production data or personal Hooks
+    were changed. Remote Required must verify the final commit independently.
+- [ ] Coordinator / independent Tester: after fixed Core/UI publication and
+  exact Skill dependency update, use an actual newly created Codex host Session
+  for connection acceptance. Record released artifact versions and host evidence;
+  do not invent a Session ID, migrate the old binding or mark a mocked run live.
+
 ## FIXTURE-063-01 · Fixed released Skill integration fixture (2026-10-05)
 
 - [x] Executor: update only the development fixture from 0.6.1 to official Skill

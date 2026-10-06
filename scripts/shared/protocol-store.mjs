@@ -465,7 +465,8 @@ export class ProtocolStore extends EventEmitter {
           previous.sessionId = payload.sessionId;
           return { session: { id: payload.sessionId, generation: previous.generation }, bindingVersion: previous.version };
         }
-        if (previous && (!options.allowMigration || previous.deviceId !== p.deviceId || payload.expectedBindingVersion !== previous.version)) fail('CONFLICT', 'Migration requires the owning device and current binding version', { currentVersion: previous.version });
+        if (previous && previous.deviceId !== p.deviceId) fail('CONFLICT', 'Session is already bound to another device', { reason: 'session-bound-elsewhere' });
+        if (previous && (!options.allowMigration || payload.expectedBindingVersion !== previous.version)) fail('CONFLICT', 'Migration requires the owning device and current binding version', { currentVersion: previous.version });
         if (!previous && payload.expectedBindingVersion) fail('CONFLICT', 'Binding does not exist', { currentVersion: '' });
         const binding = { sessionId: payload.sessionId, deviceId: p.deviceId, agentId: payload.agentId, worktreeId: payload.worktreeId, generation: (previous?.generation || 0) + 1, version: randomUUID() };
         for (const creation of Object.values(state.sessionCreations || {})) {
