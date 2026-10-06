@@ -117,6 +117,8 @@ export class WorkbenchSync {
     this.urlPinned = Boolean(requestedSession) && !this.config?.root?.startsWith('cloud:');
     this.panel = document.createElement('details'); this.panel.id = 'cg-sync'; this.panel.className = 'set-block sync-settings';
     this.panel.innerHTML = '<summary>同步与恢复</summary><p id="cg-sync-status"></p><span id="cg-sync-version" hidden></span><div class="sync-actions"><button id="cg-sync-initialize" hidden>将当前图设为真实地图</button><button id="cg-sync-retry">重试</button><button id="cg-sync-export">导出草稿/旧缓存</button><button id="cg-sync-import">导入并比较</button><button id="cg-sync-reload">保留草稿后读取磁盘</button></div><label>Agent 会话<select id="cg-sync-session"></select></label><input id="cg-sync-file" type="file" accept="application/json" hidden>';
+    this.cloudBindingNotice = document.createElement('p'); this.cloudBindingNotice.hidden = true;
+    this.cloudBindingNotice.setAttribute('role', 'status'); this.panel.querySelector('#cg-sync-status').after(this.cloudBindingNotice);
     this.repairButton = document.createElement('button'); this.repairButton.id = 'cg-sync-repair'; this.repairButton.hidden = true;
     this.panel.querySelector('.sync-actions').append(this.repairButton);
     if (this.config?.interfaceCapabilities?.deviceLogin && !this.config.root?.startsWith('cloud:')) {
@@ -764,12 +766,19 @@ export class WorkbenchSync {
     this.a.setAccess(active && !unavailableMeta ? this.grants?.[this.activeSession]?.nodes || [] : [], this.activeSession, active, this.activeSession === ALL_SESSIONS, this.project?.main || null);
   }
   renderCloudStatus(status) {
+    const bindingLabel = status?.configured && status.status === 'conflict'
+      ? status.reason === 'session-bound-elsewhere' ? '当前会话绑定旧设备，请新建会话'
+        : status.reason === 'binding-conflict' ? '会话绑定冲突，请新建会话' : ''
+      : '';
+    if (this.cloudBindingNotice) {
+      this.cloudBindingNotice.hidden = !bindingLabel; this.cloudBindingNotice.textContent = bindingLabel;
+    }
     if (!this.cloudIndicator) return;
     if (!status?.configured) { this.cloudIndicator.hidden = true; return; }
     const value = status.status === 'synced' ? 'synced' : ['conflict', 'error'].includes(status.status) ? status.status : 'syncing';
     this.cloudIndicator.hidden = false; this.cloudIndicator.className = `cloud-sync-status ${value}`;
-    const label = value === 'synced' ? '云端已同步' : value === 'syncing' ? '云端同步中' : value === 'conflict' ? '云端同步冲突' : '云端同步失败';
-    this.cloudIndicator.setAttribute('aria-label', label); this.cloudIndicator.title = label;
+    const label = bindingLabel || (value === 'synced' ? '云端已同步' : value === 'syncing' ? '云端同步中' : value === 'conflict' ? '云端同步冲突' : '云端同步失败');
+    this.cloudIndicator.setAttribute('aria-label', label); this.cloudIndicator.title = bindingLabel ? `${label}；旧记录与队列保持不变` : label;
   }
   async refreshCloudStatus() {
     if (this.config?.root?.startsWith('cloud:')) { this.renderCloudStatus({ configured: true, status: this.pendingSession ? 'syncing' : 'synced' }); return; }

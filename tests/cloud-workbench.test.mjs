@@ -19,6 +19,33 @@ const { reconcileMainBaseline, reconcileSessionMap } = await skillImport('script
 const execFileAsync = promisify(execFile);
 const git = async (root, ...args) => (await execFileAsync('git', args, { cwd: root, windowsHide: true })).stdout.trim();
 
+test('binding conflict UI distinguishes safe reasons and clears recovery notices after reconnect', async () => {
+  const source = await fs.readFile(new URL('../prototype/workbench-sync.mjs', import.meta.url), 'utf8');
+  const method = source.slice(source.indexOf('  renderCloudStatus(status) {'), source.indexOf('  async refreshCloudStatus() {'));
+  const render = runInNewContext(`({${method}}).renderCloudStatus`);
+  const attributes = {};
+  const indicator = { setAttribute: (name, value) => { attributes[name] = value; } };
+  const notice = {};
+  const sync = { cloudIndicator: indicator, cloudBindingNotice: notice };
+  for (const [reason, label] of [
+    ['session-bound-elsewhere', '当前会话绑定旧设备，请新建会话'],
+    ['binding-conflict', '会话绑定冲突，请新建会话'],
+  ]) {
+    render.call(sync, { configured: true, status: 'conflict', reason, message: '<script>private owner</script>' });
+    assert.equal(indicator.className, 'cloud-sync-status conflict');
+    assert.equal(attributes['aria-label'], label);
+    assert.equal(indicator.title, `${label}；旧记录与队列保持不变`);
+    assert.equal(notice.textContent, label); assert.equal(notice.hidden, false);
+    render.call(sync, { configured: true, status: 'synced', reason });
+    assert.equal(indicator.title, '云端已同步'); assert.equal(notice.hidden, true); assert.equal(notice.textContent, '');
+  }
+  render.call(sync, { configured: true, status: 'conflict', reason: 'unknown', message: 'private owner' });
+  assert.equal(indicator.title, '云端同步冲突'); assert.equal(notice.hidden, true);
+  render.call(sync, { configured: true, status: 'conflict', reason: 'session-bound-elsewhere' });
+  render.call(sync, { configured: false });
+  assert.equal(indicator.hidden, true); assert.equal(notice.hidden, true); assert.equal(notice.textContent, '');
+});
+
 test('legacy memory preview is escaped, read-only and does not create or mutate memory cards', async () => {
   const source = await fs.readFile(new URL('../prototype/workbench-app.js', import.meta.url), 'utf8');
   const preview = source.slice(source.indexOf('function legacyMemoryPreview('), source.indexOf('function findBugHome('));

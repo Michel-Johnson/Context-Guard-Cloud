@@ -1,5 +1,35 @@
 # Cloud split acceptance
 
+## BINDING-CONFLICT-01 · Preserve Session ownership and explain recovery (2026-10-06)
+
+- [x] Executor: cross-device `session.bind` remains HTTP 409 / `CONFLICT`;
+  details contain only `reason: session-bound-elsewhere`. Binding authorization
+  and Agent checks still run first. Same-device version and explicitly allowed
+  worktree migration semantics remain unchanged. No takeover/migration API,
+  old Session rewrite, queue removal, package bump or production operation.
+- [x] Executor: canonical UI consumes only the agreed safe `/api/cloud-sync`
+  conflict reasons. `session-bound-elsewhere` displays the old-device notice;
+  legacy `binding-conflict` displays the generic notice. Reconnection clears the
+  notice. Retry/login actions remain unchanged; backend message text is not shown.
+- [x] Executor module verification, Windows / Node 22.18.0:
+  `node --test tests/interface-store.test.mjs tests/interface-auth.test.mjs`
+  passed 26/26; `node --test --test-name-pattern="binding conflict UI"
+  tests/cloud-workbench.test.mjs` passed 1/1;
+  `node .github/scripts/verify-test-governance.mjs` and `git diff --check` passed.
+  Each of these four verification commands exited 0.
+  Tests cover sanitized HTTP errors, restart reads, unchanged old binding/queue/
+  existing receipts, permission rejection, owner reuse and same-device migration.
+  The fresh Session in the store regression is a synthetic fixture, not a real
+  Codex-host acceptance result. No full-suite or production acceptance claimed.
+- [ ] Independent Tester: verify the exact combined release revision, preserve
+  all existing assertions and test both UI reasons through the local public
+  status endpoint. Confirm a failed saved receipt is not retried with a new ID,
+  old Session/queue/permissions remain intact, and normal recovery clears notice.
+- [ ] Coordinator / independent Tester: after fixed Core/UI publication and
+  exact Skill dependency update, use an actual newly created Codex host Session
+  for connection acceptance. Record released artifact versions and host evidence;
+  do not invent a Session ID, migrate the old binding or mark a mocked run live.
+
 ## FIXTURE-063-01 · Fixed released Skill integration fixture (2026-10-05)
 
 - [x] Executor: update only the development fixture from 0.6.1 to official Skill

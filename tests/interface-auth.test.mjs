@@ -215,6 +215,38 @@ test('IF-026: one Cloud event stream hints multiple owned Sessions without expos
   } finally { await server.close(); }
 });
 
+test('Cloud HTTP session.bind returns only the cross-device conflict reason and preserves the owner binding', async t => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-binding-conflict-'));
+  const server = await startCloudServer({ dataDir, port: 0, browserToken: 'test-browser',
+    browserPasswordHash: await createWorkbenchPasswordHash('test-only'),
+    protocolConfig: { repositories: [{ slug: 'example/repo', repositoryId: '123' }] } });
+  t.after(async () => { await server.close(); await fs.rm(dataDir, { recursive: true, force: true }); });
+  const request = (body, credential) => fetch(new URL('/api/v2/messages', server.url), { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(credential ? { Authorization: `Bearer ${credential}` } : {}) }, body: JSON.stringify(body) });
+  const login = async clientId => {
+    const response = await request({ v: 2, id: `login-${clientId}`, type: 'auth.open',
+      payload: { repository: 'https://github.com/example/repo', password: 'test-only', clientId } });
+    assert.equal(response.status, 200);
+    return response.headers.get('x-context-guard-credential');
+  };
+  const owner = await login('original-device'), other = await login('new-device');
+  const bind = { v: 2, id: 'original-bind', type: 'session.bind',
+    payload: { sessionId: 'existing-host-session', worktreeId: 'owner-tree', agentId: 'owner-agent', expectedBindingVersion: '' } };
+  const initial = await request(bind, owner); assert.equal(initial.status, 200);
+  const original = (await initial.json()).data;
+  for (const expectedBindingVersion of ['', original.bindingVersion]) {
+    const response = await request({ ...bind, id: `rejected-${expectedBindingVersion || 'empty'}`,
+      payload: { ...bind.payload, expectedBindingVersion } }, other);
+    assert.equal(response.status, 409);
+    const { error } = await response.json();
+    assert.equal(error.code, 'CONFLICT'); assert.equal(error.retryable, false);
+    assert.deepEqual(error.details, { reason: 'session-bound-elsewhere' });
+    for (const secret of [original.bindingVersion, bind.payload.worktreeId, bind.payload.agentId]) assert.equal(JSON.stringify(error).includes(secret), false);
+  }
+  const retry = await request({ ...bind, id: 'owner-continues' }, owner);
+  assert.equal(retry.status, 200); assert.deepEqual((await retry.json()).data, original);
+});
+
 test('IF-021: real Cloud HTTP login, registered binding, isolation and logout', async t => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-v2-cloud-'));
   t.after(() => fs.rm(dataDir, { recursive: true, force: true }));

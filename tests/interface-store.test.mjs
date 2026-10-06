@@ -36,6 +36,55 @@ async function fixture(t) {
   await store.handle(principal, bind, { verifyBinding: () => true });
   return { dir, store, bind };
 }
+test('Cross-device binding rejection identifies the conflict without exposing or mutating the old Session', async t => {
+  const { dir, store, bind } = await fixture(t);
+  await store.execute(principal, msg('pending-notice', 'object.put', { kind: 'plan', ref: 'old-plan', baseVersion: '', content: {} }),
+    (_state, _p, _m, emit) => { emit(msg('old-notice', 'sync.event', { latestSeq: 1 })); return {}; });
+  const before = await store.transaction(state => state, { readOnly: true });
+  const original = Object.values(before.bindings)[0];
+  const other = { ...principal, deviceId: 'different-device', role: 'device' };
+  for (const allowMigration of [false, true]) for (const expectedBindingVersion of ['', 'stale-version', original.version]) {
+    const request = { ...bind, id: `different-${allowMigration}-${expectedBindingVersion || 'empty'}`,
+      payload: { ...bind.payload, expectedBindingVersion } };
+    await assert.rejects(new ProtocolStore(dir).handle(other, request, { verifyBinding: () => true, allowMigration }), error => {
+      assert.equal(error.code, 'CONFLICT'); assert.equal(error.status, 409);
+      assert.deepEqual(error.details, { reason: 'session-bound-elsewhere' });
+      for (const secret of [original.version, original.deviceId, original.worktreeId]) assert.equal(error.message.includes(secret), false);
+      return true;
+    });
+    const after = await store.transaction(state => state, { readOnly: true });
+    for (const field of ['bindings', 'queues', 'tasks', 'objects']) assert.deepEqual(after[field], before[field], field);
+    for (const [id, receipt] of Object.entries(before.receipts)) assert.deepEqual(after.receipts[id], receipt);
+  }
+  await assert.rejects(store.handle(other, { ...bind, id: 'unverified-other' }, { verifyBinding: () => false }), { code: 'FORBIDDEN' });
+  await assert.rejects(store.handle({ ...other, role: 'executor', agentId: 'wrong-agent' }, { ...bind, id: 'wrong-agent' },
+    { verifyBinding: () => true }), { code: 'FORBIDDEN' });
+  assert.equal((await store.handle(principal, msg('owner-read', 'sync.read', { afterSeq: 0, limit: 50 }))).data.messages.length, 1);
+  await store.handle(other, { ...bind, id: 'new-host-session', payload: { ...bind.payload, sessionId: 'fresh-host-session', worktreeId: 'fresh-worktree' } },
+    { verifyBinding: () => true });
+  const afterFresh = await store.transaction(state => state, { readOnly: true });
+  for (const [id, binding] of Object.entries(before.bindings)) assert.deepEqual(afterFresh.bindings[id], binding);
+  for (const [id, queue] of Object.entries(before.queues)) assert.deepEqual(afterFresh.queues[id], queue);
+});
+
+test('Same-device binding versions and explicitly authorized worktree migration retain existing semantics', async t => {
+  const { store, bind } = await fixture(t);
+  const original = await store.registeredBinding(principal, session.id);
+  const same = await store.handle(principal, { ...bind, id: 'same' }, { verifyBinding: () => true });
+  assert.equal(same.data.bindingVersion, original.version);
+  await assert.rejects(store.handle(principal, { ...bind, id: 'stale-same', payload: { ...bind.payload, expectedBindingVersion: 'stale' } },
+    { verifyBinding: () => true }), { code: 'CONFLICT', details: { currentVersion: original.version } });
+  for (const [id, allowMigration, expectedBindingVersion] of [['disabled', false, original.version], ['stale', true, 'stale']]) {
+    await assert.rejects(store.handle(principal, { ...bind, id, payload: { ...bind.payload, worktreeId: 'wt-2', expectedBindingVersion } },
+      { verifyBinding: () => true, allowMigration }), { code: 'CONFLICT', details: { currentVersion: original.version } });
+    assert.deepEqual(await store.registeredBinding(principal, session.id), original);
+  }
+  const moved = await store.handle(principal, { ...bind, id: 'authorized-move', payload: { ...bind.payload, worktreeId: 'wt-2', expectedBindingVersion: original.version } },
+    { verifyBinding: () => true, allowMigration: true });
+  assert.equal(moved.data.session.generation, original.generation + 1);
+  assert.equal((await store.registeredBinding(principal, session.id)).worktreeId, 'wt-2');
+});
+
 test('Native Session creation is human requested, device scoped and durable without duplicate identities', async t => {
   const { dir, store } = await fixture(t);
   const human = { ...principal, role: 'human' }, device = { ...principal, role: 'device' };
