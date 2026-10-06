@@ -162,6 +162,14 @@ Codex、Cursor、Claude 等宿主与 Context Guard 的连接。
 | recovery | `retrySync` `recoverSession` | 保留原事项、Session 与消息 ID；明确未执行的失败可重试，结果未知先核对；失败可见，不把排队或接收显示为完成 |
 | heartbeat | `heartbeat` `getPresence` | |
 
+### Session 绑定冲突
+
+`session.bind` 通过 `POST /api/v2/messages` 登记实际宿主 Session。设备连接授权不代表可以接管其他设备的旧 Session。
+
+跨设备绑定返回 HTTP 409，`error.code` 为 `CONFLICT`、`error.retryable` 为 `false`、`error.details.reason` 为 `session-bound-elsewhere`；不返回旧设备身份或绑定版本。同设备的版本核对与迁移权限保持原规则。
+
+客户端保留确定拒绝的回执和待同步数据，停止盲目重试并提示新建真实宿主会话。新 Session 使用新的实际宿主 ID 和独立队列；不改名复用旧 ID，不继承旧任务，不自动接管。旧版迁移拒绝只能显示一般绑定冲突，不能据此推断其他设备身份。
+
 ### 读取已发布 Main
 
 `references/map-read.md` 指向本节。Cloud 读取已发布 Main 调用 `workbench.read`，`POST /api/v2/messages`。
