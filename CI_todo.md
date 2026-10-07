@@ -1,5 +1,81 @@
 # Cloud split acceptance
 
+## SLACK-PARTICIPATION-HISTORY-01 · Current input after historical corrections (2026-10-08)
+
+- [x] Coordinator: real human Slack acceptance exposed a false silent decision:
+  an earlier stopped/answered request was treated as cancelling a newer request,
+  and similar content was mistaken for duplicate delivery. Preserve the original
+  decision; do not rewrite it into a successful replay.
+- [x] Executor: historical context appears once in native speaker-labelled frames;
+  the last current-input frame contains no nested historical context. Corrections
+  apply within the ordered current batch; only original IDs establish duplicate
+  delivery. One no-tools model decision,12s timeout,256token budget and public
+  response/identity/permission contracts are unchanged. Node24.19 gateway37/37
+  passed, actual exit0; no full-suite run during development.
+  GatewaySHA256:2af62bcfc8056d6534e12ee43e15b191fed80421127106966c2cbd0f723bdbf9.
+  TestSHA256:d910fb8f442b17141f8910260bd7e87972bc22888a87db26cee889f78254a9b8.
+- [x] Independent technical checkpoint for the above candidate: gateway37/37 and
+  real Cloud HTTP boundaries3/3 passed, actual exits0. Its first106 semantic run
+  did not pass: indirect39/40, explicit8/8/refusal8/8, ordinary negative47correct,
+  2false positives and1invalid-response out of50. Preserve the original4% result.
+  Independent label review found one negative actually asks for an observation
+  conclusion; it must not be forced silent to satisfy an incorrect label. Keep
+  that adjudication separate; do not change the original result or denominator.
+- [x] Executor semantic closeout: participation is whether to respond, not whether
+  Coordinator personally performs execution. Mere knowledge/upload/rename/status
+  is notice, not a reply request. Obvious invitations with missing detail may
+  prompt clarification; reasons do not invent missing topic/identity/referent.
+  One affected module run38/38 passed, actual exit0; old boundaries retained.
+  FinalGatewaySHA256:2faded77c84b34ac8aca028deacc7d2134027da99cdf011615316b178026a422.
+  FinalTestSHA256:b1670b49c37c274bfcf79d5000541b12fd68963fce5fdc7136aa56c0a45f9451.
+- [x] Independent v2 technical checkpoint: gateway38/38 and HTTP3/3 passed, exits0.
+  Its new first106 semantic run still failed: indirect40/40, explicit8/8 and
+  refusal8/8, ordinary negatives46correct+4false positives/50 (8%),0errors.
+  Facts, old quoted commands and existing UI descriptions were mistaken for
+  new requests; these labels were independently confirmed correct. Do not publish
+  that candidate as completed or erase either earlier failure.
+- [x] Executor v3: simplify rather than append exceptions. Approximately700Han
+  system text determines current communicative intent before recipient; retains
+  natural invitation, current/history separation, identity and permission gates.
+  Private JSON order is intent then target; public fields/parser unchanged.
+  Reason40char prompt retains the existing200char parser limit; compatibility
+  cases accept200/reject201. One module run39/39 passed, actual exit0.
+  CurrentGatewaySHA256:976435303bd4e5b0fd15aa58806d4348884effc7e3736f3523e3429eadc1384d.
+  CurrentTestSHA256:84686b305c9ab2bcb436beb920c5d9f42f7716dde6367b6cdc7fe0463a536747.
+- [x] Independent v3 technical checkpoint: gateway39/39 and HTTP3/3 passed.
+  First frozen held-out106 on that candidate: indirect38/40 (95%), negatives
+  50/50 (0 false positives), explicit8/8 and refusal8/8,0errors; participation
+  P50=794ms/P95=1084ms. Preserve both indirect misses and earlier failed runs.
+- [x] Executor final contract clarification: uncertain recipient explicitly means
+  intent=unclear,target=none. Illegal target=unclear is still rejected; parser,
+  model, deadline, budget, permissions and public contract are unchanged.
+  FinalGatewaySHA256:d84186d8af612e103bcac2823207240738963155dcf6b8c52a83286d1f27f5b8.
+  FinalTestSHA256:eacd80111a314096fa1c9620c0a4bee813762b5f7b0441452f74cd89bc89a29e.
+  Independent final contract3/3 and HTTP3/3 passed, actual exits0; exact reverse
+  comparison confirms only one prompt sentence and two test lines changed.
+- [x] Independent final seen-result review: same frozen106 is regression, not a
+  new held-out set. Indirect39/40, explicit8/8/refusal8/8, negatives49correct,
+  0false positives and1invalid response/50; P50=763ms/P95=1046ms. Errors are not
+  correct silence. The known live input also returns respond=true in a separate
+  seen probe; the original false receipt is not overwritten or called recovered.
+  Ambiguous18 regression has0format errors; unsupported confident reasons in
+  three cases remain a reported limitation, not an18/18 semantic pass.
+- [x] Independent recovery closeout on exact final source: three targeted formal
+  cases passed, actual exit0. Cloud invalid response returns502 without business
+  writes; plugin502/parse/network failures retain the frozen request and ID over
+  restart and retry. The same classification budget reaches attention on total
+  third failure, without savingfalse or posting an error as a channel reply.
+  Exhaustion fixture usesMODEL_TIMEOUT;502 recovery and common budget are checked
+  separately, not claimed as a real provider's three consecutive502 failures.
+  Original H3N32 direct probe has no durable Slack ID and remains an observed
+  error, not proof that the actual sample recovered. Human runtime acceptance
+  below remains a separate gate.
+- [ ] Delivery: remote full regression/Required, normal Main merge, actual
+  Cloud1.1.7 deployment, and new human-authenticated Slack current-after-correction
+  interaction. Prior1.1.6 runtime evidence does not prove this repair is deployed.
+  Explicit Slack stop/resume still requires its configured interrupt action;
+  do not silently expand the integration's action/project/user permissions.
+
 ## SLACK-NATURAL-01 · Natural participation, bursts and live steering (2026-10-08)
 
 - [x] Coordinator: approved current human intent as the participation rule;
