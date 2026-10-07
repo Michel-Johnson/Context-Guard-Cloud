@@ -19,6 +19,10 @@
    one marked prior output; screenshot output/computer-use/partial-after-resume-next-turn-reload.jpg.
 3. [ ] Independent Tester: review and test the exact frozen source, including
    marked output after resume/new turn/reload and model-context exclusion.
+   Additional boundary reproduction on 7d69d10 failed 1/12: a new aborted stream
+   sharing an older committed checkpoint's text was falsely deduplicated. The
+   stream now records its native response position; only that response can count
+   as already committed. Text equality across different attempts is insufficient.
 4. [ ] Full Node/browser, real computer-use stop/resume/new-turn/reload/restart,
    Required CI, normal PR merge and exact-main Cloud/Slack deployment. Paid model
    remains controlled only in isolated testing; production smoke is read-only.

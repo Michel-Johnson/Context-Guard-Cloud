@@ -196,6 +196,27 @@ test('Repeated stops keep distinct attempts, stable ordering and compacted model
   assert.equal(publicMessages(saved).filter(message => message.partial).length, 2);
 });
 
+test('A new aborted stream equal to an earlier committed checkpoint is not mistaken for a duplicate', { timeout: 10000 }, async t => {
+  const entered = [deferred(), deferred()], release = deferred(); let calls = 0;
+  const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [], execute: async () => {},
+    model: { next: async ({ signal, onText }) => {
+      const index = calls++;
+      if (index > 1) return answer('complete');
+      await onText('same prefix'); entered[index].resolve();
+      if (!index) { await release.promise; return answer('same prefix'); }
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('Stopped'), { code: 'MODEL_INTERRUPTED' })), { once: true }));
+    } } });
+  t.after(() => { release.resolve(); return service.close(); });
+  await service.submit({ id: 'start', text: 'original' }); await entered[0].promise;
+  await service.interrupt({ id: 'checkpoint-stop', expectedTurnId: 'start' }); release.resolve(); await service.close();
+  assert.equal((await service.state()).messages.filter(message => message.partial).length, 1);
+  await service.submit({ id: 'start', text: 'original', retry: true }); await entered[1].promise;
+  await service.interrupt({ id: 'stream-stop', expectedTurnId: 'start' }); await service.close();
+  assert.equal((await service.state()).messages.filter(message => message.partial).length, 2);
+  await service.submit({ id: 'start', text: 'original', retry: true }); await service.close();
+  assert.deepEqual((await service.state()).messages.map(message => message.text), ['original', 'same prefix', 'same prefix', 'complete']);
+});
+
 test('Stopping during a business tool preserves its receipt and never starts or repeats stale tools', { timeout: 10000 }, async t => {
   const entered = deferred(), release = deferred(), executed = [];
   let calls = 0;

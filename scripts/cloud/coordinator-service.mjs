@@ -68,7 +68,8 @@ function interruptedOutput(state) {
   // A completed provider response interrupted at its tool/checkpoint boundary
   // already belongs to the native transcript. Only archive aborted streams.
   const last = state.messages.at(-1);
-  const response = last?.role === 'assistant' ? last : state.messages.at(-2);
+  const response = Number.isSafeInteger(state.partialResponseIndex) ? state.messages[state.partialResponseIndex] :
+    last?.role === 'assistant' ? last : state.messages.at(-2);
   const text = response?.role === 'assistant' && (typeof response.content === 'string' ? response.content :
     response.content.filter(block => block.type === 'text').map(block => block.text).join(''));
   if (response?.superseded && text === state.partialText) return null;
@@ -81,6 +82,10 @@ function retainInterruptedOutput(state) {
   state.partialOutputId = output.id;
   const outputs = state.interruptedOutputs ||= [];
   if (!outputs.some(item => item.id === output.id)) outputs.push(output);
+}
+function captureInterruptedText(state) {
+  state.partialText = state.streaming?.text || state.partialText || '';
+  if (Number.isSafeInteger(state.streaming?.messageIndex)) state.partialResponseIndex = state.streaming.messageIndex;
 }
 
 export function publicMessages(state) {
@@ -446,7 +451,7 @@ export class CoordinatorService {
       const signals = await this.inputSignals(state);
       if (signals.interrupted) {
         state.controlRevision = (await this.inputJournal()).controlRevision || 0;
-        state.partialText = state.streaming?.text || state.partialText || '';
+        captureInterruptedText(state);
         state.status = 'interrupted'; state.streaming = null; state.activity = null;
         await this.saveState(state);
         return false;
@@ -594,6 +599,7 @@ export class CoordinatorService {
             retainInterruptedOutput(state); // Migrate legacy buffers before changing their turn/status.
             state.partialText = '';
             delete state.partialOutputId;
+            delete state.partialResponseIndex;
             journal.controlRevision = (journal.controlRevision || 0) + 1;
             await atomicWrite(this.inputFile, encode(journal));
             state.controlRevision = journal.controlRevision;
@@ -639,6 +645,7 @@ export class CoordinatorService {
           state.activeRequestIds = [id];
           state.partialText = '';
           delete state.partialOutputId;
+          delete state.partialResponseIndex;
         }
         state.status = 'running'; state.error = null; state.activity = null;
         await this.saveState(state);
@@ -861,7 +868,7 @@ export class CoordinatorService {
               system: runtimeSystem, promptVersion: hash(this.system), tools: this.tools, save, execute: this.execute,
               completePresentations: this.completePresentations,
               checkpoint: () => this.inputSignals(state), signal: this.turnAbort.signal,
-              onText: async text => { state.streaming = { turnId: state.activeTurnId, text };
+              onText: async text => { state.streaming = { turnId: state.activeTurnId, messageIndex: state.messages.length, text };
                 state.activeTiming.firstTextAt ||= new Date().toISOString(); await save(state); },
               onToolStart: async name => {
                 if (name !== 'ask_user' || state.activity?.turnId === state.activeTurnId) return;
@@ -872,7 +879,7 @@ export class CoordinatorService {
             if (Number.isSafeInteger(state.lastInputTokens) && state.lastInputTokens < this.compactAtTokens) delete state.compactionError;
           } catch (cause) {
             if (cause.code === 'MODEL_INTERRUPTED') {
-              state.partialText = state.streaming?.text || state.partialText || '';
+              captureInterruptedText(state);
               state.controlRevision = (await this.inputJournal()).controlRevision || 0;
               state.status = 'interrupted'; state.error = null;
               break;
@@ -894,7 +901,7 @@ export class CoordinatorService {
             if (changed.interrupted) { state.status = 'interrupted'; state.controlRevision = (await this.inputJournal()).controlRevision || 0; }
             else if (changed.steered) state.status = 'running';
             if (state.status === 'waiting-for-user') state.activeTurnId = null;
-            if (state.status === 'interrupted') state.partialText = state.streaming?.text || state.partialText || '';
+            if (state.status === 'interrupted') captureInterruptedText(state);
             state.streaming = null; state.activity = null;
             await save(state);
           });
