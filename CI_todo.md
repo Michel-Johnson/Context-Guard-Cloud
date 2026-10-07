@@ -1,6 +1,59 @@
 # Cloud split acceptance
 
-## UI-COORDINATOR-MOBILE-01 · Coordinator toolbar and composer geometry (2026-10-07)
+## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
+
+- [x] Executor: semantic integration targets Main
+  `845edb477453b16576aa8a096eba4cb321958417`, not the old `ce3b1a9b` UI.
+  Keeps the project model dialog/GET/POST/version semantics and three toolbar
+  controls; recovery stays after messages. Stop, its requests/listener/styles
+  and the old synthetic interrupt test are not restored. Applicable phone
+  title/action sizing, hidden state, 44px controls/recovery/send, composer
+  exclusion and empty attachment section fixes remain. Server/model APIs,
+  tests and manifest from PR #7 are unchanged. Existing failures/evidence below
+  are historical revisions, not acceptance for this integration.
+- [x] Executor: existing browser fixture retains original PR #7 model selection,
+  persistence and safe field assertions, adds 320/390 dialog containment/close
+  reachability, and adapts 320/390/1440 geometry to three controls, contextual
+  recovery, idle hidden state and single/multiline composition. Ordinary
+  screenshot pages keep precise page-only font fallbacks; cache/held-font
+  startup tests, screenshot waits and original timeouts remain.
+- [x] Executor: one affected `node tests/cloud-workbench-browser.mjs` run
+  75261, Node 22.18.0, actual exit 0, 47 checks. Evidence:
+  `output/playwright/browser-ci/cloud-1791385366803-a3df894f-26e6-47ef-8beb-010d7976b221/`
+  (`result.json`, `coordinator-mobile-toolbar.png`,
+  `coordinator-model-settings-mobile.png`, `coordinator-mobile-multiline.png`).
+  These three synthetic phone screenshots were visually inspected: current
+  history/model/new controls and readable model dialog, no obsolete Stop.
+  Original model choice/persistence, cache/held-font startup, attachment/memory
+  and version checks passed. The attachment share error is the unchanged
+  deliberate retry fixture. No new assertion failed on this integration run.
+  App SHA-256: `dc273a1cd086bdc850d369559aac1955028e35e1b56aaf670ae8cf94f7761c0e`.
+  CSS SHA-256: `daceb92ba5d19eab809ca5ee75d20df59bf1002aef7646f708236c1e4f250e15`.
+  Browser SHA-256: `17f4d0c42cf27e44338dc1df9dbbb72dc141c69caffdcc20d22d09edaabc8ef3`.
+  Syntax/diff checks passed; product conflict markers are gone. New Main
+  server/model APIs/tests/manifest have no diff from the exact 845 base.
+- [x] Independent Tester: reviewed exact 845 integration and ran the affected
+  formal module once on Node 22.18.0, session 97104, actual exit 0, 47 checks.
+  UTC 2026-10-07T15:07:24.3829127Z to 15:09:11.3683099Z. App/CSS/browser
+  hashes above stayed unchanged; server/model APIs, their formal tests and
+  manifest have zero diff from 845. Artifact:
+  `output/playwright/browser-ci/cloud-1791385647575-4f9d7d49-e48a-4be1-bb46-6b161e327297/`.
+  Viewed this run's phone toolbar/model-dialog/multiline screenshots: three
+  current controls, no obsolete Stop, readable/selectable model dialog with
+  reachable close/apply and composer exclusion. Model UI request/persistence,
+  contextual recovery, cache/held-font startup, prior mobile layout, attachment
+  retry, memory/Main and completion checks passed. Raw log SHA-256:
+  `12f4571789309780834423d231dcee595dc983662ee16ed8010c5bd984c77352`.
+  This is evidence for the new merge working tree, not inherited ce3 results.
+  Real Safari/physical phones, full RTL and
+  native 200% zoom remain unverified. Executor does not stage, commit, push,
+  deploy, install or change production/user data.
+
+## UI-COORDINATOR-MOBILE-01 · Historical ce3 toolbar/composer evidence (2026-10-07)
+
+This section documents the earlier ce3 implementation, including its now-removed
+Stop control. Its hashes and passing runs are retained as history only; the
+current Main model controls require UI-COORDINATOR-MOBILE-02 acceptance above.
 
 - [x] Executor: canonical toolbar action CSS now respects native `hidden`.
   The stop text uses a non-shrinking content-sized, non-wrapping control;
@@ -797,3 +850,24 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   This is real Chromium against isolated local Cloud/backend and the installed
   pinned Skill artifact, not production-domain or Slack acceptance. The earlier
   failure and diagnostic evidence remain retained; no product code was changed.
+
+- [ ] MODEL-SETTINGS-01: Replace Coordinator toolbar retry/stop with model settings.
+  Verify safe server-configured choices, project isolation, CAS/idempotent change,
+  restart persistence, pinned active/retry routes, provider-native thinking
+  boundaries, retained failure recovery and desktop/phone UI. New isolated
+  suite: `tests/coordinator-model-settings.test.mjs` (8 cases); browser checks use
+  synthetic provider replies and do not establish production acceptance.
+  DeepSeek V4.1 Flash (`deepseek-flash`) was tested from the production host with
+  private credentials: simple streamed reply first text 693 ms, and a real
+  two-request `read_map` tool protocol round-trip 2,323 ms, with continuation
+  first text 867 ms. The tool data in that probe was synthetic; it does not
+  establish actual project Map or full Coordinator latency. No credential is
+  in source, browser settings, test fixtures or logs. Required, merged source,
+  production configuration and real workbench acceptance must be recorded
+  separately. Independent Tester/human review remains pending.
+  Local `npm test`: 381 passed, 2 existing skips; Slack: 142 passed; security:
+  39 checks; targeted model/multimodal regression: 19 passed. Real Chromium
+  model switching, reopen persistence and phone layout passed in the workbench
+  suite. A separate initial cross-product sync run failed at the existing local
+  synced-indicator assertion before any Coordinator use; retain the failure and
+  rerun the unchanged full browser command rather than weakening that assertion.

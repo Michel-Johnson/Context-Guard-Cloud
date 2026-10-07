@@ -4513,19 +4513,58 @@ async function installCoordinatorPanel(sync){
   const workingBlot=createCoordinatorWorkingBlot?.(document,()=>{send.classList.add('is-working-fallback');send.classList.remove('is-working-ready');});
   if(workingBlot)send.append(workingBlot.canvas);
   const inputShell=document.createElement('div');inputShell.className='coordinator-input-shell';inputShell.append(input,send);
-  const retry=document.createElement('button'); retry.type='button'; retry.className='coordinator-toolbar-action';retry.textContent='↻';retry.hidden=true;
+  const retry=document.createElement('button'); retry.type='button'; retry.className='coordinator-recovery';retry.textContent='重试';retry.hidden=true;
   retry.setAttribute('aria-label','重试原请求');retry.title='重试原请求';
-  const stopTurn=document.createElement('button');stopTurn.type='button';stopTurn.className='coordinator-toolbar-action coordinator-stop';stopTurn.textContent='停止';stopTurn.hidden=true;
-  stopTurn.setAttribute('aria-label','停止当前轮次');
-  const stopRequests=new Map();
+  const modelToggle=document.createElement('button');modelToggle.type='button';modelToggle.className='coordinator-toolbar-action coordinator-model-toggle';modelToggle.textContent='模型';
+  modelToggle.setAttribute('aria-label','模型配置');modelToggle.title='模型配置';modelToggle.setAttribute('aria-haspopup','dialog');modelToggle.setAttribute('aria-expanded','false');
   const historyToggle=document.createElement('button');historyToggle.type='button';historyToggle.className='coordinator-toolbar-action';historyToggle.textContent='◷';historyToggle.setAttribute('aria-label','历史 Session');historyToggle.title='历史 Session';historyToggle.setAttribute('aria-expanded','false');historyToggle.setAttribute('aria-controls','coordinator-history');
   const creationToggle=document.createElement('button');creationToggle.type='button';creationToggle.className='coordinator-toolbar-action';creationToggle.textContent='＋';creationToggle.setAttribute('aria-label','新建 Coordinator Session');creationToggle.title='新建 Coordinator Session';
-  toolbar.append(heading,historyToggle,retry,stopTurn,creationToggle,typing);form.append(inputShell);
+  toolbar.append(heading,historyToggle,modelToggle,creationToggle,typing);form.append(inputShell);
   const history=document.createElement('section');history.id='coordinator-history';history.className='coordinator-history';history.hidden=true;
   const historyTitle=document.createElement('h3');historyTitle.textContent='历史 Session';
   const historyList=document.createElement('div');historyList.className='coordinator-history-list';
   history.append(historyTitle,historyList);
-  panel.append(toolbar,history,messages,status,form);document.body.append(panel);
+  panel.append(toolbar,history,messages,retry,status,form);document.body.append(panel);
+  const modelDialog=document.createElement('dialog');modelDialog.className='coordinator-model-dialog';modelDialog.setAttribute('aria-labelledby','coordinator-model-title');
+  const modelForm=document.createElement('form'),modelTitle=document.createElement('h3'),modelLabel=document.createElement('label'),modelSelect=document.createElement('select');
+  modelTitle.id='coordinator-model-title';modelTitle.textContent='模型配置';modelSelect.id='coordinator-model-select';modelLabel.htmlFor=modelSelect.id;modelLabel.textContent='文字回复模型';
+  const modelNote=document.createElement('p');modelNote.textContent='应用到本项目后续文字回复。正在处理的回复和重试继续使用原模型。';
+  const modelStatus=document.createElement('p');modelStatus.setAttribute('role','status');
+  const modelActions=document.createElement('div');modelActions.className='dialog-actions';
+  const modelCancel=document.createElement('button');modelCancel.type='button';modelCancel.textContent='关闭';
+  const modelSave=document.createElement('button');modelSave.type='submit';modelSave.textContent='应用';modelSave.disabled=true;
+  modelActions.append(modelCancel,modelSave);modelForm.append(modelTitle,modelLabel,modelSelect,modelNote,modelStatus,modelActions);modelDialog.append(modelForm);document.body.append(modelDialog);
+  let modelSettings=null,modelChanging=false,pendingModelRequest=null;
+  const loadModelSettings=async()=>{
+    modelSave.disabled=true;modelSelect.disabled=true;
+    const value=await sync.call('/api/coordinator/model',undefined,'GET','main');
+    if(!value||typeof value.version!=='string'||!Array.isArray(value.options)||!value.options.length||!value.options.some(option=>option.id===value.selectedId))throw new Error('模型配置暂时不可用');
+    modelSettings=value;modelSelect.replaceChildren();
+    for(const option of value.options){const element=document.createElement('option');element.value=option.id;element.textContent=option.label;modelSelect.append(element);}
+    modelSelect.value=pendingModelRequest?.providerId||value.selectedId;modelSelect.disabled=false;modelSave.disabled=value.options.length<2;
+    const current=value.options.find(option=>option.id===value.selectedId);modelToggle.title='模型配置 · '+current.label;
+  };
+  modelToggle.addEventListener('click',async()=>{
+    if(modelDialog.open)return;
+    modelDialog.showModal();modelToggle.setAttribute('aria-expanded','true');modelStatus.textContent='正在读取模型配置…';
+    try{await loadModelSettings();modelStatus.textContent='';}catch(error){modelStatus.textContent='读取失败：'+error.message;}
+  });
+  modelCancel.addEventListener('click',()=>{if(!modelChanging)modelDialog.close();});
+  modelDialog.addEventListener('cancel',event=>{if(modelChanging)event.preventDefault();});
+  modelDialog.addEventListener('close',()=>modelToggle.setAttribute('aria-expanded','false'));
+  modelSelect.addEventListener('change',()=>{if(pendingModelRequest?.providerId!==modelSelect.value)pendingModelRequest=null;modelStatus.textContent='';});
+  modelForm.addEventListener('submit',async event=>{
+    event.preventDefault();if(modelChanging||!modelSettings||!modelSelect.value)return;
+    pendingModelRequest ||= {id:crypto.randomUUID(),providerId:modelSelect.value,baseVersion:modelSettings.version};
+    modelChanging=true;modelSave.disabled=true;modelSelect.disabled=true;modelCancel.disabled=true;modelStatus.textContent='正在应用…';
+    try{
+      await sync.call('/api/coordinator/model',pendingModelRequest,'POST','main');pendingModelRequest=null;
+      await loadModelSettings();modelStatus.textContent='已应用，后续文字回复使用 '+modelSettings.options.find(option=>option.id===modelSettings.selectedId).label+'。';
+    }catch(error){
+      if(error.serverResponse){pendingModelRequest=null;try{await loadModelSettings();}catch{}}
+      modelStatus.textContent=error.code==='VERSION_CONFLICT'?'模型配置已更新，请重新选择并应用。':error.serverResponse?'设置未应用：'+error.message:'设置结果尚未确认，再次点击应用会核对同一请求。';
+    }finally{modelChanging=false;modelSelect.disabled=false;modelCancel.disabled=false;modelSave.disabled=!modelSettings||modelSettings.options.length<2;}
+  });
   let typingVisible=false,typingStartedAt=0,typingExitTimer=0,typingStopTimer=0,inkReady=false;
   const setTyping=visible=>{
     if(visible){
@@ -4738,6 +4777,7 @@ async function installCoordinatorPanel(sync){
   const setRetryMode=mode=>{
     retry.hidden=!mode;
     const label=mode==='read'?'重试读取':'重试原请求';
+    retry.textContent=mode==='read'?'重新读取':'重试';
     retry.setAttribute('aria-label',label);retry.title=label;
   };
   const scopeConversation=()=>sync.viewId.startsWith('session:')?'session:'+sync.viewId.slice('session:'.length):'main';
@@ -4836,7 +4876,6 @@ async function installCoordinatorPanel(sync){
   const render=(state,forceFinal=false)=>{
     const renderedConversation=selected;
     latestConversationState=state;
-    stopTurn.hidden=state.status!=='running';stopTurn.disabled=busy;
     // A lost HTTP response is not a lost turn. Reconcile the original request
     // against the server's durable receipt; model retries remain explicit.
     if(pending&&!pending.retry&&state.acceptedRequestIds?.includes(pending.id))confirmSubmitted(selected,pending);
@@ -5150,16 +5189,6 @@ async function installCoordinatorPanel(sync){
   form.addEventListener('submit',event=>{event.preventDefault();if(input.value.trim()&&(!pending||canCorrect)) void submit({id:crypto.randomUUID(),text:input.value.trim()});});
   input.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();if(!send.disabled)form.requestSubmit();}});
   retry.addEventListener('click',()=>{if(pending) void submit(pending);else void refresh();});
-  stopTurn.addEventListener('click',async()=>{
-    const id=selected,turnId=latestConversationState?.activeTurnId;
-    if(!turnId||stopTurn.disabled)return;
-    let request=stopRequests.get(id);
-    if(!request){request={id:crypto.randomUUID(),expectedTurnId:turnId};stopRequests.set(id,request);}
-    stopTurn.disabled=true;
-    try{await sync.call(conversationUrl('/api/coordinator/interrupt',id),request,'POST','main');stopRequests.delete(id);}
-    catch(error){if(id===selected)status.textContent=error.serverResponse?'停止未提交：'+error.message:'停止结果待确认，重试将使用原请求';if(error.serverResponse)stopRequests.delete(id);}
-    finally{stopTurn.disabled=false;await refresh();}
-  });
   window.addEventListener('pagehide',()=>{stopped=true;clearTimeout(timer);setPlanningVisible(false);setTyping(false);});
   window.addEventListener('pageshow',()=>{stopped=false;if(panel.open) void refresh();});
 }

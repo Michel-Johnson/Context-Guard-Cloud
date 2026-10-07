@@ -643,10 +643,19 @@ try {
   let releaseLongSubmission;
   const oneShotLongText='完整长段落。'.repeat(240);
   const coordinatorReads = [];
+  let modelSettings={version:'a'.repeat(64),selectedId:'glm',options:[{id:'glm',label:'GLM 5.3',model:'glm-5.3'},{id:'ds',label:'DeepSeek V4.1 Flash',model:'deepseek-flash'}]};
+  const modelSelections=[];
+  await page.route(/\/api\/coordinator\/model(?:\?|$)/,async route=>{
+    if(route.request().method()==='POST'){
+      const input=route.request().postDataJSON();modelSelections.push(input);
+      assert.deepEqual(Object.keys(input).sort(),['baseVersion','id','providerId']);
+      assert.equal(input.baseVersion,modelSettings.version);
+      modelSettings={...modelSettings,selectedId:input.providerId,version:'b'.repeat(64)};
+    }
+    await route.fulfill({json:modelSettings});
+  });
   let coordinatorReadFailure = false;
   let coordinatorReadOffline = false;
-  const interrupts = [];
-  let releaseInterrupt;
   const markdownImageRequests = [];
   const workingBlotRequests = [];
   page.on('request', request=>{
@@ -684,12 +693,6 @@ try {
     return route.fulfill({ json: { receiptId: 'human-receipt' } });
   });
   const conversationCreationRequests = [];
-  await page.route(/\/api\/coordinator\/interrupt(?:\?|$)/, async route => {
-    interrupts.push({conversation:new URL(route.request().url()).searchParams.get('conversation'),...route.request().postDataJSON()});
-    await new Promise(resolve=>{releaseInterrupt=resolve;});
-    coordinatorState={...coordinatorState,status:'waiting-for-user',activeTurnId:null};
-    return route.fulfill({json:{accepted:true}});
-  });
   await page.route(/\/api\/coordinator\/conversations\/new(?:\?|$)/, async route => {
     const request = route.request().postDataJSON();conversationCreationRequests.push(request);
     if(conversationCreationRequests.length===1)return route.abort();
@@ -776,12 +779,44 @@ try {
   const historyAction=coordinator.getByRole('button',{name:'历史 Session',exact:true});
   assert.equal(await historyAction.textContent(),'◷','history uses a symbol-only control');
   assert.equal(await historyAction.evaluate(el=>el.parentElement?.classList.contains('coordinator-toolbar')),true,'history lives in the Coordinator toolbar');
+  assert.equal(await coordinator.locator('.coordinator-toolbar button[aria-label="重试原请求"]').count(),0);
+  assert.equal(await coordinator.locator('.coordinator-toolbar button[aria-label="停止当前回复"]').count(),0);
+  assert.equal(await coordinator.locator('.coordinator-stop,button[aria-label="停止当前轮次"]').count(),0,'the removed Stop control is not restored');
+  const modelAction=coordinator.getByRole('button',{name:'模型配置',exact:true});
+  await modelAction.click();
+  const modelDialog=page.getByRole('dialog',{name:'模型配置',exact:true});
+  await modelDialog.getByLabel('文字回复模型').waitFor();
+  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='glm');
+  await modelDialog.getByLabel('文字回复模型').selectOption('ds');
+  await modelDialog.getByRole('button',{name:'应用',exact:true}).click();
+  await modelDialog.getByText('已应用，后续文字回复使用 DeepSeek V4.1 Flash。',{exact:true}).waitFor();
+  assert.equal(modelSelections.length,1);
+  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
+  await modelAction.click();
+  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='ds');
+  assert.equal(await modelDialog.locator('input').count(),0,'model settings cannot request credentials or URLs');
+  await modelDialog.screenshot({path:path.join(output,'coordinator-model-settings-desktop.png')});
+  for(const width of [320,390]){
+    await page.setViewportSize({width,height:844});
+    const modelBounds=await modelDialog.boundingBox();
+    assert.ok(modelBounds.x>=0&&modelBounds.x+modelBounds.width<=width&&modelBounds.y>=0&&modelBounds.y+modelBounds.height<=844,`model configuration fits the ${width}px phone viewport`);
+    for(const label of ['应用','关闭']){
+      const target=await modelDialog.getByRole('button',{name:label,exact:true}).boundingBox();
+      assert.ok(target.x>=modelBounds.x&&target.x+target.width<=modelBounds.x+modelBounds.width&&target.y>=modelBounds.y&&target.y+target.height<=modelBounds.y+modelBounds.height,`${label} remains reachable on the ${width}px phone`);
+    }
+    await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
+    await modelAction.click();
+    await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='ds');
+  }
+  await page.screenshot({path:path.join(output,'coordinator-model-settings-mobile.png')});
+  await page.setViewportSize({width:1280,height:900});
+  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
   const toolbarAppearance=await coordinator.locator('.coordinator-toolbar').evaluate(toolbar=>{
     const action=toolbar.querySelector('.coordinator-toolbar-action'),style=getComputedStyle(action),toolbarStyle=getComputedStyle(toolbar);
     return{width:style.width,height:style.height,fontSize:style.fontSize,borderWidth:style.borderTopWidth,borderRadius:style.borderRadius,background:style.backgroundColor,color:style.color,boxShadow:style.boxShadow,gap:toolbarStyle.gap};
   });
   assert.deepEqual(toolbarAppearance,{width:'28px',height:'28px',fontSize:'16px',borderWidth:'1px',borderRadius:'8px',background:'rgba(0, 0, 0, 0)',color:'rgb(116, 108, 96)',boxShadow:'none',gap:'8px 12px'},'Coordinator icon actions use the compact neutral button system');
-  // UI-COORDINATOR-MOBILE-01: native hidden state, text controls and composer
+  // UI-COORDINATOR-MOBILE-02: current Main's three controls and recovery keep
   // geometry are checked with synthetic state, never a user's conversation.
   const coordinatorGeometry=async(width,label)=>{
     await page.setViewportSize({width,height:width<820?844:1000});
@@ -790,13 +825,21 @@ try {
       const rect=el=>{const r=el.getBoundingClientRect();return{left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height};};
       const toolbar=panel.querySelector('.coordinator-toolbar'),buttons=[...toolbar.querySelectorAll('button')];
       const input=panel.querySelector('.coordinator-input-shell textarea'),send=panel.querySelector('.coordinator-send');
+      const recovery=panel.querySelector('.coordinator-recovery');
       const visible=buttons.filter(el=>!el.hidden).map(el=>{const range=document.createRange();range.selectNodeContents(el);return{...rect(el),text:rect(range),action:el.classList.contains('coordinator-toolbar-action')};});
       return{phone:document.documentElement.classList.contains('cg-phone'),toolbar:rect(toolbar),visible,
-        hidden:buttons.filter(el=>el.hidden).map(el=>({display:getComputedStyle(el).display,...rect(el)})),
+        recovery:{...rect(recovery),hidden:recovery.hidden,display:getComputedStyle(recovery).display,afterMessages:recovery.previousElementSibling?.classList.contains('coordinator-messages')},
+        panel:rect(panel),messages:rect(panel.querySelector('.coordinator-messages')),
         input:rect(input),send:rect(send),padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:send.computedStyleMap().get('bottom').toString()};
     });
     const details=`${label} ${width}: ${JSON.stringify(geometry)}`;
-    assert.ok(geometry.hidden.every(el=>el.display==='none'&&el.width===0&&el.height===0),`native hidden controls take no layout space: ${details}`);
+    assert.equal(geometry.visible.filter(el=>el.action).length,3,'toolbar contains history, model and new Session only');
+    assert.equal(geometry.recovery.afterMessages,true,'recovery stays after messages, outside the toolbar');
+    if(geometry.recovery.hidden)assert.ok(geometry.recovery.display==='none'&&geometry.recovery.width===0&&geometry.recovery.height===0,`hidden recovery takes no layout space: ${details}`);
+    else{
+      assert.ok(geometry.recovery.top>=geometry.messages.bottom-.5&&geometry.recovery.bottom<=geometry.input.top+.5&&geometry.recovery.left>=geometry.panel.left-.5&&geometry.recovery.right<=geometry.panel.right+.5,`recovery remains separate from transcript and composer: ${details}`);
+      if(geometry.phone)assert.ok(geometry.recovery.width>=44&&geometry.recovery.height>=44,`phone recovery has a real 44px target: ${details}`);
+    }
     assert.ok(geometry.visible.every(el=>el.left>=geometry.toolbar.left-.5&&el.right<=geometry.toolbar.right+.5&&el.top>=geometry.toolbar.top-.5&&el.bottom<=geometry.toolbar.bottom+.5&&el.text.left>=el.left-.5&&el.text.right<=el.right+.5&&el.text.top>=el.top-.5&&el.text.bottom<=el.bottom+.5),`toolbar text and controls remain contained: ${details}`);
     for(let i=0;i<geometry.visible.length;i++)for(const other of geometry.visible.slice(i+1)){
       const el=geometry.visible[i];assert.ok(el.right<=other.left+.5||other.right<=el.left+.5||el.bottom<=other.top+.5||other.bottom<=el.top+.5,`toolbar targets do not overlap: ${details}`);
@@ -823,8 +866,8 @@ try {
   await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
   const readRetry=coordinator.getByRole('button',{name:'重试读取',exact:true});
   await readRetry.waitFor();
-  assert.equal(await readRetry.textContent(),'↻','read retry uses the shared symbol-only control');
-  assert.equal(await readRetry.evaluate(el=>el.parentElement?.classList.contains('coordinator-toolbar')),true,'read retry lives in the Coordinator toolbar');
+  assert.equal(await readRetry.textContent(),'重新读取','read recovery is a contextual text action');
+  assert.equal(await readRetry.evaluate(el=>el.parentElement?.id==='coordinator-panel'),true,'recovery stays outside the toolbar');
   await readRetry.click();
   await page.waitForFunction(()=>document.querySelector('#coordinator-panel > [role=status]')?.textContent==='');
   const coordinatorLayout = await coordinator.evaluate(el => {
@@ -888,38 +931,36 @@ try {
   assert.equal(coordinatorLayout.typingDots,0,'the old dots are removed');
   for(const width of [320,390,1440]){
     await coordinatorGeometry(width,'idle empty');
+    assert.equal(await coordinator.locator('.coordinator-recovery').evaluate(el=>el.hidden),true,'idle recovery is not shown');
     assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),false);
     await coordinator.getByLabel('发送给 Coordinator').fill('Synthetic first line\nSynthetic second line\nSynthetic third line');
     await coordinatorGeometry(width,'idle multiline');
     assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),true);
     await coordinator.getByLabel('发送给 Coordinator').fill('');
   }
-  coordinatorState={...coordinatorState,status:'running',activeTurnId:'synthetic-mobile-turn'};
+  coordinatorState={...coordinatorState,status:'running'};
   await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
-  const stopAction=coordinator.getByRole('button',{name:'停止当前轮次',exact:true});
-  await stopAction.waitFor();
+  await coordinator.locator('.coordinator-send.is-working').waitFor();
   for(const width of [320,390,1440])await coordinatorGeometry(width,'running');
   assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),false,'empty running composer retains its disabled send state');
   coordinatorReadOffline=true;
   await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
   await coordinator.getByRole('button',{name:'重试读取',exact:true}).waitFor();
-  for(const width of [320,390,1440])await coordinatorGeometry(width,'running read failure, four actions');
+  for(const width of [320,390,1440])await coordinatorGeometry(width,'running read failure, three toolbar controls plus contextual recovery');
   await page.setViewportSize({width:390,height:844});
   await coordinator.locator('.coordinator-toolbar').screenshot({path:path.join(output,'coordinator-mobile-toolbar.png')});
   coordinatorReadOffline=false;
-  await stopAction.click();
-  assert.equal(await stopAction.isEnabled(),false,'the original stop handler disables its in-flight action');
-  assert.equal(interrupts.length,1,'one stop click sends exactly one interrupt');
-  assert.equal(interrupts[0].conversation,'main');assert.equal(interrupts[0].expectedTurnId,'synthetic-mobile-turn');assert.ok(interrupts[0].id);
-  releaseInterrupt();
-  await stopAction.waitFor({state:'hidden'});
-  await coordinatorGeometry(390,'stopped, empty');
+  coordinatorState={...coordinatorState,status:'waiting-for-user'};
+  assert.equal(await coordinator.getByRole('button',{name:'重试读取',exact:true}).isEnabled(),true);
+  await coordinator.getByRole('button',{name:'重试读取',exact:true}).click();
+  await coordinator.locator('.coordinator-recovery').waitFor({state:'hidden'});
+  await coordinatorGeometry(390,'recovered, empty');
   await coordinator.getByLabel('发送给 Coordinator').fill('Synthetic line one\nSynthetic line two\nSynthetic line three');
-  await coordinatorGeometry(390,'stopped multiline');
+  await coordinatorGeometry(390,'recovered multiline');
   await coordinator.locator('.coordinator-input-shell').screenshot({path:path.join(output,'coordinator-mobile-multiline.png')});
   await coordinator.getByLabel('发送给 Coordinator').fill('');
   await page.setViewportSize({width:1440,height:1000});
-  record('UI-COORDINATOR-MOBILE-01: hidden controls, 44px phone targets, stop behavior and single/multiline composer geometry');
+  record('UI-COORDINATOR-MOBILE-02: current model/three controls, contextual recovery and 44px single/multiline composer geometry');
   const historicalMessage=coordinator.locator('.coordinator-message.assistant').first();
   await historicalMessage.evaluate(node=>{node.dataset.historyProbe='kept';});
   runningPreview=true;
@@ -1415,8 +1456,8 @@ try {
   assert.equal(await coordinator.locator('.coordinator-send.is-working-ready').count(),1,'stale polling does not reset card-answer ink');
   releaseCardSubmission();
   await coordinator.getByRole('button',{name:'重试原请求',exact:true}).waitFor();
-  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).textContent(),'↻','retry uses a symbol-only control');
-  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).evaluate(el=>el.parentElement===document.querySelector('#coordinator-panel .coordinator-toolbar')),true,'retry lives in the Coordinator toolbar');
+  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).textContent(),'重试','failure recovery remains explicit');
+  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).evaluate(el=>el.parentElement===document.querySelector('#coordinator-panel')),true,'retry remains outside the toolbar');
   assert.equal(submissions.length,1);
   assert.equal(submissions[0].text,'网站构建产物\n\n保留我的补充');
   assert.equal(submissions[0].answerTo,'choice');
