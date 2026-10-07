@@ -17,21 +17,43 @@ const fixture = async t => {
 };
 const archiveName = number => `context-guard-cloud-pre-v${number}-20260924T00000${number}Z.tar`;
 const nestedName = number => `pre-v${number}-20260924T00000${number}Z.tar.zst`;
-const createCandidate = async (root, number, nested = false) => {
-  const file = path.join(root, ...(nested ? ['context-guard-cloud', nestedName(number)] : [archiveName(number)]));
+const millisecondName = number => `pre-cloud-release-20261007T204829${String(number).padStart(3, '0')}Z.tar`;
+const createCandidate = async (root, number, nested = false, name = nested ? nestedName(number) : archiveName(number)) => {
+  const file = path.join(root, ...(nested ? ['context-guard-cloud', name] : [name]));
   await fs.writeFile(file, `backup ${number}`);
   const timestamp = new Date(Date.UTC(2026, 8, 23, 0, number));
   await fs.utimes(file, timestamp, timestamp);
   return file;
 };
 
+test('inventory accepts only legacy four-to-six or exact nine-digit timestamps and both archive formats', async t => {
+  const root = await fixture(t), expected = [], ignored = [];
+  let number = 0;
+  for (const timestamp of ['2048', '20482', '204829', '204829844']) {
+    for (const nested of [false, true]) for (const extension of ['.tar', '.tar.zst']) {
+      const name = `${nested ? 'pre-cloud-release' : 'context-guard-cloud-pre-release'}-20261007T${timestamp}Z${extension}`;
+      expected.push(await createCandidate(root, ++number, nested, name));
+    }
+  }
+  for (const timestamp of ['204', '2048298', '20482984', '2048298440']) {
+    ignored.push(await createCandidate(root, ++number, true, `pre-cloud-release-20261007T${timestamp}Z.tar`));
+  }
+  for (const extension of ['.tar.part', '.tar.zst.part']) ignored.push(await createCandidate(root, ++number, true,
+    `pre-cloud-release-20261007T204829844Z${extension}`));
+  const inventory = await listCloudBackups(root);
+  assert.deepEqual(inventory.map(item => item.path).sort(), [...expected].sort());
+  assert.ok(inventory.every(item => item.kind === 'file'));
+  for (const file of ignored) assert.equal(await fs.readFile(file, 'utf8'), `backup ${expected.length + ignored.indexOf(file) + 1}`);
+});
+
 test('retention keeps five newest snapshots across both known directories and leaves other files untouched', async t => {
   const root = await fixture(t);
   const backups = [];
-  for (let number = 1; number <= 7; number++) backups.push(await createCandidate(root, number, number % 2 === 0));
+  for (let number = 1; number <= 7; number++) backups.push(await createCandidate(root, number, number % 2 === 0,
+    number === 2 || number === 4 ? millisecondName(number) : number % 2 === 0 ? nestedName(number) : archiveName(number)));
   const unrelated = path.join(root, 'dpkg.status.0');
   const diagnostic = path.join(root, 'context-guard-cloud', 'memory-before-lab.json');
-  const partial = path.join(root, 'context-guard-cloud', 'pre-v8-20260924T000008Z.tar.zst.part');
+  const partial = path.join(root, 'context-guard-cloud', millisecondName(8) + '.part');
   await fs.writeFile(unrelated, 'unrelated');
   await fs.writeFile(diagnostic, 'diagnostic');
   await fs.writeFile(partial, 'still writing');
@@ -67,6 +89,38 @@ test('a changed backup invalidates the deletion plan', async t => {
   assert.equal((await listCloudBackups(root)).length, 6);
 });
 
+test('new-format inventory changes, recent backups and invalid retained archives preserve every snapshot', async t => {
+  const root = await fixture(t), backups = [];
+  for (let number = 1; number <= 6; number++) backups.push(await createCandidate(root, number, true, millisecondName(number)));
+  const before = await listCloudBackups(root);
+  const recent = await pruneCloudBackups({ root, apply: true, now: before[0].mtimeMs + 9 * 60 * 1000, verify: async () => {} });
+  assert.equal(recent.status, 'deferred-recent-backup');
+  assert.equal((await listCloudBackups(root)).length, 6);
+  await assert.rejects(pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 24), minQuietMs: 0,
+    verify: async item => { if (item.path === backups[5]) throw new Error('invalid retained new-format archive'); } }), /invalid retained new-format archive/);
+  assert.equal((await listCloudBackups(root)).length, 6);
+  await assert.rejects(pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 24), minQuietMs: 0,
+    verify: async item => { if (item.path === backups[5]) await createCandidate(root, 7, true, millisecondName(7)); } }), /inventory changed during verification/);
+  assert.equal((await listCloudBackups(root)).length, 7);
+  for (const [index, file] of backups.entries()) assert.equal(await fs.readFile(file, 'utf8'), `backup ${index + 1}`);
+});
+
+test('new-format symbolic entries are refused before validation or deletion', async t => {
+  const root = await fixture(t);
+  for (let number = 1; number <= 6; number++) await createCandidate(root, number, true, millisecondName(number));
+  const target = path.join(root, 'protected-payload'), link = path.join(root, 'context-guard-cloud', millisecondName(7));
+  await fs.mkdir(target); await fs.writeFile(path.join(target, 'record.txt'), 'retained payload');
+  // Junctions are symbolic entries on Windows without requiring privileged
+  // file-symlink creation; both platforms exercise lstat's symbolic guard.
+  await fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+  let verified = false;
+  await assert.rejects(pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 24), minQuietMs: 0,
+    verify: async () => { verified = true; } }), /Unexpected backup entry type/);
+  assert.equal(verified, false);
+  assert.equal(await fs.readFile(path.join(target, 'record.txt'), 'utf8'), 'retained payload');
+  assert.equal((await fs.readdir(path.join(root, 'context-guard-cloud'))).length, 7);
+});
+
 test('a backup-shaped entry with an unexpected type blocks pruning', async t => {
   const root = await fixture(t);
   for (let number = 1; number <= 6; number++) await createCandidate(root, number);
@@ -99,19 +153,24 @@ test('CLI validates complete tar archives before applying retention', async t =>
   const tar = spawnSync('tar', ['-cf', valid, '-C', root, 'payload.txt'], { windowsHide: true });
   assert.equal(tar.status, 0, 'tar is a documented Cloud prerequisite');
   for (let number = 1; number <= 6; number++) {
-    const target = path.join(root, archiveName(number));
+    const target = number % 2 === 0 ? path.join(root, 'context-guard-cloud', millisecondName(number)) : path.join(root, archiveName(number));
     await fs.copyFile(valid, target);
     const timestamp = new Date(Date.UTC(2026, 8, 23, 0, number));
     await fs.utimes(target, timestamp, timestamp);
   }
+  const dryRun = spawnSync(process.execPath, [script, '--root', root], { encoding: 'utf8', windowsHide: true });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  assert.equal(JSON.parse(dryRun.stdout).status, 'dry-run');
+  assert.deepEqual(JSON.parse(dryRun.stdout).removed, []);
+  assert.equal((await listCloudBackups(root)).length, 6);
   const run = spawnSync(process.execPath, [script, '--root', root, '--apply'], { encoding: 'utf8', windowsHide: true });
   assert.equal(run.status, 0, run.stderr);
   assert.equal(JSON.parse(run.stdout).removed.length, 1);
   assert.equal((await listCloudBackups(root)).length, 5);
-  await createCandidate(root, 7);
-  await fs.writeFile(path.join(root, archiveName(7)), 'corrupt tar');
+  const corrupted = await createCandidate(root, 7, true, millisecondName(7));
+  await fs.writeFile(corrupted, 'corrupt tar');
   const timestamp = new Date(Date.UTC(2026, 8, 23, 0, 7));
-  await fs.utimes(path.join(root, archiveName(7)), timestamp, timestamp);
+  await fs.utimes(corrupted, timestamp, timestamp);
   const refused = spawnSync(process.execPath, [script, '--root', root, '--apply'], { encoding: 'utf8', windowsHide: true });
   assert.notEqual(refused.status, 0);
   assert.match(refused.stderr, /Backup verification failed/);

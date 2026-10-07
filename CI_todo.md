@@ -1,5 +1,36 @@
 # Cloud split acceptance
 
+## BACKUP-PRODUCER-FORMAT-01 · Safe release backup discovery (2026-10-08)
+
+- [x] Coordinator: approved Main1.1.8 deployment failed during backup before
+  source promotion. Subsequent read-only inspection found a full destination
+  filesystem, and the old1.1.7 services were restored. Original tar exit2 is
+  preserved; original stderr was unavailable, so no literal ENOSPC claim.
+- [x] Executor: recognize raw/compressed producer archives with exact nine-digit
+  times while preserving old four-to-six-digit names. Three regex changes only;
+  keep-five, ten-minute quiet period, default dry-run, `.part` exclusion, retained
+  integrity, immutable inventory/stat checks and symlink rejection are unchanged.
+  ScriptSHA256:6de2cf2c872653cd5f3113ef18f9621b71bb54f630446e7cff65bbb63e47d405.
+  TestsSHA256:3ceda6d7a3d30e0dc856707b3f3f214744cee37b187d100e53f3d5cbd23bc229.
+  Executor affected module9/9 passed, actualexit0.
+- [x] Independent Tester: one five-target Node24 run passed, actualexit0;
+  producer-format matrix, retained validation, inventory race, symlink/junction,
+  actual tar CLI and default dry-run verified. No production pruning or timer
+  installation. Frozen Slack gateway/test identities unchanged.
+- [x] Operator: independently verify pre-downtime source/capacity checks,
+  compressed archive validation and recovery that distinguishes untouched source
+  from a promoted release. No configuration overwrite or unnecessary npm rollback.
+  Final private operatorSHA256:4fdab7431df3bed8c03ede55a5fb721b1694b12312f0fc72919b40028982d85a.
+  Independent preliminary4targets passed; two review gaps repaired and final
+  one-target static closeout passed, actualexits0. Production read-only capacity
+  probe rejected insufficient space with unchanged service generations. Corrected
+  retention dry-run verified five retained archives, eight stale, removedempty.
+  No production recovery simulation, deletion or timer installation was executed.
+- [ ] Delivery: normal Required/Main CI; deployment requires safe capacity and
+  verified backup before downtime. Any expanded active-timer deletion scope
+  requires explicit inventory/integrity review and corresponding authorization.
+  Specific partial-file cleanup does not authorize complete-archive pruning.
+
 ## SLACK-CURRENT-ADDRESSEE-01 · New addressee after Coordinator discussion (2026-10-08)
 
 - [x] Coordinator: new real-human1.1.7 acceptance exposed a false positive after
