@@ -1073,8 +1073,12 @@ export async function startCloudServer({
     return { ...state, conversationId };
   };
   const submitCoordinator = async (project, conversationId, input, options = {}) => {
-    if (!input || Object.keys(input).some(key => !['id', 'text', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
+    if (!input || Object.keys(input).some(key => !['id', 'text', 'inputs', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
       protocolFail('INVALID_ARGUMENT', 'Provide a message, stable ID and optional attachment references');
+    }
+    if (input.inputs !== undefined && (options.source !== 'slack' || input.retry ||
+        ['text', 'attachments', 'answerTo'].some(key => Object.hasOwn(input, key)))) {
+      protocolFail('INVALID_ARGUMENT', 'Only verified Slack batches may supply ordered inputs without replacing retry data');
     }
     const service = await coordinatorFor(project, conversationId);
     if (input.retry) {

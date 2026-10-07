@@ -1523,6 +1523,8 @@ test('Slack reply policy is supplied as system instructions without changing nat
   } });
   await service.running;
   assert.match(calls[0].system, /本轮答复发往 Slack：使用纯文本/);
+  assert.match(calls[0].system, /段间留一个空行/);
+  assert.match(calls[0].system, /并列事项用短列表/);
   assert.match(calls[0].system, /最多 200 字/);
   assert.match(calls[0].system, /只问 TODO 就只列 TODO，不附 Bug/);
   assert.deepEqual(calls[0].tools, tools, 'Delivery format does not replace JSON Schema tool definitions');

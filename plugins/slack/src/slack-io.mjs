@@ -1,7 +1,21 @@
 import { digest } from './store.mjs';
-import { plainText } from './plain-text.mjs';
+import { plainText, plainChunks } from './plain-text.mjs';
 
-const fallbackText = text => plainText(text).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').slice(0, 39000);
+const fallbackText = (text, rendered = false) => (rendered ? text : plainText(text)).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+function messageParts(text, blocks) {
+  if (!blocks?.length) return plainChunks(text, 6000).map(value => ({ text: value, rendered: true }));
+  const parts = []; let group = [], size = 0;
+  for (const block of blocks) {
+    const content = block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '');
+    if (group.length && (group.length >= 49 || size + content.length > 6000)) { parts.push(group); group = []; size = 0; }
+    group.push(block); size += content.length;
+  }
+  if (group.length) parts.push(group);
+  // Each message has the content's own fallback for notifications and assistive
+  // clients. No 39K slice or 49-block truncation hides the end of an answer.
+  return parts.map((group, index) => ({ blocks: group,
+    text: group.map(block => block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '')).join('') || (index ? 'Coordinator · 操作' : plainText(text)), rendered: true }));
+}
 
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const MAX_TOTAL_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -22,6 +36,10 @@ export class SlackIO {
       }
     }
   }
+  // Identity is advisory semantic context. Use the SDK's existing 15s timeout
+  // without sleeping through API retry windows; the plugin waits at most 1s,
+  // retains the in-flight slot and includes it in shutdown cleanup.
+  async identity(userId) { return this.client.apiCall('users.info', { user: userId }); }
   async write(channel, operation) {
     const prior = this.channelTails.get(channel) || Promise.resolve();
     const next = prior.catch(() => {}).then(async () => {
@@ -45,12 +63,46 @@ export class SlackIO {
     throw new UncertainDelivery(record.id);
   }
   async post({ id, channel, threadTs, text, blocks }) {
+    const parts = messageParts(text, blocks);
+    const previousCount = this.store.data.outgoing[id]?.partCount || 1;
+    if (parts.length === 1 && previousCount === 1) return this.postOne({ id, channel, threadTs, text, blocks });
+    let first;
+    for (const [index, part] of parts.entries()) {
+      const ts = await this.postOne({ id: index ? `${id}:part:${index}` : id, channel, threadTs, ...part });
+      first ||= ts;
+      if (index === 0) await this.store.update(state => { state.outgoing[id].partCount = Math.max(previousCount, parts.length); });
+    }
+    await this.retireParts(id, channel, threadTs, parts.length, previousCount);
+    await this.store.update(state => { state.outgoing[id].partCount = parts.length; });
+    return first;
+  }
+  async retireParts(id, channel, threadTs, count, previousCount) {
+    for (let index = count; index < previousCount; index++) {
+      const prior = this.store.data.outgoing[`${id}:part:${index}`];
+      if (prior && ['sent', 'sending', 'unknown'].includes(prior.status)) await this.postOne({
+        id: prior.id, channel, threadTs, text: '此部分已纳入更新后的回复。', blocks: [], rendered: true });
+    }
+  }
+  async postOne({ id, channel, threadTs, text, blocks, rendered = false }) {
     const previous = this.store.data.outgoing[id];
-    if (previous?.status === 'sent') return previous.ts;
-    if (previous?.status === 'sending' || previous?.status === 'unknown') return this.reconcile(previous);
-    await this.store.update(state => { state.outgoing[id] = { id, channel, threadTs, status: 'sending', hash: digest({ text, blocks }), at: Date.now() }; });
+    const contentHash = digest({ text, blocks });
+    if (previous && (previous.channel !== channel || previous.threadTs !== threadTs || previous.kind === 'file')) {
+      throw Object.assign(new Error('Slack operation ID belongs to another destination'), { code: 'ID_REUSED' });
+    }
+    if (['sent', 'sending', 'unknown'].includes(previous?.status)) {
+      const ts = previous.status === 'sent' ? previous.ts : await this.reconcile(previous);
+      // Reconciliation proves delivery of the old contents, not delivery of the
+      // current stream revision. Updating a known timestamp is safe to repeat
+      // after a lost update response; allocating another message is not.
+      if (previous.hash !== contentHash) {
+        await this.write(channel, () => this.call('chat.update', { channel, ts, text: fallbackText(text, rendered), mrkdwn: false, parse: 'none', link_names: false, blocks: blocks || [] }));
+        await this.store.update(state => { state.outgoing[id].hash = contentHash; });
+      }
+      return ts;
+    }
+    await this.store.update(state => { state.outgoing[id] = { id, channel, threadTs, status: 'sending', hash: contentHash, at: Date.now() }; });
     try {
-      const result = await this.write(channel, () => this.call('chat.postMessage', { channel, thread_ts: threadTs, text: fallbackText(text), mrkdwn: false, parse: 'none', link_names: false, ...(blocks ? { blocks } : {}),
+      const result = await this.write(channel, () => this.call('chat.postMessage', { channel, thread_ts: threadTs, text: fallbackText(text, rendered), mrkdwn: false, parse: 'none', link_names: false, ...(blocks ? { blocks } : {}),
         metadata: { event_type: 'context_guard', event_payload: { id } }, unfurl_links: false, unfurl_media: false }));
       await this.store.update(state => { state.outgoing[id].status = 'sent'; state.outgoing[id].ts = result.ts; });
       return result.ts;
@@ -62,7 +114,19 @@ export class SlackIO {
       throw error;
     }
   }
-  async update(channel, ts, text, blocks) { return this.write(channel, () => this.call('chat.update', { channel, ts, text: fallbackText(text), mrkdwn: false, parse: 'none', link_names: false, ...(blocks ? { blocks } : {}) })); }
+  async update(channel, ts, text, blocks) {
+    const parts = messageParts(text, blocks), original = Object.values(this.store.data.outgoing).find(record => record.channel === channel && record.ts === ts);
+    const id = original?.id || `update-${digest([channel, ts])}`;
+    const previousCount = original?.partCount || 1;
+    if (original) await this.store.update(state => { state.outgoing[id].partCount = Math.max(previousCount, parts.length); });
+    const result = await this.write(channel, () => this.call('chat.update', { channel, ts, text: fallbackText(parts[0].text, true), mrkdwn: false, parse: 'none', link_names: false, blocks: parts[0].blocks || [] }));
+    for (let index = 1; index < parts.length; index++) {
+      await this.postOne({ id: `${id}:part:${index}`, channel, threadTs: original?.threadTs, ...parts[index] });
+    }
+    await this.retireParts(id, channel, original?.threadTs, parts.length, previousCount);
+    if (original) await this.store.update(state => { state.outgoing[id].partCount = parts.length; });
+    return result;
+  }
   async uploadPrompt({ id, channel, threadTs, text, filename }) {
     let previous = this.store.data.outgoing[id];
     filename = `${digest(id).slice(0, 12)}-${String(filename || 'execution-prompt.md').split(/[\\/]/).at(-1)}`;

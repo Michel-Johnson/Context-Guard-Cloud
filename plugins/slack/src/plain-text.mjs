@@ -49,3 +49,28 @@ export function plainText(source) {
   let output = slackLinks(render(lexer(input, { gfm: true }))).replace(/\n{3,}/g, '\n\n').trim();
   return output.replace(new RegExp(`${prefix}(\\d+)\u0000`, 'g'), (match, index) => literals[Number(index)] ?? match);
 }
+
+// Keep short paragraphs and code together. Oversize units split at lines,
+// then words; the final fallback protects UTF-16 pairs and never drops text.
+export function plainChunks(source, limit = 2800) {
+  const value = plainText(source) || '—', chunks = [];
+  const codeRanges = lexer(String(source || ''), { gfm: true }).filter(token => token.type === 'code')
+    .map(token => { const start = value.indexOf(token.text); return { start, end: start + token.text.length }; })
+    .filter(range => range.start >= 0 && range.end - range.start <= limit);
+  let offset = 0;
+  while (offset < value.length) {
+    let end = Math.min(value.length, offset + limit);
+    if (end < value.length) {
+      const code = codeRanges.find(range => range.start < end && range.end > end && range.start > offset);
+      if (code) end = code.start;
+      else {
+        const window = value.slice(offset, end), paragraph = window.lastIndexOf('\n\n'), line = window.lastIndexOf('\n');
+        const boundary = paragraph > 0 ? paragraph + 2 : line > 0 ? line + 1 : window.lastIndexOf(' ') > 0 ? window.lastIndexOf(' ') + 1 : window.length;
+        end = offset + boundary;
+      }
+      if (/^[\uDC00-\uDFFF]$/.test(value[end]) && /^[\uD800-\uDBFF]$/.test(value[end - 1])) end--;
+    }
+    chunks.push(value.slice(offset, end)); offset = end;
+  }
+  return chunks;
+}

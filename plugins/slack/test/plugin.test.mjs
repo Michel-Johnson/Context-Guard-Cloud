@@ -8,8 +8,11 @@ import { SlackPlugin, envelopeId } from '../src/plugin.mjs';
 import { SlackIO, UncertainDelivery } from '../src/slack-io.mjs';
 import { Gateway } from '../src/gateway.mjs';
 import { homeView, formValues, messageBlocks, approvalBlocks } from '../src/views.mjs';
-import { plainText } from '../src/plain-text.mjs';
+import { plainText, plainChunks } from '../src/plain-text.mjs';
 import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
+import { startIntegrationGateway } from '../../../scripts/cloud/integration-gateway.mjs';
+import { CoordinatorService } from '../../../scripts/cloud/coordinator-service.mjs';
+import { IntegrationAttachmentStore } from '../../../scripts/cloud/integration-attachments.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 
@@ -85,7 +88,7 @@ test('Completed node presentations render plain Slack links from the trusted pro
   assert.ok(links.every(block => block.elements.length <= 5));
   assert.ok(links.flatMap(block => block.elements).every(button => button.text.text.length <= 75));
   const overflow = messageBlocks({ text: '段'.repeat(110000), actions: [{ kind: 'node-tour', nodes: Array.from({ length: 70 }, (_, index) => ({ id: `N${index}`, title: `节点${index}` })) }] }, 'thread', context);
-  assert.ok(overflow.length <= 49);
+  assert.ok(overflow.length > 49, 'Transport splits long presentations instead of dropping their tail');
   assert.equal(overflow.filter(block => block.type === 'actions').flatMap(block => block.elements).filter(button => button.url.includes('relation=')).length, 60);
   assert.ok(overflow.some(block => block.elements?.some(element => element.type === 'plain_text' && element.text.includes('还有 10 个'))));
   assert.equal(overflow.find(block => block.type === 'actions' && block.elements[0].action_id === 'map_all').elements[0].url, 'https://map.example.com/projects/test-project');
@@ -112,8 +115,11 @@ test('plugin lockfile is portable outside the developer registry', async () => {
 const project = { id: 'lab', name: 'Lab', version: 'v1', map: { id: 'T0', title: 'Root', children: [{ id: 'login', title: '登录', todos: [{ id: 'TD1', title: 'refresh', status: 'pending' }], bugs: [], memories: [{ text: '现有记忆' }], children: [] }] }, sessions: [{ id: 'session-1', status: 'running' }] };
 async function fixture(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-'));
-  t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = await new Store(directory).open(), calls = [], sent = [];
+  const receive = store.receive.bind(store);
+  // Existing lifecycle cases flush immediately; collection timing has separate
+  // tests using the real default deadlines and persisted journal below.
+  store.receive = (id, envelope, options = { collectMs: 0, maxCollectMs: 0 }) => receive(id, envelope, options);
   const gateway = { async command(type, args) {
     calls.push({ type, ...args });
     if (type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
@@ -128,11 +134,326 @@ async function fixture(t) {
   } };
   const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
     async download() { return { filename: 'screen.png', mimeType: 'image/png', base64: 'aGVsbG8=' }; }, async uploadPrompt(input) { sent.push({ export: input }); } };
-  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, logger: { warn() {}, error() {} } });
+  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} } });
+  t.after(async () => { await plugin.stop(); await fs.rm(directory, { recursive: true, force: true }); });
   return { plugin, store, gateway, io, calls, sent, directory };
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
 function formBody(draftId, values) { return { type: 'view_submission', user: { id: user }, view: { private_metadata: draftId, state: { values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value: { value } }])) } } }; }
+
+test('durable collection merges other-bot request and unmentioned correction once across restart', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const options = { collectMs: 800, maxCollectMs: 2000 };
+  const messages = [event({ ts: '300.001', text: '<@UOTHER> 修复登录', files: [{ id: 'F1' }] }),
+    event({ ts: '300.002', text: 'Coordinator 帮我跟进，先只整理验收' })];
+  for (const item of messages) await f.store.receive(envelopeId('events_api', { team_id: teamId, event: item }), { type: 'events_api', body: { team_id: teamId, event: item } }, options);
+  const ids = Object.keys(f.store.data.inbox), batch = f.store.data.messageBatches[ids[0]];
+  assert.deepEqual(batch.ids, ids); assert.ok(batch.readyAt <= batch.deadline); assert.equal(batch.deadline - batch.firstAt, 2000);
+  f.plugin.stopped = false; f.plugin.kick = () => {};
+  await f.plugin.tick(); assert.equal(f.calls.length, 0, 'Do not classify the first message before the correction window closes');
+  const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
+  await reopened.update(state => { state.messageBatches[ids[0]].readyAt = Date.now() - 1; });
+  await f.plugin.tick();
+  await Promise.all([...f.plugin.processing.values()]);
+  const judgments = f.calls.filter(call => call.type === 'conversation.relevance'), submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(judgments.length, 1); assert.deepEqual(judgments[0].payload.inputs.map(item => item.text), messages.map(item => item.text));
+  assert.equal(submits.length, 1); assert.deepEqual(submits[0].payload.inputs.map(item => item.text), messages.map(item => item.text));
+  assert.equal(submits[0].payload.inputs[0].attachments.length, 1); assert.equal(submits[0].payload.inputs[1].attachments, undefined);
+  assert.ok(ids.every(id => reopened.data.inbox[id].status === 'done'));
+  assert.equal(await reopened.receive(ids[0], { type: 'events_api', body: { team_id: teamId, event: messages[0] } }), false);
+  await f.plugin.tick(); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
+  await f.plugin.stop();
+});
+
+test('collection keeps different senders receivers projects and explicit threads separate and caps batch size', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const add = async (id, extra) => f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: event({ ts: `400.${id}`, ...extra }) } }, { collectMs: 800, maxCollectMs: 2000 });
+  await add('1', { text: '<@UOTHER> first' }); await add('2', { text: '<@UANOTHER> second' });
+  await add('3', { text: 'ambiguous unmentioned' }); await add('4', { text: 'another user', user: 'U000002' });
+  await add('5', { text: 'explicit thread', thread_ts: '399.001' });
+  await f.store.update(state => { state.channels[channel] = 'other-project'; }); await add('6', { text: 'different project' });
+  assert.equal(new Set(Object.values(f.store.data.inbox).map(item => item.batchId)).size, 6);
+  for (let index = 0; index < 21; index++) await add(`x${index}`, { text: 'same receiver', thread_ts: '398.001' });
+  const batches = Object.values(f.store.data.messageBatches).filter(batch => batch.rootTs === '398.001');
+  assert.deepEqual(batches.map(batch => batch.ids.length), [20, 1]);
+});
+
+test('receive queued before freeze is included in the atomic snapshot and cannot remain stranded', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const envelope = text => ({ type: 'events_api', body: { team_id: teamId, event: event({ text }) } });
+  const options = { collectMs: 800, maxCollectMs: 2000 };
+  await f.store.receive('a', envelope('first'), options);
+  let release; const held = new Promise(resolve => { release = resolve; });
+  const write = f.store.update(async () => { await held; });
+  const receiveB = f.store.receive('b', envelope('correction'), options);
+  const running = f.plugin.runEntry('a', f.store.data.inbox.a);
+  release(); await write; await receiveB; await running;
+  const submit = f.calls.find(call => call.type === 'conversation.submit');
+  assert.deepEqual(submit.payload.inputs.map(input => input.text), ['first', 'correction']);
+  assert.equal(f.store.data.inbox.a.status, 'done'); assert.equal(f.store.data.inbox.b.status, 'done');
+});
+
+test('single plugin input crosses real HTTP gateway and Coordinator service with independent batch receipt', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'coordinator'), system: 'Test Coordinator', tools: [], execute: async () => {},
+    model: { next: async () => ({ stop: 'end_turn', content: [{ type: 'text', text: '收到单条原文' }] }) } });
+  const token = 'synthetic-plugin-http-test-credential-123456'; let submitted;
+  const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token, teamId, projectIds: ['lab'] }, stateDir: path.join(f.directory, 'gateway'),
+    state: async () => ({ ...(await service.state()), conversationId: 'chat-real-http' }),
+    command: async (input, context) => {
+      if (input.type === 'conversation.relevance') return { respond: true, mainVersion: 'v1' };
+      if (input.type === 'conversation.create') return { conversationId: 'chat-real-http' };
+      if (input.type === 'conversation.submit') { submitted = input; return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      if (input.type === 'conversation.state') return { ...(await service.state()), conversationId: 'chat-real-http' };
+      return {};
+    } });
+  try {
+    f.plugin.gateway = new Gateway({ url: server.url, token, teamId });
+    await f.plugin.message('single-http', event({ text: '请原样记录我的输入' })); await service.close();
+    assert.notEqual(submitted.id, submitted.payload.inputs[0].id);
+    const state = await service.state(); assert.ok(state.acceptedRequestIds.includes(submitted.payload.inputs[0].id));
+    const binding = Object.values(f.store.data.threads)[0]; assert.equal(binding.awaitingReplyId, submitted.payload.inputs[0].id);
+    await f.plugin.mirror(Object.keys(f.store.data.threads)[0]); assert.equal(Object.values(f.store.data.threads)[0].awaitingReplyId, undefined);
+  } finally { await server.close(); await service.close({ stop: true }); }
+});
+
+test('continuous arrivals do not extend collection beyond two seconds or cross its next window', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const original = Date.now; let now = original(); Date.now = () => now;
+  try {
+    const add = id => f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: event({ ts: `600.${id}`, text: 'more' }) } }, { collectMs: 800, maxCollectMs: 2000 });
+    await add('first'); const deadline = f.store.data.messageBatches.first.deadline;
+    now += 700; await add('second'); now += 700; await add('third'); now += 599; await add('fourth');
+    assert.equal(f.store.data.messageBatches.first.readyAt, deadline); assert.equal(f.store.data.messageBatches.first.deadline, deadline);
+    now += 1; await add('fifth'); assert.equal(f.store.data.inbox.fifth.batchId, 'fifth');
+    assert.equal(f.store.data.messageBatches.fifth.rootTs, '600.fifth');
+  } finally { Date.now = original; }
+});
+
+test('frozen batch replays the same original IDs and retains every member on lost reply', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  // Deliberately deliver the newer correction first; native timestamps determine
+  // semantic order inside the frozen batch, not Socket delivery order.
+  for (const [id, ts, text] of [['late', '700.002', 'new correction'], ['early', '700.001', 'original request']]) {
+    await f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: event({ ts, text }) } }, { collectMs: 800, maxCollectMs: 2000 });
+  }
+  const command = f.gateway.command, submissions = []; let lost = true;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.submit') { submissions.push(structuredClone(input)); if (lost) { lost = false; throw new TypeError('reply lost'); } }
+    return command(type, input);
+  };
+  await f.plugin.runEntry('late', f.store.data.inbox.late); assert.equal(f.store.data.inbox.late.status, 'pending'); assert.equal(f.store.data.inbox.early.status, 'pending');
+  const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
+  await f.plugin.runEntry('late', reopened.data.inbox.late);
+  assert.deepEqual(submissions[0], submissions[1]);
+  assert.deepEqual(submissions[1].payload.inputs.map(input => input.text), ['original request', 'new correction']);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 1);
+  assert.equal(reopened.data.inbox.early.status, 'done'); assert.equal(reopened.data.inbox.late.status, 'done');
+});
+
+test('a second top-level batch inherits only the original two-second conversation window', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const original = Date.now; let now = original(); Date.now = () => now;
+  try {
+    const add = id => f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: event({ ts: `800.${id}`, text: 'more' }) } }, { collectMs: 800, maxCollectMs: 2000 });
+    await add('first'); const deadline = f.store.data.messageBatches.first.deadline;
+    await f.store.update(state => { state.messageBatches.first.frozen = true; });
+    now += 900; await add('second');
+    assert.equal(f.store.data.messageBatches.second.rootTs, '800.first'); assert.equal(f.store.data.messageBatches.second.deadline, deadline);
+    now += 1101; await add('third'); assert.equal(f.store.data.messageBatches.third.rootTs, '800.third');
+  } finally { Date.now = original; }
+});
+
+test('slow identity lookup has one-second bounded wait eight real in-flight slots and shutdown cleanup', async t => {
+  const f = await fixture(t); let release, calls = 0; const held = new Promise(resolve => { release = resolve; });
+  f.io.identity = async id => { calls++; await held; return { user: { id, is_bot: true } }; };
+  const started = Date.now();
+  const routing = await f.plugin.mentionRoute('slow-identities', event({ text: Array.from({ length: 8 }, (_, index) => `<@UOTHER${index}>`).join(' ') }));
+  assert.ok(Date.now() - started < 1800); assert.equal(calls, 8); assert.equal(f.plugin.identityTasks.size, 8);
+  assert.ok(routing.mentionedUsers.every(user => user.isBot === null));
+  await f.plugin.mentionRoute('capacity', event({ text: '<@UNEW> more' })); assert.equal(calls, 8);
+  await f.plugin.mentionRoute('cached-null', event({ text: '<@UOTHER0> more' })); assert.equal(calls, 8);
+  let stopped = false; const stopping = f.plugin.stop().then(() => { stopped = true; }); await Promise.resolve(); assert.equal(stopped, false);
+  release(); await stopping; assert.equal(f.plugin.identityTasks.size, 0);
+});
+
+test('private top-level inputs reuse a durable current conversation and start-chat creates a new one', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
+  await f.plugin.message('dm1', event({ channel: 'D000001', ts: '500.001', text: 'first' }));
+  await f.plugin.message('dm2', event({ channel: 'D000001', ts: '500.002', text: 'correction' }));
+  assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
+  const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
+  await f.plugin.message('dm3', event({ channel: 'D000001', ts: '500.003', text: 'after restart' }));
+  assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
+  await f.plugin.message('new-chat', event({ channel: 'D000001', ts: 'command-fresh', type: 'app_mention', text: 'new conversation' }));
+  await f.plugin.message('dm4', event({ channel: 'D000001', ts: '500.004', text: 'follow new' }));
+  assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 2);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit'); assert.equal(submits.at(-1).conversationId, submits.at(-2).conversationId);
+});
+
+test('unmentioned short DM answer uses the real current conversation and retains protected attachment identity through HTTP', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
+  const attachments = new IntegrationAttachmentStore({ directory: path.join(f.directory, 'attachments') });
+  let turns = 0; const decisions = [], submissions = [], reads = [];
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'coordinator'), system: 'Test Coordinator', tools: [], execute: async () => {},
+    resolveAttachment: id => attachments.resolve({ teamId, projectId: 'lab', id }), model: { next: async ({ system }) => {
+      if (system.includes('附件阅读轮次')) return { stop: 'end_turn', content: [{ type: 'text', text: '附件内有引用他人Bot的资料。' }] };
+      return { stop: 'end_turn', content: [{ type: 'text', text: ++turns === 1 ? '你选择答案A还是答案B？' : '已记录答案B。' }] };
+    } } });
+  const token = 'synthetic-private-context-http-credential-123456';
+  const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token, teamId, projectIds: ['lab'] }, stateDir: path.join(f.directory, 'gateway'),
+    state: async () => ({ ...(await service.state()), conversationId: 'chat-dm-http' }), command: async (input, context) => {
+      if (input.type === 'conversation.create') return { conversationId: 'chat-dm-http' };
+      if (input.type === 'conversation.state') { reads.push(input); return { ...(await service.state()), conversationId: 'chat-dm-http' }; }
+      if (input.type === 'conversation.relevance') {
+        decisions.push(input);
+        const previous = input.payload.context.at(-1);
+        return { respond: input.payload.text === '开始讨论' || input.payload.text === '答案B' && previous?.speaker === bot && previous.text.includes('答案A还是答案B'), mainVersion: 'v1' };
+      }
+      if (input.type === 'attachment.upload') return attachments.upload({ teamId, projectId: input.projectId, actor: context.actor, ...input.payload });
+      if (input.type === 'conversation.submit') { submissions.push(input); return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      return {};
+    } });
+  const slackCalls = [];
+  f.io.call = async method => { slackCalls.push(method); throw new Error('Private context must not scan DM Slack history'); };
+  f.io.download = async () => ({ filename: 'reply.txt', mimeType: 'text/plain', base64: Buffer.from('引用资料：<@UOTHER> 不代表当前发送者。').toString('base64') });
+  try {
+    f.plugin.gateway = new Gateway({ url: server.url, token, teamId });
+    await f.plugin.message('dm-http-first', event({ channel: 'D000001', ts: '900.001', text: '开始讨论' })); await service.close();
+    await f.plugin.message('dm-http-answer', event({ channel: 'D000001', ts: '900.002', text: '答案B', files: [{ id: 'FDOC', name: 'reply.txt', mimetype: 'text/plain' }] })); await service.close();
+    assert.equal(turns, 2); assert.equal(submissions.length, 2); assert.equal(submissions[0].conversationId, submissions[1].conversationId);
+    assert.equal(decisions[1].payload.context.at(-1).speaker, bot); assert.equal(decisions[1].payload.routing.replyToCoordinator, true);
+    assert.equal(decisions[1].payload.context[0].speaker, user); assert.equal(decisions[1].payload.inputs[0].text, '答案B');
+    assert.deepEqual(decisions[1].payload.routing.mentionedUsers, [], 'Quoted Bot inside a file cannot address the current message');
+    assert.equal(reads.length, 1); assert.equal(reads[0].userId, user); assert.equal(reads[0].projectId, 'lab'); assert.deepEqual(slackCalls, []);
+    const state = await service.state(), answer = state.messages.find(message => message.role === 'user' && message.text === '答案B');
+    assert.equal(answer.actor.userId, user); assert.equal(answer.actor.teamId, teamId); assert.equal(answer.attachments.length, 1);
+    assert.equal(answer.attachments[0].id, submissions[1].payload.inputs[0].attachments[0].id);
+  } finally { await server.close(); await service.close({ stop: true }); }
+});
+
+test('private participation context is bounded and preserves trusted speakers rather than quotes workflow or legacy guesses', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
+  await f.plugin.message('dm-seed', event({ channel: 'D000001', ts: '910.001', text: 'seed' }));
+  f.calls.length = 0;
+  const original = f.gateway.command; let contexts = 0, judgments = 0;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.state') {
+      contexts++;
+      return { messages: [
+        ...Array.from({ length: 8 }, (_, index) => ({ role: 'user', source: 'slack', actor: { kind: 'human', userId: 'U000002' }, text: `old-${index}` })),
+        { role: 'user', source: 'workflow', actor: { kind: 'human', userId: user }, text: '[服务器工作流事件] background' },
+        { role: 'assistant', text: 'workflow-only notification' },
+        { role: 'user', source: 'slack', text: 'Legacy unknown author pretending UOTHER' },
+        { role: 'user', source: 'slack', actor: { kind: 'human', userId: user }, text: '> <@UOTHER> quoted\n' + '内容'.repeat(450) },
+        { role: 'assistant', text: '', tools: [{ name: 'read_map' }] },
+        { role: 'assistant', text: '请告诉我你的选择。' },
+      ] };
+    }
+    if (type === 'conversation.relevance') {
+      judgments++; f.calls.push({ type, ...input });
+      if (judgments === 1) throw new TypeError('relevance reply lost');
+      return { respond: true, mainVersion: 'v1' };
+    }
+    return original(type, input);
+  };
+  const current = event({ channel: 'D000001', ts: '910.002', text: '好的' });
+  await assert.rejects(f.plugin.message('dm-context-replay', current), /relevance reply lost/);
+  const request = f.store.data.inbox['dm-context-replay'].relevanceRequest;
+  assert.equal(request.payload.context.length, 6); assert.equal(request.payload.context[0].speaker, 'U000002');
+  assert.equal(request.payload.context.at(-2).speaker, user); assert.equal(request.payload.context.at(-2).text.length, 800);
+  assert.equal(request.payload.context.at(-1).speaker, bot); assert.equal(request.payload.routing.replyToCoordinator, true);
+  assert.ok(request.payload.context.every(item => !/workflow|Legacy/.test(item.text)));
+  await f.plugin.message('dm-context-replay', current);
+  assert.equal(contexts, 1); assert.deepEqual(f.calls.filter(call => call.type === 'conversation.relevance').map(call => call.payload), [request.payload, request.payload]);
+});
+
+test('native DM thread context has priority over current-conversation state', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
+  await f.plugin.message('dm-native-seed', event({ channel: 'D000001', ts: '920.001', text: 'seed' }));
+  f.calls.length = 0; f.io.call = async method => { assert.equal(method, 'conversations.replies'); return { messages: [{ ts: '920.001', user: bot, text: '真实Slack线程问题' }] }; };
+  await f.plugin.message('dm-native-answer', event({ channel: 'D000001', ts: '920.002', thread_ts: '920.001', text: '继续' }));
+  const request = f.calls.find(call => call.type === 'conversation.relevance'); assert.deepEqual(request.payload.context, [{ speaker: bot, text: '真实Slack线程问题' }]);
+  assert.equal(f.calls.some(call => call.type === 'conversation.state'), false);
+});
+
+test('plain section boundaries preserve paragraphs code and emoji and transport delivers every section once', async t => {
+  const f = await fixture(t), code = 'const value = 1;\n'.repeat(80), text = '段落。'.repeat(750) + '\n\n```js\n' + code + '```\n\n' + '末尾🙂'.repeat(5000);
+  const chunks = plainChunks(text); assert.equal(chunks.join(''), plainText(text)); assert.ok(chunks.some(chunk => chunk.includes(code)));
+  assert.ok(chunks.every(chunk => chunk.length <= 2800 && !/^[\uDC00-\uDFFF]/.test(chunk) && !/[\uD800-\uDBFF]$/.test(chunk)));
+  const calls = [], io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: `${calls.length}.0` }; } } });
+  const blocks = messageBlocks({ text }, 'thread');
+  const ts = await io.post({ id: 'long-answer', channel, threadTs: '1.0', text, blocks });
+  assert.equal(calls.filter(call => call.method === 'chat.postMessage').flatMap(call => call.args.blocks).map(block => block.text?.text || '').join(''), plainText(text));
+  assert.ok(calls.every(call => call.args.blocks.length <= 49 && call.args.text.length < 40000));
+  const count = calls.length; await io.post({ id: 'long-answer', channel, threadTs: '1.0', text, blocks }); assert.equal(calls.length, count);
+  await io.update(channel, ts, '简短的新回复', messageBlocks({ text: '简短的新回复' }, 'thread'));
+  assert.equal(calls.filter(call => call.method === 'chat.update').length, count, 'Retire every old continuation after a stream shrinks');
+});
+
+async function uncertainMultipart(t) {
+  const f = await fixture(t), remote = new Map(), calls = [];
+  let visible = false, losePost = true, loseUpdate = false;
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    calls.push({ method, args: structuredClone(args) });
+    if (method === 'chat.postMessage') {
+      const ts = `${remote.size + 100}.0`; remote.set(ts, { ...structuredClone(args), user: bot, ts });
+      if (args.metadata.event_payload.id === 'multipart:part:1' && losePost) { losePost = false; throw new Error('Post response lost after delivery'); }
+      return { ts };
+    }
+    if (method === 'conversations.replies') return { messages: visible ? [...remote.values()] : [] };
+    if (method === 'chat.update') {
+      Object.assign(remote.get(args.ts), structuredClone(args));
+      if (args.ts === '101.0' && loseUpdate) { loseUpdate = false; throw new TypeError('Update response lost after application'); }
+      return { ts: args.ts };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  } } });
+  const initial = '首段。'.repeat(2500) + '\n\n' + '旧续段。'.repeat(2500);
+  await assert.rejects(io.post({ id: 'multipart', channel, threadTs: '1.0', text: initial, blocks: messageBlocks({ text: initial }, 'thread') }), UncertainDelivery);
+  return { ...f, io, remote, calls, show: () => { visible = true; }, loseUpdate: () => { loseUpdate = true; } };
+}
+
+test('unknown and sending multipart continuations reconcile then update the latest stream across lost update replies', async t => {
+  for (const status of ['unknown', 'sending']) {
+    const f = await uncertainMultipart(t);
+    await f.store.update(state => { state.outgoing['multipart:part:1'].status = status; });
+    f.show(); f.loseUpdate();
+    const text = '新首段。'.repeat(1800) + '\n\n' + '修订后续段。'.repeat(2200), blocks = messageBlocks({ text }, 'thread');
+    const priorHash = f.store.data.outgoing['multipart:part:1'].hash;
+    await assert.rejects(f.io.update(channel, '100.0', text, blocks), /Update response lost/);
+    assert.equal(f.store.data.outgoing['multipart:part:1'].hash, priorHash, 'A lost update receipt cannot claim the new contents were acknowledged');
+    await f.io.update(channel, '100.0', text, blocks); await f.io.update(channel, '100.0', text, blocks);
+    assert.equal(f.calls.filter(call => call.method === 'chat.postMessage' && call.args.metadata.event_payload.id === 'multipart:part:1').length, 1);
+    const actual = [...f.remote.values()].sort((a, b) => Number(a.ts) - Number(b.ts)).filter(message => message.text !== '此部分已纳入更新后的回复。')
+      .flatMap(message => message.blocks || []).map(block => block.text?.text || '').join('');
+    assert.equal(actual, plainText(text));
+    assert.ok(f.calls.some(call => call.method === 'chat.update' && call.args.ts === '101.0'));
+    assert.notEqual(f.store.data.outgoing['multipart:part:1'].hash, priorHash);
+  }
+});
+
+test('shrinking an uncertain multipart response retains uncertainty and part count until the original continuation is found', async t => {
+  const f = await uncertainMultipart(t), count = f.store.data.outgoing.multipart.partCount;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await assert.rejects(f.io.update(channel, '100.0', '短回复', messageBlocks({ text: '短回复' }, 'thread')), UncertainDelivery);
+    assert.equal(f.store.data.outgoing.multipart.partCount, count); assert.equal(f.store.data.outgoing['multipart:part:1'].status, 'unknown');
+  }
+  f.show(); await f.io.update(channel, '100.0', '短回复', messageBlocks({ text: '短回复' }, 'thread'));
+  assert.equal(f.remote.get('101.0').text, '此部分已纳入更新后的回复。'); assert.deepEqual(f.remote.get('101.0').blocks, []);
+  assert.equal(f.store.data.outgoing.multipart.partCount, 1);
+  assert.equal(f.calls.filter(call => call.method === 'chat.postMessage').length, 2, 'Neither uncertainty nor shrink allocates a replacement message');
+});
+
+test('post retry with changed stream contents updates known timestamps and retires uncertain old parts', async t => {
+  const f = await uncertainMultipart(t); f.show();
+  await f.io.post({ id: 'multipart', channel, threadTs: '1.0', text: '修订后的短回复', blocks: messageBlocks({ text: '修订后的短回复' }, 'thread') });
+  assert.equal(f.remote.get('100.0').text, '修订后的短回复'); assert.equal(f.remote.get('101.0').text, '此部分已纳入更新后的回复。');
+  assert.equal(f.store.data.outgoing.multipart.partCount, 1); assert.equal(f.calls.filter(call => call.method === 'chat.postMessage').length, 2);
+  const before = f.calls.length;
+  for (const extra of [{ channel: 'C000002' }, { threadTs: '2.0' }]) await assert.rejects(f.io.post({ id: 'multipart', channel, threadTs: '1.0', text: 'wrong destination', ...extra }), error => error.code === 'ID_REUSED');
+  assert.equal(f.calls.length, before, 'Destination mismatch fails before reconciliation or any write');
+});
 
 test('journal is durable before ack; duplicate envelopes remain one pending entry', async t => {
   const f = await fixture(t), body = { team_id: teamId, event_id: 'E1', event: event() }; let acknowledged = 0;
@@ -187,7 +508,7 @@ test('unbound explicit message offers clickable projects and resumes its origina
   await runPluginCycle(f.plugin);
   assert.equal(f.store.data.channels[channel], 'lab');
   const submitted = f.calls.find(call => call.type === 'conversation.submit');
-  assert.equal(submitted.userId, user); assert.equal(submitted.payload.text, '登录刷新有 Bug，请分析');
+  assert.equal(submitted.userId, user); assert.equal(submitted.payload.inputs[0].text, `<@${bot}> 登录刷新有 Bug，请分析`);
   assert.equal(Object.values(f.store.data.threads)[0].threadTs, original.ts);
   assert.ok(f.sent.some(input => input.update?.[2].includes('已关联 Lab')));
   assert.ok(f.sent.some(input => input.method === 'views.publish'));
@@ -212,7 +533,7 @@ test('unbound DM offers projects and selects only the requesting users preferenc
   await f.plugin.process('dm-select', { type: 'interactive', body: projectChoice(f, 'dm-choice') });
   await runPluginCycle(f.plugin);
   assert.equal(f.store.data.preferences[user], 'lab'); assert.deepEqual(f.store.data.channels, {});
-  assert.equal(f.calls.find(call => call.type === 'conversation.submit').payload.text, '看看登录模块');
+  assert.equal(f.calls.find(call => call.type === 'conversation.submit').payload.inputs[0].text, '看看登录模块');
 });
 test('project choice rejects another user, channel, message or unoffered project without binding', async t => {
   const f = await fixture(t); await f.plugin.message('onboard', event());
@@ -272,7 +593,7 @@ test('onboarding continuation uses the normal FIFO lane through held create and 
     await f.plugin.tick(); assert.equal(f.calls.some(call => call.type === 'conversation.submit'), false);
     await f.store.update(state => { state.inbox.original.next = 0; });
     await f.plugin.tick(); await f.plugin.tick();
-    assert.deepEqual(f.calls.filter(call => call.type === 'conversation.submit').map(call => call.payload.text), ['原需求', '后续修正']);
+    assert.deepEqual(f.calls.filter(call => call.type === 'conversation.submit').map(call => call.payload.inputs[0].text), [`<@${bot}> 原需求`, `<@${bot}> 后续修正`]);
     assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
   } finally { release(); await f.plugin.stop(); }
   assert.equal(f.plugin.messageLanes.size, 0);
@@ -301,7 +622,7 @@ test('unbound slash ask resumes in the project-choice root instead of opening a 
   await runPluginCycle(f.plugin);
   assert.equal(Object.values(f.store.data.threads)[0].threadTs, promptTs);
   assert.equal(f.sent.filter(input => input.text?.startsWith('Coordinator ·')).length, 0);
-  assert.equal(f.calls.find(call => call.type === 'conversation.submit').payload.text, '原问题');
+  assert.equal(f.calls.find(call => call.type === 'conversation.submit').payload.inputs[0].text, '原问题');
   await f.store.receive('follow-up', { type: 'events_api', body: { event: event({ ts: '124.001', thread_ts: promptTs, text: `<@${bot}> 继续` }) } });
   await runPluginCycle(f.plugin);
   assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
@@ -342,7 +663,7 @@ test('stale tick snapshot cannot overwrite a project-choice lane or overtake a r
     assert.equal(f.calls.some(input => input.type === 'conversation.submit'), false);
     f.plugin.stopped = true; releaseChoice(); await select; f.plugin.stopped = false;
     await f.plugin.tick(); await f.plugin.tick();
-    assert.deepEqual(f.calls.filter(input => input.type === 'conversation.submit').map(input => input.payload.text), ['原需求', '后续修正']);
+    assert.deepEqual(f.calls.filter(input => input.type === 'conversation.submit').map(input => input.payload.inputs[0].text), [`<@${bot}> 原需求`, `<@${bot}> 后续修正`]);
   } finally { releaseHome(); releaseChoice(); await f.plugin.stop(); }
 });
 test('tracked replies reuse conversation, new roots have independent conversations', async t => {
@@ -482,7 +803,7 @@ test('slow overheard classifiers cannot block explicit messages or conversation 
   const original = f.gateway.command; let release, classifications = 0;
   const held = new Promise(resolve => { release = resolve; });
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance') { classifications++; await held; }
+    if (type === 'conversation.relevance' && !input.payload.routing.mentionedUsers.some(item => item.id === bot)) { classifications++; await held; }
     return original(type, input);
   };
   for (let index = 0; index < 3; index++) await f.store.receive(`indirect-${index}`, { type: 'events_api', body: {
@@ -494,7 +815,7 @@ test('slow overheard classifiers cannot block explicit messages or conversation 
     assert.equal(classifications, 2); assert.equal(f.plugin.classifying.size, 2);
     assert.equal(f.store.data.inbox['explicit-priority'].status, 'done');
     assert.equal(f.store.data.inbox['indirect-2'].status, 'pending');
-    assert.ok(f.calls.some(call => call.type === 'conversation.submit' && call.payload.text === 'direct'));
+    assert.ok(f.calls.some(call => call.type === 'conversation.submit' && call.payload.inputs[0].text === `<@${bot}> direct`));
     assert.ok(f.calls.some(call => call.type === 'conversation.state'));
   } finally {
     const stopping = f.plugin.stop(); release(); await stopping;
@@ -612,7 +933,7 @@ test('a submit ACK racing an older mirror snapshot resets its next poll atomical
     const original = f.gateway.command; let release, entered, requestId, accepted = false, reads = 0;
     const held = new Promise(resolve => { release = resolve; }), began = new Promise(resolve => { entered = resolve; });
     f.gateway.command = async (type, args) => {
-      if (type === 'conversation.submit') { requestId = args.id; entered(); await held; accepted = true; return { accepted: true }; }
+      if (type === 'conversation.submit') { requestId = args.payload.inputs?.at(-1)?.id || args.id; entered(); await held; accepted = true; return { accepted: true }; }
       if (type === 'conversation.state') { reads++; return { status: 'waiting-for-user', activeTurnId: null,
         acceptedRequestIds: accepted ? [requestId] : ['old-request'], messages: accepted
           ? [{ id: 'new-answer', requestId, role: 'assistant', text: '新轮次答案' }] : [], approvals: [] }; }
@@ -635,13 +956,14 @@ test('a submit ACK racing an older mirror snapshot resets its next poll atomical
 test('same-thread corrections and explicit replies cannot overtake an earlier classification or BUSY retry', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('seed', event());
-  const original = f.gateway.command; let release, busy = true, judgments = 0;
+  const original = f.gateway.command; let release, entered, busy = true, judgments = 0;
+  const classified = new Promise(resolve => { entered = resolve; });
   const held = new Promise(resolve => { release = resolve; }), submitted = [];
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance') { judgments++; if (input.payload.text === '原需求') await held; }
+    if (type === 'conversation.relevance') { judgments++; entered(); if (input.payload.text === '原需求') await held; }
     if (type === 'conversation.submit') {
-      if (input.payload.text === '原需求' && busy) { busy = false; throw Object.assign(new Error('Busy'), { code: 'BUSY' }); }
-      submitted.push(input.payload.text);
+      if (input.payload.inputs[0].text === '原需求' && busy) { busy = false; throw Object.assign(new Error('Busy'), { code: 'BUSY' }); }
+      submitted.push(input.payload.inputs[0].text);
     }
     return original(type, input);
   };
@@ -651,7 +973,7 @@ test('same-thread corrections and explicit replies cannot overtake an earlier cl
   // Manually advance cycles while retaining the real journal and runEntry.
   f.plugin.kick = () => {}; f.plugin.stopped = false;
   try {
-    await f.plugin.tick(); const first = f.plugin.processing.get('first');
+    await f.plugin.tick(); const first = f.plugin.processing.get('first'); await classified;
     assert.equal(judgments, 1); assert.deepEqual(submitted, []);
     release(); await first;
     assert.equal(f.store.data.inbox.first.status, 'pending');
@@ -661,7 +983,7 @@ test('same-thread corrections and explicit replies cannot overtake an earlier cl
     assert.deepEqual(submitted, ['原需求']);
     await f.plugin.tick(); await Promise.all([...f.plugin.processing.values()]);
     assert.deepEqual(submitted, ['原需求', '修正']);
-    await f.plugin.tick(); assert.deepEqual(submitted, ['原需求', '修正', '最后确认']);
+    await f.plugin.tick(); assert.deepEqual(submitted, ['原需求', '修正', `<@${bot}> 最后确认`]);
   } finally { release(); await f.plugin.stop(); }
   assert.equal(f.plugin.messageLanes.size, 0);
 });
@@ -682,7 +1004,7 @@ test('BUSY replay preserves original gateway operation ID and received record', 
 });
 test('attachments are uploaded before turn submission with only protected references', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; }); await f.plugin.message('E1', event({ files: [{ id: 'F1' }] }));
-  assert.deepEqual(f.calls.find(call => call.type === 'conversation.submit').payload.attachments, [{ id: 'attachment-1' }]);
+  assert.deepEqual(f.calls.find(call => call.type === 'conversation.submit').payload.inputs[0].attachments, [{ id: 'attachment-1' }]);
   assert.ok(f.calls.findIndex(call => call.type === 'attachment.upload') < f.calls.findIndex(call => call.type === 'conversation.submit'));
 });
 test('total images over 5MiB and more than 6 files reject before uploading or submitting', async t => {
@@ -710,7 +1032,7 @@ test('Home TODO Bug memory and existing-item entrypoints start natural conversat
     await runPluginCycle(f.plugin);
     assert.equal(f.sent.some(input => input.method === 'views.open'), false);
     assert.equal(f.calls.some(input => input.type === 'map.write'), false);
-    assert.ok(f.calls.find(input => input.type === 'conversation.submit').payload.text.includes('讨论'));
+    assert.ok(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].text.includes('讨论'));
     assert.equal(f.store.data.drafts.existing.text, 'Existing unsent draft');
     assert.equal(Object.keys(f.store.data.threads).length, 1);
   }
@@ -724,7 +1046,7 @@ test('global TODO shortcut prompts project choice then continues as a DM convers
   assert.equal(f.calls.some(input => input.type === 'conversation.submit'), false);
   await f.plugin.process('project-selection', { type: 'interactive', body: projectChoice(f, originalId) });
   await runPluginCycle(f.plugin);
-  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.text, '我想和你讨论一条 TODO。');
+  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].text, '我想和你讨论一条 TODO。');
   assert.equal(Object.values(f.store.data.threads)[0].channel, 'D000001');
 });
 test('plain cg command opens project choice rather than an ID binding form', async t => {
@@ -740,8 +1062,8 @@ test('natural thread reply answers the pending question with a pinned identity, 
   f.gateway.command = async (type, input) => type === 'conversation.state' ? { status: 'waiting-for-user', messages: [{ id: 'q-message', role: 'assistant', questions: [{ id: 'q1', text: '期望是什么？' }] }] } : gateway(type, input);
   await f.plugin.mirror(key);
   await f.plugin.message('answer', event({ ts: '123.002', thread_ts: '123.001', text: `<@${bot}> 先修复刷新逻辑` }));
-  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.answerTo, 'q1');
-  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.text, '先修复刷新逻辑');
+  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].answerTo, 'q1');
+  assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].text, `<@${bot}> 先修复刷新逻辑`);
   assert.equal(f.sent.some(input => input.method === 'views.open'), false);
   assert.equal(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['a', 'b'] }] }, key).some(block => block.type === 'actions'), false);
   assert.match(JSON.stringify(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['只改刷新', '完整登录'] }] }, key)), /只改刷新/);
@@ -1154,29 +1476,31 @@ test('Block Kit shows literal user text without mentions and emits versioned bri
   assert.deepEqual(formValues({ state: { values: { p: { v: { selected_option: { value: 'lab' } } } } } }), { p: 'lab' });
 });
 
-test('other bot mention is silent even in an existing thread, without models or attachments', async t => {
+test('other bot routing metadata is semantic input; a silent decision downloads no attachments', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('seed', event()); f.calls.length = 0; f.sent.length = 0;
   let identityCalls = 0;
-  f.io.call = async method => { assert.equal(method, 'users.info'); identityCalls++; return { user: { id: 'UOTHER', is_bot: true } }; };
+  f.io.call = async method => { if (method === 'conversations.replies') return { messages: [] }; assert.equal(method, 'users.info'); identityCalls++; return { user: { id: 'UOTHER', is_bot: true } }; };
+  const command = f.gateway.command;
+  f.gateway.command = async (type, input) => type === 'conversation.relevance' ? (f.calls.push({ type, ...input }), { respond: false, mainVersion: 'v1' }) : command(type, input);
   f.io.download = async () => assert.fail('misaddressed message cannot download files');
   for (let i = 0; i < 2; i++) await f.plugin.message(`other-${i}`, event({ thread_ts: '123.001', ts: `124.00${i}`, text: '<@UOTHER> fix it', files: [{ id: 'F1' }] }));
-  assert.equal(identityCalls, 1); assert.deepEqual(f.calls, []); assert.deepEqual(f.sent, []);
-  assert.equal(f.store.data.inbox['other-0'].routing.reason, 'addressed-to-other-bot');
-  const reopened = await new Store(f.directory).open(); assert.equal(reopened.data.inbox['other-1'].routing.reason, 'addressed-to-other-bot');
+  assert.equal(identityCalls, 1); assert.equal(f.calls.length, 2); assert.deepEqual(f.sent, []);
+  assert.deepEqual(f.calls[0].payload.routing.mentionedUsers, [{ id: 'UOTHER', isBot: true }]);
+  const reopened = await new Store(f.directory).open(); assert.equal(reopened.data.inbox['other-1'].relevance.respond, false);
 });
 
-test('own native mention wins when both bots are addressed; identity lookup failure stays silent', async t => {
+test('own native mention and unknown bot identities still use semantic intent; no permanent hard silence', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   let lookups = 0;
   f.io.call = async () => { lookups++; throw new Error('lookup unavailable'); };
   await f.plugin.message('both', event({ text: `<@UOTHER> <@${bot}> help` }));
-  assert.equal(lookups, 0); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
+  assert.equal(lookups, 1); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
   f.calls.length = 0;
   await f.plugin.message('unknown', event({ text: '<@UUNKNOWN> help', ts: '200.001' }));
   await f.plugin.message('unknown-again', event({ text: '<@UUNKNOWN> help', ts: '201.001' }));
-  assert.equal(lookups, 1); assert.deepEqual(f.calls, []);
-  assert.equal(f.store.data.inbox.unknown.routing.reason, 'mention-identity-unavailable');
+  assert.equal(lookups, 2); assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 2);
+  assert.deepEqual(f.store.data.inbox.unknown.routingMetadata.mentionedUsers, [{ id: 'UUNKNOWN', isBot: null }]);
 });
 
 test('identity cache is bounded and quoted own mention still uses relevance', async t => {

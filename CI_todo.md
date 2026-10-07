@@ -1,5 +1,63 @@
 # Cloud split acceptance
 
+## SLACK-NATURAL-01 · Natural participation, bursts and live steering (2026-10-08)
+
+- [x] Coordinator: approved current human intent as the participation rule;
+  mentioning another Bot is a clue, not a hard exclusion. Requirements and
+  independent test standards: `docs/slack-conversation-acceptance.md`.
+- [x] Executor (Coordinator): atomic ordered original inputs, distinct trusted
+  identity/receipts, immediate model-only steering cancellation, retained partial
+  text and started business-tool receipts. Affected steer tests passed 12/12;
+  Coordinator/multimodal/model-settings regression passed 107 with one existing
+  live-provider skip, actual exits 0. Root subsequently aligned the runtime Slack
+  paragraph instructions; final source still needs independent verification.
+- [x] Executor (gateway): bounded receiver metadata and ordered classification
+  inputs, gateway-assigned batch operator, browser/forged identity rejection,
+  unchanged Main in HTTP acceptance. Four targeted cases passed, exit 0. First
+  nested-actor request returned 409; explicit gateway validation now rejects it
+  before business handling with 400. Original failure remains recorded.
+- [x] Executor (Slack): durable collection, semantic receiver metadata,
+  original input identities and paragraph-aware presentation; Node24.19 modules
+  152/152 passed. Independent review then found two unknown-delivery multipart
+  update/retirement defects not covered by those tests. Both original probes
+  failed and remain preserved. Executor repaired them with stable timestamps,
+  acknowledged content hashes and retained uncertainty; modules155/155 passed.
+  Tester reran both original probes and three formal cases successfully.
+  Private-message participation still needs the existing conversation's trusted
+  bounded context; that follow-up is in development.
+- [ ] Independent Tester: final-source affected modules, HTTP cross-module
+  behavior, recovery and identity boundaries; separately labelled Chinese held-out
+  invitation recall >=95%, non-participation false positives <=2%, explicit cases
+  all correct. Report errors and ambiguity separately, not as silent successes.
+- [ ] Delivery: full regression, remote Required, normal Main merge, Cloud/Slack
+  release and actual running identity. Real human-authenticated Slack burst,
+  mixed-Bot/implicit-call/stop cases and readable mobile presentation remain
+  required; model substitutes or Socket readiness do not establish them.
+
+Read-only production preflight: Main c938c9d, Cloud/Slack active and Slack
+auth.test successful; actual token lacks users:read. No token or private journal
+was exported, no message sent and no runtime data changed by that preflight.
+
+One full Node24.19 regression ended exit1:396 total,393 passed,1 failed,2 existing
+separate-suite skips,360912ms. The sole failure was an old Slack instruction
+prefix assertion after paragraph instructions changed. Restore the plain-text
+prefix and verify new paragraph/list instructions; four affected cases passed.
+One browser command ended exit1 after device approval and earlier workbench
+checks: a control fixture waited for queued input after immediate steering now
+consumes it. The remaining browser/sync checks were not executed or claimed.
+Keep stop-uncertainty and partial-output assertions when adapting that fixture.
+Main subsequently advanced independently to80f8e96 (interrupted-output preservation
+and model menu); normal integration must preserve those changes before release.
+
+Real-model semantic evaluation uses independent synthetic Chinese inputs and the
+currently selected provider. Initial heldout124 identified39/40 indirect calls
+but falsely joined6/60 clear non-participation cases. A separate fresh118 set on
+an adjusted prompt identified40/40 but still falsely joined6/60. Both fail the
+2% target and remain recorded. Speaker-role evidence and ordered intent rules
+are being evaluated against another frozen independent set; none of these
+model calls create conversations or write project memory. Do not relabel seen
+regressions as new heldout acceptance or count transport errors as correct silence.
+
 ## COORDINATOR-CONTROLS-FOCUS-01 · Current-main port (2026-10-07)
 
 1. [x] Executor: empty composer ink uses the existing authenticated interrupt

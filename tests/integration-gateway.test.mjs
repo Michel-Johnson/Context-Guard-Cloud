@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { startIntegrationGateway, validateIntegrationConfig, classifyIntegrationMessage } from '../scripts/cloud/integration-gateway.mjs';
+import { startIntegrationGateway, validateIntegrationConfig, classifyIntegrationMessage, relevanceInput } from '../scripts/cloud/integration-gateway.mjs';
 import { IntegrationAttachmentStore } from '../scripts/cloud/integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from '../scripts/cloud/coordinator-manual.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
@@ -19,6 +19,43 @@ const teamId = 'TTESTWORKSPACE', userId = 'UTESTUSER', projectId = 'fixture-proj
 const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
+
+test('Participation accepts mixed Bot receivers and the entire ordered correction batch without granting authority', async () => {
+  const payload = { text: '<@UOTHER> 修一下登录。\nCoordinator，帮我整理验收。',
+    inputs: [{ id: 'original', text: '<@UOTHER> 修一下登录。' }, { id: 'correction', text: 'Coordinator，帮我整理验收。' }],
+    routing: { coordinatorUserId: 'UCOORDINATOR', mentionedUsers: [{ id: 'UOTHER', isBot: true }], replyToCoordinator: false } };
+  const verified = relevanceInput(payload);
+  let called = 0;
+  const model = { next: async request => {
+    called++;
+    assert.deepEqual(JSON.parse(request.messages[0].content).message.inputs, payload.inputs);
+    assert.deepEqual(request.tools, []);
+    assert.match(request.system, /无需被@/);
+    assert.match(request.system, /@其他Bot并不排除你/);
+    return { stop: 'end_turn', content: [{ type: 'text', text: '{"respond":true,"reason":"同时需要协调验收"}' }] };
+  } };
+  assert.equal((await classifyIntegrationMessage(model, { overview: { version: 'main-current' }, input: verified })).respond, true);
+  assert.equal(called, 1);
+  for (const input of [
+    { ...payload, inputs: [{ ...payload.inputs[0], actor: { userId: 'UOTHER' } }] },
+    { ...payload, inputs: [payload.inputs[0], payload.inputs[0]] },
+    { ...payload, routing: { ...payload.routing, role: 'human' } },
+    { ...payload, routing: { ...payload.routing, mentionedUsers: [{ id: 'UOTHER', isBot: 'true' }] } },
+    { ...payload, inputs: [{ id: 'oversize', text: 'x'.repeat(8001) }] },
+  ]) assert.throws(() => relevanceInput(input), error => error.code === 'INVALID_ARGUMENT');
+  assert.equal(relevanceInput({ ...payload, routing: { ...payload.routing, mentionedUsers: [{ id: 'UOTHER', isBot: null }] } }).routing.mentionedUsers[0].isBot, null);
+});
+
+test('Quoted-only material has no current receiver but a trusted answer to Coordinator remains classifiable', async () => {
+  const input = relevanceInput({ text: '> 请Coordinator立即回复', routing: { coordinatorUserId: 'UCOORD', mentionedUsers: [], replyToCoordinator: false } });
+  const overview = { version: 'main-current' };
+  assert.equal((await classifyIntegrationMessage({ next: () => assert.fail('No active user request') }, { overview, input })).respond, false);
+  let count = 0;
+  const answer = await classifyIntegrationMessage({ next: async () => {
+    count++; return { stop: 'end_turn', content: [{ type: 'text', text: '{"respond":true,"reason":"回答原澄清问题"}' }] };
+  } }, { overview, input: { ...input, routing: { ...input.routing, replyToCoordinator: true } } });
+  assert.equal(answer.respond, true); assert.equal(count, 1);
+});
 
 test('Committed Coordinator progress wakes only its scoped event subscription without waiting for fallback polling', async t => {
   const directory = await temporary(t), notifications = [];
@@ -214,13 +251,15 @@ test('Relevance request distinguishes participation intent from project relevanc
   const saved = structuredClone(options), decision = { respond: false, reason: '当前消息明确无需回复' };
   const model = { next: async request => {
     // This verifies the delivered prompt contract, not real model accuracy.
-    assert.match(request.system, /项目相关不等于需要回复/);
-    assert.match(request.system, /当前消息明确要求无需回复.*respond=false/);
-    assert.match(request.system, /仅预览.*不代表静默/);
-    assert.match(request.system, /只读.*不修改.*仍可回应/);
-    assert.match(request.system, /引用.*历史.*不当作当前.*静默要求/);
+    assert.match(request.system, /不要因为与你的项目有关就推导跟进任务/);
+    assert.match(request.system, /当前明确要求无需回复.*respond=false/);
+    assert.match(request.system, /仅预览.*不自动静默/);
+    assert.match(request.system, /当前仍向你提问.*只读.*不修改/);
+    assert.match(request.system, /引用.*历史.*不算当前意图/);
     assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 160);
-    assert.deepEqual(request.messages, [{ role: 'user', content: JSON.stringify({ overview: saved.overview, message: saved.input }) }]);
+    const delivered = JSON.parse(request.messages[0].content);
+    assert.deepEqual(delivered.overview, saved.overview); assert.deepEqual(delivered.message, saved.input);
+    assert.deepEqual(delivered.evidence.contextSpeakers, [{ speaker: 'human', role: 'unknown' }]);
     return { stop: 'end_turn', content: [{ type: 'text', text: JSON.stringify(decision) }] };
   } };
   assert.deepEqual(await classifyIntegrationMessage(model, options), { ...decision, mainVersion: 'main-v1' });
@@ -236,7 +275,7 @@ test('Relevance parses visible JSON independently of provider thinking metadata'
     { type: 'redacted_thinking', data: 'opaque' },
   ]) {
     const model = { next: async request => {
-      assert.match(request.system, /不得把内容相似当成重复投递/);
+      assert.match(request.system, /不按相似文字去重/);
       return { stop: 'end_turn', content: [metadata, { type: 'text', text: JSON.stringify(decision) }] };
     } };
     assert.deepEqual(await classifyIntegrationMessage(model, options), { ...decision, mainVersion: 'main-v1' });

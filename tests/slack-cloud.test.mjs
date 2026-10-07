@@ -242,6 +242,32 @@ test('relevance input, workspace, project and conversation boundaries are checke
   assert.equal(f.modelCalls.length, calls);
 });
 
+test('An atomic Slack input batch retains each original identity and rejects forged or mixed retry data', async t => {
+  const f = await fixture(t), conversation = await f.newConversation('batch-chat'), before = await f.main();
+  const inputs = [{ id: 'batch-original-1', text: '整理登录问题。' },
+    { id: 'batch-original-2', text: '补充：只列验收标准。' }];
+  const sent = await f.gateway('conversation.submit', { inputs, followup: 'steer' }, { id: 'batch-envelope', conversationId: conversation });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  const state = await f.wait(conversation, value => !value.activeTurnId && value.status === 'waiting-for-user');
+  const messages = state.messages.filter(message => message.role === 'user');
+  assert.deepEqual(messages.map(message => message.requestId), inputs.map(input => input.id));
+  assert.deepEqual(messages.map(message => message.text), inputs.map(input => input.text));
+  assert.ok(messages.every(message => message.actor.userId === userId && message.actor.teamId === teamId && message.source === 'slack'));
+  const calls = f.modelCalls.length;
+  assert.deepEqual((await f.gateway('conversation.submit', { inputs, followup: 'steer' }, { id: 'batch-envelope', conversationId: conversation })).body, sent.body);
+  assert.equal(f.modelCalls.length, calls);
+  assert.equal((await f.gateway('conversation.submit', { inputs: [{ ...inputs[0], actor: { userId: 'UOTHER' } }] }, { id: 'batch-forged', conversationId: conversation })).status, 400);
+  assert.equal((await f.gateway('conversation.submit', { inputs, text: 'replacement' }, { id: 'batch-mixed', conversationId: conversation })).status, 400);
+  assert.equal((await f.browser(conversation, { body: { id: 'batch-browser', inputs } })).status, 400);
+  const single = await f.gateway('conversation.submit', { inputs: [{ id: 'single-original', text: '再确认一下验收范围。' }], followup: 'steer' },
+    { id: 'single-envelope', conversationId: conversation });
+  assert.equal(single.status, 200, JSON.stringify(single.body));
+  const completed = await f.wait(conversation, value => !value.activeTurnId && value.acceptedRequestIds.includes('single-original'));
+  assert.equal(completed.messages.filter(message => message.requestId === 'single-original' && message.role === 'user').length, 1);
+  assert.equal(completed.acceptedRequestIds.includes('single-envelope'), false, 'Plugin must track original acceptance IDs, not the transport envelope');
+  assert.deepEqual(await f.main(), before);
+});
+
 test('Slack vision configuration cannot silently select a different model', async t => {
   const invalid = await fixture(t, { visionProvider: { model: 'wrong-image-model' } });
   const rejected = await invalid.gateway('conversation.create', { operationId: 'create-wrong-model' }, { id: 'create-wrong-model' });
