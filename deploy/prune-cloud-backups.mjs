@@ -4,9 +4,9 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const rootArchive = /^context-guard-cloud-pre-[a-z0-9-]+-20\d{6}(?:T\d{4,6}Z)?\.tar(?:\.zst)?$/i;
-const nestedArchive = /^pre-[a-z0-9-]+-20\d{6}(?:T\d{4,6}Z)?\.tar\.zst$/i;
-const nestedDirectory = /^pre-[a-z0-9-]+-20\d{6}(?:T\d{4,6}Z)?$/i;
+const rootArchive = /^context-guard-cloud-pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\d{9})Z)?\.tar(?:\.zst)?$/i;
+const nestedArchive = /^pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\d{9})Z)?\.tar(?:\.zst)?$/i;
+const nestedDirectory = /^pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\d{9})Z)?$/i;
 const keepCount = 5;
 const quietMs = 10 * 60 * 1000;
 

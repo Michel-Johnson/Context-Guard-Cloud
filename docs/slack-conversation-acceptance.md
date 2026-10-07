@@ -48,6 +48,36 @@ This plan defines work and acceptance; it does not assert implementation,
 deployment or passing results. Record each actual result as passed, failed or
 incomplete with its exact source revision and run. Preserve failed evidence.
 
+### Natural participation: receiver judgment, not mention routing
+
+The human requirement is human-like participation: Coordinator can recognize
+an explicit or implicit invitation without being mentioned. It must not interpret
+another Bot's mention as a blanket exclusion, nor answer every project message.
+Assess the whole current batch together with bounded, author-labelled context:
+
+- Participate when asked directly, when the user implicitly seeks coordination,
+  or when the current request continues Coordinator's discussion. A request to
+  another Bot can simultaneously invite Coordinator to assess, organize or help.
+- Wait when the current request belongs only to another participant, is a notice,
+  or explicitly asks Coordinator not to respond. Third-person descriptions and
+  quoted mentions do not, by themselves, identify the current receiver.
+- Ask one short question when an invitation is evident but necessary details are
+  missing. Do not turn every uncertain receiver into a clarification that
+  interrupts someone else's exchange; waiting remains appropriate when no
+  invitation is supported by the available context.
+
+Implement this policy in the existing bounded participation prompt. Later prompt
+adjustments must not require transport rewrites or accumulating hard mention and
+keyword branches. Do not add a second model round, autonomous background
+conversation, broader history access or task-execution authority for this work.
+Keep participation decisions, input collection and reliable delivery separate.
+
+Executor hands off receiver-boundary, burst/steering and rendering checks as
+numbered CI TODOs after development and affected-module tests. Tester independently
+labels a frozen semantic set, reviews the same source revision and verifies the
+user-visible result. Failed cases become regression cases; subsequent prompt
+changes require fresh held-out evidence, not relabelling or discarding failures.
+
 ### Numbered behavioral test standards
 
 | ID | Input/context | Expected result |
@@ -67,6 +97,10 @@ incomplete with its exact source revision and run. Preserve failed evidence.
 | NAT-13 | Similar text with a new original ID | Classify as a new request; do not use model-inferred semantic deduplication |
 | NAT-14 | Different people, projects, explicit threads or changed recipients | Preserve scope and receiver changes; no accidental batch or history leakage |
 | NAT-15 | Long reply with paragraphs, list, code and link; streaming to final | Readable sections; no flattening, truncation or duplicate tail; verify desktop and native phone separately |
+| NAT-16 | Mention another Bot to investigate, then implicitly ask how to coordinate verification or next steps | Coordinator contributes its coordination part without requiring its own mention; does not duplicate the other Bot's investigation |
+| NAT-17 | Identical current second-person wording with different trusted histories: Coordinator's question versus another Bot's own output | Resolve the receiver from the relevant exchange; do not always participate or always wait because of mention presence |
+| NAT-18 | A current receiver transfer or mixed invitation arrives as the final message of a short burst | Judge all current messages in order; follow the final transfer, preserve earlier requirements, and issue one final reply |
+| NAT-19 | Participation provider fails, times out or returns an invalid decision | Record a recoverable classification failure, retain the input and retry within existing limits; never claim intentional silence |
 
 Tester labels expected participation before model calls and keeps explicit,
 indirect, clear-negative and ambiguous cases separate. Include both mentioned
@@ -75,6 +109,11 @@ for the same current text. The participation rate alone is not a success metric.
 For clarification, inspect the user-visible question as well as the classifier:
 it must be brief, grounded and not request information already in the batch.
 For intentional silence, prove the input was received and decided, not dropped.
+For NAT-03/04/16/17, include native mentions, plain-text names, quotations and
+missing Bot-identity metadata. Pair the same current wording with different
+relevant histories and include explicit receiver transfers. Test both false
+positives (stealing another participant's request) and false negatives (missing
+an indirect invitation); overall reply rate cannot hide either failure.
 Thresholds below apply to the frozen held-out set. Once a case informs a prompt
 change, later evaluations of that case are regressions, not new held-out proof.
 Report invalid responses and exhausted retries separately; never count them as

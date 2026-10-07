@@ -198,6 +198,12 @@ health does not establish Slack readiness.
    Back up **business data and protected configuration** using the established
    policy. Include private memory, attachments and Slack state/receipts.
    Do not archive or copy the source checkout.
+   Before stopping either service, verify every required backup source and the
+   actual destination filesystem's available capacity. A missing optional drop-in
+   is not a missing required source. Budget apparent data size plus an explicit
+   reserve for archive overhead, dependencies and concurrent filesystem use;
+   do not assume compression will make an otherwise unsafe deployment fit.
+   Insufficient capacity must leave the running release untouched.
 2. Fetch the Cloud repository and select the exact approved release commit. Stop
    Slack before Cloud, install root production dependencies and the plugin's
    independent dependencies, then start Cloud followed by Slack.
@@ -217,6 +223,11 @@ Use Git history or the approved release artifact to redeploy a previous compatib
 version at the same entrypoint. Preserve the current business data and receipts.
 If a release requires incompatible data migration, stop for an explicit migration
 and recovery plan; a source rollback must not silently restore stale data.
+Track service stops, source changes and dependency installation separately. A
+backup failure before source/dependency changes only requires restarting services
+that were stopped and verifying the old Cloud release and initial Slack Socket
+readiness. Do not attempt Git/npm rollback for an unchanged release, overwrite
+protected configuration or report recovery solely because a process is active.
 
 ## 5. Business-data backup retention
 
@@ -231,6 +242,14 @@ they may contain the only copy of business data.
 snapshots, refuses changed inventories/symlinks, and waits ten minutes after recent
 backup changes. It does not create backups. Keep the existing backup producer
 configured for data and protected configuration.
+Both raw `.tar` and `.tar.zst` final archives are recognized. Timestamp names
+support the existing four-to-six-digit time and the producer's exact nine-digit
+`HHMMSSmmm` time. `.part` files remain excluded, not automatically deleted.
+When updating discovery rules on a host with an active `--apply` timer, inspect
+the newly recognized inventory, retained/stale lists and retained integrity first.
+Obtain authorization for any expanded deletion scope before installing the new
+script; approval to remove specific `.part` files does not authorize pruning
+complete snapshots.
 
 Install the reviewed retention script and units as **root-owned** files; never
 execute a service-writable checkout script as root:
