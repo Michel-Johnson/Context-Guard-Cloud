@@ -3621,10 +3621,11 @@ function renderDetail(){
       : "";
   const nodeFiles = fileList(node);
   const nodeFilesDetail = attachHtml("node", node.id, node, false, false);
-  const filesHtml = `<section class="sec-block" data-fold="files" data-drop-files data-fk="node" data-fi="${escAttr(node.id)}">
-      ${canUploadAttachment()?`<button type="button" class="sec-add" data-act="ask-file" data-fk="node" data-fi="${escAttr(node.id)}" title="${escAttr(t("attachTitle"))}">${t("attachments")}${nodeFiles.length?" "+nodeFiles.length:""} ＋</button>`:nodeFiles.length?`<span>${t("attachments")} ${nodeFiles.length}</span>`:""}
+  const uploadEnabled = canUploadAttachment();
+  const filesHtml = uploadEnabled || nodeFiles.length ? `<section class="sec-block" data-fold="files" data-drop-files data-fk="node" data-fi="${escAttr(node.id)}">
+      ${uploadEnabled?`<button type="button" class="sec-add" data-act="ask-file" data-fk="node" data-fi="${escAttr(node.id)}" title="${escAttr(t("attachTitle"))}">${t("attachments")}${nodeFiles.length?" "+nodeFiles.length:""} ＋</button>`:nodeFiles.length?`<span>${t("attachments")} ${nodeFiles.length}</span>`:""}
       ${nodeFilesDetail?`<div class="files-row">${nodeFilesDetail}</div>`:""}
-    </section>`;
+    </section>` : "";
   const trashBtn = canDelete && !composing && deleteAskId!==node.id
     ? `<button type="button" class="trash" data-act="delete" title="${t("delete")}" aria-label="${t("delete")}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><g class="lid"><rect x="9" y="3.2" width="6" height="1.7" rx=".7" fill="currentColor" stroke="none"/><path d="M4.5 7.1h15"/></g><g class="can"><path d="M7 7.1v12.3a1.7 1.7 0 0 0 1.7 1.7h6.6a1.7 1.7 0 0 0 1.7-1.7V7.1"/></g><g class="rib"><path d="M10 11.2v6"/><path d="M14 11.2v6"/></g></svg></button>`
     : "";

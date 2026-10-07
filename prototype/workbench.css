@@ -859,6 +859,7 @@ html.cg-phone header.top .brand{order:1;flex:1 1 0;min-width:0}
 html.cg-phone .settings-wrap{order:2;flex:0 0 auto;margin-left:0}
 html.cg-phone .top-tools{
   order:4;flex:1 1 100%;margin-left:0;min-width:0;
+  height:auto;min-height:calc(var(--chrome-btn-h) + 6px);
   overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;
   scrollbar-width:thin;padding:2px 0 4px;gap:6px 8px;
 }
@@ -942,10 +943,11 @@ html.cg-phone .drawer h2{font-size:18px}
 }
 #coordinator-panel[open]{display:flex;flex:1;flex-direction:column}
 #coordinator-panel:not([open]) { display: none; }
-#coordinator-panel > .coordinator-toolbar{display:flex;align-items:center;column-gap:12px;row-gap:0;margin:0 0 12px}
-#coordinator-panel .coordinator-heading{margin:0 auto 0 0;padding:0;border:0;background:transparent;box-shadow:none;font-size:18px;font-weight:700;cursor:pointer}
+#coordinator-panel > .coordinator-toolbar{display:flex;flex-wrap:wrap;align-items:center;column-gap:12px;row-gap:8px;margin:0 0 12px}
+#coordinator-panel .coordinator-heading{margin:0 auto 0 0;padding:0;border:0;background:transparent;box-shadow:none;font-size:18px;font-weight:700;white-space:nowrap;cursor:pointer}
 #coordinator-panel .coordinator-heading:hover,#coordinator-panel .coordinator-heading:focus{background:transparent;box-shadow:none;transform:none;text-decoration:underline}
-#coordinator-panel .coordinator-toolbar-action{display:grid;place-items:center;width:28px;height:28px;margin:0;padding:0;border:1px solid var(--line);border-radius:8px;background:transparent;box-shadow:none;color:var(--muted);font-size:16px;font-weight:700;line-height:1}
+#coordinator-panel .coordinator-toolbar-action{display:grid;place-items:center;flex-shrink:0;width:28px;height:28px;margin:0;padding:0;border:1px solid var(--line);border-radius:8px;background:transparent;box-shadow:none;color:var(--muted);font-size:16px;font-weight:700;line-height:1;white-space:nowrap}
+#coordinator-panel .coordinator-toolbar-action[hidden]{display:none}
 #coordinator-panel .coordinator-toolbar-action:hover{background:var(--module-soft);color:var(--ink);transform:none}
 #coordinator-panel .coordinator-toolbar-action:focus-visible{outline:2px solid var(--module);outline-offset:2px;background:var(--paper);color:var(--ink);transform:none}
 #coordinator-panel .coordinator-toolbar-action:active{background:var(--focus-soft);transform:scale(.96)}
@@ -1068,3 +1070,9 @@ html.cg-phone .drawer h2{font-size:18px}
 #coordinator-panel .coordinator-node-link:hover { background: #ffe87e; }
 #coordinator-panel .coordinator-node-link:focus-visible { outline: 2px solid #27624b; outline-offset: 2px; }
 @media(max-width: 520px){#coordinator-panel .coordinator-session-create form{grid-template-columns:1fr;}}
+html.cg-phone #coordinator-panel .coordinator-heading{flex-basis:100%;min-height:44px;text-align:start}
+html.cg-phone #coordinator-panel .coordinator-toolbar-action{width:44px;height:44px}
+html.cg-phone #coordinator-panel .coordinator-model-toggle{width:auto;min-width:44px}
+html.cg-phone #coordinator-panel .coordinator-recovery{min-height:44px;min-width:44px;flex-shrink:0}
+html.cg-phone #coordinator-panel .coordinator-input-shell textarea{min-height:60px;padding-inline-end:60px}
+html.cg-phone #coordinator-panel .coordinator-input-shell > .coordinator-send{width:44px;height:44px;min-height:44px}

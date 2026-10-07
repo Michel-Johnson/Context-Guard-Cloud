@@ -45,6 +45,192 @@
    controls checks, Session sync) passed, exit 0. Workbench evidence:
    output/playwright/browser-ci/cloud-1791386469287-aab84a88-d7ff-4627-9ddb-c0afc49f6a90.
 
+## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
+
+- [x] Executor: semantic integration targets Main
+  `845edb477453b16576aa8a096eba4cb321958417`, not the old `ce3b1a9b` UI.
+  Keeps the project model dialog/GET/POST/version semantics and three toolbar
+  controls; recovery stays after messages. Stop, its requests/listener/styles
+  and the old synthetic interrupt test are not restored. Applicable phone
+  title/action sizing, hidden state, 44px controls/recovery/send, composer
+  exclusion and empty attachment section fixes remain. Server/model APIs,
+  tests and manifest from PR #7 are unchanged. Existing failures/evidence below
+  are historical revisions, not acceptance for this integration.
+- [x] Executor: existing browser fixture retains original PR #7 model selection,
+  persistence and safe field assertions, adds 320/390 dialog containment/close
+  reachability, and adapts 320/390/1440 geometry to three controls, contextual
+  recovery, idle hidden state and single/multiline composition. Ordinary
+  screenshot pages keep precise page-only font fallbacks; cache/held-font
+  startup tests, screenshot waits and original timeouts remain.
+- [x] Executor: one affected `node tests/cloud-workbench-browser.mjs` run
+  75261, Node 22.18.0, actual exit 0, 47 checks. Evidence:
+  `output/playwright/browser-ci/cloud-1791385366803-a3df894f-26e6-47ef-8beb-010d7976b221/`
+  (`result.json`, `coordinator-mobile-toolbar.png`,
+  `coordinator-model-settings-mobile.png`, `coordinator-mobile-multiline.png`).
+  These three synthetic phone screenshots were visually inspected: current
+  history/model/new controls and readable model dialog, no obsolete Stop.
+  Original model choice/persistence, cache/held-font startup, attachment/memory
+  and version checks passed. The attachment share error is the unchanged
+  deliberate retry fixture. No new assertion failed on this integration run.
+  App SHA-256: `dc273a1cd086bdc850d369559aac1955028e35e1b56aaf670ae8cf94f7761c0e`.
+  CSS SHA-256: `daceb92ba5d19eab809ca5ee75d20df59bf1002aef7646f708236c1e4f250e15`.
+  Browser SHA-256: `17f4d0c42cf27e44338dc1df9dbbb72dc141c69caffdcc20d22d09edaabc8ef3`.
+  Syntax/diff checks passed; product conflict markers are gone. New Main
+  server/model APIs/tests/manifest have no diff from the exact 845 base.
+- [x] Independent Tester: reviewed exact 845 integration and ran the affected
+  formal module once on Node 22.18.0, session 97104, actual exit 0, 47 checks.
+  UTC 2026-10-07T15:07:24.3829127Z to 15:09:11.3683099Z. App/CSS/browser
+  hashes above stayed unchanged; server/model APIs, their formal tests and
+  manifest have zero diff from 845. Artifact:
+  `output/playwright/browser-ci/cloud-1791385647575-4f9d7d49-e48a-4be1-bb46-6b161e327297/`.
+  Viewed this run's phone toolbar/model-dialog/multiline screenshots: three
+  current controls, no obsolete Stop, readable/selectable model dialog with
+  reachable close/apply and composer exclusion. Model UI request/persistence,
+  contextual recovery, cache/held-font startup, prior mobile layout, attachment
+  retry, memory/Main and completion checks passed. Raw log SHA-256:
+  `12f4571789309780834423d231dcee595dc983662ee16ed8010c5bd984c77352`.
+  This is evidence for the new merge working tree, not inherited ce3 results.
+  Real Safari/physical phones, full RTL and
+  native 200% zoom remain unverified. Executor does not stage, commit, push,
+  deploy, install or change production/user data.
+
+## UI-COORDINATOR-MOBILE-01 · Historical ce3 toolbar/composer evidence (2026-10-07)
+
+This section documents the earlier ce3 implementation, including its now-removed
+Stop control. Its hashes and passing runs are retained as history only; the
+current Main model controls require UI-COORDINATOR-MOBILE-02 acceptance above.
+
+- [x] Executor: canonical toolbar action CSS now respects native `hidden`.
+  The stop text uses a non-shrinking content-sized, non-wrapping control;
+  desktop icons retain 28px visual density. Phone heading and actions occupy
+  separate rows, action/send targets are actual 44px controls, and the composer
+  reserves 60px for the send target. Explicit `bottom:auto` removes the legacy
+  competing vertical constraint. Existing stop/retry/Enter/send behavior,
+  Map/permissions and prior UI-MOBILE-LAYOUT-01 changes are preserved.
+- [x] Executor: new synthetic scenarios in the existing browser module passed
+  at 320/390 phone and 1440 desktop: idle hidden controls, running/failed-read
+  four-action containment, one original interrupt with exact turn ID, disabled
+  in-flight stop, enabled/disabled send and single/multiline input exclusion.
+  The 390px toolbar and multiline screenshots were visually inspected.
+  No private conversation text or screenshot is included in the fixture.
+- [x] Executor: final affected `node tests/cloud-workbench-browser.mjs` run
+  73734 passed, actual exit 0, 47 checks, Windows / Node 22.18.0. Evidence:
+  `output/playwright/browser-ci/cloud-1791371639220-f7c6a1b5-2327-4b49-bb26-6e469c5d91c7/`
+  (`result.json`, `coordinator-mobile-toolbar.png`,
+  `coordinator-mobile-multiline.png`, `cloud-session-edit.png`). Both new
+  phone screenshots were visually inspected. Original cache, independently
+  held-font startup, attachment retry, memory, Main and version checks passed.
+  Main-page external-font routes use local fallbacks only after the unchanged
+  warm-cache acceptance; screenshot waiting and the 35000ms budget remain.
+  The attachment share error is the existing deliberate successful retry fixture.
+- [x] Run 60423 emitted all business checks but exited 1 when the original
+  final full-page screenshot waited 35000ms for external fonts; it was not a
+  passing module result. Evidence:
+  `output/playwright/browser-ci/cloud-1791370774742-103c28ad-539a-46e2-98f4-d080af37d3ad/`.
+  The original screenshot timeout remains recorded.
+- [x] Earlier failures retained: run 11332, exit 1, added assertion mistook
+  CSSOM's used bottom coordinate for the declared `auto`; verified Typed OM
+  and corrected only the assertion. Evidence: `output/playwright/browser-ci/cloud-1791370572582-70230000-3a7e-4ba5-bee5-79ce5b5a3352/`.
+  Run 77500, exit 1, new running-state fixture preceded the original default
+  accessible-label assertion. The scenario was moved after original defaults;
+  no original assertion was weakened. Evidence: `output/playwright/browser-ci/cloud-1791370682354-9776a0c8-3bde-4c9b-b577-d8f07a8839dc/`.
+  Run 10748, exit 1, a page-only external-font route was initially installed
+  before the existing private-cache acceptance; Playwright routing disables
+  the page's HTTP cache. The cache assertion remains unchanged. Evidence:
+  `output/playwright/browser-ci/cloud-1791371404156-333955b0-a31e-41b3-85de-f1c6c719323d/`.
+- [x] Frozen product hashes: app `f2a97df1b04e3033c1947bedaf9ff0ba757cd1ea35ab18d490f6893267517a89`;
+  CSS `6b1944e03a9433da5f955b168c029d4a3fbb1dfa482cb7b2a531e5815b603dd4`.
+  Browser hash at run 60423: `3317d32f5474d773983c9e0e63bf5aaf78e4f220a8372893320df10184bc17e6`.
+  Browser SHA-256 at Executor 73734 / Independent Tester 99131:
+  `66c1464e996f09908f9c15b9c590a32ee88320d4fead9651e8dc5d846216deaf`.
+  Syntax and diff checks passed. The post-fix synthetic toolbar screenshot
+  shows no yellow strip; its separate root cause is not established.
+- [x] Independent Tester failure evidence: exact final app/CSS/browser hashes
+  above remained unchanged during one affected standalone run, Node 22.18.0,
+  session 99131, UTC 2026-10-07T11:27:16.3812209Z to 11:29:58.2485092Z.
+  Actual exit 1, 41 completed-check lines and no `result.json`; not a passing
+  full module. Existing attachment-page screenshot at browser line 1870 timed
+  out after its original 30000ms waiting for fonts, before clicking retry.
+  The main-page font route does not affect this independent attachment page.
+  New Coordinator geometry/stop assertions and prior mobile-layout/cache/held-font
+  startup checks completed; visually inspected 390px toolbar/multiline PNGs.
+  Artifact: `output/playwright/browser-ci/cloud-1791372439806-39203452-194a-4155-a07d-2be2951f7c16/`;
+  `failure.txt` preserves synchronized UI and the deliberate share-error/retry
+  state; later attachment/memory/completion checks were not reached. Raw log
+  SHA-256 `2b833dc7a5241ff68c871b942c2fbe4f5894f8b07c67d437fa9168ad53a4a18a`.
+  Screenshots/report were retained; the original finally cleaned its synthetic
+  data directory. No retry, timeout/assertion change or source fix was performed.
+- [x] Executor: after the independent failure, only the existing screenshot
+  fixture uses one page-level helper for precise Google `/css2` and gstatic
+  font requests. Main calls it after unchanged cache/reopened assertions;
+  attachment/mobile screenshot pages call it on creation. No context-wide
+  routing, product change, `startupPage` held-font interception change,
+  screenshot bypass, timeout increase or assertion weakening. Latest browser
+  SHA-256: `d2adcffe2734c18cbcaa5394185f4fe485591dde39d53af830274a2541b1b618`.
+  Product hashes above are unchanged; syntax/diff checks passed. This latest
+  fixture was not executed again by Executor; independent final acceptance
+  remains pending. All preceding failures and passing revision evidence remain.
+- [x] Independent Tester: final affected standalone module against app/CSS
+  hashes above and browser `d2adcffe2734c18cbcaa5394185f4fe485591dde39d53af830274a2541b1b618`
+  passed once, Windows / Node 22.18.0, session 41089, actual exit 0, 47 checks.
+  UTC 2026-10-07T11:47:26.3226538Z to 11:49:06.2543014Z; all three input
+  hashes remained unchanged. Artifact:
+  `output/playwright/browser-ci/cloud-1791373647647-32c85a96-735b-452f-a8f6-d9145b02d4ec/`.
+  The exact font helper remains page-only, installed after original main cache
+  assertions and on mobile/attachment screenshot pages, never on startupPage.
+  Original held-font startup, private cache, 320/390/718 mobile/desktop,
+  Coordinator stop/send geometry, attachment retry, memory, Main and completion
+  checks passed. Independently viewed final 390px toolbar/multiline PNGs.
+  Raw log SHA-256 `0fedfc0b978223f6800496e1c0b4b29ba5d8dcd3934e21f4189f34f47b56cd2e`.
+  Prior session 99131 exit 1 and all earlier failures remain recorded; no
+  assertions, screenshot waiting or original timeout budgets were reduced.
+  Real Safari/physical phones,
+  full RTL, native 200% zoom and this change's 200% layout simulation are not
+  verified. No commit, push, branch, install, publication, deployment or
+  production/user-data modification occurred.
+
+## UI-MOBILE-LAYOUT-01 · Toolbar clipping and empty attachment separators (2026-10-07)
+
+- [x] Executor: phone toolbar no longer inherits a 36px border-box height while
+  spending 6px on vertical padding. Its auto/min-height contains the unchanged
+  controls and their text; desktop rules and horizontal scrolling remain intact.
+  Detail rendering omits only an attachment section with neither upload capability
+  nor existing files. Existing references, upload-enabled empty entry, memory
+  documents and all underlying records remain unchanged. No user screenshot
+  content or private project data is copied into the synthetic acceptance fixture.
+- [x] Executor: one affected `node tests/cloud-workbench-browser.mjs` execution
+  (Windows / Node 22.18.0, run 24764) passed, exit 0. Covers toolbar containment
+  and centered label at 320/390/718 forced-phone widths and 1440 desktop;
+  overview with disabled uploads/no files omits the blank bordered section,
+  memory remains accessible, an existing reference is still visible without
+  upload, and the upload-enabled empty entry/actual upload retain original tests.
+  Only the isolated service's overview fixture is staged and restored; project
+  Main version and complete Map are unchanged. Syntax and diff checks passed.
+- [x] Evidence: `output/playwright/browser-ci/cloud-1791369008768-a7377127-f610-476c-897c-98cdc62251a0/`
+  (`result.json`, `mobile-toolbar-320.png`, `mobile-toolbar-390.png`,
+  `mobile-toolbar-718.png`). The 390px screenshot was visually inspected.
+  No new assertion failed on the first run. The logged attachment share failure
+  is the original deliberate retry fixture and its subsequent upload passed.
+  App SHA-256: `9e5c0dc497fc2599d380ba3a3929e60749621e0cf40918316772f075c67f9f37`.
+  CSS SHA-256: `55826dcb9b7cb66b1bb446b825db14fbc95e8648df736c1719722a23c173ac21`.
+  Browser SHA-256: `6b5daf8a4723bd37f60861df5df5627f5cacaffebcfe0965979a8de40c61857f`.
+- [x] Independent Tester: reviewed the frozen three product/test hashes above
+  against base `ce3b1a9b1bbce081e80141712ba44d110093fd57` plus this four-file
+  local diff, then ran the original affected module once on Node 22.18.0.
+  Actual exit 0, 46 checks, UTC 2026-10-07T10:37:57.3648831Z to
+  10:39:40.1801095Z; product/test hashes remained unchanged. Artifact:
+  `output/playwright/browser-ci/cloud-1791369479120-f9c15304-59c9-4a42-b791-9cdcc6c5cfeb/`.
+  Visually inspected the 320px and 390px screenshots: Session label is contained,
+  no empty attachment separator remains, and memory/Idea/TODO/Bug controls remain.
+  Original desktop, existing/upload-enabled attachments, retry, read-only Main
+  preservation and version/permission checks passed. Log SHA-256:
+  `0fe3c70e351cec760624616d22041730dfb9215675ed3b384866a3e577ddfc38`.
+  Toolbar-only RTL geometry and 200% body CSS zoom simulations passed; these are
+  not full RTL support or native browser zoom acceptance. Real Safari/device
+  testing was not performed. No full-suite repetition, install, source commit/push,
+  publication or deployment occurred. The share failure was the existing deliberate
+  retry fixture, not a failing assertion.
+
 ## R3-STATIC-PREVIEW-01 · Device tools tolerate missing server config (2026-10-07)
 
 - [x] Executor: one optional-chain guard in canonical `installDeviceApprovals`
