@@ -44,6 +44,12 @@
    zero failures, exit 0. Full browser (BDA-012, workbench including the three
    controls checks, Session sync) passed, exit 0. Workbench evidence:
    output/playwright/browser-ci/cloud-1791386469287-aab84a88-d7ff-4627-9ddb-c0afc49f6a90.
+   Integration fetch then found concurrent Main PR #8 (38b5c82, Cloud 1.1.5).
+   Both evidence sections, its 44px phone targets, model/toolbar/recovery fixes
+   and attachment fix remain. Composition keeps this task's bottom anchoring.
+   First integrated browser run failed a positioning declaration check because
+   getComputedStyle resolves auto top to the used pixel value; the original
+   Typed OM declaration check now tests top:auto and bottom:8px explicitly.
 
 ## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
 

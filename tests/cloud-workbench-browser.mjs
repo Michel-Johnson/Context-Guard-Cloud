@@ -958,7 +958,7 @@ try {
         recovery:{...rect(recovery),hidden:recovery.hidden,display:getComputedStyle(recovery).display,afterMessages:recovery.previousElementSibling?.classList.contains('coordinator-messages')},
         panel:rect(panel),messages:rect(panel.querySelector('.coordinator-messages')),
         input:rect(input),shell:rect(send.parentElement),send:rect(send),arrow:rect(send.querySelector('svg')),
-        padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:getComputedStyle(send).bottom,top:getComputedStyle(send).top};
+        padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:send.computedStyleMap().get('bottom').toString(),top:send.computedStyleMap().get('top').toString()};
     });
     const details=`${label} ${width}: ${JSON.stringify(geometry)}`;
     assert.equal(geometry.visible.filter(el=>el.action).length,3,'toolbar contains history, model and new Session only');
