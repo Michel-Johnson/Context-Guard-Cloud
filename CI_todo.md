@@ -1,5 +1,36 @@
 # Cloud split acceptance
 
+## R3-STATIC-PREVIEW-01 · Device tools tolerate missing server config (2026-10-07)
+
+- [x] Executor: one optional-chain guard in canonical `installDeviceApprovals`
+  returns safely when `sync.config` or its feature capability is absent. No
+  preview-specific behavior, Skill generated copy, dependency lock, permission,
+  release metadata or production state change. The original Skill browser scene
+  `cg-browser-ci-zH4Jjq` remains first product-failure evidence, not a selector bug.
+- [x] Executor: existing BDA012 retains real configured-device approval and adds
+  a static page using canonical HTML/assets without `__CG_SERVER`. Only its HTML
+  and exact synthetic Map GET are routed; app/assets are not replaced. The actual
+  root appears and accepts a click, device entry stays hidden and `pageerror`
+  stays empty. A VM diagnostic of the actual extracted installer confirms the
+  missing-config call returns with the fixed guard and reproducibly throws
+  `interfaceCapabilities` with only the guard reverted (exit 0).
+- [x] Executor: syntax and diff checks passed. One affected standalone
+  `node tests/browser-device-login-runner.mjs` (Windows / Node 22.18.0, run 31744)
+  passed 1/1, zero skips, exit 0, without changed timeouts, sleeps or force.
+  Evidence: `output/playwright/device-approvals-1791358177802/`
+  (`result.json`, `static-preview-no-config.png`, `device-requests-phone.png`).
+  App SHA-256: `72e2df4530736b87c1290c9273970ae460f41cda6752dd398b701ccfa22c3c13`.
+  Test SHA-256: `37d62efa260350b093fbb6a511ce254c8f835c07fb20f0294a94867579c6bc53`.
+- [x] Independent Tester: BDA012 run 17501 (Node 24.19.0) passed 1/1, exit 0,
+  on the same frozen app/test hashes before and after execution. Real static
+  root/click without `__CG_SERVER`, hidden approval entry, zero page errors,
+  configured approval and phone scope/close checks passed. The old guard's
+  in-memory negative check still throws TypeError. This is technical acceptance,
+  not human device approval or production/native Skill browser acceptance.
+- [ ] Release 1.1.4: exact Cloud/Core/UI packages, unchanged complete Required,
+  normal Main merge/CI and new immutable shared-v1.1.4 assets. Earlier 1.1.3
+  static-preview failure remains preserved; no old asset or tag is replaced.
+
 ## RELEASE-1.1.3: persistent human device approval and current UI delivery
 
 - [x] Preserve the exact independently verified authorization/UI source and all
