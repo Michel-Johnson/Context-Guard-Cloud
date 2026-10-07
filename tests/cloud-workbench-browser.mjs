@@ -186,6 +186,9 @@ async function coordinatorControlAcceptance() {
     assert.match(await panel.locator('.coordinator-messages').textContent(), /正在生成的尾段/);
     await panel.getByRole('button', { name: '重试原请求', exact: true }).click();
     await panel.getByText('已继续当前讨论。', { exact: true }).waitFor();
+    await panel.getByText(/部分回复（未完成）/).waitFor();
+    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 1,
+      'Retry preserves one marked aborted output, rather than hiding or duplicating it');
     await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
     await input.fill('记住登录节点'); await panel.getByRole('button', { name: '发送', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel [data-conversation="main"]')?.textContent.includes('Login discussion'));
@@ -196,6 +199,11 @@ async function coordinatorControlAcceptance() {
     await fixturePage.locator('#btn-coordinator').click();
     await input.fill('继续讨论'); await panel.getByRole('button', { name: '发送', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
+    await panel.getByText(/部分回复（未完成）/).waitFor();
+    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 1);
+    state = await (await fixtureContext.request.get(stateUrl)).json();
+    assert.equal(state.messages.filter(message => message.partial).length, 1);
+    await panel.screenshot({ path: path.join(output, 'coordinator-partial-after-resume-new-turn-reload.png') });
     assert.ok(modelInputs.at(-1).system.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
     assert.deepEqual(errors, []);
     record('CONTROL-01 real ink-click stop uses an idempotent original-turn request and preserves text across reload/resume');
