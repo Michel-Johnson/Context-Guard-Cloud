@@ -91,19 +91,19 @@ async function coordinatorControlAcceptance() {
       { id: 'N1', title: 'Login', kind: 'module', state: 'dirty', owns: [], memoryDocument: 'BROWSER-DURABLE-FOCUS-MEMORY', children: [] },
     ] },
   } } }, sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
-  const held = new Set(), errors = [], modelInputs = []; let heldOnce = false, cloud, fixtureContext, fixturePage;
+  const held = new Set(), errors = [], modelInputs = []; let heldGenerations = 0, cloud, fixtureContext, fixturePage;
   try {
     cloud = await startCloudServer({ host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig: memory,
       browserToken: 'fixture-browser', browserPasswordHash: await createWorkbenchPasswordHash('control-password'), privateAccess: true,
       protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'control-fixture', slug: 'example/control-fixture' }] },
       coordinatorModelFactory: () => ({ model: 'fixture-model', next: async input => {
         modelInputs.push(input); const text = input.messages.at(-1)?.content;
-        if (text === '开始停止测试' && !heldOnce) {
-          heldOnce = true; await input.onText('已经输出的完整段落。\n\n正在生成的尾段');
+        if ((text === '开始停止测试' || text === '第一行补充\n第二行补充') && heldGenerations < 2) {
+          heldGenerations++; await input.onText('已经输出的完整段落。\n\n正在生成的尾段');
           return new Promise((resolve, reject) => {
             const release = () => { held.delete(release); resolve({ stop: 'end_turn', content: [{ type: 'text', text: 'completed' }] }); };
             held.add(release);
-            input.signal.addEventListener('abort', () => { held.delete(release); reject(Object.assign(new Error('Controlled stop'), { code: 'MODEL_INTERRUPTED' })); }, { once: true });
+            input.signal.addEventListener('abort', () => { held.delete(release); reject(input.signal.reason); }, { once: true });
           });
         }
         if (text === '记住登录节点') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'browser-mount', name: 'mount_conversation',
@@ -146,7 +146,17 @@ async function coordinatorControlAcceptance() {
     await panel.locator('.coordinator-input-shell').screenshot({ path: path.join(output, 'coordinator-arrow-multiline-mobile.png') });
     await panel.getByRole('button', { name: '发送', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
-    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('已保存 1 条补充'));
+    const generationDeadline = Date.now() + 5000;
+    for (;;) {
+      const state = await (await fixtureContext.request.get(cloud.url + '/api/workbench/projects/control-fixture/api/coordinator?conversation=main')).json();
+      if (heldGenerations === 2 && state.status === 'running' && state.pendingInputCount === 0 && state.streamingText === '已经输出的完整段落。\n\n正在生成的尾段' &&
+          state.messages.some(message => message.role === 'user' && message.text === '第一行补充\n第二行补充')) break;
+      assert.ok(Date.now() < generationDeadline, 'The durable supplement must be consumed by the replacement generation');
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(heldGenerations, 2, 'The supplement cancels and replaces the active generation before the stop test');
+    assert.deepEqual(modelInputs[1].messages.filter(message => message.role === 'user').map(message => message.content), ['开始停止测试', '第一行补充\n第二行补充']);
+    assert.ok(!JSON.stringify(modelInputs[1].messages).includes('已经输出的完整段落'), 'A superseded fragment is display history, not a complete model message');
     await input.fill('');
     await fixturePage.waitForFunction(() => {
       const send = document.querySelector('.coordinator-send.is-working-ready');
@@ -178,17 +188,22 @@ async function coordinatorControlAcceptance() {
     let state = await (await fixtureContext.request.get(stateUrl)).json();
     assert.equal(state.status, 'interrupted'); assert.equal(state.activeTurnId, interruptRequests[0].expectedTurnId);
     assert.equal(state.partialText, '已经输出的完整段落。\n\n正在生成的尾段');
-    await panel.getByText(/部分回复（未完成）/).waitFor();
+    const partialIds = state.messages.filter(message => message.partial).map(message => message.id);
+    assert.equal(partialIds.length, 2); assert.equal(new Set(partialIds).size, 2, 'Each canceled generation has exactly one distinct retained output');
+    assert.equal(await panel.getByText(/部分回复（未完成）/).count(), 2, 'Superseded and explicitly stopped attempts both retain their visible fragments');
     assert.match(await panel.locator('.coordinator-messages').textContent(), /已经输出的完整段落/);
     await fixturePage.reload(); await fixturePage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
     await fixturePage.locator('#btn-coordinator').click();
-    await panel.getByText(/部分回复（未完成）/).waitFor();
+    await panel.getByText(/部分回复（未完成）/).first().waitFor();
+    assert.equal(await panel.getByText(/部分回复（未完成）/).count(), 2, 'Both retained attempts survive reload');
     assert.match(await panel.locator('.coordinator-messages').textContent(), /正在生成的尾段/);
     await panel.getByRole('button', { name: '重试原请求', exact: true }).click();
     await panel.getByText('已继续当前讨论。', { exact: true }).waitFor();
-    await panel.getByText(/部分回复（未完成）/).waitFor();
-    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 1,
-      'Retry preserves one marked aborted output, rather than hiding or duplicating it');
+    await panel.getByText(/部分回复（未完成）/).first().waitFor();
+    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 2,
+      'Retry preserves one marked output per canceled generation, rather than hiding or duplicating it');
+    state = await (await fixtureContext.request.get(stateUrl)).json();
+    assert.deepEqual(state.messages.filter(message => message.partial).map(message => message.id), partialIds, 'Retry preserves the exact original output identities and ordering');
     await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
     await input.fill('记住登录节点'); await panel.getByRole('button', { name: '发送', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel [data-conversation="main"]')?.textContent.includes('Login discussion'));
@@ -199,12 +214,13 @@ async function coordinatorControlAcceptance() {
     await fixturePage.locator('#btn-coordinator').click();
     await input.fill('继续讨论'); await panel.getByRole('button', { name: '发送', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
-    await panel.getByText(/部分回复（未完成）/).waitFor();
-    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 1);
+    await panel.getByText(/部分回复（未完成）/).first().waitFor();
+    assert.equal(await panel.getByText('已经输出的完整段落。', { exact: true }).count(), 2);
     state = await (await fixtureContext.request.get(stateUrl)).json();
-    assert.equal(state.messages.filter(message => message.partial).length, 1);
+    assert.deepEqual(state.messages.filter(message => message.partial).map(message => message.id), partialIds, 'New turns and another reload retain each original fragment exactly once');
     await panel.screenshot({ path: path.join(output, 'coordinator-partial-after-resume-new-turn-reload.png') });
     assert.ok(modelInputs.at(-1).system.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
+    assert.ok(!JSON.stringify(modelInputs.at(-1).messages).includes('已经输出的完整段落'), 'Aborted display history never enters later native model requests');
     assert.deepEqual(errors, []);
     record('CONTROL-01 real ink-click stop uses an idempotent original-turn request and preserves text across reload/resume');
     record('CONTROL-02 mobile multi-line send stays aligned; existing one-second ink and typed supplements remain');

@@ -76,8 +76,8 @@ function interruptedOutput(state) {
   return { id: state.partialOutputId || `partial-${hash(JSON.stringify([state.activeTurnId, state.controlRevision || 0, state.messages.length, state.partialText]))}`,
     afterIndex: state.messages.length - 1, turnId: state.activeTurnId, text: state.partialText };
 }
-function retainInterruptedOutput(state) {
-  const output = interruptedOutput(state);
+function retainInterruptedOutput(state, { superseded = false } = {}) {
+  const output = interruptedOutput(superseded ? { ...state, status: 'interrupted' } : state);
   if (!output) return;
   state.partialOutputId = output.id;
   const outputs = state.interruptedOutputs ||= [];
@@ -327,10 +327,11 @@ export class CoordinatorMapIntake {
 export class CoordinatorService {
   constructor({ directory, model, system, tools, execute, context = null, maxSteps = 12, maxModelRetries = 2, retryDelayMs = 250,
     compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, onStateChange = null,
-    textModels = null, selectTextModel = null }) {
+    textModels = null, selectTextModel = null, steerSettleMs = 80 }) {
     if (!Number.isSafeInteger(compactMinTurns) || compactMinTurns < 1) throw error('INVALID_ARGUMENT', 'Compaction requires a positive completed-turn interval');
     if (onStateChange !== null && typeof onStateChange !== 'function') throw error('INVALID_ARGUMENT', 'State observer must be a function');
     if (textModels !== null && !(textModels instanceof Map) || selectTextModel !== null && typeof selectTextModel !== 'function') throw error('INVALID_ARGUMENT', 'Configured text models require a model selector');
+    if (!Number.isSafeInteger(steerSettleMs) || steerSettleMs < 0 || steerSettleMs > 2000) throw error('INVALID_ARGUMENT', 'Steer settling must be bounded');
     this.file = path.join(directory, 'conversation.json');
     // Input receipts have a short lock independent of the long-running model
     // loop. A streamed state save must never overwrite a newly accepted input.
@@ -344,6 +345,7 @@ export class CoordinatorService {
     this.visionModel = visionModel; this.resolveAttachment = resolveAttachment;
     this.onStateChange = onStateChange;
     this.textModels = textModels; this.selectTextModel = selectTextModel;
+    this.steerSettleMs = steerSettleMs;
   }
   async saveState(state) {
     retainInterruptedOutput(state);
@@ -499,18 +501,16 @@ export class CoordinatorService {
       await atomicWrite(this.inputFile, encode(journal));
       return { accepted: true, id, turnId: expectedTurnId };
     });
-    if (!result.replayed) this.turnAbort?.abort();
+    if (!result.replayed) this.turnAbort?.abort(error('MODEL_INTERRUPTED', 'The human stopped this turn'));
     this.kick();
     return result;
   }
-  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], followup = 'queue', expectedTurnId }, { source = 'human', actor } = {}) {
-    if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
-    if (!['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128) ||
-        typeof id !== 'string' || !id || id.length > 128 || typeof text !== 'string' || text.length > 8000 ||
+  async prepareInput({ id, text = '', answerTo, attachments = [] }, { source, actor }) {
+    if (typeof id !== 'string' || !id || id.length > 128 || typeof text !== 'string' || text.length > 8000 ||
+        answerTo !== undefined && (typeof answerTo !== 'string' || !answerTo || answerTo.length > 128) ||
         !Array.isArray(attachments) || attachments.length > COORDINATOR_MAX_ATTACHMENTS || !text.trim() && !attachments.length ||
         attachments.some(item => !item || Object.keys(item).some(key => key !== 'id') || typeof item.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.id)) ||
         new Set(attachments.map(item => item.id)).size !== attachments.length) throw error('INVALID_INPUT', 'Provide a bounded message, attachment references and stable request ID');
-    actor = trustedActor(actor);
     if (!['human', 'slack', 'workflow'].includes(source)) throw error('INVALID_INPUT', 'Unknown verified message source');
     if (source === 'slack' && (!actor?.teamId || !actor?.userId)) throw error('INVALID_INPUT', 'Slack input requires a verified workspace actor');
     if (attachments.length && !isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can attach files');
@@ -521,23 +521,36 @@ export class CoordinatorService {
     if (metadata.filter(item => IMAGE_TYPES.has(item.mimeType)).reduce((sum, item) => sum + item.size, 0) > COORDINATOR_MAX_IMAGE_BYTES) {
       throw error('ATTACHMENT_TOO_LARGE', 'The combined image size must not exceed 5 MiB per turn');
     }
-    // Reject unreadable/invalid inputs before acknowledging or writing a turn.
     for (const reference of metadata) {
       const value = await this.resolvedAttachment(reference, { actor, source, requestId: id });
       if (!IMAGE_TYPES.has(reference.mimeType)) this.attachmentText(value);
     }
+    const baseInput = answerTo === undefined ? text : JSON.stringify({ text, answerTo });
+    const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
+    return { id, text, answerTo, metadata, hasImages, fingerprint };
+  }
+  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor } = {}) {
+    if (inputs !== undefined) {
+      if (text || retry || answerTo !== undefined || attachments.length) throw error('INVALID_INPUT', 'A batch cannot mix single-message controls');
+      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor });
+    }
+    if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
+    if (!['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128) ||
+        typeof retry !== 'boolean') throw error('INVALID_INPUT', 'Provide valid follow-up controls');
+    actor = trustedActor(actor);
+    const { metadata, hasImages, fingerprint } = await this.prepareInput({ id, text, answerTo, attachments }, { source, actor });
     const receivedAt = Date.now(), contextStartedAt = Date.now();
     const nextContext = this.context ? await this.context() : null;
     const contextCompletedAt = Date.now();
     // A published terminal state can precede the runner's final durable write.
     // Drain that runner outside the submission lock before accepting a new turn.
+    let steered = false;
     for (;;) {
       let finishingRunner;
       await withFileLock(this.file + '.submit.lock', async () => {
         const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
-        const baseInput = answerTo === undefined ? text : JSON.stringify({ text, answerTo });
-        const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
         const journal = await this.inputJournal();
+        if (state.batches?.[id] || journal.batches?.[id]) throw error('ID_REUSED', 'This identity belongs to an accepted batch');
         const queued = journal.requests[id];
         if (queued) {
           if (queued.fingerprint !== fingerprint || queued.followup !== followup || queued.expectedTurnId !== expectedTurnId) throw error('ID_REUSED', 'Conversation request ID differs');
@@ -578,6 +591,7 @@ export class CoordinatorService {
           journal.requests[id] = { id, fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
             revision: ++journal.revision, turnId: state.activeTurnId, text, ...(answerTo ? { answerTo } : {}), message, context: nextContext };
           await atomicWrite(this.inputFile, encode(journal));
+          steered = true;
           return;
         }
         if (state.status === 'interrupted' && !retry) throw error('TURN_INTERRUPTED', 'Explicitly resume the stopped turn before sending more input');
@@ -653,8 +667,117 @@ export class CoordinatorService {
       if (!finishingRunner) break;
       await finishingRunner;
     }
+    if (steered) this.modelAbort?.abort(error('MODEL_STEERED', 'Durable human input supersedes this generation'));
     this.kick();
     return { accepted: true, id, ...(followup === 'steer' ? { followup } : {}) };
+  }
+  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor } = {}) {
+    if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
+    if (typeof id !== 'string' || !id || id.length > 128 || !Array.isArray(inputs) || !inputs.length || inputs.length > 100 ||
+        inputs.some(input => !input || Object.keys(input).some(key => !['id', 'text', 'attachments', 'answerTo'].includes(key))) ||
+        new Set(inputs.map(input => input.id)).size !== inputs.length || inputs.some(input => input.id === id) ||
+        !['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128)) {
+      throw error('INVALID_INPUT', 'Provide a bounded batch of distinct original human inputs');
+    }
+    actor = trustedActor(actor);
+    if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can submit a batch');
+    const prepared = await Promise.all(inputs.map(input => this.prepareInput(input, { source, actor })));
+    const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor }));
+    const mode = hash(JSON.stringify({ followup, expectedTurnId }));
+    const receivedAt = Date.now(), nextContext = this.context ? await this.context() : null;
+    const contextMs = Date.now() - receivedAt;
+    let steered = false;
+    for (;;) {
+      let finishingRunner;
+      await withFileLock(this.file + '.submit.lock', async () => {
+        const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
+        const journal = await this.inputJournal();
+        const previous = state.batches?.[id] || journal.batches?.[id];
+        if (previous) {
+          if (previous !== fingerprint) throw error('ID_REUSED', 'Conversation batch ID differs');
+          return;
+        }
+        if (state.requests[id] || journal.requests[id] || prepared.some(input => state.requests[input.id] || journal.requests[input.id])) {
+          throw error('ID_REUSED', 'An original input already belongs to another accepted request');
+        }
+        if (expectedTurnId !== undefined && state.activeTurnId !== expectedTurnId) throw error('STALE_TURN', 'Follow-up targets a different turn');
+        if (state.status === 'interrupted') throw error('TURN_INTERRUPTED', 'Explicitly resume the stopped turn before sending more input');
+        const steering = followup === 'steer' && state.activeTurnId && state.status === 'running';
+        if (!steering && this.running && state.status === 'waiting-for-user' && !state.activeTurnId) { finishingRunner = this.running; return; }
+        if (!steering && this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
+        if (!steering && state.activeTurnId) {
+          if (state.status !== 'error' || !settleRejectedTools(state)) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          state.activeTurnId = null;
+        }
+        const pending = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0));
+        if (steering && pending.length + prepared.length > 100) throw error('BUSY', 'Follow-up capacity reached; retry the original batch ID');
+        const answered = new Set(pending.map(item => item.answerTo).filter(Boolean));
+        const messages = prepared.map(input => {
+          let question;
+          if (input.answerTo !== undefined) {
+            question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === input.answerTo);
+            if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.answer || answered.has(input.answerTo)) throw error('ALREADY_ANSWERED', 'This question already has an answer');
+            answered.add(input.answerTo);
+          }
+          return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
+            content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
+            ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
+        });
+        const active = steering ? state.messages.filter(message => (state.activeRequestIds || [state.activeTurnId]).includes(message.requestId)) : [];
+        const references = [...active, ...(steering ? pending.map(item => item.message) : []), ...messages].flatMap(message => message.attachments || []);
+        if (references.length > COORDINATOR_MAX_ATTACHMENTS || references.filter(item => IMAGE_TYPES.has(item.mimeType)).reduce((sum, item) => sum + item.size, 0) > COORDINATOR_MAX_IMAGE_BYTES) {
+          throw error('ATTACHMENT_TOO_LARGE', 'Batch inputs share the active turn attachment limits');
+        }
+        if (steering) {
+          for (const [index, input] of prepared.entries()) journal.requests[input.id] = {
+            id: input.id, fingerprint: input.fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
+            revision: ++journal.revision, turnId: state.activeTurnId, text: input.text,
+            ...(input.answerTo ? { answerTo: input.answerTo } : {}), message: messages[index], context: nextContext,
+          };
+          (journal.batches ||= {})[id] = fingerprint;
+          await atomicWrite(this.inputFile, encode(journal));
+          steered = true;
+          return;
+        }
+        const first = prepared[0], hasImages = prepared.some(input => input.hasImages);
+        const selection = !hasImages && this.selectTextModel ? await this.selectTextModel() : null;
+        const selected = hasImages ? this.visionModel : selection?.model || this.model;
+        const route = { kind: hasImages ? 'vision' : 'text', model: selected.model || null, ...(selection ? { providerId: selection.providerId } : {}) };
+        const candidate = { ...state, activeTurnId: first.id, activeRequestIds: prepared.map(input => input.id), activeModelRoute: route, messages: [...state.messages, ...messages] };
+        if (references.length) {
+          const request = { system: this.system + (nextContext?.text || ''), tools: this.tools,
+            messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
+          if (selected.prepareRequest) selected.prepareRequest(request);
+          else if (Buffer.byteLength(JSON.stringify(request)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Batch exceeds the provider request limit');
+        }
+        const version = hash(this.system);
+        if (state.promptVersion && state.promptVersion !== version) (state.promptChanges ||= []).push({ from: state.promptVersion, to: version, requestId: first.id, at: new Date().toISOString() });
+        state.promptVersion = version;
+        for (const input of prepared) {
+          state.requests[input.id] = input.fingerprint;
+          (state.requestModes ||= {})[input.id] = mode;
+          if (input.answerTo) (state.answers ||= {})[input.answerTo] = { text: input.text, requestId: input.id };
+        }
+        (state.batches ||= {})[id] = fingerprint;
+        state.messages.push(...messages);
+        // The first original input owns retries; the batch ID is only a receipt.
+        state.activeInput = { id: first.id, text: first.text, source, ...(actor ? { actor } : {}),
+          ...(first.metadata.length ? { attachments: first.metadata.map(({ id }) => ({ id })) } : {}), ...(first.answerTo ? { answerTo: first.answerTo } : {}) };
+        state.activeRequestIds = prepared.map(input => input.id);
+        state.activeModelRoute = route; state.activeContext = nextContext;
+        state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs };
+        state.activeTurnId = first.id; state.steps = 0; state.modelRetries = 0;
+        state.partialText = ''; delete state.partialOutputId; delete state.partialResponseIndex;
+        state.status = 'running'; state.error = null; state.activity = null;
+        await this.saveState(state);
+      });
+      if (!finishingRunner) break;
+      await finishingRunner;
+    }
+    if (steered) this.modelAbort?.abort(error('MODEL_STEERED', 'Durable human input supersedes this generation'));
+    this.kick();
+    return { accepted: true, id, inputIds: prepared.map(input => input.id), ...(followup === 'steer' ? { followup } : {}) };
   }
   async resolvedAttachment(reference, message) {
     if (!this.resolveAttachment) throw error('ATTACHMENTS_UNAVAILABLE', 'Coordinator attachment storage is not configured');
@@ -852,25 +975,36 @@ export class CoordinatorService {
       try {
         while (!this.stopping && state.activeTurnId && state.steps < this.maxSteps) {
           if (!await this.consumeInputs(state)) break;
+          // Cancellation belongs to one generation, not to its resumed round.
+          this.turnAbort = new AbortController();
+          const generation = this.turnAbort;
+          const signals = await this.inputSignals(state);
+          if (signals.interrupted || signals.steered) generation.abort(error(signals.interrupted ? 'MODEL_INTERRUPTED' : 'MODEL_STEERED', 'New durable input arrived before generation'));
           state.steps++;
           state.activeTiming ||= {};
           state.activeTiming.modelStartedAt ||= new Date().toISOString();
           await save(state);
           const runtimeSystem = this.system + (state.activeContext?.text || '') + (state.activeInput?.source === 'slack'
-            ? '\n\n本轮答复发往 Slack：使用纯文本，不用 Markdown 标题、星号、反引号或表格。普通聊天约 100 字、最多 200 字；直接回答当前问题，不加同义总结。清单只写短标题和必要状态，不主动展开路径、内部 ID 或历史；只问 TODO 就只列 TODO，不附 Bug。用户明确要完整报告或详细步骤时才扩展；完整 brief、执行提示与必要风险/确认不裁切。'
+            ? '\n\n本轮答复发往 Slack：使用纯文本，结论独立成段，每段围绕一件事，段间留一个空行；并列事项用短列表。普通正文不用 Markdown 标题、星号或表格，代码可用独立围栏代码块，链接和标识符保持完整。普通聊天约 100 字、最多 200 字；直接回答当前问题，不加同义总结。清单只写短标题和必要状态，不主动展开路径、内部 ID 或历史；只问 TODO 就只列 TODO，不附 Bug。用户明确要完整报告或详细步骤时才扩展；完整 brief、执行提示与必要风险/确认不裁切。'
             : '');
           try {
             const model = this.modelForTurn(state);
+            this.modelAbort = generation;
             await this.ensureVisualSummary(state, save);
             await this.ensureDocumentSummary(state, save);
             state = await coordinatorStep({ turnId: this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId, state, model,
               materializeMessages: value => this.materializeMessages(value, { currentImages: value.activeModelRoute?.kind === 'vision' }),
-              system: runtimeSystem, promptVersion: hash(this.system), tools: this.tools, save, execute: this.execute,
+              system: runtimeSystem, promptVersion: hash(this.system), tools: this.tools, save, execute: (...args) => {
+                this.modelAbort = null; // A started business tool must save its receipt.
+                return this.execute(...args);
+              },
               completePresentations: this.completePresentations,
               checkpoint: () => this.inputSignals(state), signal: this.turnAbort.signal,
-              onText: async text => { state.streaming = { turnId: state.activeTurnId, messageIndex: state.messages.length, text };
+              onText: async text => { if (generation.signal.aborted || this.turnAbort !== generation) return;
+                state.streaming = { turnId: state.activeTurnId, messageIndex: state.messages.length, text };
                 state.activeTiming.firstTextAt ||= new Date().toISOString(); await save(state); },
               onToolStart: async name => {
+                if (generation.signal.aborted || this.turnAbort !== generation) return;
                 if (name !== 'ask_user' || state.activity?.turnId === state.activeTurnId) return;
                 state.activity = { kind: 'preparing-question', turnId: state.activeTurnId };
                 await save(state);
@@ -878,11 +1012,26 @@ export class CoordinatorService {
             state.modelRetries = 0;
             if (Number.isSafeInteger(state.lastInputTokens) && state.lastInputTokens < this.compactAtTokens) delete state.compactionError;
           } catch (cause) {
-            if (cause.code === 'MODEL_INTERRUPTED') {
+            if (['MODEL_INTERRUPTED', 'MODEL_STEERED'].includes(cause.code)) {
+              const changed = await this.inputSignals(state);
+              if (!state.streaming?.text && cause.partialText) state.streaming = {
+                turnId: state.activeTurnId, messageIndex: state.messages.length, text: cause.partialText,
+              };
               captureInterruptedText(state);
+              state.streaming = null; state.activity = null;
               state.controlRevision = (await this.inputJournal()).controlRevision || 0;
-              state.status = 'interrupted'; state.error = null;
-              break;
+              state.error = null;
+              if (changed.interrupted || !changed.steered) { state.status = 'interrupted'; break; }
+              // Aborted streams remain display-only history. Incomplete native
+              // blocks must not alter provider replay or compaction hashes.
+              retainInterruptedOutput(state, { superseded: true });
+              state.partialText = ''; delete state.partialOutputId; delete state.partialResponseIndex;
+              state.status = 'running'; state.steps--;
+              await save(state);
+              // Only superseded generation waits briefly; tools and unrelated
+              // conversations keep running. All inputs are already durable.
+              if (this.steerSettleMs) await new Promise(resolve => setTimeout(resolve, this.steerSettleMs));
+              continue;
             }
             if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause.code) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending) {
               state.modelRetries = (state.modelRetries || 0) + 1;
@@ -893,7 +1042,7 @@ export class CoordinatorService {
               continue;
             }
             throw cause;
-          }
+          } finally { this.modelAbort = null; }
           // The terminal transition shares the input acceptance lock. A steer
           // accepted at the finish boundary must not be stranded or overwritten.
           await withFileLock(this.file + '.submit.lock', async () => {
@@ -917,6 +1066,7 @@ export class CoordinatorService {
       }
       if (state.status === 'interrupted') { state.streaming = null; state.activity = null; await save(state); }
       this.turnAbort = null;
+      this.modelAbort = null;
       return state.status === 'waiting-for-user' && !state.activeTurnId &&
         Number.isSafeInteger(state.lastInputTokens) && state.lastInputTokens >= this.compactAtTokens;
     });

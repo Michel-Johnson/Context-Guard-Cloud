@@ -31,6 +31,9 @@ const failedTool = (code, toolHint) => ({ isError: true, result: { error: { code
 const toolReply = (call, receipt) => ({ type: 'tool_result', tool_use_id: call.id, content: JSON.stringify(receipt.result), ...(receipt.isError ? { is_error: true } : {}) });
 
 const timeoutProblem = () => problem('MODEL_TIMEOUT', 'Coordinator model timed out');
+const interruptionProblem = signal => signal?.reason?.code === 'MODEL_STEERED'
+  ? problem('MODEL_STEERED', 'Coordinator generation was superseded by new input')
+  : problem('MODEL_INTERRUPTED', 'Coordinator generation was explicitly stopped');
 // Conversation history is persisted separately from the model's compacted view.
 // Keep a transport guard, but do not confuse bytes with the token threshold.
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -67,15 +70,20 @@ function openAiResult(value, model) {
   return { model: value.model, content, usage: value.usage || {}, stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn' };
 }
 async function readChunk(reader, deadlineAt, abort) {
+  if (abort.signal.aborted) throw abort.signal.reason;
   const remaining = deadlineAt - Date.now();
   if (remaining <= 0) { abort.abort(); throw timeoutProblem(); }
-  let timer;
+  let timer, cancel;
   try {
     return await Promise.race([
       reader.read(),
+      new Promise((_, reject) => {
+        cancel = () => { void reader.cancel().catch(() => {}); reject(abort.signal.reason); };
+        abort.signal.addEventListener('abort', cancel, { once: true });
+      }),
       new Promise((_, reject) => { timer = setTimeout(() => { abort.abort(); reject(timeoutProblem()); }, remaining); }),
     ]);
-  } finally { clearTimeout(timer); }
+  } finally { clearTimeout(timer); abort.signal.removeEventListener('abort', cancel); }
 }
 
 async function readBoundedJson(response, deadlineAt, abort) {
@@ -230,9 +238,9 @@ export class CoordinatorModel {
   async next({ system, messages, tools = [], maxTokens = this.maxTokens, onText = null, onToolStart = null, signal = null }) {
     const body = this.prepareRequest({ system, messages, tools, maxTokens });
     const abort = new AbortController();
-    const cancel = () => abort.abort();
+    const cancel = () => abort.abort(signal.reason);
     signal?.addEventListener('abort', cancel, { once: true });
-    if (signal?.aborted) abort.abort();
+    if (signal?.aborted) cancel();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => abort.abort(), this.timeoutMs);
     try {
@@ -267,7 +275,7 @@ export class CoordinatorModel {
     } catch (error) {
       const timedOut = abort.signal.aborted;
       abort.abort();
-      if (signal?.aborted) throw problem('MODEL_INTERRUPTED', 'Coordinator generation was explicitly stopped');
+      if (signal?.aborted) throw interruptionProblem(signal);
       if (timedOut) throw problem('MODEL_TIMEOUT', 'Coordinator model timed out; no automatic retry was made');
       if (String(error.code || '').startsWith('MODEL_') || error.code === 'CONTEXT_TOO_LARGE') throw error;
       throw problem('MODEL_UNAVAILABLE', 'Coordinator model connection failed; no automatic retry was made');
@@ -292,10 +300,19 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const started = Date.now();
     let next;
     try {
+      if (signal?.aborted) throw interruptionProblem(signal);
       next = await model.next({ system, messages, tools, signal, onText: measurement ? async text => {
+        if (signal?.aborted) return;
         if (text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
         await onText?.(text);
       } : onText, onToolStart });
+      if (signal?.aborted) {
+        // An adapter may finish despite cancellation. Preserve only visible text;
+        // incomplete thinking signatures and tool blocks are never replayed.
+        const cause = interruptionProblem(signal);
+        cause.partialText = next.content?.filter(block => block.type === 'text').map(block => block.text).join('') || '';
+        throw cause;
+      }
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started,
         stop: next.stop, inputTokens: coordinatorInputTokens(next.usage),
         cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens : null });

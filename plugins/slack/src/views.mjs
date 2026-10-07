@@ -1,10 +1,10 @@
-import { plainText } from './plain-text.mjs';
+import { plainText, plainChunks } from './plain-text.mjs';
 
 export const plain = (text, length = 2000) => ({ type: 'plain_text', text: String(text || '—').slice(0, length) });
 export const escape = text => String(text || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 export const section = text => ({ type: 'section', text: { type: 'mrkdwn', text: String(text || '—').slice(0, 2900) } });
 export const textSections = text => { const value = String(text || '—'); return Array.from({ length: Math.ceil(value.length / 2800) }, (_, index) => section(value.slice(index * 2800, (index + 1) * 2800))); };
-export const plainSections = text => { const value = plainText(text) || '—'; return Array.from({ length: Math.ceil(value.length / 2800) }, (_, index) => ({ type: 'section', text: plain(value.slice(index * 2800, (index + 1) * 2800), 2800) })); };
+export const plainSections = text => plainChunks(text).map(value => ({ type: 'section', text: plain(value, 2800) }));
 export const button = (label, action, value, style) => ({ type: 'button', text: plain(label, 75), action_id: action, value: JSON.stringify(value), ...(style ? { style } : {}) });
 export function projectChoiceBlocks(projects, requestId, direct) {
   const blocks = [section('你好，我可以帮你讨论项目、分析 Bug 和整理任务。先选择这次要聊的项目，选好后我会继续处理刚才的问题。')];
@@ -81,7 +81,7 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId } = {}) {
   return blocks;
 }
 export function messageBlocks(message, key, context) {
-  const blocks = plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复')).slice(0, 35);
+  const blocks = plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'));
   blocks.push(...nodeLinkBlocks(message.actions, context));
   for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
   for (const question of message.questions || []) if (!question.answer) {
@@ -89,7 +89,7 @@ export function messageBlocks(message, key, context) {
     if (question.options?.length) blocks.push(...plainSections('可参考：\n' + question.options.map(option => `• ${option}`).join('\n')));
     blocks.push(...plainSections('直接在这个线程回复即可，不需要填写表单。'));
   }
-  return blocks.slice(0, 49);
+  return blocks;
 }
 export function approvalBlocks(approval, key) {
   const version = approval.version || approval.brief?.version;

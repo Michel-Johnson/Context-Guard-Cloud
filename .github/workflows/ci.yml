@@ -85,6 +85,16 @@ jobs:
         with:
           python-version: '3.13'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Bound browser dependency downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The hosted runner's Azure HTTP mirror can stall every index fetch.
+          # Keep Ubuntu's archive keys/sources, using the official HTTPS archive.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          printf 'Acquire::http::Timeout "20";\nAcquire::https::Timeout "20";\nAcquire::Retries "1";\n' | sudo tee /etc/apt/apt.conf.d/99-context-guard-ci-network > /dev/null
       - run: npx --no-install playwright install --with-deps chromium
       - run: npm run test:browser
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -92,6 +102,7 @@ jobs:
         with:
           name: cloud-browser-evidence
           path: |
+            output/playwright/browser-ci/**/result.json
             output/playwright/browser-ci/**/results.json
             output/playwright/browser-ci/**/failure.txt
             output/playwright/browser-ci/**/*.png

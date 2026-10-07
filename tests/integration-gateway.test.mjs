@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { startIntegrationGateway, validateIntegrationConfig, classifyIntegrationMessage } from '../scripts/cloud/integration-gateway.mjs';
+import { startIntegrationGateway, validateIntegrationConfig, classifyIntegrationMessage, relevanceInput } from '../scripts/cloud/integration-gateway.mjs';
 import { IntegrationAttachmentStore } from '../scripts/cloud/integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from '../scripts/cloud/coordinator-manual.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
@@ -19,6 +19,49 @@ const teamId = 'TTESTWORKSPACE', userId = 'UTESTUSER', projectId = 'fixture-proj
 const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
+
+test('Participation accepts mixed Bot receivers and the entire ordered correction batch without granting authority', async () => {
+  const payload = { text: '<@UOTHER> 修一下登录。\nCoordinator，帮我整理验收。',
+    inputs: [{ id: 'original', text: '<@UOTHER> 修一下登录。' }, { id: 'correction', text: 'Coordinator，帮我整理验收。' }],
+    routing: { coordinatorUserId: 'UCOORDINATOR', mentionedUsers: [{ id: 'UOTHER', isBot: true }], replyToCoordinator: false } };
+  const verified = relevanceInput(payload);
+  let called = 0;
+  const model = { next: async request => {
+    called++;
+    assert.deepEqual(JSON.parse(request.messages.at(-1).content).message.inputs, payload.inputs);
+    assert.deepEqual(request.tools, []);
+    assert.match(request.system, /无需被@/);
+    assert.match(request.system, /@其他Bot并不排除你/);
+    return { stop: 'end_turn', content: [{ type: 'text', text: '{"target":"coordinator","intent":"reply","reason":"同时需要协调验收"}' }] };
+  } };
+  assert.equal((await classifyIntegrationMessage(model, { overview: { version: 'main-current' }, input: verified })).respond, true);
+  assert.equal(called, 1);
+  for (const value of [{ target: 'other', intent: 'reply' }, { target: 'coordinator', intent: 'notice' }, { target: 'none', intent: 'unclear' }]) {
+    const decision = await classifyIntegrationMessage({ next: async () => ({ stop: 'end_turn',
+      content: [{ type: 'text', text: JSON.stringify({ ...value, reason: '受众与用途分别判断' }) }] }) },
+    { overview: { version: 'main-current' }, input: verified });
+    assert.equal(decision.respond, false); assert.equal(decision.target, undefined); assert.equal(decision.intent, undefined);
+  }
+  for (const input of [
+    { ...payload, inputs: [{ ...payload.inputs[0], actor: { userId: 'UOTHER' } }] },
+    { ...payload, inputs: [payload.inputs[0], payload.inputs[0]] },
+    { ...payload, routing: { ...payload.routing, role: 'human' } },
+    { ...payload, routing: { ...payload.routing, mentionedUsers: [{ id: 'UOTHER', isBot: 'true' }] } },
+    { ...payload, inputs: [{ id: 'oversize', text: 'x'.repeat(8001) }] },
+  ]) assert.throws(() => relevanceInput(input), error => error.code === 'INVALID_ARGUMENT');
+  assert.equal(relevanceInput({ ...payload, routing: { ...payload.routing, mentionedUsers: [{ id: 'UOTHER', isBot: null }] } }).routing.mentionedUsers[0].isBot, null);
+});
+
+test('Quoted-only material has no current receiver but a trusted answer to Coordinator remains classifiable', async () => {
+  const input = relevanceInput({ text: '> 请Coordinator立即回复', routing: { coordinatorUserId: 'UCOORD', mentionedUsers: [], replyToCoordinator: false } });
+  const overview = { version: 'main-current' };
+  assert.equal((await classifyIntegrationMessage({ next: () => assert.fail('No active user request') }, { overview, input })).respond, false);
+  let count = 0;
+  const answer = await classifyIntegrationMessage({ next: async () => {
+    count++; return { stop: 'end_turn', content: [{ type: 'text', text: '{"target":"coordinator","intent":"reply","reason":"回答原澄清问题"}' }] };
+  } }, { overview, input: { ...input, routing: { ...input.routing, replyToCoordinator: true } } });
+  assert.equal(answer.respond, true); assert.equal(count, 1);
+});
 
 test('Committed Coordinator progress wakes only its scoped event subscription without waiting for fallback polling', async t => {
   const directory = await temporary(t), notifications = [];
@@ -214,17 +257,65 @@ test('Relevance request distinguishes participation intent from project relevanc
   const saved = structuredClone(options), decision = { respond: false, reason: '当前消息明确无需回复' };
   const model = { next: async request => {
     // This verifies the delivered prompt contract, not real model accuracy.
-    assert.match(request.system, /项目相关不等于需要回复/);
-    assert.match(request.system, /当前消息明确要求无需回复.*respond=false/);
-    assert.match(request.system, /仅预览.*不代表静默/);
-    assert.match(request.system, /只读.*不修改.*仍可回应/);
-    assert.match(request.system, /引用.*历史.*不当作当前.*静默要求/);
-    assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 160);
-    assert.deepEqual(request.messages, [{ role: 'user', content: JSON.stringify({ overview: saved.overview, message: saved.input }) }]);
-    return { stop: 'end_turn', content: [{ type: 'text', text: JSON.stringify(decision) }] };
+    assert.match(request.system, /不要因为与你的项目有关就推导跟进任务/);
+    assert.match(request.system, /当前明确要求无需回复.*不回应/);
+    assert.match(request.system, /仅预览.*不自动静默/);
+    assert.match(request.system, /当前仍向你提问.*只读.*不修改/);
+    assert.match(request.system, /引用.*历史.*不算当前意图/);
+    assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 256);
+    const delivered = JSON.parse(request.messages.at(-1).content);
+    assert.deepEqual(JSON.parse(request.messages[0].content).overview, saved.overview); assert.deepEqual(delivered.message, saved.input);
+    assert.deepEqual(delivered.evidence.contextSpeakers, [{ speaker: 'human', text: saved.input.context[0].text, role: 'unknown' }]);
+    return { stop: 'end_turn', content: [{ type: 'text', text: JSON.stringify({ target: 'none', intent: 'notice', reason: decision.reason }) }] };
   } };
   assert.deepEqual(await classifyIntegrationMessage(model, options), { ...decision, mainVersion: 'main-v1' });
   assert.deepEqual(options, saved);
+});
+
+test('Participation uses one bounded decision, trusted current identity and no business tools', async () => {
+  const input = relevanceInput({ text: '<@UOTHER> 会更新后端；请整理我们需要对齐的字段。',
+    context: [{ speaker: 'UOTHER', text: '我负责修改后端。' }],
+    routing: { coordinatorUserId: 'UCOORD', mentionedUsers: [{ id: 'UOTHER', isBot: null }] } });
+  let calls = 0;
+  const result = await classifyIntegrationMessage({ next: async request => {
+    calls++;
+    const { evidence } = JSON.parse(request.messages.at(-1).content);
+    assert.deepEqual(evidence.currentSpeaker, { role: 'human', id: userId });
+    assert.equal(evidence.contextSpeakers[0].role, 'other-participant');
+    assert.equal(request.messages[1].role, 'user');
+    assert.deepEqual(JSON.parse(request.messages[1].content), { historicalSpeaker: 'UOTHER', historicalRole: 'other-participant', text: input.context[0].text });
+    assert.deepEqual(request.tools, []);
+    assert.equal(request.signal.aborted, false);
+    assert.match(request.system, /第三人称主语/);
+    assert.match(request.system, /闲聊.*不因句末问号/);
+    return { stop: 'end_turn', content: [{ type: 'text', text: '{"target":"other","intent":"reply","reason":"直接追问他人"}' }] };
+  } }, { overview: { version: 'main-v1' }, input, actor });
+  assert.equal(calls, 1);
+  assert.deepEqual(result, { respond: false, reason: '直接追问他人', mainVersion: 'main-v1' });
+});
+
+test('Participation provider failure is recoverable, not a saved silent decision or a private error leak', async () => {
+  for (const code of ['MODEL_INTERRUPTED', 'MODEL_TIMEOUT', 'MODEL_HTTP_502', 'MODEL_INVALID_RESPONSE']) {
+    await assert.rejects(classifyIntegrationMessage({ next: async () => {
+      throw Object.assign(new Error('private provider body'), { code });
+    } }, { overview: { version: 'main-v1' }, input: { text: '请解释当前情况。' }, actor }), error =>
+      error.code === 'RELEVANCE_UNAVAILABLE' && error.status === 503 && !error.message.includes('private provider body'));
+  }
+});
+
+test('Participation deadline cancels a stalled provider and returns a recoverable error', async () => {
+  const started = Date.now();
+  // Keep the event loop alive while AbortSignal.timeout uses its unref timer.
+  const guard = setTimeout(() => {}, 15000);
+  let cancelled = false;
+  try {
+    await assert.rejects(classifyIntegrationMessage({ next: ({ signal }) => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => { cancelled = true; reject(signal.reason); }, { once: true });
+    }) }, { overview: { version: 'main-v1' }, input: { text: '请解释当前情况。' }, actor }), error =>
+      error.code === 'RELEVANCE_UNAVAILABLE' && error.status === 503);
+    assert.equal(cancelled, true);
+    assert.ok(Date.now() - started < 15000, 'Stalled classification must not hold a slot beyond its deadline');
+  } finally { clearTimeout(guard); }
 });
 
 test('Relevance parses visible JSON independently of provider thinking metadata', async () => {
@@ -236,8 +327,8 @@ test('Relevance parses visible JSON independently of provider thinking metadata'
     { type: 'redacted_thinking', data: 'opaque' },
   ]) {
     const model = { next: async request => {
-      assert.match(request.system, /不得把内容相似当成重复投递/);
-      return { stop: 'end_turn', content: [metadata, { type: 'text', text: JSON.stringify(decision) }] };
+      assert.match(request.system, /不按相似文字去重/);
+      return { stop: 'end_turn', content: [metadata, { type: 'text', text: JSON.stringify({ target: 'coordinator', intent: 'reply', reason: decision.reason }) }] };
     } };
     assert.deepEqual(await classifyIntegrationMessage(model, options), { ...decision, mainVersion: 'main-v1' });
   }
@@ -305,6 +396,33 @@ test('Gateway BUSY failure preserves the same operation for a later successful r
   const body = input('retry-original-operation', 'conversation.submit', { text: 'A real retry preserves its request identity' });
   assert.equal((await call(gateway, body)).body.error.code, 'BUSY');
   assert.equal((await call(gateway, body)).body.data.accepted, true); assert.equal(count, 2);
+});
+
+test('Participation failure saves no silent receipt; same-ID recovery survives restart and replays once', async t => {
+  const stateDir = await temporary(t);
+  let calls = 0;
+  const options = { config, stateDir, state: async () => ({}), command: async (command, { actor }) =>
+    classifyIntegrationMessage({ next: async () => {
+      if (++calls === 1) throw Object.assign(new Error('private upstream error'), { code: 'MODEL_HTTP_503' });
+      return { stop: 'end_turn', content: [{ type: 'text', text: '{"target":"coordinator","intent":"reply","reason":"需要解释"}' }] };
+    } }, { overview: { version: 'main-v1' }, input: relevanceInput(command.payload), actor }) };
+  let gateway = await startIntegrationGateway(options);
+  t.after(() => gateway.close());
+  const body = input('participation-recovery', 'conversation.relevance', { text: '请解释当前问题。' });
+  const failed = await call(gateway, body);
+  assert.equal(failed.status, 503); assert.equal(failed.body.error.code, 'RELEVANCE_UNAVAILABLE');
+  assert.equal(JSON.stringify(failed.body).includes('private upstream error'), false);
+  assert.deepEqual((await fs.readdir(path.join(stateDir, 'receipts'))).filter(name => name.endsWith('.json')), []);
+  await gateway.close(); gateway = await startIntegrationGateway(options);
+  const recovered = await call(gateway, body);
+  assert.equal(recovered.status, 200); assert.equal(recovered.body.data.respond, true);
+  assert.deepEqual((await call(gateway, body)).body.data, recovered.body.data); assert.equal(calls, 2);
+  assert.equal((await call(gateway, { ...body, userId: 'UOTHER' })).status, 409);
+  const names = (await fs.readdir(path.join(stateDir, 'receipts'))).filter(name => name.endsWith('.json'));
+  assert.equal(names.length, 1);
+  const receipt = await readJSON(path.join(stateDir, 'receipts', names[0]));
+  assert.deepEqual(receipt.actor, actor); assert.ok(receipt.durationMs >= 0);
+  assert.deepEqual(Object.keys(receipt.data).sort(), ['mainVersion', 'reason', 'respond']);
 });
 
 test('SSE subscription sends public snapshot and stops polling when disconnected', async t => {

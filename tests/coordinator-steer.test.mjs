@@ -263,3 +263,93 @@ test('Native model distinguishes user cancellation from timeout and releases the
   await entered.promise; controller.abort();
   await assert.rejects(result, { code: 'MODEL_INTERRUPTED' });
 });
+
+test('Steer aborts a live generation, combines durable originals and rejects late stream writes', { timeout: 10000 }, async t => {
+  const entered = deferred(), canceled = deferred(), seen = [];
+  let lateText;
+  const actor = { kind: 'human', teamId: 'T1', userId: 'U1' };
+  const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [], execute: async () => {},
+    model: { next: async ({ messages, signal, onText }) => {
+      seen.push(messages);
+      if (seen.length > 1) return answer('all corrections included');
+      await onText('old streamed text'); lateText = onText; entered.resolve();
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => { canceled.resolve(); reject(signal.reason); }, { once: true }));
+    } } });
+  t.after(() => service.close());
+  await service.submit({ id: 'original', text: 'original' }, { source: 'slack', actor });
+  await entered.promise;
+  const batch = { id: 'batch-followup', followup: 'steer', expectedTurnId: 'original', inputs: [
+    { id: 'slack-a', text: 'first clarification' }, { id: 'slack-b', text: 'second clarification' },
+  ] };
+  await service.submit(batch, { source: 'slack', actor });
+  await canceled.promise;
+  await lateText('late stale overwrite');
+  await service.submit(batch, { source: 'slack', actor });
+  await service.close();
+  assert.equal(seen.length, 2);
+  assert.deepEqual(seen[1].filter(message => message.role === 'user').map(message => message.content), ['original', 'first clarification', 'second clarification']);
+  const state = await service.state();
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(state.pendingInputCount, 0);
+  assert.equal(state.messages.filter(message => message.text === 'old streamed text' && message.partial).length, 1);
+  assert.ok(!JSON.stringify(seen[1]).includes('old streamed text'), 'Superseded stream is display-only and cannot become completed model history');
+  assert.equal(state.messages.some(message => message.text === 'late stale overwrite'), false);
+  for (const id of ['slack-a', 'slack-b']) assert.deepEqual(state.messages.find(message => message.requestId === id).actor, actor);
+  await assert.rejects(service.submit({ ...batch, inputs: [{ id: 'slack-a', text: 'changed' }] }, { source: 'slack', actor }), { code: 'ID_REUSED' });
+});
+
+test('Initial batch is accepted atomically with independent identities, retry and restart receipts', { timeout: 10000 }, async t => {
+  const root = await directory(t), observed = [];
+  const actor = { kind: 'human', teamId: 'T1', userId: 'U1' };
+  let calls = 0;
+  const options = { directory: root, system: 'test', tools: [], execute: async () => {}, maxModelRetries: 0,
+    model: { next: async ({ messages }) => { observed.push(messages); if (++calls === 1) throw Object.assign(new Error('Offline'), { code: 'MODEL_UNAVAILABLE' }); return answer('restored'); } } };
+  const service = new CoordinatorService(options);
+  const batch = { id: 'batch-start', inputs: [{ id: 'first-original', text: 'first' }, { id: 'second-original', text: 'second' }] };
+  await service.submit(batch, { source: 'slack', actor }); await service.close();
+  assert.deepEqual(observed[0].map(message => message.content), ['first', 'second']);
+  const retry = (await service.state()).retryInput;
+  assert.equal(retry.id, 'first-original');
+  await service.submit({ ...retry, retry: true }, { source: 'slack', actor }); await service.close();
+  assert.deepEqual(observed[1].map(message => message.content), ['first', 'second']);
+  const restarted = new CoordinatorService(options);
+  await restarted.submit(batch, { source: 'slack', actor }); await restarted.close();
+  assert.equal(calls, 2); assert.equal((await restarted.state()).messages.filter(message => message.role === 'user').length, 2);
+  await assert.rejects(restarted.submit({ id: 'different-batch', inputs: batch.inputs }, { source: 'slack', actor }), { code: 'ID_REUSED' });
+  await assert.rejects(restarted.submit({ id: 'batch-start', text: 'single identity collision' }, { source: 'slack', actor }), { code: 'ID_REUSED' });
+  await assert.rejects(restarted.submit({ id: 'invalid-batch', inputs: [{ id: 'valid', text: 'valid' }, { id: 'spoofed', text: 'x', actor }] }, { source: 'slack', actor }), { code: 'INVALID_INPUT' });
+  assert.equal((await restarted.state()).acceptedRequestIds.includes('valid'), false, 'Rejected batch saves no partial input');
+});
+
+test('Native stream cancellation preserves visible partial text without replaying incomplete thinking or tools', { timeout: 10000 }, async t => {
+  const entered = deferred(), observed = [];
+  let canceled = 0, requests = 0;
+  const encodeEvent = value => `data: ${JSON.stringify(value)}\n\n`;
+  const model = new CoordinatorModel({ baseUrl: 'https://provider.example', model: 'model', token: 'synthetic-provider-token',
+    fetch: async (_url, input) => {
+      observed.push(JSON.parse(input.body));
+      if (++requests > 1) return new Response(JSON.stringify({ model: 'model', stop_reason: 'end_turn', content: [{ type: 'text', text: 'corrected' }] }));
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode([
+          { type: 'message_start', message: { model: 'model' } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'private partial' } },
+          { type: 'content_block_start', index: 1, content_block: { type: 'text', text: 'visible partial' } },
+        ].map(encodeEvent).join('')));
+      }, cancel() { canceled++; } }), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+  const service = new CoordinatorService({ directory: await directory(t), model, system: 'test', tools: [], execute: async () => {},
+    onStateChange: async () => { if ((await service.state()).streamingText === 'visible partial') entered.resolve(); } });
+  t.after(() => service.close());
+  await service.submit({ id: 'first', text: 'original' }); await entered.promise;
+  await service.submit({ id: 'correction', text: 'corrected requirement', followup: 'steer' }); await service.close();
+  assert.equal(canceled, 1); assert.equal(requests, 2);
+  assert.equal(JSON.stringify(observed[1]).includes('private partial'), false);
+  assert.equal(observed[1].messages.some(message => Array.isArray(message.content) && message.content.some(block => block.type === 'thinking' || block.type === 'tool_use')), false);
+  assert.ok((await service.state()).messages.some(message => message.text === 'visible partial' && message.partial));
+});
+
+test('Model timeout is distinct from steering and explicit stop', { timeout: 10000 }, async () => {
+  const model = new CoordinatorModel({ baseUrl: 'https://provider.example', model: 'model', token: 'synthetic-provider-token', timeoutMs: 20,
+    fetch: async () => new Response(new ReadableStream({}), { headers: { 'content-type': 'text/event-stream' } }) });
+  await assert.rejects(model.next({ system: 'test', messages: [] }), { code: 'MODEL_TIMEOUT' });
+});

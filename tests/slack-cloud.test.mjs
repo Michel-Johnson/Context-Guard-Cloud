@@ -96,11 +96,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       ...(visionProvider ? { visionProviderFile } : {}) } } : {}),
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push({ system: request.system, messages: request.messages, tools: request.tools, maxTokens: request.maxTokens });
-      if (request.system?.startsWith('你仅判断 Slack 消息')) {
-        const input = JSON.parse(request.messages[0].content);
+      if (request.tools.length === 0 && request.maxTokens === 256) {
+        // Identify the bounded no-tools contract, not a particular PE prefix.
+        const input = JSON.parse(request.messages.at(-1).content);
+        assert.equal(typeof input.message.text, 'string');
         if (input.message.text === 'relevance-tool') return { stop: 'tool_use', content: [{ type: 'tool_use', name: 'edit_map', id: 'forbidden-relevance-tool', input: {} }] };
         return { stop: 'end_turn', content: [{ type: 'text', text: input.message.text === 'invalid-relevance'
-          ? 'not a decision' : JSON.stringify({ respond: input.message.text === '登录刷新 Bug，请分析。', reason: 'Controlled decision' }) }] };
+          ? 'not a decision' : JSON.stringify({ target: input.message.text === '登录刷新 Bug，请分析。' ? 'coordinator' : 'none', intent: input.message.text === '登录刷新 Bug，请分析。' ? 'reply' : 'notice', reason: 'Controlled decision' }) }] };
       }
       const message = request.messages.at(-1), text = typeof message?.content === 'string' ? message.content : '';
       if (text === 'show-node-complete') return { stop: 'tool_use', content: [
@@ -205,7 +207,7 @@ test('relevance endpoint reads current Main but never creates conversations, wor
   assert.equal(result.status, 200);
   assert.deepEqual(result.body.data, { respond: true, reason: 'Controlled decision', mainVersion: before.main.version });
   const request = f.modelCalls.at(-1);
-  assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 160);
+  assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 256);
   assert.equal(JSON.parse(request.messages[0].content).overview.memory, 'Current project facts');
   assert.deepEqual(await f.main(), before);
   assert.deepEqual(conversationFiles(await fs.readdir(path.join(f.directory, 'coordinators'), { recursive: true }).catch(error => {
@@ -240,6 +242,32 @@ test('relevance input, workspace, project and conversation boundaries are checke
   assert.equal((await f.gateway('conversation.relevance', { text: 'x' }, { credential: browserCredential })).status, 401);
   assert.equal((await f.gateway('conversation.relevance', { text: 'x' }, { conversationId: 'legacy' })).status, 403);
   assert.equal(f.modelCalls.length, calls);
+});
+
+test('An atomic Slack input batch retains each original identity and rejects forged or mixed retry data', async t => {
+  const f = await fixture(t), conversation = await f.newConversation('batch-chat'), before = await f.main();
+  const inputs = [{ id: 'batch-original-1', text: '整理登录问题。' },
+    { id: 'batch-original-2', text: '补充：只列验收标准。' }];
+  const sent = await f.gateway('conversation.submit', { inputs, followup: 'steer' }, { id: 'batch-envelope', conversationId: conversation });
+  assert.equal(sent.status, 200, JSON.stringify(sent.body));
+  const state = await f.wait(conversation, value => !value.activeTurnId && value.status === 'waiting-for-user');
+  const messages = state.messages.filter(message => message.role === 'user');
+  assert.deepEqual(messages.map(message => message.requestId), inputs.map(input => input.id));
+  assert.deepEqual(messages.map(message => message.text), inputs.map(input => input.text));
+  assert.ok(messages.every(message => message.actor.userId === userId && message.actor.teamId === teamId && message.source === 'slack'));
+  const calls = f.modelCalls.length;
+  assert.deepEqual((await f.gateway('conversation.submit', { inputs, followup: 'steer' }, { id: 'batch-envelope', conversationId: conversation })).body, sent.body);
+  assert.equal(f.modelCalls.length, calls);
+  assert.equal((await f.gateway('conversation.submit', { inputs: [{ ...inputs[0], actor: { userId: 'UOTHER' } }] }, { id: 'batch-forged', conversationId: conversation })).status, 400);
+  assert.equal((await f.gateway('conversation.submit', { inputs, text: 'replacement' }, { id: 'batch-mixed', conversationId: conversation })).status, 400);
+  assert.equal((await f.browser(conversation, { body: { id: 'batch-browser', inputs } })).status, 400);
+  const single = await f.gateway('conversation.submit', { inputs: [{ id: 'single-original', text: '再确认一下验收范围。' }], followup: 'steer' },
+    { id: 'single-envelope', conversationId: conversation });
+  assert.equal(single.status, 200, JSON.stringify(single.body));
+  const completed = await f.wait(conversation, value => !value.activeTurnId && value.acceptedRequestIds.includes('single-original'));
+  assert.equal(completed.messages.filter(message => message.requestId === 'single-original' && message.role === 'user').length, 1);
+  assert.equal(completed.acceptedRequestIds.includes('single-envelope'), false, 'Plugin must track original acceptance IDs, not the transport envelope');
+  assert.deepEqual(await f.main(), before);
 });
 
 test('Slack vision configuration cannot silently select a different model', async t => {

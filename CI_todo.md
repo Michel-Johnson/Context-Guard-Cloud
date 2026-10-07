@@ -1,5 +1,126 @@
 # Cloud split acceptance
 
+## SLACK-NATURAL-01 · Natural participation, bursts and live steering (2026-10-08)
+
+- [x] Coordinator: approved current human intent as the participation rule;
+  mentioning another Bot is a clue, not a hard exclusion. Requirements and
+  independent test standards: `docs/slack-conversation-acceptance.md`.
+- [x] Executor (Coordinator): atomic ordered original inputs, distinct trusted
+  identity/receipts, immediate model-only steering cancellation, retained partial
+  text and started business-tool receipts. Affected steer tests passed 12/12;
+  Coordinator/multimodal/model-settings regression passed 107 with one existing
+  live-provider skip, actual exits 0. Root subsequently aligned the runtime Slack
+  paragraph instructions; final source still needs independent verification.
+- [x] Executor (gateway): bounded receiver metadata and ordered classification
+  inputs, gateway-assigned batch operator, browser/forged identity rejection,
+  unchanged Main in HTTP acceptance. Four targeted cases passed, exit 0. First
+  nested-actor request returned 409; explicit gateway validation now rejects it
+  before business handling with 400. Original failure remains recorded.
+- [x] Executor (Slack): durable collection, semantic receiver metadata,
+  original input identities and paragraph-aware presentation; Node24.19 modules
+  152/152 passed. Independent review then found two unknown-delivery multipart
+  update/retirement defects not covered by those tests. Both original probes
+  failed and remain preserved. Executor repaired them with stable timestamps,
+  acknowledged content hashes and retained uncertainty; modules155/155 passed.
+  Tester reran both original probes and three formal cases successfully.
+  Private-message participation now uses its existing conversation's six bounded
+  trusted messages. Modules158/158 passed; independent DM/multipart targets6/6
+  passed. Original Slack thread context remains preferred and retries retain
+  the frozen context rather than impersonating the current user in old messages.
+- [x] Executor (participation recovery): one model classification per batch with
+  gateway-verified identity and native historical-speaker turns. Provider failures
+  return sanitized503, invalid decisions502; neither saves a silent receipt.
+  Durable classification failures have a separate three-attempt budget; original
+  IDs/context survive restart. Authentication/identity/contract failures do not
+  retry and existing business-write retry behavior is unchanged. Slack161/161
+  passed; independent four retry cases and four gateway recovery/deadline cases
+  passed on the frozen source. The deadline cancelled a stalled provider at12s.
+- [ ] Independent Tester: final-source affected modules, HTTP cross-module
+  behavior, recovery and identity boundaries; separately labelled Chinese held-out
+  invitation recall >=95%, non-participation false positives <=2%, explicit cases
+  all correct. Report errors and ambiguity separately, not as silent successes.
+- [ ] Delivery: full regression, remote Required, normal Main merge, Cloud/Slack
+  release and actual running identity. Real human-authenticated Slack burst,
+  mixed-Bot/implicit-call/stop cases and readable mobile presentation remain
+  required; model substitutes or Socket readiness do not establish them.
+
+Read-only production preflight: Main c938c9d, Cloud/Slack active and Slack
+auth.test successful; actual token lacks users:read. No token or private journal
+was exported, no message sent and no runtime data changed by that preflight.
+
+One full Node24.19 regression ended exit1:396 total,393 passed,1 failed,2 existing
+separate-suite skips,360912ms. The sole failure was an old Slack instruction
+prefix assertion after paragraph instructions changed. Restore the plain-text
+prefix and verify new paragraph/list instructions; four affected cases passed.
+One browser command ended exit1 after device approval and earlier workbench
+checks: a control fixture waited for queued input after immediate steering now
+consumes it. The remaining browser/sync checks were not executed or claimed.
+Keep stop-uncertainty and partial-output assertions when adapting that fixture.
+Main subsequently advanced independently to80f8e96 (interrupted-output preservation
+and model menu); normal integration must preserve those changes before release.
+The normal merge retains Main's display-only interrupted history: aborted steer
+and stop outputs never enter provider/compaction transcripts. Executor steer16/16
+and controls-only passed; independent steer16/16, DM/multipart6/6 and three browser
+controls passed on the same frozen source. Fixture adaptation failures (async
+polling readiness, reload render timing and two separate partial records) remain
+recorded. Current Main UI/menu changes are preserved without modification.
+
+Real-model semantic evaluation uses independent synthetic Chinese inputs and the
+currently selected provider. Initial heldout124 identified39/40 indirect calls
+but falsely joined6/60 clear non-participation cases. A separate fresh118 set on
+an adjusted prompt identified40/40 but still falsely joined6/60. Both fail the
+2% target and remain recorded. Speaker-role evidence and ordered intent rules
+are being evaluated against another frozen independent set; none of these
+model calls create conversations or write project memory. Do not relabel seen
+regressions as new heldout acceptance or count transport errors as correct silence.
+
+The extra receiver-review model call failed to reduce false participation and
+increased latency; it was removed, not stacked onto the final harness. Single-call
+native-speaker regression108:38/40indirect,1/60negative false positives,8/8explicit
+calls,12/12explicit silence,zeroerrors; P50 844ms/P95 1152ms. The independent
+fresh108 first evaluation:40/40indirect,1/60negative false positives,8/8explicit
+calls,12/12explicit silence,one invalid-response error; negative cases comprise
+58correct,1false participation and1error. P50 860ms/P95 1192ms. First error is
+not a silent pass and the original result remains immutable; same-input recovery
+requires separate real-provider evidence. Dataset86f62227/classifier55073384,
+selected deepseek-flash. These synthetic model calls do not create conversations,
+write memory or replace human-authenticated Slack acceptance. A separate real
+provider recovery call on the original failed example produced a valid decision;
+an isolated loopback gateway saved one receipt and same-ID replay made no further
+provider call. The original first-round error remains counted: this follow-up
+does not imply that the original direct evaluator had a gateway operation ID or
+that a real Slack event was tested.
+
+Final full Node24.19 ended exit1:405total,400passed,3failed,2existing separate-suite
+skips,396935ms. Two failures came from an HTTP fixture identifying classification
+by an obsolete PE prefix; it now recognizes the bounded no-tools request and
+reads the final current-input frame. All original no-mutation, invalid502 and
+permission assertions remain; targeted3/3 passed. The other failure was the
+fixed Skill fixture's archive-session command killed by its30s parent deadline;
+Executor is investigating its actual inner request lifecycle before any repair.
+Original failed logs remain. The whole browser command ended exit0: device-login,
+51workbench checks and7Session-sync checks completed. Release/real interaction
+and final all-green Required remain unchecked.
+
+Final traced full regression ended exit0:405total,403passed,zerofailed,2existing
+separate-suite skips,334713ms. The original Hook archive/finish/replay assertions
+passed without changing its deadline or product code; trace retains archive16s
+and both finish calls. Old full failures are not overwritten. Product files
+remained frozen. Independent final combined-source audit, GitHub Required and
+actual release/human Slack acceptance are still required.
+
+Remote PR12 run37664306084 passed security,Node22,Node18,Slack andpackage. Browser
+dependency installation repeatedly retried the hosted runner's Azure Ubuntu HTTP
+mirror while Ubuntu's official HTTPS archive responded; browser tests had not
+started. CI now maps that mirror to the same official HTTPS archive and bounds
+APT fetch time/retries. Archive signatures, all browser tests and fail-closed
+Required remain unchanged. The observed old run is retained, not called a page
+test failure; updated workflow verification and its new remote run are required.
+Independent workflow review also found that the artifact glob only matched
+results.json while the browser generates result.json; include both names so the
+existing pass/fail JSON evidence is uploaded alongside screenshots. No test or
+artifact content is synthesized to compensate for the missing old glob.
+
 ## COORDINATOR-PARTIAL-HISTORY-01 · Interrupted-output preservation (2026-10-08)
 
 1. [x] Executor: aborted streams persist as display-only records at their native
