@@ -158,6 +158,9 @@ async function coordinatorControlAcceptance() {
     });
     await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('停止结果尚未确认'));
+    await fixturePage.waitForResponse(response => new URL(response.url()).pathname.endsWith('/api/coordinator') && response.request().method() === 'GET');
+    assert.match(await panel.locator(':scope > [role=status]').textContent(), /停止结果尚未确认/,
+      'A normal Coordinator heartbeat must preserve the uncertain stop outcome');
     await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
     await panel.getByText('本轮已停止，已有操作和部分回复已保留；点击重试可继续', { exact: true }).waitFor();
     assert.equal(interruptRequests.length, 2); assert.deepEqual(interruptRequests[0], interruptRequests[1]);

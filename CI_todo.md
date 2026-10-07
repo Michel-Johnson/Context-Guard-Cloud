@@ -55,6 +55,13 @@
    heartbeat had already changed synced to syncing. The invariant now captures
    class plus display:none/zero rectangles in one browser task; a visible synced
    indicator still fails immediately. No sync behavior or timeout changed.
+   Exact-head remote run 37644590753 failed only browser/Required at CONTROL-01:
+   stop transport uncertainty was immediately cleared by the next 250ms normal
+   render. Its screenshot is retained under output/ci-fail-37644590753. This is
+   a product status bug, not an increased waiting-budget case. Unknown stop
+   outcome now stays with the same in-memory stop request until success, a
+   definite server rejection, or a verified terminal/different turn. Regression
+   also waits for a real subsequent GET and checks the warning persists.
 
 ## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
 

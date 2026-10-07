@@ -4900,7 +4900,7 @@ async function installCoordinatorPanel(sync){
     if(pending&&!pending.retry&&state.acceptedRequestIds?.includes(pending.id))confirmSubmitted(selected,pending);
     renderHistory(state);
     consumeNavigationActions(state);
-    status.textContent=state.error?'处理暂停：'+state.error.code:reviewFeedback||(pendingError&&pending?'尚未确认提交：'+pendingError:'');
+    status.textContent=state.error?'处理暂停：'+state.error.code:stop?.error||reviewFeedback||(pendingError&&pending?'尚未确认提交：'+pendingError:'');
     if(state.status==='interrupted')status.textContent='本轮已停止，已有操作和部分回复已保留；点击重试可继续';
     else if(state.pendingInputCount)status.textContent=`已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮`;
     const streamingText=String(state.streamingText||'');
@@ -5157,15 +5157,18 @@ async function installCoordinatorPanel(sync){
       }
       let request=stopRequests.get(id);
       if(!request||request.expectedTurnId!==expectedTurnId){request={id:crypto.randomUUID(),expectedTurnId};stopRequests.set(id,request);}
+      delete request.error;
       const result=await sync.call(conversationUrl('/api/coordinator/interrupt',id),
         {id:request.id,expectedTurnId:request.expectedTurnId},'POST','main');
       request.accepted=result.accepted===true;
       if(id===selected)await refresh();
     }catch(error){
       if(error.serverResponse)stopRequests.delete(id);
+      const message=error.code==='STALE_TURN'?'本轮已结束；未停止其他回复':
+        error.serverResponse?'停止未提交：'+error.message:'停止结果尚未确认；再次点击会核对同一请求';
+      if(!error.serverResponse&&stopRequests.has(id))stopRequests.get(id).error=message;
       if(id===selected){
-        status.textContent=error.code==='STALE_TURN'?'本轮已结束；未停止其他回复':
-          error.serverResponse?'停止未提交：'+error.message:'停止结果尚未确认；再次点击会核对同一请求';
+        status.textContent=message;
         if(error.code==='STALE_TURN')await refresh();
       }
     }finally{if(stoppingConversation===id)stoppingConversation=null;syncSendState();}
