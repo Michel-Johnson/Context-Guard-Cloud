@@ -120,8 +120,15 @@ try {
   for (const page of [localPage, cloudPage]) page.setDefaultTimeout(12000);
   await localPage.goto(`${local.state.url}?session=${sessionId}`);
   await localPage.waitForFunction(id => document.querySelector('#cg-sync-session')?.value === id, sessionId);
-  await localPage.waitForSelector('#cloud-sync-status.synced', { state: 'attached' });
-  assert.equal(await localPage.locator('#cloud-sync-status').isVisible(), false, 'synced Cloud status does not render a checkmark button');
+  const syncedAppearance = await localPage.waitForFunction(() => {
+    const indicator = document.querySelector('#cloud-sync-status.synced');
+    if (!indicator) return false;
+    // Read class and visibility in the same browser task: the next heartbeat
+    // may legitimately show its syncing spinner between two protocol calls.
+    return { display: getComputedStyle(indicator).display, rectangles: indicator.getClientRects().length };
+  });
+  assert.deepEqual(await syncedAppearance.jsonValue(), { display: 'none', rectangles: 0 },
+    'synced Cloud status does not render a checkmark button');
   await cloudPage.goto(`${cloud.url}/auth?token=cloud-admin&next=${encodeURIComponent('/projects/context-guard')}`);
   await cloudPage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
   await cloudPage.locator('.node[data-id="T0"]').click();

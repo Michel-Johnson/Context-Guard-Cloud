@@ -50,6 +50,11 @@
    First integrated browser run failed a positioning declaration check because
    getComputedStyle resolves auto top to the used pixel value; the original
    Typed OM declaration check now tests top:auto and bottom:8px explicitly.
+   Integrated workbench's 50 checks passed, then Session sync failed its old
+   separate class/visibility reads: retained local-diagnosis.json proves the
+   heartbeat had already changed synced to syncing. The invariant now captures
+   class plus display:none/zero rectangles in one browser task; a visible synced
+   indicator still fails immediately. No sync behavior or timeout changed.
 
 ## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
 
