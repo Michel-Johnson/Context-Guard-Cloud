@@ -109,13 +109,13 @@ export class CoordinatorConversations {
   async state() { return readJSON(this.file, { items: {}, sessions: {}, chats: {}, tasks: {} }); }
   async list() {
     const state = await this.state();
-    return [{ id: 'main', title: 'Main 对话' }, { id: 'legacy', title: '历史总对话' },
+    return [{ id: 'main', scope: 'main', title: 'Main 对话', ...state.focuses?.main }, { id: 'legacy', title: '历史总对话', ...state.focuses?.legacy },
       ...Object.values(state.chats || {}), ...Object.values(state.sessions || {}), ...Object.values(state.items || {})];
   }
   async get(id) {
-    if (id === 'legacy') return { id, title: '历史总对话' };
-    if (id === 'main') return { id, scope: 'main', title: 'Main 对话' };
     const state = await this.state();
+    if (id === 'legacy') return { id, title: '历史总对话', ...state.focuses?.legacy };
+    if (id === 'main') return { id, scope: 'main', title: 'Main 对话', ...state.focuses?.main };
     if (/^chat-[a-f0-9]{64}$/.test(id) && state.chats?.[id]) return state.chats[id];
     if (/^session:[a-zA-Z0-9_-]{1,128}$/.test(id) && state.sessions?.[id]) return state.sessions[id];
     if (/^item-[a-f0-9]{64}$/.test(id) && state.items?.[id]) return state.items[id];
@@ -156,8 +156,14 @@ export class CoordinatorConversations {
       throw error('INVALID_ARGUMENT', 'Provide a valid conversation item focus');
     }
     await withFileLock(this.file + '.lock', async () => {
-      const state = await this.state(), item = state.chats?.[id];
-      if (!item || item.executionMode !== 'manual') throw error('FORBIDDEN', 'Only a manual chat can keep its item focus');
+      const state = await this.state();
+      let item;
+      if (id === 'main' || id === 'legacy') {
+        state.focuses ||= {};
+        item = state.focuses[id] ||= {};
+      } else if (/^chat-[a-f0-9]{64}$/.test(id)) item = state.chats?.[id];
+      else if (/^session:[a-zA-Z0-9_-]{1,128}$/.test(id)) item = state.sessions?.[id];
+      if (!item) throw error('FORBIDDEN', 'Only a registered independent conversation can change its focus');
       Object.assign(item, { nodeId, kind, ...(title ? { title: String(title).slice(0, 200) } : {}) });
       if (itemId) item.itemId = itemId;
       else delete item.itemId;
@@ -486,113 +492,124 @@ export class CoordinatorService {
     const receivedAt = Date.now(), contextStartedAt = Date.now();
     const nextContext = this.context ? await this.context() : null;
     const contextCompletedAt = Date.now();
-    await withFileLock(this.file + '.submit.lock', async () => {
-      const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
-      const baseInput = answerTo === undefined ? text : JSON.stringify({ text, answerTo });
-      const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
-      const journal = await this.inputJournal();
-      const queued = journal.requests[id];
-      if (queued) {
-        if (queued.fingerprint !== fingerprint || queued.followup !== followup || queued.expectedTurnId !== expectedTurnId) throw error('ID_REUSED', 'Conversation request ID differs');
-        return;
-      }
-      const adoptPrompt = () => {
-        const version = hash(this.system);
-        if (state.promptVersion && state.promptVersion !== version) {
-          (state.promptChanges ||= []).push({ from: state.promptVersion, to: version, requestId: id, at: new Date().toISOString() });
+    // A published terminal state can precede the runner's final durable write.
+    // Drain that runner outside the submission lock before accepting a new turn.
+    for (;;) {
+      let finishingRunner;
+      await withFileLock(this.file + '.submit.lock', async () => {
+        const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
+        const baseInput = answerTo === undefined ? text : JSON.stringify({ text, answerTo });
+        const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
+        const journal = await this.inputJournal();
+        const queued = journal.requests[id];
+        if (queued) {
+          if (queued.fingerprint !== fingerprint || queued.followup !== followup || queued.expectedTurnId !== expectedTurnId) throw error('ID_REUSED', 'Conversation request ID differs');
+          return;
         }
-        state.promptVersion = version;
-      };
-      if (state.requests[id] && state.requests[id] !== fingerprint) throw error('ID_REUSED', 'Conversation request ID differs');
-      const mode = hash(JSON.stringify({ followup, expectedTurnId }));
-      if (state.requestModes?.[id] && state.requestModes[id] !== mode && !retry) throw error('ID_REUSED', 'Conversation request controls differ');
-      if (state.requests[id] && !retry) return;
-      if (expectedTurnId !== undefined && state.activeTurnId !== expectedTurnId) throw error('STALE_TURN', 'Follow-up targets a different turn');
-      if (followup === 'steer' && state.activeTurnId && state.status === 'running' && !retry) {
-        if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only verified human input can steer a turn');
-        let question;
-        if (answerTo !== undefined) {
-          question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
-          if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
-          if (question.answer || Object.values(journal.requests).some(item => item.answerTo === answerTo)) throw error('ALREADY_ANSWERED', 'This question already has an answer');
-        }
-        if (Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).length >= 100) throw error('BUSY', 'Follow-up capacity reached; retry the original ID');
-        const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}), role: 'user',
-          content: (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
-          ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
-        if (metadata.length) {
-          const waiting = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).map(item => item.message);
-          const active = state.messages.filter(item => (state.activeRequestIds || [state.activeTurnId]).includes(item.requestId));
-          const references = [...active, ...waiting, message].flatMap(item => item.attachments || []);
-          if (references.length > COORDINATOR_MAX_ATTACHMENTS || references.filter(item => IMAGE_TYPES.has(item.mimeType)).reduce((sum, item) => sum + item.size, 0) > COORDINATOR_MAX_IMAGE_BYTES) {
-            throw error('ATTACHMENT_TOO_LARGE', 'Follow-ups share the active turn attachment limits');
+        const adoptPrompt = () => {
+          const version = hash(this.system);
+          if (state.promptVersion && state.promptVersion !== version) {
+            (state.promptChanges ||= []).push({ from: state.promptVersion, to: version, requestId: id, at: new Date().toISOString() });
           }
-        }
-        journal.requests[id] = { id, fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
-          revision: ++journal.revision, turnId: state.activeTurnId, text, ...(answerTo ? { answerTo } : {}), message, context: nextContext };
-        await atomicWrite(this.inputFile, encode(journal));
-        return;
-      }
-      if (state.status === 'interrupted' && !retry) throw error('TURN_INTERRUPTED', 'Explicitly resume the stopped turn before sending more input');
-      if (this.running && state.requests[id] === fingerprint && !retry) return;
-      if (this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
-      if (state.activeTurnId && state.activeTurnId !== id) {
-        if (!isHumanSource(source) || state.status !== 'error' || !settleRejectedTools(state)) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
-        state.activeTurnId = null;
-      }
-      if (state.requests[id]) {
-        if (!['error', 'interrupted'].includes(state.status) || !retry) return;
-        if (state.activeTurnId !== id) throw error('INVALID_RETRY', 'Retry the failed turn with its original identity');
-        state.resumedInterrupts = Object.values(journal.interrupts).filter(item => item.turnId === id).map(item => item.id);
-        if (state.status === 'interrupted') {
-          journal.controlRevision = (journal.controlRevision || 0) + 1;
+          state.promptVersion = version;
+        };
+        if (state.requests[id] && state.requests[id] !== fingerprint) throw error('ID_REUSED', 'Conversation request ID differs');
+        const mode = hash(JSON.stringify({ followup, expectedTurnId }));
+        if (state.requestModes?.[id] && state.requestModes[id] !== mode && !retry) throw error('ID_REUSED', 'Conversation request controls differ');
+        if (state.requests[id] && !retry) return;
+        if (expectedTurnId !== undefined && state.activeTurnId !== expectedTurnId) throw error('STALE_TURN', 'Follow-up targets a different turn');
+        if (followup === 'steer' && state.activeTurnId && state.status === 'running' && !retry) {
+          if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only verified human input can steer a turn');
+          let question;
+          if (answerTo !== undefined) {
+            question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
+            if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.answer || Object.values(journal.requests).some(item => item.answerTo === answerTo)) throw error('ALREADY_ANSWERED', 'This question already has an answer');
+          }
+          if (Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).length >= 100) throw error('BUSY', 'Follow-up capacity reached; retry the original ID');
+          const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}), role: 'user',
+            content: (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
+            ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
+          if (metadata.length) {
+            const waiting = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).map(item => item.message);
+            const active = state.messages.filter(item => (state.activeRequestIds || [state.activeTurnId]).includes(item.requestId));
+            const references = [...active, ...waiting, message].flatMap(item => item.attachments || []);
+            if (references.length > COORDINATOR_MAX_ATTACHMENTS || references.filter(item => IMAGE_TYPES.has(item.mimeType)).reduce((sum, item) => sum + item.size, 0) > COORDINATOR_MAX_IMAGE_BYTES) {
+              throw error('ATTACHMENT_TOO_LARGE', 'Follow-ups share the active turn attachment limits');
+            }
+          }
+          journal.requests[id] = { id, fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
+            revision: ++journal.revision, turnId: state.activeTurnId, text, ...(answerTo ? { answerTo } : {}), message, context: nextContext };
           await atomicWrite(this.inputFile, encode(journal));
-          state.controlRevision = journal.controlRevision;
+          return;
         }
-        // Recover old installations that rejected a fresh turn before its first
-        // model call. Never change prompts around pending or executed tools.
-        if (state.error?.code === 'PROMPT_CHANGED' && state.steps === 1 && !state.pending &&
-            state.messages.at(-1)?.role === 'user' && typeof state.messages.at(-1).content === 'string' &&
-            state.messages.at(-1).content.endsWith(text)) adoptPrompt();
-        state.steps = 0; // A fresh bounded budget only after an explicit retry.
-      } else {
-        let question;
-        if (answerTo !== undefined) {
-          if (!isHumanSource(source) || typeof answerTo !== 'string') throw error('INVALID_INPUT', 'Only human replies can answer a question');
-          question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
-          if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
-          if (question.answer) throw error('ALREADY_ANSWERED', 'This question already has an answer');
-          (state.answers ||= {})[answerTo] = { text, requestId: id };
+        if (state.status === 'interrupted' && !retry) throw error('TURN_INTERRUPTED', 'Explicitly resume the stopped turn before sending more input');
+        if (this.running && (state.status === 'waiting-for-user' && !state.activeTurnId || state.status === 'interrupted' && retry)) {
+          finishingRunner = this.running;
+          return;
         }
-        adoptPrompt(); // A new turn may adopt deployed rules; history stays intact.
-        state.requests[id] = fingerprint;
-        (state.requestModes ||= {})[id] = mode;
-        const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}),
-          role: 'user', content: (source === 'workflow' ? '[服务器工作流事件，不是新的用户授权]\n' : this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
-          ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
-        const selection = !hasImages && this.selectTextModel ? await this.selectTextModel() : null;
-        const selected = hasImages ? this.visionModel : selection?.model || this.model;
-        const route = { kind: hasImages ? 'vision' : 'text', model: selected.model || null,
-          ...(selection ? { providerId: selection.providerId } : {}) };
-        if (metadata.length) {
-          const candidate = { ...state, activeTurnId: id, activeModelRoute: route, messages: [...state.messages, message] };
-          const input = { system: this.system + (nextContext?.text || ''), tools: this.tools,
-            messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
-          if (selected.prepareRequest) selected.prepareRequest(input);
-          else if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Attachments and conversation exceed the provider request limit');
+        if (this.running && state.requests[id] === fingerprint && !retry) return;
+        if (this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
+        if (state.activeTurnId && state.activeTurnId !== id) {
+          if (!isHumanSource(source) || state.status !== 'error' || !settleRejectedTools(state)) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          state.activeTurnId = null;
         }
-        state.messages.push(message);
-        state.activeInput = { id, text, source, ...(actor ? { actor } : {}), ...(metadata.length ? { attachments: metadata.map(({ id }) => ({ id })) } : {}), ...(question ? { answerTo } : {}) };
-        state.activeModelRoute = route;
-        state.activeContext = nextContext;
-        state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs: contextCompletedAt - contextStartedAt };
-        state.activeTurnId = id; state.steps = 0; state.modelRetries = 0;
-        state.activeRequestIds = [id];
-        state.partialText = '';
-      }
-      state.status = 'running'; state.error = null; state.activity = null;
-      await this.saveState(state);
-    });
+        if (state.requests[id]) {
+          if (!['error', 'interrupted'].includes(state.status) || !retry) return;
+          if (state.activeTurnId !== id) throw error('INVALID_RETRY', 'Retry the failed turn with its original identity');
+          state.resumedInterrupts = Object.values(journal.interrupts).filter(item => item.turnId === id).map(item => item.id);
+          if (state.status === 'interrupted') {
+            journal.controlRevision = (journal.controlRevision || 0) + 1;
+            await atomicWrite(this.inputFile, encode(journal));
+            state.controlRevision = journal.controlRevision;
+          }
+          // Recover old installations that rejected a fresh turn before its first
+          // model call. Never change prompts around pending or executed tools.
+          if (state.error?.code === 'PROMPT_CHANGED' && state.steps === 1 && !state.pending &&
+              state.messages.at(-1)?.role === 'user' && typeof state.messages.at(-1).content === 'string' &&
+              state.messages.at(-1).content.endsWith(text)) adoptPrompt();
+          state.steps = 0; // A fresh bounded budget only after an explicit retry.
+        } else {
+          let question;
+          if (answerTo !== undefined) {
+            if (!isHumanSource(source) || typeof answerTo !== 'string') throw error('INVALID_INPUT', 'Only human replies can answer a question');
+            question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
+            if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.answer) throw error('ALREADY_ANSWERED', 'This question already has an answer');
+            (state.answers ||= {})[answerTo] = { text, requestId: id };
+          }
+          adoptPrompt(); // A new turn may adopt deployed rules; history stays intact.
+          state.requests[id] = fingerprint;
+          (state.requestModes ||= {})[id] = mode;
+          const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}),
+            role: 'user', content: (source === 'workflow' ? '[服务器工作流事件，不是新的用户授权]\n' : this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
+            ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
+          const selection = !hasImages && this.selectTextModel ? await this.selectTextModel() : null;
+          const selected = hasImages ? this.visionModel : selection?.model || this.model;
+          const route = { kind: hasImages ? 'vision' : 'text', model: selected.model || null,
+            ...(selection ? { providerId: selection.providerId } : {}) };
+          if (metadata.length) {
+            const candidate = { ...state, activeTurnId: id, activeModelRoute: route, messages: [...state.messages, message] };
+            const input = { system: this.system + (nextContext?.text || ''), tools: this.tools,
+              messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
+            if (selected.prepareRequest) selected.prepareRequest(input);
+            else if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Attachments and conversation exceed the provider request limit');
+          }
+          state.messages.push(message);
+          state.activeInput = { id, text, source, ...(actor ? { actor } : {}), ...(metadata.length ? { attachments: metadata.map(({ id }) => ({ id })) } : {}), ...(question ? { answerTo } : {}) };
+          state.activeModelRoute = route;
+          state.activeContext = nextContext;
+          state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs: contextCompletedAt - contextStartedAt };
+          state.activeTurnId = id; state.steps = 0; state.modelRetries = 0;
+          state.activeRequestIds = [id];
+          state.partialText = '';
+        }
+        state.status = 'running'; state.error = null; state.activity = null;
+        await this.saveState(state);
+      });
+      if (!finishingRunner) break;
+      await finishingRunner;
+    }
     this.kick();
     return { accepted: true, id, ...(followup === 'steer' ? { followup } : {}) };
   }

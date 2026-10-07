@@ -8,11 +8,13 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium } from 'playwright';
 import { createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
-import { completeSessionMemory } from '../scripts/cloud/memory.mjs';
+import { completeSessionMemory, readMemoryView } from '../scripts/cloud/memory.mjs';
+import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 
 const execFileAsync = promisify(execFile);
 const git = async (root, ...args) => (await execFileAsync('git', args, { cwd: root, windowsHide: true })).stdout.trim();
-const output = path.resolve(process.argv[2] || `output/playwright/browser-ci/cloud-${Date.now()}-${randomUUID()}`);
+const controlsOnly = process.argv.includes('--controls-only');
+const output = path.resolve(process.argv.slice(2).find(value => !value.startsWith('--')) || `output/playwright/browser-ci/cloud-${Date.now()}-${randomUUID()}`);
 const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-cloud-browser-'));
 const repository = path.join(dataDir, 'repository');
 const memoryConfig = {
@@ -71,7 +73,145 @@ const useScreenshotFallbackFonts = screenshotPage => screenshotPage.route(
   route=>route.abort(),
 );
 
+// Real browser -> authenticated HTTP -> Coordinator -> durable state. Only the
+// paid model provider and one deliberately lost HTTP request are controlled.
+async function coordinatorControlAcceptance() {
+  const directory = path.join(dataDir, 'control-acceptance'), providerFile = path.join(directory, 'provider.json');
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(providerFile, JSON.stringify({ model: 'fixture-model', token: 'synthetic', baseUrl: 'https://fixture.invalid' }));
+  await fs.writeFile(path.join(directory, 'projects.json'), JSON.stringify({ v: 2, projects: [{ id: 'control-fixture', name: 'Control fixture' }] }));
+  const memory = { dataDir: path.join(directory, 'memory'), adminToken: 'fixture-memory-admin', projects: {
+    'control-fixture': { root: directory, ref: 'refs/heads/main', token: 'fixture-project',
+      coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true } },
+  } };
+  const file = legacyProjectMemoryFile(memory.dataDir, 'control-fixture');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({ revision: 1, main: { version: 'control-main', memory: { records: {}, map: {
+    project: 'Control fixture', bootstrap: 'ready', root: { id: 'T0', title: 'Controls', kind: 'module', state: 'dirty', owns: [], children: [
+      { id: 'N1', title: 'Login', kind: 'module', state: 'dirty', owns: [], memoryDocument: 'BROWSER-DURABLE-FOCUS-MEMORY', children: [] },
+    ] },
+  } } }, sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
+  const held = new Set(), errors = [], modelInputs = []; let heldOnce = false, cloud, fixtureContext, fixturePage;
+  try {
+    cloud = await startCloudServer({ host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig: memory,
+      browserToken: 'fixture-browser', browserPasswordHash: await createWorkbenchPasswordHash('control-password'), privateAccess: true,
+      protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'control-fixture', slug: 'example/control-fixture' }] },
+      coordinatorModelFactory: () => ({ model: 'fixture-model', next: async input => {
+        modelInputs.push(input); const text = input.messages.at(-1)?.content;
+        if (text === '开始停止测试' && !heldOnce) {
+          heldOnce = true; await input.onText('已经输出的完整段落。\n\n正在生成的尾段');
+          return new Promise((resolve, reject) => {
+            const release = () => { held.delete(release); resolve({ stop: 'end_turn', content: [{ type: 'text', text: 'completed' }] }); };
+            held.add(release);
+            input.signal.addEventListener('abort', () => { held.delete(release); reject(Object.assign(new Error('Controlled stop'), { code: 'MODEL_INTERRUPTED' })); }, { once: true });
+          });
+        }
+        if (text === '记住登录节点') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'browser-mount', name: 'mount_conversation',
+          input: { nodeId: 'N1', kind: 'todo', title: 'Login discussion', description: 'Keep login focus', mainVersion: 'control-main' } }] };
+        return { stop: 'end_turn', content: [{ type: 'text', text: '已继续当前讨论。' }] };
+      } }) });
+    fixtureContext = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+    fixturePage = await fixtureContext.newPage(); fixturePage.on('pageerror', error => errors.push(error.message));
+    await fixturePage.goto(cloud.url + '/login?next=%2Fprojects%2Fcontrol-fixture');
+    await fixturePage.getByLabel('密码').fill('control-password');
+    await fixturePage.getByRole('button', { name: '登录', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
+    await fixturePage.locator('#btn-coordinator').click();
+    const panel = fixturePage.locator('#coordinator-panel'), input = panel.getByLabel('发送给 Coordinator');
+    const before = await readMemoryView(memory, 'control-fixture');
+    await input.fill('开始停止测试'); await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
+    await panel.getByRole('button', { name: '停止当前回复', exact: true }).waitFor();
+    await panel.getByText('已经输出的完整段落。', { exact: true }).waitFor();
+    await fixturePage.waitForFunction(() => {
+      const send = document.querySelector('.coordinator-send.is-working-ready');
+      return send && getComputedStyle(send.querySelector('canvas')).opacity === '1';
+    });
+    await panel.screenshot({ path: path.join(output, 'coordinator-click-stop-desktop.png') });
+    await fixturePage.setViewportSize({ width: 390, height: 844 });
+    await input.fill('第一行补充\n第二行补充');
+    assert.equal(await panel.getByRole('button', { name: '发送', exact: true }).isEnabled(), true, 'A typed supplement still has a send action during generation');
+    await fixturePage.waitForFunction(() => {
+      const send = document.querySelector('.coordinator-send');
+      return send && getComputedStyle(send.querySelector('svg')).opacity === '1' &&
+        getComputedStyle(send.querySelector('canvas')).opacity === '0';
+    });
+    const alignment = await panel.locator('.coordinator-send').evaluate(send => {
+      const box = send.getBoundingClientRect(), shell = send.parentElement.getBoundingClientRect(), arrow = send.querySelector('svg').getBoundingClientRect();
+      return { bottom: shell.bottom - box.bottom, right: shell.right - box.right,
+        center: [Math.abs((arrow.left + arrow.right - box.left - box.right) / 2), Math.abs((arrow.top + arrow.bottom - box.top - box.bottom) / 2)] };
+    });
+    assert.ok(Math.abs(alignment.bottom - 8) <= .25 && Math.abs(alignment.right - 8) <= .25, JSON.stringify(alignment));
+    assert.ok(alignment.center.every(value => value <= .25), 'Mobile multi-line arrow is centered in a single grid cell');
+    await panel.locator('.coordinator-input-shell').screenshot({ path: path.join(output, 'coordinator-arrow-multiline-mobile.png') });
+    await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('已保存 1 条补充'));
+    await input.fill('');
+    await fixturePage.waitForFunction(() => {
+      const send = document.querySelector('.coordinator-send.is-working-ready');
+      return send && getComputedStyle(send.querySelector('canvas')).opacity === '1';
+    });
+    await panel.screenshot({ path: path.join(output, 'coordinator-click-stop-mobile.png') });
+    const interruptRequests = [];
+    await fixturePage.route(/\/api\/coordinator\/interrupt(?:\?|$)/, async route => {
+      interruptRequests.push(route.request().postDataJSON());
+      if (interruptRequests.length === 1) return route.abort(); // Not committed: retry must keep the original request ID.
+      await route.continue();
+    });
+    await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('停止结果尚未确认'));
+    await panel.locator(':scope > [role=status]').evaluate(status => {
+      status.__stopWarningWrites = 0;
+      status.__stopWarningObserver = new MutationObserver(() => status.__stopWarningWrites++);
+      status.__stopWarningObserver.observe(status, { childList: true });
+    });
+    await fixturePage.waitForResponse(response => new URL(response.url()).pathname.endsWith('/api/coordinator') && response.request().method() === 'GET');
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.__stopWarningWrites > 0);
+    assert.match(await panel.locator(':scope > [role=status]').textContent(), /停止结果尚未确认/,
+      'A rendered Coordinator heartbeat must preserve uncertain stop outcome ahead of queued-input status');
+    await panel.locator(':scope > [role=status]').evaluate(status => status.__stopWarningObserver.disconnect());
+    await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
+    await panel.getByText('本轮已停止，已有操作和部分回复已保留；点击重试可继续', { exact: true }).waitFor();
+    assert.equal(interruptRequests.length, 2); assert.deepEqual(interruptRequests[0], interruptRequests[1]);
+    const stateUrl = cloud.url + '/api/workbench/projects/control-fixture/api/coordinator?conversation=main';
+    let state = await (await fixtureContext.request.get(stateUrl)).json();
+    assert.equal(state.status, 'interrupted'); assert.equal(state.activeTurnId, interruptRequests[0].expectedTurnId);
+    assert.equal(state.partialText, '已经输出的完整段落。\n\n正在生成的尾段');
+    await panel.getByText(/部分回复（未完成）/).waitFor();
+    assert.match(await panel.locator('.coordinator-messages').textContent(), /已经输出的完整段落/);
+    await fixturePage.reload(); await fixturePage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
+    await fixturePage.locator('#btn-coordinator').click();
+    await panel.getByText(/部分回复（未完成）/).waitFor();
+    assert.match(await panel.locator('.coordinator-messages').textContent(), /正在生成的尾段/);
+    await panel.getByRole('button', { name: '重试原请求', exact: true }).click();
+    await panel.getByText('已继续当前讨论。', { exact: true }).waitFor();
+    await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
+    await input.fill('记住登录节点'); await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel [data-conversation="main"]')?.textContent.includes('Login discussion'));
+    state = await (await fixtureContext.request.get(stateUrl)).json();
+    assert.equal(state.conversations.find(value => value.id === 'main').nodeId, 'N1');
+    assert.deepEqual(await readMemoryView(memory, 'control-fixture'), before, 'Clicking stop and mounting focus never change Main or create an execution Session');
+    await fixturePage.reload(); await fixturePage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
+    await fixturePage.locator('#btn-coordinator').click();
+    await input.fill('继续讨论'); await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
+    assert.ok(modelInputs.at(-1).system.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
+    assert.deepEqual(errors, []);
+    record('CONTROL-01 real ink-click stop uses an idempotent original-turn request and preserves text across reload/resume');
+    record('CONTROL-02 mobile multi-line send stays aligned; existing one-second ink and typed supplements remain');
+    record('FOCUS-01 real Main mounting survives reload and supplies the saved node memory without Main/Session writes');
+  } catch (error) {
+    await fixturePage?.screenshot({ path: path.join(output, 'failure-coordinator-controls.png'), fullPage: true }).catch(() => {});
+    throw error;
+  } finally {
+    for (const release of held) release();
+    await fixtureContext?.close(); await cloud?.close();
+  }
+}
+
 try {
+  if (!controlsOnly) {
   assert.deepEqual(await fs.readFile('prototype/vendor/marked.mjs'), await fs.readFile('node_modules/marked/lib/marked.esm.js'), 'vendor lexer must match the locked dependency');
   assert.deepEqual(await fs.readFile('licenses/Marked-MIT.txt'), await fs.readFile('node_modules/marked/LICENSE.md'), 'ship the upstream license unchanged');
   const markdownDependency=JSON.parse(await fs.readFile('package-lock.json','utf8')).packages['node_modules/marked'];
@@ -830,7 +970,8 @@ try {
       return{phone:document.documentElement.classList.contains('cg-phone'),toolbar:rect(toolbar),visible,
         recovery:{...rect(recovery),hidden:recovery.hidden,display:getComputedStyle(recovery).display,afterMessages:recovery.previousElementSibling?.classList.contains('coordinator-messages')},
         panel:rect(panel),messages:rect(panel.querySelector('.coordinator-messages')),
-        input:rect(input),send:rect(send),padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:send.computedStyleMap().get('bottom').toString()};
+        input:rect(input),shell:rect(send.parentElement),send:rect(send),arrow:rect(send.querySelector('svg')),
+        padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:send.computedStyleMap().get('bottom').toString(),top:send.computedStyleMap().get('top').toString()};
     });
     const details=`${label} ${width}: ${JSON.stringify(geometry)}`;
     assert.equal(geometry.visible.filter(el=>el.action).length,3,'toolbar contains history, model and new Session only');
@@ -849,8 +990,11 @@ try {
       assert.ok(geometry.visible.filter(el=>el.action).every(el=>el.top>=geometry.visible[0].bottom),`phone actions follow the heading row: ${details}`);
       assert.deepEqual([geometry.send.width,geometry.send.height],[44,44]);
     }
-    assert.equal(geometry.bottom,'auto','send has only one vertical positioning constraint');
-    assert.ok(Math.abs((geometry.send.top+geometry.send.bottom-geometry.input.top-geometry.input.bottom)/2)<=.5,`single/multiline send stays vertically centered: ${details}`);
+    assert.equal(geometry.top,'auto','send has only one vertical positioning constraint');
+    assert.equal(geometry.bottom,'8px');
+    assert.ok(Math.abs(geometry.shell.bottom-geometry.send.bottom-8)<=.5,`single/multiline send stays bottom anchored: ${details}`);
+    assert.ok(Math.abs((geometry.send.top+geometry.send.bottom-geometry.arrow.top-geometry.arrow.bottom)/2)<=.25&&
+      Math.abs((geometry.send.left+geometry.send.right-geometry.arrow.left-geometry.arrow.right)/2)<=.25,`send arrow stays centered in its control: ${details}`);
     assert.ok(geometry.send.left>=geometry.input.right-geometry.padding+4&&geometry.send.right<=geometry.input.right&&geometry.send.top>=geometry.input.top&&geometry.send.bottom<=geometry.input.bottom,`send remains inside reserved composer space: ${details}`);
   };
   await coordinator.getByLabel('发送给 Coordinator').fill('Main 草稿');await historyAction.click();
@@ -1538,7 +1682,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('可补充纠正意见'));
   await coordinator.locator('textarea').fill('更正审批 ID，先核对当前 Plan');
   await coordinator.getByRole('button', { name: '发送', exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent === '' && document.querySelector('#coordinator-panel button[type=submit]').disabled && !document.querySelector('.coordinator-send.is-working') && document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
+  await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent === '' && document.querySelector('#coordinator-panel .coordinator-send')?.disabled && !document.querySelector('.coordinator-send.is-working') && document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
   assert.notEqual(submissions.at(-1).id, submissions[0].id);
   assert.equal(submissions.at(-1).retry, undefined, 'human correction is a new message, not an unsafe replay');
   record('Coordinator feature gate, safe Markdown rendering and durable explicit retries');
@@ -1551,7 +1695,7 @@ try {
     const retry = panel.querySelector('button[aria-label="重试原请求"]');
     return panel.querySelector(':scope > [role=status]').textContent === '' && retry.hidden &&
       !panel.querySelector('.coordinator-send.is-working') &&
-      panel.querySelector('button[type=submit]').disabled && panel.querySelector('textarea[aria-label="发送给 Coordinator"]').value === '';
+      panel.querySelector('.coordinator-send')?.disabled && panel.querySelector('textarea[aria-label="发送给 Coordinator"]').value === '';
   });
   assert.equal(submissions.length, beforeLostReply + 1, 'durable receipt reconciliation never submits a second model turn');
   record('Coordinator reconciles a lost HTTP acknowledgement without manual retry or duplicate submission');
@@ -2112,7 +2256,11 @@ try {
   record('Session completion requires synchronized human review and exact current version; stale review preserves Main');
 
   await page.screenshot({ path: path.join(output, 'cloud-session-edit.png'), fullPage: true });
-  await fs.writeFile(path.join(output, 'result.json'), `${JSON.stringify({ passed: true, checks }, null, 2)}\n`);
+  }
+  await fs.mkdir(output, { recursive: true });
+  browser ||= await chromium.launch({ headless: true });
+  await coordinatorControlAcceptance();
+  await fs.writeFile(path.join(output, 'result.json'), `${JSON.stringify({ passed: true, scope: controlsOnly ? 'coordinator-controls-and-focus' : 'all', checks }, null, 2)}\n`);
   passed = true;
 } finally {
   if (attachmentPage && !attachmentPage.isClosed() && !passed) {

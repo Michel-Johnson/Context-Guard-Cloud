@@ -1,5 +1,73 @@
 # Cloud split acceptance
 
+## COORDINATOR-CONTROLS-FOCUS-01 · Current-main port (2026-10-07)
+
+1. [x] Executor: empty composer ink uses the existing authenticated interrupt
+   endpoint with the captured turn identity and stable retry request ID. Typed
+   supplements retain send/steer. Completed/stale turns cannot stop a newer turn;
+   output, resume identity, original 48-frame hue cycle and one-second transition
+   remain. Multi-line phone send uses one grid cell and bottom/right anchoring.
+2. [x] Executor: automatic chats, Main, legacy and existing Session scopes persist
+   mounting focus and clear obsolete item identity. The next model context reads
+   that node before/after restart. Mounting creates no Main item, task, execution
+   Session or binding; existing binding and Main snapshots remain equal.
+3. [x] Executor: terminal-runner drain outside the submission lock fixes the
+   observed completion-boundary busy race without concurrent transcript writes.
+   A deterministic held-runner test covers acceptance and both message identities.
+4. [x] Executor module evidence: targeted mount checks passed 6/6; combined modules
+   initially failed 3/36 at the completion boundary, retained as failure evidence.
+   After the drain fix the combined run passed 36/36 (zero skips); adding the
+   deterministic race case then passed the full steer module 8/8 (zero skips).
+5. [x] Executor browser controls: real password UI/HTTP/backend/storage with a
+   controlled paid model, and one lost interrupt request. Three checks passed:
+   CONTROL-01 stop/retry/reload/resume, CONTROL-02 phone alignment/supplements,
+   FOCUS-01 persisted Main focus/context and unchanged Main/Session snapshot.
+   Run: output/playwright/browser-ci/cloud-1791386366033-55281d5b-f0de-4312-9367-c94f705d8f7d.
+   Desktop, phone and multi-line screenshots inspected. Initial login URL,
+   post-reload DOM readiness and synthetic missing tool-description failures are
+   preserved in earlier browser output directories; no assertion weakened or
+   waiting budget expanded. Phone ink repaint is observed before its screenshot.
+6. [x] Independent Tester c93a13e168f36bace0676feb532d281531fe648f:
+   modules 37/37 passed, browser controls 3/3 passed, zero skips, exit 0;
+   starting/ending source and tracked-clean state identical. Evidence:
+   output/playwright/browser-ci/cloud-1791386539019-18854610-8147-4cc8-84ab-c79206627fe2.
+   Review identified the phone-arrow screenshot could precede the one-second
+   repaint; now observe actual arrow/canvas opacity before recording the same
+   geometry assertion. Final-revision independent recheck remains pending.
+7. [ ] Final full Node/browser, unchanged Required gate, normal PR merge and
+   exact merged-SHA Cloud/Slack deployment. Production checks must remain
+   read-only: no test messages, business mutations, provider changes or new data.
+   First full browser run passed BDA-012 and 28 workbench checks, then failed on
+   a legacy submit-type selector while the ink is now a stop-type button. The
+   idle assertion retains disabled/empty/not-working checks on the stable control.
+   Executor c93a13e full Node passed 388/390 with two existing environment skips,
+   zero failures, exit 0. Full browser (BDA-012, workbench including the three
+   controls checks, Session sync) passed, exit 0. Workbench evidence:
+   output/playwright/browser-ci/cloud-1791386469287-aab84a88-d7ff-4627-9ddb-c0afc49f6a90.
+   Integration fetch then found concurrent Main PR #8 (38b5c82, Cloud 1.1.5).
+   Both evidence sections, its 44px phone targets, model/toolbar/recovery fixes
+   and attachment fix remain. Composition keeps this task's bottom anchoring.
+   First integrated browser run failed a positioning declaration check because
+   getComputedStyle resolves auto top to the used pixel value; the original
+   Typed OM declaration check now tests top:auto and bottom:8px explicitly.
+   Integrated workbench's 50 checks passed, then Session sync failed its old
+   separate class/visibility reads: retained local-diagnosis.json proves the
+   heartbeat had already changed synced to syncing. The invariant now captures
+   class plus display:none/zero rectangles in one browser task; a visible synced
+   indicator still fails immediately. No sync behavior or timeout changed.
+   Exact-head remote run 37644590753 failed only browser/Required at CONTROL-01:
+   stop transport uncertainty was immediately cleared by the next 250ms normal
+   render. Its screenshot is retained under output/ci-fail-37644590753. This is
+   a product status bug, not an increased waiting-budget case. Unknown stop
+   outcome now stays with the same in-memory stop request until success, a
+   definite server rejection, or a verified terminal/different turn. Regression
+   also waits for a real subsequent GET and checks the warning persists.
+   Independent source-level reproduction on 3f5565b found queued steer count
+   still overwrote that warning. Stop uncertainty now takes priority over the
+   pending-input count. CONTROL-01 sends a real held-turn steer first, and then
+   observes a status MutationObserver write after the next GET, so it verifies
+   frontend render rather than only response arrival. No sleep/budget increase.
+
 ## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
 
 - [x] Executor: semantic integration targets Main

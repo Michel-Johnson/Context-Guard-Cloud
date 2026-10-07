@@ -16,6 +16,7 @@ import { publicMessages, CoordinatorConversations } from '../scripts/cloud/coord
 import { createCoordinatorExecutor } from '../scripts/cloud/coordinator-tools.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store, threadKey } from '../plugins/slack/src/store.mjs';
+import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 
 // These exercise real Cloud and loopback HTTP with isolated persistence. Only
 // the paid model provider is replaced; no Slack SDK/account/network is involved.
@@ -331,14 +332,14 @@ async function prepared(f, conversation, name, id) {
     value.approvals.some(proposal => proposal.manual && proposal.pending));
   return state.approvals.find(proposal => proposal.manual && proposal.pending);
 }
-async function assertNoDispatch(f) {
+async function assertNoDispatch(f, existingBindings = {}) {
   const state = await f.main(); assert.deepEqual(Object.keys(state.sessions), []);
   for (const repositoryId of ['123', '124']) {
     const state = await readJSON(path.join(f.directory, 'interface-v2', hash(repositoryId), 'protocol-v2.json'), {});
     assert.equal(Object.keys(state.sessionCreations || {}).length, 0);
     assert.equal(Object.keys(state.projectTasks || {}).length, 0);
     assert.equal(Object.keys(state.tasks || {}).length, 0);
-    assert.equal(Object.keys(state.bindings || {}).length, 0);
+    assert.deepEqual(state.bindings || {}, existingBindings[repositoryId] || {}, 'Existing bindings stay exact; mounting cannot create or modify a Session');
   }
 }
 
@@ -418,6 +419,62 @@ for (const scenario of [
   assert.equal(JSON.parse(reply.content).error.code,'INVALID_ARGUMENT');
   assert.deepEqual(await f.main(),before,'A failed proposal must not mutate any Main item');
   await assertNoDispatch(f);
+});
+
+for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Automatic mount retains ${scope} node memory across restart without Main or dispatch writes`, async t => {
+  const f = await fixture(t, { childNodes: [{ id: 'N1', title: 'Login', kind: 'module', state: 'dirty', owns: [],
+    memoryDocument: 'MOUNT-FOCUS-UNIQUE-MEMORY', children: [] }] });
+  f.options.coordinatorModelFactory = () => ({ next: async request => {
+    f.modelCalls.push(request);
+    if (request.messages.at(-1)?.content === 'mount-focus-node') return { stop: 'tool_use', content: [{ type: 'tool_use',
+      id: 'mount-focus-tool', name: 'mount_conversation', input: {
+        mainVersion: 'main-initial', nodeId: 'N1', kind: 'todo', title: 'Review login', description: 'Keep this discussion focused',
+      } }] };
+    return { stop: 'end_turn', content: [{ type: 'text', text: 'done' }] };
+  } });
+  let id = scope;
+  if (scope === 'session') {
+    const store = new ProtocolStore(path.join(f.directory, 'interface-v2', hash('123')));
+    await store.handle({ repositoryId: '123', deviceId: 'fixture-device', agentId: 'fixture-executor' }, {
+      v: 2, id: 'register-focus-session', type: 'session.bind', payload: { sessionId: 'focus-session', worktreeId: 'fixture-worktree',
+        agentId: 'fixture-executor', expectedBindingVersion: '' },
+    }, { verifyBinding: () => true });
+    id = 'session:focus-session';
+  }
+  await f.restart();
+  if (scope === 'automatic-chat') {
+    const chat = await f.browser('main', { suffix: '/conversations/new', body: { id: 'automatic-focus-chat' } });
+    assert.equal(chat.status, 201, JSON.stringify(chat.body)); id = chat.body.id;
+  }
+  const before = await f.main();
+  const bindingsBefore = {};
+  if (scope === 'session') bindingsBefore['123'] = (await readJSON(path.join(f.directory, 'interface-v2', hash('123'), 'protocol-v2.json'), {})).bindings;
+  const mounted = await f.browser(id, { body: { id: 'mount-focus', text: 'mount-focus-node' } });
+  assert.equal(mounted.status, 202, JSON.stringify(mounted.body));
+  const final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  const action = final.messages.flatMap(message => message.actions || []).find(value => value.kind === 'conversation-mounted');
+  assert.equal(action?.node.id, 'N1');
+  assert.equal(final.conversations.find(value => value.id === id).nodeId, 'N1');
+  assert.deepEqual(await f.main(), before, 'Mounting cannot change the Main memory, version or Session store');
+  await assertNoDispatch(f, bindingsBefore);
+  for (const restart of [false, true]) {
+    if (restart) await f.restart();
+    const state = await f.browser(id); assert.equal(state.status, 200);
+    assert.equal(state.body.conversations.find(value => value.id === id).nodeId, 'N1');
+    assert.equal((await f.browser(id, { body: { id: `focused-followup-${restart}`, text: 'followup' } })).status, 202);
+    await f.wait(id, value => value.status === 'waiting-for-user' && !value.activeTurnId);
+    assert.ok(f.modelCalls.at(-1).system.includes('MOUNT-FOCUS-UNIQUE-MEMORY'), 'Next turn uses the saved node, not merely a display label');
+  }
+});
+
+test('Automatic mount rejects an out-of-scope node without saving focus or changing Main', async t => {
+  const f = await fixture(t, { nodeIds: ['N1'], childNodes: [{ id: 'N1', title: 'Allowed', kind: 'module', state: 'dirty', owns: [], children: [] }] });
+  const chat = await f.browser('main', { suffix: '/conversations/new', body: { id: 'restricted-auto-chat' } });
+  assert.equal(chat.status, 201); const id = chat.body.id, before = await f.main();
+  assert.equal((await f.browser(id, { body: { id: 'restricted-mount', text: 'mount-bug' } })).status, 202);
+  const final = await f.wait(id, state => ['waiting-for-user', 'error'].includes(state.status) && state.messages.length > 1);
+  assert.equal(final.conversations.find(value => value.id === id).nodeId, undefined);
+  assert.deepEqual(await f.main(), before); await assertNoDispatch(f);
 });
 
 test('Manual mount does not write Main and keeps node focus without an execution Session', async t => {
