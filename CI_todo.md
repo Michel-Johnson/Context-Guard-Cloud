@@ -27,14 +27,23 @@
    post-reload DOM readiness and synthetic missing tool-description failures are
    preserved in earlier browser output directories; no assertion weakened or
    waiting budget expanded. Phone ink repaint is observed before its screenshot.
-6. [ ] Independent Tester: review and execute on the exact frozen source SHA,
-   including completion/interrupt races, scope restrictions and no-dispatch.
+6. [x] Independent Tester c93a13e168f36bace0676feb532d281531fe648f:
+   modules 37/37 passed, browser controls 3/3 passed, zero skips, exit 0;
+   starting/ending source and tracked-clean state identical. Evidence:
+   output/playwright/browser-ci/cloud-1791386539019-18854610-8147-4cc8-84ab-c79206627fe2.
+   Review identified the phone-arrow screenshot could precede the one-second
+   repaint; now observe actual arrow/canvas opacity before recording the same
+   geometry assertion. Final-revision independent recheck remains pending.
 7. [ ] Final full Node/browser, unchanged Required gate, normal PR merge and
    exact merged-SHA Cloud/Slack deployment. Production checks must remain
    read-only: no test messages, business mutations, provider changes or new data.
    First full browser run passed BDA-012 and 28 workbench checks, then failed on
    a legacy submit-type selector while the ink is now a stop-type button. The
    idle assertion retains disabled/empty/not-working checks on the stable control.
+   Executor c93a13e full Node passed 388/390 with two existing environment skips,
+   zero failures, exit 0. Full browser (BDA-012, workbench including the three
+   controls checks, Session sync) passed, exit 0. Workbench evidence:
+   output/playwright/browser-ci/cloud-1791386469287-aab84a88-d7ff-4627-9ddb-c0afc49f6a90.
 
 ## R3-STATIC-PREVIEW-01 · Device tools tolerate missing server config (2026-10-07)
 

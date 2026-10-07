@@ -125,6 +125,11 @@ async function coordinatorControlAcceptance() {
     await fixturePage.setViewportSize({ width: 390, height: 844 });
     await input.fill('第一行补充\n第二行补充');
     assert.equal(await panel.getByRole('button', { name: '发送', exact: true }).isEnabled(), true, 'A typed supplement still has a send action during generation');
+    await fixturePage.waitForFunction(() => {
+      const send = document.querySelector('.coordinator-send');
+      return send && getComputedStyle(send.querySelector('svg')).opacity === '1' &&
+        getComputedStyle(send.querySelector('canvas')).opacity === '0';
+    });
     const alignment = await panel.locator('.coordinator-send').evaluate(send => {
       const box = send.getBoundingClientRect(), shell = send.parentElement.getBoundingClientRect(), arrow = send.querySelector('svg').getBoundingClientRect();
       return { bottom: shell.bottom - box.bottom, right: shell.right - box.right,
