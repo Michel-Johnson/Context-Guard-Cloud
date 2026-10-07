@@ -954,14 +954,14 @@ html.cg-phone .drawer h2{font-size:18px}
 #coordinator-panel .coordinator-model-toggle{width:auto;min-width:44px;padding:0 8px;font-size:12px;white-space:nowrap}
 #coordinator-panel .coordinator-recovery{align-self:flex-start;margin:0 0 8px;padding:4px 10px;background:transparent;box-shadow:none;font-size:12px}
 #coordinator-panel .coordinator-recovery[hidden]{display:none}
-.coordinator-model-dialog{width:min(440px,calc(100vw - 32px));box-sizing:border-box;padding:24px;border:2px solid var(--line-ink);border-radius:14px;background:var(--paper);color:var(--ink);box-shadow:var(--shadow)}
-.coordinator-model-dialog::backdrop{background:rgba(35,31,25,.28)}
-.coordinator-model-dialog form{display:grid;gap:12px;margin:0}
-.coordinator-model-dialog h3,.coordinator-model-dialog p{margin:0}
-.coordinator-model-dialog label{font-size:14px;font-weight:700}
-.coordinator-model-dialog select{width:100%;min-width:0;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink);font:inherit}
-.coordinator-model-dialog p{font-size:13px;line-height:1.6;color:var(--muted)}
-.coordinator-model-dialog .dialog-actions{display:flex;justify-content:flex-end;gap:8px}
+#coordinator-panel .coordinator-model-picker{position:relative;display:inline-flex;flex-shrink:0}
+#coordinator-panel .coordinator-model-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:20;width:220px;max-width:calc(100vw - 32px);box-sizing:border-box;padding:4px;border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);box-shadow:0 4px 16px rgba(35,31,25,.12)}
+#coordinator-panel .coordinator-model-menu[hidden]{display:none}
+#coordinator-panel .coordinator-model-option{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;min-height:44px;margin:0;padding:8px 10px;border:0;border-radius:6px;background:transparent;box-shadow:none;color:var(--ink);font:inherit;font-size:13px;text-align:left;transform:none}
+#coordinator-panel .coordinator-model-option:hover,#coordinator-panel .coordinator-model-option:focus-visible{background:var(--module-soft);transform:none}
+#coordinator-panel .coordinator-model-option[aria-checked=true]{background:var(--focus-soft);font-weight:650}
+#coordinator-panel .coordinator-model-menu p{margin:4px 10px;font-size:12px;line-height:1.5;color:var(--muted)}
+#coordinator-panel .coordinator-model-menu p:empty{display:none}
 #coordinator-panel .coordinator-history{margin:-4px 0 12px;padding:10px;border:1px solid #dccfaa;border-radius:12px;background:#faf3dc}
 #coordinator-panel .coordinator-history h3{margin:0 0 8px;font-size:13px;color:#746e5e}
 #coordinator-panel .coordinator-history-list{display:grid;gap:6px}
@@ -1073,6 +1073,7 @@ html.cg-phone .drawer h2{font-size:18px}
 html.cg-phone #coordinator-panel .coordinator-heading{flex-basis:100%;min-height:44px;text-align:start}
 html.cg-phone #coordinator-panel .coordinator-toolbar-action{width:44px;height:44px}
 html.cg-phone #coordinator-panel .coordinator-model-toggle{width:auto;min-width:44px}
+html.cg-phone #coordinator-panel .coordinator-model-menu{left:0;right:auto}
 html.cg-phone #coordinator-panel .coordinator-recovery{min-height:44px;min-width:44px;flex-shrink:0}
 html.cg-phone #coordinator-panel .coordinator-input-shell textarea{min-height:60px;padding-inline-end:60px}
 html.cg-phone #coordinator-panel .coordinator-input-shell > .coordinator-send{width:44px;height:44px;min-height:44px}

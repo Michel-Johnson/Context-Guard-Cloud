@@ -785,12 +785,23 @@ try {
   const coordinatorReads = [];
   let modelSettings={version:'a'.repeat(64),selectedId:'glm',options:[{id:'glm',label:'GLM 5.3',model:'glm-5.3'},{id:'ds',label:'DeepSeek V4.1 Flash',model:'deepseek-flash'}]};
   const modelSelections=[];
+  const modelReceipts=new Map();let modelFailure=null,modelWrites=0;
   await page.route(/\/api\/coordinator\/model(?:\?|$)/,async route=>{
     if(route.request().method()==='POST'){
       const input=route.request().postDataJSON();modelSelections.push(input);
       assert.deepEqual(Object.keys(input).sort(),['baseVersion','id','providerId']);
+      if(modelReceipts.has(input.id)){
+        assert.deepEqual(input,modelReceipts.get(input.id).input,'unknown-outcome retries preserve the exact operation');
+        await route.fulfill({json:modelReceipts.get(input.id).value});return;
+      }
       assert.equal(input.baseVersion,modelSettings.version);
-      modelSettings={...modelSettings,selectedId:input.providerId,version:'b'.repeat(64)};
+      if(modelFailure==='conflict'){
+        modelFailure=null;modelSettings={...modelSettings,version:'f'.repeat(64)};
+        await route.fulfill({status:409,json:{error:{code:'VERSION_CONFLICT',message:'model settings changed'}}});return;
+      }
+      modelWrites++;modelSettings={...modelSettings,selectedId:input.providerId,version:String(modelWrites).padStart(64,'0')};
+      modelReceipts.set(input.id,{input,value:modelSettings});
+      if(modelFailure==='unknown'){modelFailure=null;await route.abort('failed');return;}
     }
     await route.fulfill({json:modelSettings});
   });
@@ -924,33 +935,58 @@ try {
   assert.equal(await coordinator.locator('.coordinator-stop,button[aria-label="停止当前轮次"]').count(),0,'the removed Stop control is not restored');
   const modelAction=coordinator.getByRole('button',{name:'模型配置',exact:true});
   await modelAction.click();
-  const modelDialog=page.getByRole('dialog',{name:'模型配置',exact:true});
-  await modelDialog.getByLabel('文字回复模型').waitFor();
-  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='glm');
-  await modelDialog.getByLabel('文字回复模型').selectOption('ds');
-  await modelDialog.getByRole('button',{name:'应用',exact:true}).click();
-  await modelDialog.getByText('已应用，后续文字回复使用 DeepSeek V4.1 Flash。',{exact:true}).waitFor();
+  const modelMenu=coordinator.getByRole('menu',{name:'模型选择',exact:true});
+  const glmChoice=modelMenu.getByRole('menuitemradio',{name:'GLM 5.3',exact:true}),dsChoice=modelMenu.getByRole('menuitemradio',{name:'DeepSeek V4.1 Flash',exact:true});
+  await glmChoice.waitFor();
+  assert.equal(await glmChoice.getAttribute('aria-checked'),'true');
+  assert.equal(await page.locator('.coordinator-model-dialog').count(),0,'model selection has no modal or backdrop');
+  assert.equal(await modelMenu.locator('input,select,form').count(),0,'direct choices need no configuration form');
+  assert.ok((await modelMenu.boundingBox()).y>=(await modelAction.boundingBox()).y+(await modelAction.boundingBox()).height,'menu opens immediately below the model button');
+  await dsChoice.click();await modelMenu.waitFor({state:'hidden'});
   assert.equal(modelSelections.length,1);
-  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
   await modelAction.click();
-  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='ds');
-  assert.equal(await modelDialog.locator('input').count(),0,'model settings cannot request credentials or URLs');
-  await modelDialog.screenshot({path:path.join(output,'coordinator-model-settings-desktop.png')});
+  await page.waitForFunction(()=>document.querySelector('[role=menuitemradio][aria-checked=true]')?.textContent.includes('DeepSeek'));
+  await page.screenshot({path:path.join(output,'coordinator-model-menu-desktop.png')});
+  await dsChoice.click();await modelMenu.waitFor({state:'hidden'});
+  assert.equal(modelSelections.length,1,'clicking the selected model is a no-op');
+  await modelAction.click();await dsChoice.waitFor();await modelAction.press('Escape');await modelMenu.waitFor({state:'hidden'});
+  assert.equal(await modelAction.evaluate(el=>el===document.activeElement),true,'Escape restores the toggle focus');
+  await modelAction.click();await dsChoice.waitFor();await coordinator.locator('textarea').click();await modelMenu.waitFor({state:'hidden'});
+  assert.equal(await coordinator.locator('textarea').evaluate(el=>el===document.activeElement),true,'outside dismissal does not block the composer');
+  await modelAction.press('ArrowDown');await glmChoice.waitFor();
+  await page.waitForFunction(()=>document.activeElement?.getAttribute('role')==='menuitemradio');
+  await glmChoice.press('End');assert.equal(await dsChoice.evaluate(el=>el===document.activeElement),true);
+  await dsChoice.press('Escape');
+  modelFailure='unknown';await modelAction.click();await glmChoice.waitFor();await glmChoice.click();
+  await modelMenu.getByText('结果尚未确认，请再次点选同一模型。',{exact:true}).waitFor();
+  assert.equal(await dsChoice.isDisabled(),true,'unresolved writes cannot be replaced with a different operation');
+  const uncertainRequest=modelSelections.at(-1),writesBeforeRetry=modelWrites;
+  await glmChoice.click();await modelMenu.waitFor({state:'hidden'});
+  assert.deepEqual(modelSelections.at(-1),uncertainRequest);assert.equal(modelWrites,writesBeforeRetry,'receipt replay does not repeat the write');
+  modelFailure='conflict';await modelAction.click();await dsChoice.waitFor();await dsChoice.click();
+  await modelMenu.getByText('配置已更新，请重新点选。',{exact:true}).waitFor();
+  const conflictRequest=modelSelections.at(-1);
+  await dsChoice.click();await modelMenu.waitFor({state:'hidden'});
+  assert.notEqual(modelSelections.at(-1).id,conflictRequest.id);assert.equal(modelSelections.at(-1).baseVersion,'f'.repeat(64));
+  await modelAction.click();await dsChoice.waitFor();
   for(const width of [320,390]){
     await page.setViewportSize({width,height:844});
-    const modelBounds=await modelDialog.boundingBox();
-    assert.ok(modelBounds.x>=0&&modelBounds.x+modelBounds.width<=width&&modelBounds.y>=0&&modelBounds.y+modelBounds.height<=844,`model configuration fits the ${width}px phone viewport`);
-    for(const label of ['应用','关闭']){
-      const target=await modelDialog.getByRole('button',{name:label,exact:true}).boundingBox();
-      assert.ok(target.x>=modelBounds.x&&target.x+target.width<=modelBounds.x+modelBounds.width&&target.y>=modelBounds.y&&target.y+target.height<=modelBounds.y+modelBounds.height,`${label} remains reachable on the ${width}px phone`);
+    await page.waitForFunction(()=>document.documentElement.classList.contains('cg-phone'));
+    await page.waitForFunction(()=>{const menu=document.querySelector('#coordinator-model-menu');return menu&&!menu.hidden&&!menu.querySelector('[role=status]').textContent&&menu.querySelectorAll('button:not(:disabled)').length===2;});
+    const modelBounds=await modelMenu.boundingBox(),toggleBounds=await modelAction.boundingBox();
+    assert.ok(modelBounds.x>=0&&modelBounds.x+modelBounds.width<=width&&modelBounds.y>=toggleBounds.y+toggleBounds.height&&modelBounds.y+modelBounds.height<=844,`model menu fits below the toggle on the ${width}px phone`);
+    for(const choice of [glmChoice,dsChoice]){
+      const target=await choice.boundingBox();
+      assert.ok(target.height>=44&&target.x>=modelBounds.x&&target.x+target.width<=modelBounds.x+modelBounds.width&&target.y>=modelBounds.y&&target.y+target.height<=modelBounds.y+modelBounds.height,`model choice has a reachable 44px target on the ${width}px phone`);
+      assert.equal(await choice.evaluate(el=>{const r=el.getBoundingClientRect();return el.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));}),true,'menu choices are not obscured by the transcript');
     }
-    await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
-    await modelAction.click();
-    await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='ds');
+    await page.screenshot({path:path.join(output,`coordinator-model-menu-mobile-${width}.png`)});
+    await dsChoice.click();await modelMenu.waitFor({state:'hidden'});await modelAction.click();await dsChoice.waitFor();
   }
-  await page.screenshot({path:path.join(output,'coordinator-model-settings-mobile.png')});
   await page.setViewportSize({width:1280,height:900});
-  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.waitForFunction(()=>!document.documentElement.classList.contains('cg-phone'));
+  await modelAction.press('Escape');
+  record('model dropdown direct selection, current no-op, keyboard/outside dismissal, unknown receipt replay, stale-version recovery and 320/390px phone placement (synthetic API)');
   const toolbarAppearance=await coordinator.locator('.coordinator-toolbar').evaluate(toolbar=>{
     const action=toolbar.querySelector('.coordinator-toolbar-action'),style=getComputedStyle(action),toolbarStyle=getComputedStyle(toolbar);
     return{width:style.width,height:style.height,fontSize:style.fontSize,borderWidth:style.borderTopWidth,borderRadius:style.borderRadius,background:style.backgroundColor,color:style.color,boxShadow:style.boxShadow,gap:toolbarStyle.gap};
@@ -966,7 +1002,7 @@ try {
       const toolbar=panel.querySelector('.coordinator-toolbar'),buttons=[...toolbar.querySelectorAll('button')];
       const input=panel.querySelector('.coordinator-input-shell textarea'),send=panel.querySelector('.coordinator-send');
       const recovery=panel.querySelector('.coordinator-recovery');
-      const visible=buttons.filter(el=>!el.hidden).map(el=>{const range=document.createRange();range.selectNodeContents(el);return{...rect(el),text:rect(range),action:el.classList.contains('coordinator-toolbar-action')};});
+      const visible=buttons.filter(el=>!el.hidden&&el.getClientRects().length).map(el=>{const range=document.createRange();range.selectNodeContents(el);return{...rect(el),text:rect(range),action:el.classList.contains('coordinator-toolbar-action')};});
       return{phone:document.documentElement.classList.contains('cg-phone'),toolbar:rect(toolbar),visible,
         recovery:{...rect(recovery),hidden:recovery.hidden,display:getComputedStyle(recovery).display,afterMessages:recovery.previousElementSibling?.classList.contains('coordinator-messages')},
         panel:rect(panel),messages:rect(panel.querySelector('.coordinator-messages')),

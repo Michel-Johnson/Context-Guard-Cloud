@@ -939,3 +939,20 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   suite. A separate initial cross-product sync run failed at the existing local
   synced-indicator assertion before any Coordinator use; retain the failure and
   rerun the unchanged full browser command rather than weakening that assertion.
+
+- [ ] MODEL-MENU-01: Simplify workbench model selection to an inline dropdown
+  directly below the toolbar button. Click a model to apply; indicate the current
+  model and dismiss on outside click/Escape. Remove the modal, form and separate
+  Apply/Close actions. Frontend only: preserve the existing CAS/idempotent API,
+  project scope and pinned in-flight/retry routes. Browser regression covers
+  current-model no-op, keyboard focus, unknown-outcome same-ID receipt replay,
+  stale-version recovery and unobscured 44px choices at 320/390px phone widths.
+  Isolated API fixtures are not production model acceptance. Local checks,
+  Required/merge/deployment revision and real UI acceptance are recorded
+  separately. Independent Tester/human review remains pending.
+  Local regression passed: `npm test` 388 passed / 2 existing skips; Slack 142
+  passed; security acceptance 39 checks; staged and package scans passed.
+  Full `npm run test:browser` passed, including device login, workbench controls
+  and real isolated local-to-Cloud Session sync. Initial browser attempts found
+  and fixed mobile left-edge clipping; two later fixture races were corrected by
+  waiting for model load and desktop layout completion, without relaxing bounds.
