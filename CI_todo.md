@@ -1,5 +1,28 @@
 # Cloud split acceptance
 
+## COORDINATOR-PARTIAL-HISTORY-01 · Interrupted-output preservation (2026-10-08)
+
+1. [x] Executor: aborted streams persist as display-only records at their native
+   transcript position. Original retry, later turns and reload retain a stable
+   partial marker; native model/tool transcript and compaction hashes are unchanged.
+   Legacy interrupted buffers are projected and migrated before retry. Committed
+   interrupted tool responses are not duplicated; repeated same-prefix attempts
+   have separate identities and stop replays remain idempotent.
+2. [x] Regression baseline c938c9d: steer module 8/10 passed, 2 failed at the
+   missing partial history assertions (exit 1). Initial implementation passed
+   10/10, zero skips (exit 0); expanded steer module passed 11/11. Combined
+   Coordinator/steer passed 99/100 with one opt-in paid-provider skip, exit 0.
+   Full Node passed 391/393, two existing environment skips; full browser passed
+   BDA-012, 50 workbench checks and Session sync, exit 0. Browser artifacts:
+   output/playwright/browser-ci/cloud-1791390610416-4a376ae9-65b5-4e6f-997f-3958ff461e12.
+   Computer use confirmed ink stop, retry, new turn and reload preserve exactly
+   one marked prior output; screenshot output/computer-use/partial-after-resume-next-turn-reload.jpg.
+3. [ ] Independent Tester: review and test the exact frozen source, including
+   marked output after resume/new turn/reload and model-context exclusion.
+4. [ ] Full Node/browser, real computer-use stop/resume/new-turn/reload/restart,
+   Required CI, normal PR merge and exact-main Cloud/Slack deployment. Paid model
+   remains controlled only in isolated testing; production smoke is read-only.
+
 ## COORDINATOR-CONTROLS-FOCUS-01 · Current-main port (2026-10-07)
 
 1. [x] Executor: empty composer ink uses the existing authenticated interrupt

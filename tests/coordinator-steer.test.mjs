@@ -4,8 +4,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { CoordinatorConversations, CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
-import { CoordinatorModel } from '../scripts/cloud/coordinator-model.mjs';
+import { CoordinatorConversations, CoordinatorService, publicMessages } from '../scripts/cloud/coordinator-service.mjs';
+import { CoordinatorModel, coordinatorModelMessages } from '../scripts/cloud/coordinator-model.mjs';
+import { hash } from '../scripts/shared/io.mjs';
 
 const deferred = () => { let resolve; const promise = new Promise(value => { resolve = value; }); return { promise, resolve }; };
 const answer = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
@@ -108,9 +109,10 @@ test('Steer waits for the started tool receipt and does not start remaining stal
 });
 
 test('Explicit interruption preserves partial text and requires an original-identity resume', { timeout: 10000 }, async t => {
-  const entered = deferred(); let calls = 0;
+  const entered = deferred(), inputs = []; let calls = 0;
   const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [], execute: async () => {},
-    model: { next: async ({ signal, onText }) => {
+    model: { next: async ({ signal, onText, messages }) => {
+      inputs.push(messages);
       if (++calls > 1) return answer('resumed');
       await onText('partial answer'); entered.resolve();
       return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('Stopped'), { code: 'MODEL_INTERRUPTED' })), { once: true }));
@@ -120,10 +122,78 @@ test('Explicit interruption preserves partial text and requires an original-iden
   await service.interrupt(stop); await service.close();
   assert.equal((await service.state()).status, 'interrupted');
   assert.equal((await service.state()).partialText, 'partial answer');
+  const partial = (await service.state()).messages.find(message => message.partial);
+  assert.equal(partial?.text, 'partial answer');
   await assert.rejects(service.submit({ id: 'new', text: 'continue', followup: 'steer' }), { code: 'TURN_INTERRUPTED' });
   await service.submit({ id: 'start', text: 'original', retry: true }); await service.close();
   assert.equal((await service.state()).status, 'waiting-for-user'); assert.equal(calls, 2);
+  assert.deepEqual((await service.state()).messages.map(message => message.text), ['original', 'partial answer', 'resumed']);
+  assert.ok(!JSON.stringify(inputs[1]).includes('partial answer'), 'An aborted response is display history, not a committed model message');
   await service.interrupt(stop); assert.equal(calls, 2, 'A replayed stop cannot cancel newer work');
+  await service.submit({ id: 'next', text: 'next turn' }); await service.close();
+  const restarted = new CoordinatorService({ directory: path.dirname(service.file), system: 'test', tools: [], execute: async () => {}, model: service.model });
+  const history = (await restarted.state()).messages;
+  assert.equal(history.filter(message => message.id === partial.id).length, 1);
+  assert.deepEqual(history.map(message => message.text), ['original', 'partial answer', 'resumed', 'next turn', 'resumed']);
+  assert.equal(history[1].partial, true);
+});
+
+test('Legacy interrupted buffer is retained on resume without rewriting native transcript or compaction', async t => {
+  const root = await directory(t), inputs = [];
+  const service = new CoordinatorService({ directory: root, system: 'test', tools: [], execute: async () => {},
+    model: { next: async input => { inputs.push(input.messages); return answer('legacy fragment'); } } });
+  await fs.mkdir(root, { recursive: true });
+  await fs.writeFile(service.file, JSON.stringify({ messages: [{ role: 'user', content: 'original', requestId: 'old' }],
+    requests: {}, activeTurnId: 'old', activeInput: { id: 'old', text: 'original', source: 'human' },
+    status: 'interrupted', partialText: 'legacy fragment', controlRevision: 2, toolReceipts: {} }));
+  // Recreate the accepted legacy fingerprint through the normal submit contract.
+  const disk = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  disk.requests.old = hash('original');
+  await fs.writeFile(service.file, JSON.stringify(disk));
+  const before = (await service.state()).messages;
+  assert.equal(before[1]?.partial, true);
+  await service.submit({ id: 'old', text: 'original', retry: true }); await service.close();
+  assert.equal(inputs[0].length, 1);
+  const history = (await service.state()).messages;
+  assert.deepEqual(history.map(message => [message.text, !!message.partial]),
+    [['original', false], ['legacy fragment', true], ['legacy fragment', false]]);
+  assert.equal(history[1].id, before[1].id);
+  const saved = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  assert.equal(saved.messages.length, 2, 'Native model transcript never includes the aborted buffer');
+  assert.equal(saved.partialText, '');
+});
+
+test('Display projection does not duplicate a committed interrupted tool response or invent empty output', () => {
+  const messages = [{ role: 'user', content: 'request' }, { role: 'assistant', superseded: true,
+    content: [{ type: 'text', text: 'tool progress' }, tool('write')] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'write', content: '{}' }] }];
+  const state = { messages, activeTurnId: 'start', status: 'interrupted', partialText: 'tool progress' };
+  assert.equal(publicMessages(state).filter(message => message.text === 'tool progress').length, 1);
+  assert.equal(publicMessages({ ...state, messages: [messages[0]], partialText: '' }).length, 1);
+});
+
+test('Repeated stops keep distinct attempts, stable ordering and compacted model context', { timeout: 10000 }, async t => {
+  const root = await directory(t), entered = [deferred(), deferred()]; let calls = 0;
+  const service = new CoordinatorService({ directory: root, system: 'test', tools: [], execute: async () => {},
+    model: { next: async ({ signal, onText }) => {
+      const index = calls++;
+      if (index > 1) return answer('completed');
+      await onText('same prefix'); entered[index].resolve();
+      return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('Stopped'), { code: 'MODEL_INTERRUPTED' })), { once: true }));
+    } } });
+  for (let index = 0; index < 2; index++) {
+    await service.submit({ id: 'start', text: 'original', ...(index ? { retry: true } : {}) }); await entered[index].promise;
+    await service.interrupt({ id: `stop-${index}`, expectedTurnId: 'start' }); await service.close();
+    await service.interrupt({ id: `stop-${index}`, expectedTurnId: 'start' });
+  }
+  await service.submit({ id: 'start', text: 'original', retry: true }); await service.close();
+  const saved = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  const partials = (await service.state()).messages.filter(message => message.partial);
+  assert.equal(partials.length, 2); assert.equal(new Set(partials.map(message => message.id)).size, 2);
+  assert.deepEqual((await service.state()).messages.map(message => message.text), ['original', 'same prefix', 'same prefix', 'completed']);
+  saved.compaction = { through: 1, summary: 'historical request', sourceHash: hash(JSON.stringify(saved.messages.slice(0, 1))) };
+  assert.equal(coordinatorModelMessages(saved).length, 2);
+  assert.equal(publicMessages(saved).filter(message => message.partial).length, 2);
 });
 
 test('Stopping during a business tool preserves its receipt and never starts or repeats stale tools', { timeout: 10000 }, async t => {
