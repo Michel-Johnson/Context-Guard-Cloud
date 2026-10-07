@@ -32,6 +32,9 @@
 7. [ ] Final full Node/browser, unchanged Required gate, normal PR merge and
    exact merged-SHA Cloud/Slack deployment. Production checks must remain
    read-only: no test messages, business mutations, provider changes or new data.
+   First full browser run passed BDA-012 and 28 workbench checks, then failed on
+   a legacy submit-type selector while the ink is now a stop-type button. The
+   idle assertion retains disabled/empty/not-working checks on the stable control.
 
 ## R3-STATIC-PREVIEW-01 · Device tools tolerate missing server config (2026-10-07)
 

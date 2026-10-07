@@ -1522,7 +1522,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('可补充纠正意见'));
   await coordinator.locator('textarea').fill('更正审批 ID，先核对当前 Plan');
   await coordinator.getByRole('button', { name: '发送', exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent === '' && document.querySelector('#coordinator-panel button[type=submit]').disabled && !document.querySelector('.coordinator-send.is-working') && document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
+  await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent === '' && document.querySelector('#coordinator-panel .coordinator-send')?.disabled && !document.querySelector('.coordinator-send.is-working') && document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
   assert.notEqual(submissions.at(-1).id, submissions[0].id);
   assert.equal(submissions.at(-1).retry, undefined, 'human correction is a new message, not an unsafe replay');
   record('Coordinator feature gate, safe Markdown rendering and durable explicit retries');
@@ -1535,7 +1535,7 @@ try {
     const retry = panel.querySelector('button[aria-label="重试原请求"]');
     return panel.querySelector(':scope > [role=status]').textContent === '' && retry.hidden &&
       !panel.querySelector('.coordinator-send.is-working') &&
-      panel.querySelector('button[type=submit]').disabled && panel.querySelector('textarea[aria-label="发送给 Coordinator"]').value === '';
+      panel.querySelector('.coordinator-send')?.disabled && panel.querySelector('textarea[aria-label="发送给 Coordinator"]').value === '';
   });
   assert.equal(submissions.length, beforeLostReply + 1, 'durable receipt reconciliation never submits a second model turn');
   record('Coordinator reconciles a lost HTTP acknowledgement without manual retry or duplicate submission');
