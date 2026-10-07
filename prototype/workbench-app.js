@@ -63,6 +63,12 @@ const I18N = {
     workCopy1:"浏览器在按写死的步骤和稿子走，没有模型在读 OpenClaw 或本仓库。真实 skill 启用时，才由你正在对话的那个 Agent 读代码。",
     workCopy2:"下面的笔记是预置演示稿。真做时先商量第一层怎么切，定了再往下拆；卡名必须一眼能看懂。演示里第一页仍是定稿后的 4–8 张主干。这不是这次点击实时读仓得到的。",
     trayTitle:"已取消的提议",
+    trayClose:"关闭已取消的提议",
+    deviceApprovals:"设备连接申请", deviceApprovalsClose:"关闭设备连接申请", deviceApprovalsRefresh:"刷新申请",
+    deviceApprovalScope:"仅允许你发起的连接：读取本项目 Main、读写自身 Session；不授予管理或 Main 发布权限。",
+    deviceApprovalsEmpty:"没有待审批申请。", deviceAllow:"允许连接", deviceDeny:"拒绝", devicePending:"待审批", deviceOld:"旧申请",
+    deviceApprovalsFailed:"申请读取失败，请重新登录或刷新。", deviceDecisionUnknown:"决定尚未确认，请刷新核对。", deviceDecisionDone:"申请已处理。",
+    deviceLoginRequired:"登录已失效，请重新登录。", deviceTicketRefresh:"审批表单已失效，请刷新申请重试。", deviceAccessRevoked:"仓库授权已撤销，无法审批。", deviceScopeUnavailable:"该项目申请不可用，请刷新核对。", deviceAlreadyDecided:"申请已处理，请刷新核对。",
     trayHint:"已隐藏，后续 Agent 不会读到。可重新加入 Context Map，或永久删除。",
     openBugs:"Bug 处理状态", openTodos:"TODO 处理状态",
     boot_ready:"已建图", boot_proposed:"待确认", boot_analyzing:"分析中", boot_pending:"首次使用",
@@ -167,6 +173,12 @@ const I18N = {
     workCopy1:"The browser is walking hard-coded steps. No model is reading OpenClaw or this repo. When the real skill runs, the agent you are talking to reads the code.",
     workCopy2:"The notes below are a prepared demo. Real first-use decides L1 with you, then goes deeper; titles must be instantly readable. This demo still shows the agreed 4–8 trunk cards. This is not a live read of the repo.",
     trayTitle:"Cancelled proposals",
+    trayClose:"Close cancelled proposals",
+    deviceApprovals:"Device connection requests", deviceApprovalsClose:"Close device connection requests", deviceApprovalsRefresh:"Refresh requests",
+    deviceApprovalScope:"Allow only connections you initiated: read this project's Main and read/write your own Sessions; no administration or Main publication permission.",
+    deviceApprovalsEmpty:"No pending requests.", deviceAllow:"Allow connection", deviceDeny:"Deny", devicePending:"Pending", deviceOld:"Older request",
+    deviceApprovalsFailed:"Requests unavailable. Sign in or refresh.", deviceDecisionUnknown:"Decision not confirmed. Refresh to check.", deviceDecisionDone:"Request processed.",
+    deviceLoginRequired:"Sign-in expired. Sign in again.", deviceTicketRefresh:"Approval form expired. Refresh the request.", deviceAccessRevoked:"Repository authorization was revoked.", deviceScopeUnavailable:"Project request unavailable. Refresh to check.", deviceAlreadyDecided:"Request already processed. Refresh to check.",
     trayHint:"Hidden. Later agents will not read these. Restore them to the map, or delete permanently.",
     openBugs:"Bug status", openTodos:"TODO status",
     boot_ready:"Mapped", boot_proposed:"Pending", boot_analyzing:"Analyzing", boot_pending:"First use",
@@ -979,6 +991,7 @@ function syncBootstrapFromTree(){
   }
 }
 let workbenchSync = null;
+let refreshDeviceApprovals = null;
 let applyingServerMap = false;
 let renderedAccessSession = null;
 let hasRenderedAccessSession = false;
@@ -2414,7 +2427,7 @@ function exitBugPath(restore){
 }
 function openBugPanel(open, kind=activeWorkPanelKind){
   if(open){
-    document.getElementById("tray").classList.remove("open");
+    closeTray();
     const coordinator=document.getElementById('coordinator-panel');
     if(coordinator?.open)coordinator.setOpen(false);
   }
@@ -2651,13 +2664,35 @@ document.getElementById("btn-auth").onclick = ()=>{
 };
 
 /* ================= 已取消托盘 ================= */
+function closeTray(restoreFocus=false){
+  const tray = document.getElementById("tray");
+  const focusedInside = tray.contains(document.activeElement);
+  tray.classList.remove("open");
+  const trigger = document.getElementById("btn-tray");
+  trigger.classList.remove("on");
+  trigger.setAttribute("aria-expanded", "false");
+  if(restoreFocus && focusedInside) document.getElementById("btn-settings").focus();
+}
 document.getElementById("btn-tray").onclick = ()=>{
   const tray = document.getElementById("tray");
   const open = !tray.classList.contains("open");
+  if(!open){ closeTray(); return; }
   tray.classList.toggle("open", open);
   document.getElementById("btn-tray").classList.toggle("on", open);
-  if(open) closeSettings();
+  document.getElementById("btn-tray").setAttribute("aria-expanded", "true");
+  closeSettings();
+  document.getElementById("tray-close").focus();
 };
+document.getElementById("tray-close").onclick = ()=>closeTray(true);
+document.addEventListener("click", e=>{
+  if(!e.target.closest("#tray, #btn-tray")) closeTray();
+}, true);
+document.addEventListener("keydown", e=>{
+  if(e.key!=="Escape" || e.defaultPrevented || e.isComposing || !document.getElementById("tray").classList.contains("open")) return;
+  if(e.target.closest('input, textarea, [contenteditable="true"]') || document.querySelector("dialog[open]")) return;
+  e.preventDefault();
+  closeTray(true);
+});
 document.getElementById("btn-link-repo").onclick = async ()=>{
   await linkRepo();
   closeSettings();
@@ -4620,7 +4655,7 @@ async function installCoordinatorPanel(sync){
   const setPanelOpen=open=>{
     panel.open=open;panel.toggleAttribute('open',open);
     if(open){
-      openBugPanel(false);document.getElementById('tray').classList.remove('open');
+      openBugPanel(false);closeTray();
       inspector.append(panel);inspector.classList.add('coordinator-open');
     }else{
       clearTimeout(timer);history.hidden=true;historyToggle.setAttribute('aria-expanded','false');inspector.classList.remove('coordinator-open');document.body.append(panel);renderDetail();
@@ -5127,6 +5162,69 @@ async function installCoordinatorPanel(sync){
   window.addEventListener('pagehide',()=>{stopped=true;clearTimeout(timer);setPlanningVisible(false);setTyping(false);});
   window.addEventListener('pageshow',()=>{stopped=false;if(panel.open) void refresh();});
 }
+function installDeviceApprovals(sync){
+  if(!sync.config.interfaceCapabilities?.deviceAuthorization) return;
+  const trigger=document.getElementById('btn-device-approvals'), panel=document.getElementById('device-approvals');
+  const status=document.getElementById('device-approvals-status'), list=document.getElementById('device-approval-list');
+  trigger.hidden=false;
+  let running=false, deciding=false, stopped=false, refreshFailed=false, renderedRequests=null;
+  const projectId=sync.config.root.slice('cloud:'.length);
+  const errorLabel=(error,decision=false)=>t(error?.code==='UNAUTHORIZED'?'deviceLoginRequired':error?.reason==='repository-access-revoked'?'deviceAccessRevoked':error?.code==='FORBIDDEN'?'deviceTicketRefresh':error?.code==='NOT_FOUND'?'deviceScopeUnavailable':error?.code==='CONFLICT'?'deviceAlreadyDecided':decision&&!error?.serverResponse?'deviceDecisionUnknown':'deviceApprovalsFailed');
+  const refresh=async()=>{
+    if(running||deciding||stopped)return;
+    const requestedDetailed=panel.open;
+    let fullReadNeeded=false;
+    running=true;
+    try{
+      const data=await sync.call('/api/device-authorizations'+(requestedDetailed?'':'?summary=1'),undefined,'GET','main');
+      if(!Number.isSafeInteger(data.count)||data.count<0||data.count>1000||(requestedDetailed&&!Array.isArray(data.requests)))throw Object.assign(new Error('invalid-request-list'),{code:'UNAVAILABLE',serverResponse:true});
+      if(refreshFailed){status.textContent='';refreshFailed=false;}
+      document.getElementById('device-approval-count').textContent=String(data.count);
+      trigger.title=t('deviceApprovals');
+      if(panel.open&&requestedDetailed){
+        const signature=JSON.stringify(data.requests);
+        if(signature===renderedRequests){for(const button of list.querySelectorAll('button'))button.disabled=false;return;}
+        renderedRequests=signature;
+        list.replaceChildren();
+        for(const request of data.requests||[]){
+          const row=document.createElement('article'), heading=document.createElement('b'), detail=document.createElement('p');
+          heading.textContent=request.label;
+          detail.textContent=[request.repository,t('devicePending'),request.createdAt||t('deviceOld')].join(' · ');
+          row.append(heading,detail);
+          for(const [decision,label] of [['approve','deviceAllow'],['deny','deviceDeny']]){
+            const button=document.createElement('button');button.type='button';button.textContent=t(label);
+            button.onclick=async()=>{
+              if(deciding)return;
+              deciding=true;for(const control of list.querySelectorAll('button'))control.disabled=true;
+              try{
+                const ticket=await sync.call('/api/device-authorizations/'+encodeURIComponent(request.requestId),undefined,'GET','main');
+                if(ticket.status!=='pending'){status.textContent=t('deviceDecisionDone');return;}
+                const response=await fetch('/auth/device/decision',{method:'POST',credentials:'same-origin',body:new URLSearchParams({projectId,userCode:ticket.userCode,csrf:ticket.csrf,decision}),signal:AbortSignal.timeout(10000)});
+                if(!response.ok){const error=await response.json().catch(()=>({}));throw Object.assign(new Error('decision-rejected'),{code:error.error?.code,reason:error.error?.reason,serverResponse:true});}
+                status.textContent=t('deviceDecisionDone');
+              }catch(error){status.textContent=errorLabel(error,true);}
+              finally{deciding=false;await refresh();}
+            };
+            row.append(button);
+          }
+          list.append(row);
+        }
+        if(!data.count)list.textContent=t('deviceApprovalsEmpty');
+      }else if(panel.open)fullReadNeeded=true;
+    }catch(error){refreshFailed=true;for(const button of list.querySelectorAll('button'))button.disabled=true;document.getElementById('device-approval-count').textContent='?';trigger.title=errorLabel(error);if(panel.open)status.textContent=errorLabel(error);}
+    finally{running=false;if(fullReadNeeded&&panel.open&&!stopped&&!deciding)void refresh();}
+  };
+  trigger.onclick=()=>{closeTray();document.getElementById('workbench-tools').open=false;status.textContent='';panel.showModal();trigger.setAttribute('aria-expanded','true');document.getElementById('device-approvals-close').focus();void refresh();};
+  document.getElementById('device-approvals-close').onclick=()=>panel.close();
+  document.getElementById('device-approvals-refresh').onclick=()=>void refresh();
+  panel.addEventListener('close',()=>{trigger.setAttribute('aria-expanded','false');document.querySelector('#workbench-tools > summary').focus();});
+  panel.addEventListener('click',event=>{if(event.target!==panel)return;const rect=panel.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)panel.close();});
+  window.addEventListener('pagehide',()=>{stopped=true;});
+  window.addEventListener('pageshow',()=>{stopped=false;void refresh();});
+  document.getElementById('workbench-tools').addEventListener('toggle',()=>{if(document.getElementById('workbench-tools').open)void refresh();});
+  refreshDeviceApprovals=refresh;
+  void refresh();
+}
 async function boot(){
   const stored = readStoredUiLang();
   if(stored) uiLang = stored;
@@ -5150,9 +5248,11 @@ async function boot(){
     pending:()=>{ for(const id of ['nodes','links','currents']) document.getElementById(id)?.replaceChildren(); },
     apply:doc=>{ applyingServerMap=true; try{ applyMapDoc(doc); renderAll(); }finally{ applyingServerMap=false; } },
     setAccess:setWorkbenchAccess,
-    statusChanged:()=>renderAll()
+    statusChanged:()=>renderAll(),
+    refreshDeviceApprovals:()=>refreshDeviceApprovals?.()
   });
   const connected=await workbenchSync.start();
+  installDeviceApprovals(workbenchSync);
   if(connected) installCoordinatorPanel(workbenchSync);
   if(!connected){
     if(!window.__CG_SERVER) await loadMapFromHttp();

@@ -84,6 +84,7 @@
     <button class="auth-btn" id="btn-auth" data-i18n-title="authMode" title="授权模式" aria-label="授权模式">🔑</button>
     <button class="tray-btn" id="btn-bugs">🐞 Bug (<span id="bug-count">0</span>)</button>
     <button class="tray-btn" id="btn-todos">TODO (<span id="todo-count">0</span>)</button>
+    <button type="button" class="tray-btn" id="btn-device-approvals" aria-expanded="false" aria-controls="device-approvals" hidden><span data-i18n="deviceApprovals">设备连接申请</span> (<span id="device-approval-count">0</span>)</button>
       </div>
     </details>
     <button type="button" class="tray-btn" id="btn-coordinator" aria-expanded="false" hidden>Coordinator</button>
@@ -110,7 +111,7 @@
           <div class="rel-toggle" id="lens-toggle" data-i18n-title="lensTitle" title="首次建图：候选模块摆在画布上，与主节点无连线；选中一个，它才挂到主节点下。">
             <button type="button" id="btn-lens" aria-pressed="false" data-i18n="lensMode">第一层候选</button>
           </div>
-          <button class="tray-btn" id="btn-tray">🗂 <span data-i18n="cancelled">已取消</span> (<span id="tray-count">0</span>)</button>
+          <button type="button" class="tray-btn" id="btn-tray" aria-expanded="false" aria-controls="tray">🗂 <span data-i18n="cancelled">已取消</span> (<span id="tray-count">0</span>)</button>
           <button type="button" class="tray-btn" id="btn-link-repo" hidden data-i18n="linkRepo" data-i18n-title="linkRepoTitle" title="选带 SKILL.md 的仓库根，改图可以写回 map.json">连接仓库</button>
         </div>
       </div>
@@ -190,9 +191,19 @@
   </div>
 </div>
 <div id="dot-hint" hidden role="tooltip"></div>
+<dialog id="device-approvals" class="device-approvals" aria-labelledby="device-approvals-title">
+  <div class="tray-head"><h3 id="device-approvals-title" data-i18n="deviceApprovals">设备连接申请</h3><button type="button" id="device-approvals-close" data-i18n-title="deviceApprovalsClose" aria-label="关闭设备连接申请">×</button></div>
+  <p data-i18n="deviceApprovalScope">仅允许你发起的连接：读取本项目 Main、读写自身 Session；不授予管理或 Main 发布权限。</p>
+  <p role="status" id="device-approvals-status"></p>
+  <div id="device-approval-list"></div>
+  <button type="button" id="device-approvals-refresh" data-i18n="deviceApprovalsRefresh">刷新申请</button>
+</dialog>
 
-<div class="tray" id="tray">
-  <h3 data-i18n="trayTitle">已取消的提议</h3>
+<div class="tray" id="tray" role="region" aria-labelledby="tray-title">
+  <div class="tray-head">
+    <h3 id="tray-title" data-i18n="trayTitle">已取消的提议</h3>
+    <button type="button" id="tray-close" data-i18n-title="trayClose" aria-label="关闭已取消的提议" title="关闭已取消的提议">×</button>
+  </div>
   <p class="hint" data-i18n="trayHint">已隐藏，后续 Agent 不会读到。可重新加入 Context Map，或永久删除。</p>
   <ul id="tray-list"></ul>
 </div>

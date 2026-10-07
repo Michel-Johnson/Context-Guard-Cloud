@@ -1,5 +1,137 @@
 # Cloud split acceptance
 
+## RELEASE-1.1.3: persistent human device approval and current UI delivery
+
+- [x] Preserve the exact independently verified authorization/UI source and all
+  earlier failures; root, Core and workbench manifests advance together to 1.1.3.
+  Existing fixed Skill 0.6.3 fixture stays unchanged to avoid a publication cycle.
+- [x] Metadata boundaries, workflow/governance and exact Cloud/Core/UI package
+  security passed locally: Cloud 90 files, Core 44 files, UI 13 files. These
+  package checks do not substitute for remote functional or browser acceptance.
+- [ ] Pass the unchanged six-job Required gate on the release PR.
+- [ ] Merge normally, bind the immutable shared-v1.1.3 assets to that merged
+  source revision, and independently verify anonymous downloads and checksums.
+- [ ] Server deployment, installed Skill upgrade and real human approval remain
+  separate acceptance steps; package publication does not complete them.
+
+## DEVICE-APPROVAL-PERSIST-01 · Project tools and persistent pending requests (2026-10-07)
+
+- [x] Executor: pending device requests no longer expire or get evicted. Existing
+  unclaimed legacy pending records migrate only with the original identity and
+  current repository authorization; absent old records are not fabricated.
+  Denied/claimed/expired-approved requests never restart as pending. Approval
+  retains a finite claim window; cookie/device credential lifetimes, scoped
+  privileges and persist-consumption-before-issue remain unchanged. The 1000
+  capacity counts pending, not terminal history; existing requests can retry.
+- [x] Executor: `X-Context-Guard-Device-Grant: persistent-v1` negotiates
+  pending `persistent:true/status:pending/expiresAt:null/expiresIn:null`;
+  approved requests return `persistent:false/status:approved` with a finite
+  claim window. Old clients retain finite wire waiting budgets and may stop
+  locally after ten minutes; that is not server pending-request expiry.
+- [x] Executor: two project-scoped GET routes enumerate safe request metadata
+  or prepare a short-lived decision ticket. Only the human workbench Cookie
+  is accepted; Bearer alone, cross-origin and cross-project requests are denied.
+  Decisions retain the original endpoint, Origin/CSRF checks and hard repository
+  scope. No deviceCode, hashed secret, credential or password enters the list/DOM.
+  `/connect` uses only its exact script SHA-256 plus same-origin fetch permission;
+  login and other page CSPs remain unchanged, without unsafe-inline script access.
+- [x] Executor: Workbench Tools exposes pending count and human Allow/Deny.
+  No countdown; bounded phone dialog, close/Escape/reopen, explicit known errors,
+  unavailable `?` count and disabled stale actions. Fresh unchanged data preserves
+  focus/scroll; opening during a summary read requests one full list after that
+  read succeeds. Existing Map heartbeat triggers an independent caught refresh,
+  never waits for that API, and keeps its original 10000ms schedule.
+- [x] Executor module evidence, Windows / Node 22.18.0: BDA001..009/018/019
+  passed 11/11 in run 85502 (exit 0). A later combined Node run 12112 retained
+  13 pass / 1 AUTH001 failure (legacy absolute waiting-budget equality), not
+  success. AUTH001 now asserts full persistent reply equality and stable legacy
+  identity plus real finite budget bounds; final `interface-auth` module passed
+  11/11 (exit 0), preserving credential expiry/revocation/isolation tests.
+  The focused `device approval refresh` heartbeat regression passed 1/1 (exit 0),
+  including a never-settled approval request and rejected ancillary callback.
+  Syntax checks and `git diff --check` passed. No full Node/browser suite claimed.
+- [x] Executor browser evidence: the first BDA012 run 40567 failed because
+  `/connect` CSP blocked the new ticket script/fetch. Its record remains at
+  `output/playwright/device-auth-r3-first-failure-20261007.md`; Node's first
+  failure remains in `device-auth-r3-node-first-failure-20261007.md`.
+  Earlier runs 16216 and 17921 passed but predate final heartbeat/race changes.
+  Final affected `node tests/browser-device-login-runner.mjs` run 40768 passed
+  1/1, zero skips, exit 0, without widened budgets/forced clicks/sleeps.
+  Evidence: `output/playwright/device-approvals-1791345725057/`
+  (`result.json`, `device-requests-phone.png`). Covers real password approval,
+  exact-script CSP, tools count, held-summary/open-dialog/full-list race,
+  safe labels, focus preservation, phone close, Allow/Deny, expired-login `?`
+  recovery and reload. Final browser test SHA-256:
+  `b43648e315c65d893196fb6dbfd21d5bebb6c79464fd24b89e9f7af884344c4d`.
+- [x] Executor final disclosure-only follow-up: the device request dialog now
+  states in Chinese/English that only self-initiated connections should be allowed,
+  granting Main read and own Session read/write but no administration/Main
+  publication. No permission or protocol behavior changed. BDA012 adds a visible
+  disclosure assertion and retains phone-close/internal-scroll, approval,
+  summary/open race and error-recovery assertions. Only the affected
+  `node tests/browser-device-login-runner.mjs` was run: 1/1, zero skips, exit 0.
+  Final evidence: `output/playwright/device-approvals-1791346526355/`.
+  Browser test SHA-256:
+  `c27158a287446fb5052a731659792f62ec894535478edd5658494836256620df`.
+  Above run 40768/hash remains pre-disclosure evidence, not this final revision.
+  The earlier focused BDA019 follow-up passed 1/1 using two valid configured
+  projects/repositories/IDs, proving both lists and cross-project detail/decision
+  rejection plus real configured admin-Bearer rejection; it did not mutate product
+  source. Independent Tester must confirm the final affected revisions.
+- [x] Independent Tester: verify exact Cloud and new Skill revisions, run fresh
+  authenticated HTTP across two valid projects (not merely an unknown route),
+  revoked repository and credentials, old pending migration and terminal replay,
+  plus real persistent Skill recovery/unknown one-time claim handling. Review
+  no-secret HTML/log/URL boundaries, no unchanged-read disk writes, preserved
+  Map cadence and dialog focus. Existing browser evidence uses the pinned older
+  client artifact, not a newly installed Skill. No production deployment,
+  installation upgrade, Git push or human acceptance has occurred.
+  Independent Node 24 Cloud checks passed 11 device + 11 auth + 1 heartbeat +
+  1 browser (all actual exit 0), with pre-disclosure browser evidence at
+  `output/playwright/device-approvals-1791346251995/`. Final disclosure UI alone
+  independently passed BDA012 1/1, exit 0 (run 91223); evidence
+  `output/playwright/device-approvals-1791346617708/`, final test SHA above.
+  New Skill full Node 22 client module passed 22/22; Node 18/24 each passed
+  five compatibility targets. Cross-repository real isolated HTTP passed 7/7
+  against current server/client, including owned-worker request recovery,
+  two valid project scopes and unchanged Main/Session content. Private evidence
+  remains in the Skill worktree temp reports, not public credentials or Map.
+  Scroll preservation and unchanged-read disk behavior were statically reviewed,
+  not separately dynamically asserted. Function-layer cancellation is not public
+  CLI or Native acceptance; long expiry coverage used controlled module clocks.
+
+## UI-TRAY-CLOSE-01 · Cancelled proposal tray dismissal (2026-10-07)
+
+- [x] Executor: canonical workbench adds a translated native close button and
+  synchronized trigger `aria-expanded` / `aria-controls`. Button, non-editor
+  Escape and outside clicks close only UI state. Capture-phase outside handling
+  respects tray controls and still reaches settings/session controls. Bug and
+  Coordinator panel openings use the same close helper. Escape skips editors,
+  composition and open dialogs; outside dismissal does not steal target focus.
+- [x] Executor: bounded tray with a fixed header and independently scrolling
+  list keeps the close button visible on narrow screens. No authorization,
+  expiry, API, Skill source, production data, package or deployment changes.
+- [x] Executor verification: `node --check prototype/workbench-app.js`,
+  `node --check tests/cloud-workbench-browser.mjs` and `git diff --check` passed.
+  One affected standalone `node tests/cloud-workbench-browser.mjs` execution
+  (Windows, run `83959`, exit 0) passed, including the numbered tray scenario:
+  internal delete-confirm cancellation, button/Escape/outside dismissal,
+  editor Escape retaining text, focus return to visible Settings, 390px list
+  scrolling with a reachable close header, zero Map commits and unchanged
+  authoritative Main version/content. No full-suite or production test claimed.
+  Browser SHA-256:
+  `e9d8d6ff8cad64042d14baccaf948e75ef5f5a6467e5b86919c9bd024e03b6f5`.
+  Evidence: `output/playwright/browser-ci/cloud-1791342397982-9c461139-d853-4d7b-9886-19593a333dc2/`
+  (`result.json`, `cancelled-tray-phone.png`). This first execution had no failed
+  tray assertion; the attachment share failure in its log is the pre-existing
+  deliberate retry fixture, not an ignored product failure.
+- [ ] Independent Tester: verify these exact uncommitted canonical file hashes,
+  rerun the affected browser module, inspect desktop/phone controls, test opening
+  Bug/Coordinator while the tray is open clears trigger state, and confirm real
+  restore/delete-confirm actions remain functional without premature dismissal.
+  Recheck composition/dialog Escape isolation and no lost editor draft. Do not
+  mark production deployed or human accepted from isolated browser success.
+
 ## BINDING-CONFLICT-01 · Preserve Session ownership and explain recovery (2026-10-06)
 
 - [x] Executor: cross-device `session.bind` remains HTTP 409 / `CONFLICT`;

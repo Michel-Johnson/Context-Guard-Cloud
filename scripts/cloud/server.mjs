@@ -202,13 +202,15 @@ button{width:100%;height:48px;margin-top:18px;border:2px solid #302f2d;border-ra
 <form method="post" action="/auth/login"><input type="hidden" name="next" value="${escapeHtml(next)}"><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">登录</button></form></main></body></html>`;
 }
 
-function deviceAuthorizationPage(grant) {
+function deviceAuthorizationPage(grant, projectId) {
   const pending = grant.status === 'pending' && !grant.claimed;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>连接设备 · Context Guard</title>
 <style>body{font:18px system-ui,sans-serif;background:#f7f2e8;color:#2d2b28;margin:0;padding:24px}main{max-width:620px;margin:8vh auto;padding:28px;background:#fffdf8;border:2px solid;border-radius:8px}h1{font-size:28px}dt{margin-top:16px;font-weight:700}dd{margin:8px 0;overflow-wrap:anywhere}button{font:inherit;padding:12px 20px;margin:12px 12px 0 0;border:2px solid;border-radius:6px;background:#f7cf55}button[value=deny]{background:#fff}</style></head><body><main><h1>连接设备</h1>
 <p>只确认你刚刚发起的连接，并核对验证码。</p><dl><dt>项目</dt><dd>${escapeHtml(grant.repository)}</dd><dt>设备</dt><dd>${escapeHtml(grant.label)}</dd><dt>验证码</dt><dd>${escapeHtml(grant.userCode)}</dd></dl>
 <p>允许设备读取本项目 Main，并读写绑定到该设备的 Session；不授予管理或 Main 发布权限。</p>
-${pending ? `<form method="post" action="/auth/device/decision"><input type="hidden" name="userCode" value="${escapeHtml(grant.userCode)}"><input type="hidden" name="csrf" value="${escapeHtml(grant.csrf)}"><button name="decision" value="approve">允许连接</button><button name="decision" value="deny">拒绝</button></form>` : `<p role="status">${grant.status === 'denied' ? '已拒绝连接。' : '已授权，请返回 Agent；等待中的连接会自动完成。'}</p>`}
+${pending ? `<form id="device-decision"><button name="decision" value="approve">允许连接</button><button name="decision" value="deny">拒绝</button><p role="status"></p></form>
+<script>const project=${JSON.stringify(projectId).replace(/</g, '\\u003c')},request=${JSON.stringify(grant.requestId).replace(/</g, '\\u003c')};
+document.querySelector('form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget,decision=event.submitter.value;for(const button of form.querySelectorAll('button'))button.disabled=true;try{const ticketResponse=await fetch('/api/workbench/projects/'+encodeURIComponent(project)+'/api/device-authorizations/'+encodeURIComponent(request),{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(10000)});if(!ticketResponse.ok)throw Error('申请读取失败，请重新登录或刷新');const ticket=await ticketResponse.json();if(ticket.status!=='pending')throw Error('申请已处理，请刷新');const response=await fetch('/auth/device/decision',{method:'POST',credentials:'same-origin',body:new URLSearchParams({projectId:project,userCode:ticket.userCode,csrf:ticket.csrf,decision}),signal:AbortSignal.timeout(10000)});if(!response.ok)throw Error('决定未确认，请刷新核对后重试');location.reload();}catch(error){form.querySelector('[role=status]').textContent=error.message;for(const button of form.querySelectorAll('button'))button.disabled=false;}});</script>` : `<p role="status">${grant.claimed ? '该授权已领取。' : grant.status === 'denied' ? '已拒绝连接。' : grant.status === 'expired' ? '授权领取已过期，请重新申请。' : '已授权，请返回 Agent；等待中的连接会自动完成。'}</p>`}
 </main></body></html>`;
 }
 
@@ -1343,6 +1345,15 @@ export async function startCloudServer({
   const requireWorkbench = (req, url) => {
     if (!hasWorkbenchAccess(req, url)) throw new MapError('UNAUTHORIZED', browserPasswordHash ? 'Sign in before editing the cloud workbench' : 'Open /auth?token=... before editing the cloud workbench', 401);
   };
+  const requireHumanWorkbench = req => {
+    if (!browserToken || !safeEqual(decodedCookieValue(req), browserToken)) throw new MapError('UNAUTHORIZED', 'Sign in to approve device connections', 401);
+    if (req.headers.origin && req.headers.origin !== (allowedOrigin || `http://${req.headers.host}`)) throw new MapError('ORIGIN_REJECTED', 'Cross-origin request rejected', 403);
+  };
+  const deviceRepository = projectId => {
+    const repositories = interfaceConfig?.repositories?.filter(item => item.projectId === projectId && /^\d+$/.test(item.repositoryId)) || [];
+    if (!projectById(projectId) || !configuredMemory?.projects?.[projectId] || repositories.length !== 1) throw new MapError('NOT_FOUND', 'Device authorization project is unavailable', 404);
+    return repositories[0];
+  };
   const loginKey = req => String(req.socket.remoteAddress || 'unknown');
   const loginBlocked = req => {
     const entry = loginFailures.get(loginKey(req));
@@ -2068,7 +2079,7 @@ export async function startCloudServer({
         if (req.method !== 'POST' || req.headers.origin || !String(req.headers['content-type'] || '').startsWith('application/json')) protocolFail('FORBIDDEN', 'Use the CLI device authorization flow');
         const input = await requestBody(req, 4096);
         if (route.endsWith('/start')) {
-          const data = await deviceAuthorization.start(input, String(req.socket.remoteAddress));
+          const data = await deviceAuthorization.start(input, String(req.socket.remoteAddress), req.headers['x-context-guard-device-grant'] === 'persistent-v1');
           return send(res, 200, { ok: true, data: { ...data, verificationPath: `/connect?code=${encodeURIComponent(data.userCode)}` } });
         }
         const result = await deviceAuthorization.poll(input);
@@ -2076,16 +2087,32 @@ export async function startCloudServer({
       }
       if (route === '/connect' && req.method === 'GET') {
         if (!deviceAuthorization) protocolFail('UNAVAILABLE', 'Device authorization is not configured');
-        if (!hasWorkbenchAccess(req)) return redirect(res, `/login?next=${encodeURIComponent(route + url.search)}`);
-        return sendHtml(res, 200, deviceAuthorizationPage(await deviceAuthorization.view(url.searchParams.get('code'), String(req.socket.remoteAddress))), { 'Referrer-Policy': 'same-origin' });
+        if (!browserToken || !safeEqual(decodedCookieValue(req), browserToken)) return redirect(res, `/login?next=${encodeURIComponent(route + url.search)}`);
+        const grant = await deviceAuthorization.view(url.searchParams.get('code'), String(req.socket.remoteAddress));
+        const repository = interfaceConfig.repositories.find(item => item.slug === grant.repository && item.repositoryId === grant.repositoryId);
+        deviceRepository(repository?.projectId);
+        const html = deviceAuthorizationPage(grant, repository.projectId);
+        const script = /<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+        const scriptPolicy = script ? `; script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'; connect-src 'self'` : '';
+        return sendHtml(res, 200, html, { 'Referrer-Policy': 'same-origin', 'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'${scriptPolicy}` });
       }
       if (route === '/auth/device/decision' && req.method === 'POST') {
-        requireWorkbench(req, url);
+        requireHumanWorkbench(req);
         if (!deviceAuthorization) protocolFail('UNAVAILABLE', 'Device authorization is not configured');
         if (req.headers.origin !== (allowedOrigin || `http://${req.headers.host}`)) protocolFail('FORBIDDEN', 'Submit the authorization form from Cloud');
         const form = await requestForm(req);
-        await deviceAuthorization.decide({ userCode: form.get('userCode'), csrf: form.get('csrf'), decision: form.get('decision') }, String(req.socket.remoteAddress));
+        const repository = deviceRepository(form.get('projectId'));
+        await deviceAuthorization.decide({ userCode: form.get('userCode'), csrf: form.get('csrf'), decision: form.get('decision'), repository: repository.slug, repositoryId: repository.repositoryId }, String(req.socket.remoteAddress));
         return redirect(res, `/connect?code=${encodeURIComponent(form.get('userCode'))}`);
+      }
+      const deviceListing = route.match(/^\/api\/workbench\/projects\/([^/]+)\/api\/device-authorizations(?:\/([A-Za-z0-9-]+))?$/);
+      if (deviceListing && req.method === 'GET') {
+        requireHumanWorkbench(req);
+        if (!deviceAuthorization) protocolFail('UNAVAILABLE', 'Device authorization is not configured');
+        const repository = deviceRepository(decodeURIComponent(deviceListing[1]));
+        const data = deviceListing[2] ? await deviceAuthorization.detail(deviceListing[2], repository.slug, repository.repositoryId)
+          : await deviceAuthorization.list(repository.slug, repository.repositoryId, url.searchParams.get('summary') === '1');
+        return send(res, 200, data);
       }
       if (memoryHandler && await memoryHandler(req, res)) return;
       if (route === '/login' && req.method === 'GET') {
@@ -2122,7 +2149,7 @@ export async function startCloudServer({
         const conversationId = url.searchParams.get('conversation') || 'legacy';
         if (viewId !== 'main' && (!project || !viewId.startsWith('session:'))) throw new MapError('UNKNOWN_VIEW', 'Select Main or a project Session', 404);
         const action = workbench[3];
-        if (action === '/bootstrap' && req.method === 'GET') { requirePrivateRead(req, url); return send(res, 200, { root: project ? `cloud:${project.id}` : 'cloud:overview', protocol: 3, apiBase: route.slice(0, -'/bootstrap'.length), authenticated: !!cookieValue(req), interfaceCapabilities: { sessionCompletion: !!project && !!configuredMemory?.projects?.[project.id], attachments: !!project && !!configuredMemory?.projects?.[project.id] && !!attachments, taskDispatch: !!project && !!interfaceConfig, humanReview: !!project && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[project?.id]?.coordinator?.enabled } }); }
+        if (action === '/bootstrap' && req.method === 'GET') { requirePrivateRead(req, url); return send(res, 200, { root: project ? `cloud:${project.id}` : 'cloud:overview', protocol: 3, apiBase: route.slice(0, -'/bootstrap'.length), authenticated: !!cookieValue(req), interfaceCapabilities: { deviceAuthorization: !!project && !!deviceAuthorization && !!interfaceConfig?.repositories?.find(item => item.projectId === project.id), sessionCompletion: !!project && !!configuredMemory?.projects?.[project.id], attachments: !!project && !!configuredMemory?.projects?.[project.id] && !!attachments, taskDispatch: !!project && !!interfaceConfig, humanReview: !!project && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[project?.id]?.coordinator?.enabled } }); }
         requireWorkbench(req, url);
         if (action.startsWith('/api/coordinator/attachments/') && project && req.method === 'GET') {
           if (!integrationAttachments) protocolFail('NOT_FOUND', 'Coordinator attachments are unavailable');
@@ -2596,7 +2623,7 @@ export async function startCloudServer({
         if (/^\/projects\//.test(route) && !projectById(decodeURIComponent(route.slice('/projects/'.length)))) throw new MapError('NOT_FOUND', 'Project is missing', 404);
         const projectId = /^\/projects\//.test(route) ? decodeURIComponent(route.slice('/projects/'.length)) : null;
         const scope = projectId ? `projects/${encodeURIComponent(projectId)}` : 'overview';
-        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { sessionCompletion: !!projectId && !!configuredMemory?.projects?.[projectId], attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
+        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { deviceAuthorization: !!projectId && !!deviceAuthorization && !!interfaceConfig?.repositories?.find(item => item.projectId === projectId), sessionCompletion: !!projectId && !!configuredMemory?.projects?.[projectId], attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
         const marker = `<script>window.__CG_SERVER=${config};</script>`;
         const html = workbenchHtml.replace('<!-- CG_SERVER_BOOT -->', marker);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' });

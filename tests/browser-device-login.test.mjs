@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/server.mjs';
@@ -23,7 +23,7 @@ const repository = 'https://github.com/example/repo';
 const repositoryId = '123';
 const execFileAsync = promisify(execFile);
 
-async function fixture(t) {
+async function fixture(t, { secondProject = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-browser-auth-'));
   const memory = { dataDir: path.join(directory, 'memory'), adminToken: 'fixture-memory-admin',
     projects: { 'context-guard': { token: 'fixture-project-memory' } } };
@@ -39,6 +39,16 @@ async function fixture(t) {
     browserToken: 'fixture-browser-cookie', browserPasswordHash: await createWorkbenchPasswordHash(password),
     protocolConfig: { repositories: [{ slug: 'example/repo', repositoryId, projectId: 'context-guard',
       clients: { coordinator: { deviceId: 'privileged-device', agentId: 'coordinator', role: 'coordinator' } } }] } };
+  if(secondProject){
+    options.adminToken='fixture-cloud-admin';
+    memory.projects.other={token:'fixture-other-memory'};
+    options.protocolConfig.repositories.push({slug:'example/other-repo',repositoryId:'456',projectId:'other',clients:{}});
+    await fs.mkdir(options.dataDir,{recursive:true});
+    await fs.writeFile(path.join(options.dataDir,'projects.json'),JSON.stringify({v:2,projects:[
+      {id:'context-guard',name:'Context Guard',description:'Pairing fixture A'},
+      {id:'other',name:'Other project',description:'Pairing fixture B'},
+    ]}));
+  }
   let cloud = await startCloudServer(options);
   const state = { directory, options, get cloud() { return cloud; },
     restart: async () => { const port = new URL(cloud.url).port; await cloud.close(); cloud = await startCloudServer({ ...options, port: Number(port) }); } };
@@ -76,14 +86,25 @@ async function formFor(f, grant, cookie) {
   const response = await fetch(new URL(grant.verificationPath || grant.verificationUrl, f.cloud.url), { headers: { Cookie: cookie }, redirect: 'manual' });
   assert.equal(response.status, 200);
   const html = await response.text();
-  const csrf = /name="csrf" value="([^"]+)"/.exec(html)?.[1];
+  const script=/<script>([\s\S]*?)<\/script>/.exec(html)?.[1];
+  assert.ok(script);
+  const policy=response.headers.get('content-security-policy');
+  assert.ok(policy.includes(`script-src 'sha256-${createHash('sha256').update(script).digest('base64')}'`));
+  assert.match(policy,/default-src 'none'/); assert.match(policy,/connect-src 'self'/);
+  assert.doesNotMatch(policy,/script-src[^;]*'unsafe-inline'/);
+  const requestId = grant.requestId || JSON.parse(/request=("[^"]+")/.exec(html)?.[1] || 'null');
+  assert.ok(requestId);
+  const ticketResponse = await fetch(new URL(`/api/workbench/projects/context-guard/api/device-authorizations/${requestId}`, f.cloud.url), { headers: { Cookie: cookie } });
+  assert.equal(ticketResponse.status, 200);
+  const { csrf } = await ticketResponse.json();
   assert.ok(csrf);
+  assert.equal(html.includes(csrf), false, 'decision ticket is not embedded in the HTML');
   return { html, csrf };
 }
 
 const decide = (f, grant, csrf, cookie, decision = 'approve', origin = f.cloud.url) => fetch(new URL('/auth/device/decision', f.cloud.url), {
   method: 'POST', redirect: 'manual', headers: { Cookie: cookie, ...(origin ? { Origin: origin } : {}) },
-  body: new URLSearchParams({ userCode: grant.userCode, csrf, decision }),
+  body: new URLSearchParams({ projectId: 'context-guard', userCode: grant.userCode, csrf, decision }),
 });
 
 async function approve(f, grant) {
@@ -234,7 +255,7 @@ test('BDA-007: choosing a registered Coordinator client ID through browser pairi
   assert.equal(publish.status, 401);
 });
 
-test('BDA-008: expired, revoked and interrupted issuance never produce a replayable credential', async t => {
+test('BDA-008: pending survives while expired tickets, finite approved claims and revoked issuance remain blocked', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-browser-expiry-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   let now = 1000, authorized = true, issued = 0;
@@ -244,6 +265,10 @@ test('BDA-008: expired, revoked and interrupted issuance never produce a replaya
   const csrf = (await grants.view(expiration.userCode, 'fixture')).csrf;
   now = 2000;
   await assert.rejects(grants.decide({ userCode: expiration.userCode, csrf, decision: 'approve' }, 'fixture'), { code: 'FORBIDDEN' });
+  assert.equal((await grants.poll({ deviceCode: expired.deviceCode })).data.status, 'pending');
+  const ticket = await grants.detail(expiration.requestId, 'example/repo', repositoryId);
+  await grants.decide({ userCode: ticket.userCode, csrf: ticket.csrf, decision: 'approve' }, 'fixture');
+  now = 3000;
   await assert.rejects(grants.poll({ deviceCode: expired.deviceCode }), { code: 'UNAUTHORIZED' });
   const revoked = grantInput(), pending = await grants.start(revoked, 'fixture'), page = await grants.view(pending.userCode, 'fixture');
   authorized = false;
@@ -382,13 +407,103 @@ test('BDA-017: oversized or non-integer relative authorization TTLs are rejected
   }
 });
 
+test('BDA-018: persistent pending, legacy migration, finite claims and terminal replay are independent', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-device-persistent-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let now = 1000, authorized = true, issued = 0;
+  const options = { directory, now: () => now, lifetimeMs: 1000, authorizeRepository: () => authorized ? repositoryId : null,
+    issueDevice: async () => { issued++; return { data: { connected: true } }; } };
+  const service = new DeviceAuthorization(options), input = grantInput();
+  const pending = await service.start(input, 'fixture', true);
+  assert.equal(pending.persistent, true); assert.equal(pending.expiresAt, null); assert.equal(pending.expiresIn, null);
+  now = 86400000;
+  const restarted = new DeviceAuthorization(options);
+  assert.equal((await restarted.poll({ deviceCode: input.deviceCode })).data.status, 'pending');
+  assert.equal((await restarted.start(input, 'fixture', true)).requestId, pending.requestId);
+  const legacyWire = await restarted.start(input, 'fixture');
+  assert.equal(legacyWire.expiresIn, 1); assert.ok(Number.isFinite(Date.parse(legacyWire.expiresAt)));
+  const ticket = await restarted.detail(pending.requestId, 'example/repo', repositoryId);
+  await restarted.decide({ userCode: ticket.userCode, csrf: ticket.csrf, decision: 'approve' }, 'fixture');
+  const approved = await restarted.start(input, 'fixture', true);
+  assert.equal(approved.persistent, false); assert.equal(approved.status, 'approved'); assert.equal(approved.expiresIn, 1);
+  await restarted.poll({ deviceCode: input.deviceCode });
+  await assert.rejects(restarted.poll({ deviceCode: input.deviceCode }), error => error.details?.reason === 'authorization-already-claimed');
+  await assert.rejects(restarted.start(input, 'fixture', true), error => error.details?.reason === 'authorization-already-claimed');
+  assert.equal(issued, 1);
+  const old = grantInput({ clientId: 'old' }), denied = grantInput({ clientId: 'denied' });
+  const state = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  state.grants[hash(old.deviceCode)] = { repository: 'example/repo', repositoryId, clientId: old.clientId, label: old.label,
+    userCode: 'AAAA-BBBB', csrf: randomBytes(32).toString('base64url'), expiresAt: 2000, status: 'pending' };
+  state.grants[hash(denied.deviceCode)] = { ...state.grants[hash(old.deviceCode)], clientId: denied.clientId, userCode: 'CCCC-DDDD', status: 'denied' };
+  await fs.writeFile(service.file, JSON.stringify(state));
+  const migrated = await restarted.start(old, 'fixture', true);
+  assert.equal(migrated.expiresAt, null);
+  assert.equal((await restarted.list('example/repo', repositoryId)).requests[0].createdAt, null);
+  await assert.rejects(restarted.start(denied, 'fixture', true), error => error.details?.reason === 'authorization-denied');
+  const ledger = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  for(let index=0;index<1000;index++) ledger.grants[hash(`terminal-fixture-${index}`)] = { repository: 'example/repo', repositoryId, status: 'denied', claimed: false };
+  await fs.writeFile(service.file, JSON.stringify(ledger));
+  const fresh = grantInput({ clientId: 'fresh-after-terminal-history' });
+  assert.equal((await restarted.start(fresh, 'fixture', true)).status, 'pending', 'terminal history does not fill the pending capacity');
+  const full = JSON.parse(await fs.readFile(service.file, 'utf8'));
+  for(let index=0;index<998;index++) full.grants[hash(`pending-fixture-${index}`)] = { repository: 'example/repo', repositoryId, status: 'pending', label: 'Fixture', userCode: `fixture-${index}` };
+  await fs.writeFile(service.file, JSON.stringify(full));
+  await assert.rejects(restarted.start(grantInput({ clientId: 'over-capacity' }), 'fixture', true), { code: 'UNAVAILABLE' });
+  assert.equal((await restarted.start(fresh, 'fixture', true)).status, 'pending', 'capacity never evicts an existing request');
+  authorized = false;
+  await assert.rejects(restarted.poll({ deviceCode: old.deviceCode }), error => error.details?.reason === 'repository-access-revoked');
+});
+
+test('BDA-019: project device request tools require a human cookie and do not enumerate secrets', async t => {
+  const f = await fixture(t,{secondProject:true}), input = grantInput({ label: '<unsafe device>' });
+  const response = await post(f, '/api/auth/device/start', input, { 'X-Context-Guard-Device-Grant': 'persistent-v1' });
+  const grant = (await response.json()).data;
+  assert.equal(grant.persistent, true);
+  const listUrl = new URL('/api/workbench/projects/context-guard/api/device-authorizations', f.cloud.url);
+  const otherInput=grantInput({repository:'https://github.com/example/other-repo',clientId:'other-device',label:'Other project request'});
+  const otherGrant=await begin(f,otherInput);
+  for (const headers of [{}, { Authorization: 'Bearer fixture-browser-cookie' }, { Authorization: 'Bearer fixture-project-memory' }, {Authorization:'Bearer fixture-cloud-admin'}])
+    assert.equal((await fetch(listUrl, { headers })).status, 401);
+  const cookie = await login(f, '/projects/context-guard');
+  const loginPolicy=await fetch(new URL('/login',f.cloud.url)).then(response=>response.headers.get('content-security-policy'));
+  assert.match(loginPolicy,/default-src 'none'/); assert.doesNotMatch(loginPolicy,/script-src/);
+  assert.equal((await fetch(listUrl, { headers: { Cookie: cookie, Origin: 'https://attacker.invalid' } })).status, 403);
+  const listed = await fetch(listUrl, { headers: { Cookie: cookie } }), data = await listed.json();
+  assert.equal(data.count, 1); assert.equal(data.requests[0].requestId, grant.requestId); assert.equal(data.requests[0].label, '<unsafe device>');
+  assert.equal(JSON.stringify(data).includes(otherGrant.requestId),false);
+  const otherListUrl=new URL('/api/workbench/projects/other/api/device-authorizations',f.cloud.url);
+  const otherData=await fetch(otherListUrl,{headers:{Cookie:cookie}}).then(response=>response.json());
+  assert.equal(otherData.count,1);assert.equal(otherData.requests[0].requestId,otherGrant.requestId);
+  assert.equal(otherData.requests[0].repository,'example/other-repo');
+  assert.equal(JSON.stringify(otherData).includes(grant.requestId),false);
+  for (const secret of [input.deviceCode, hash(input.deviceCode), grant.userCode]) assert.equal(JSON.stringify(data).includes(secret), false);
+  assert.deepEqual(Object.keys(data.requests[0]).sort(), ['createdAt', 'label', 'repository', 'requestId', 'status']);
+  assert.deepEqual(await fetch(new URL(listUrl+'?summary=1'), { headers: { Cookie: cookie } }).then(response => response.json()), { count: 1 });
+  const detailUrl = new URL(`${listUrl}/${grant.requestId}`);
+  assert.equal((await fetch(detailUrl, { headers: { Authorization: 'Bearer fixture-browser-cookie' } })).status, 401);
+  assert.equal((await fetch(new URL(`/api/workbench/projects/other/api/device-authorizations/${grant.requestId}`, f.cloud.url), { headers: { Cookie: cookie } })).status, 404);
+  const ticket = await fetch(detailUrl, { headers: { Cookie: cookie } }).then(response => response.json());
+  const wrongScope = await fetch(new URL('/auth/device/decision', f.cloud.url), { method: 'POST', redirect: 'manual', headers: { Cookie: cookie, Origin: f.cloud.url },
+    body: new URLSearchParams({ projectId: 'other', userCode: ticket.userCode, csrf: ticket.csrf, decision: 'approve' }) });
+  assert.equal(wrongScope.status, 404);
+  assert.equal((await post(f,'/api/auth/device/poll',{deviceCode:otherInput.deviceCode}).then(response=>response.json())).data.status,'pending');
+  assert.equal((await decide(f, grant, ticket.csrf, cookie, 'deny')).status, 302);
+  assert.equal((await decide(f, grant, ticket.csrf, cookie, 'deny')).status, 409);
+  assert.equal((await post(f, '/api/auth/device/poll', { deviceCode: input.deviceCode })).status, 403);
+  assert.equal((await fetch(listUrl, { headers: { Cookie: cookie } }).then(response => response.json())).count, 0);
+  assert.equal((await fetch(otherListUrl,{headers:{Cookie:cookie}}).then(response=>response.json())).count,1,'denying A never decides B');
+});
+
 test('BDA-012: real browser password entry and approval buttons complete pairing without exposing backend credentials', {
   skip: process.env.CONTEXT_GUARD_AUTH_BROWSER !== '1' && 'Explicit browser acceptance: set CONTEXT_GUARD_AUTH_BROWSER=1 with Playwright Chromium installed',
 }, async t => {
   const f = await fixture(t), device = deviceFor(f), { chromium } = await import('playwright');
   const browser = await chromium.launch({ headless: true });
-  t.after(() => browser.close());
   const context = await browser.newContext(), page = await context.newPage();
+  const artifacts=path.resolve('output/playwright',`device-approvals-${Date.now()}`);await fs.mkdir(artifacts,{recursive:true});
+  const browserErrors=[];let browserPassed=false;
+  page.on('console',message=>{if(message.type()==='error')browserErrors.push(message.text().slice(0,600));});
+  t.after(async()=>{if(!browserPassed&&!page.isClosed()){await page.screenshot({path:path.join(artifacts,'failure.png'),fullPage:true}).catch(()=>{});await fs.writeFile(path.join(artifacts,'failure.json'),JSON.stringify({passed:false,browserErrors},null,2));}await browser.close();});
   const connected = await browserLogin(device, { repository, repositoryId, wait: true, onPending: async grant => {
     await page.goto(grant.verificationUrl);
     await page.getByLabel('密码', { exact: true }).fill(password);
@@ -408,4 +523,69 @@ test('BDA-012: real browser password entry and approval buttons complete pairing
   assert.equal(page.url().includes(saved.credential), false);
   assert.equal(JSON.stringify(await context.storageState()).includes(saved.credential), false);
   assert.equal(Object.hasOwn(connected, 'credential'), false);
+  const approveInput = grantInput({ label: 'UI device approval fixture' }), denyInput = grantInput({ label: '<img src=x onerror=alert(1)>' });
+  const approvedRequest = await begin(f, approveInput), deniedRequest = await begin(f, denyInput);
+  let releaseSummary,summaryStarted,heldSummary=false;
+  const summaryGate=new Promise(resolve=>{releaseSummary=resolve;}),summaryRead=new Promise(resolve=>{summaryStarted=resolve;});
+  await page.route('**/api/device-authorizations?*',async route=>{
+    if(new URL(route.request().url()).searchParams.get('summary')==='1'&&!heldSummary){heldSummary=true;summaryStarted();await summaryGate;}
+    await route.continue();
+  });
+  await page.goto(new URL('/projects/context-guard', f.cloud.url).href);
+  await page.locator('#cg-sync[data-status="synced"]').waitFor({ state: 'attached' });
+  await summaryRead;
+  await page.locator('#workbench-tools > summary').click();
+  await page.locator('#btn-device-approvals').waitFor();
+  await page.locator('#btn-device-approvals').click();
+  const dialog = page.locator('#device-approvals');
+  assert.equal(await dialog.isVisible(),true);
+  await dialog.locator('[data-i18n="deviceApprovalScope"]').filter({hasText:'仅允许你发起的连接：读取本项目 Main、读写自身 Session；不授予管理或 Main 发布权限。'}).waitFor();
+  const fullRequests=page.waitForResponse(response=>response.url().includes('/api/device-authorizations?')&&!new URL(response.url()).searchParams.has('summary'));
+  releaseSummary();await fullRequests;
+  await dialog.locator('article').filter({ hasText: denyInput.label }).waitFor();
+  assert.equal(await page.locator('#device-approval-count').textContent(),'2');
+  assert.equal(await page.locator('#device-approvals-status').textContent(),'','summary-to-open transition is not a malformed-list error');
+  await page.unroute('**/api/device-authorizations?*');
+  const focusedButton=dialog.locator('article').filter({hasText:approveInput.label}).getByRole('button',{name:'允许连接',exact:true});
+  await focusedButton.focus();
+  const unchangedRefresh=page.waitForResponse(response=>response.url().includes('/api/device-authorizations?')&&response.request().method()==='GET');
+  await page.evaluate(()=>document.querySelector('#device-approvals-refresh').click());
+  await unchangedRefresh;
+  assert.equal(await focusedButton.evaluate(button=>button===document.activeElement),true,'unchanged fresh data preserves keyboard focus');
+  assert.equal(await dialog.locator('img').count(), 0, 'device label is text, not executable HTML');
+  for(const secret of [approveInput.deviceCode, denyInput.deviceCode, saved.credential]) assert.equal((await page.content()).includes(secret), false);
+  await page.setViewportSize({ width: 390, height: 844 });
+  assert.equal(await page.locator('#device-approvals-close').evaluate(button => {const rect=button.getBoundingClientRect();return rect.top>=0&&rect.bottom<=innerHeight&&rect.right<=innerWidth;}), true);
+  await page.screenshot({path:path.join(artifacts,'device-requests-phone.png'),fullPage:true});
+  await page.locator('#device-approvals-close').click();
+  assert.equal(await dialog.isVisible(), false);
+  await page.locator('#workbench-tools > summary').click();
+  await page.locator('#btn-device-approvals').click();
+  const approveRow = dialog.locator('article').filter({ hasText: approveInput.label });
+  await approveRow.getByRole('button', { name: '允许连接', exact: true }).click();
+  await approveRow.waitFor({ state: 'detached' });
+  assert.equal((await post(f, '/api/auth/device/poll', { deviceCode: approveInput.deviceCode }).then(response=>response.json())).ok, true);
+  const denyRow=dialog.locator('article').filter({hasText:denyInput.label});
+  await denyRow.getByRole('button', {name:'拒绝',exact:true}).click();
+  await denyRow.waitFor({state:'detached'});
+  assert.equal((await post(f, '/api/auth/device/poll', {deviceCode:denyInput.deviceCode})).status,403);
+  assert.equal(await page.locator('#device-approval-count').textContent(),'0');
+  await page.keyboard.press('Escape');
+  assert.equal(await dialog.isVisible(),false);
+  await page.route('**/api/device-authorizations?*',route=>route.fulfill({status:401,contentType:'application/json',body:JSON.stringify({error:{code:'UNAUTHORIZED'}})}));
+  await page.locator('#workbench-tools > summary').click();
+  await page.locator('#btn-device-approvals').click();
+  await page.locator('#device-approvals-status').filter({hasText:'登录已失效'}).waitFor();
+  assert.equal(await page.locator('#device-approval-count').textContent(),'?');
+  await page.unroute('**/api/device-authorizations?*');
+  await page.locator('#device-approvals-refresh').click();
+  await page.waitForFunction(()=>document.querySelector('#device-approval-count')?.textContent==='0');
+  assert.equal(await page.locator('#device-approvals-status').textContent(),'');
+  await page.locator('#device-approvals-close').click();
+  await page.reload();
+  await page.locator('#btn-device-approvals').waitFor({state:'attached'});
+  assert.equal(await page.locator('#device-approval-count').textContent(),'0');
+  browserPassed=true;
+  await fs.writeFile(path.join(artifacts,'result.json'),JSON.stringify({passed:true,checks:['password entry','hash-restricted connect script','project tools count','text-only labels','phone close','allow and deny','cookie error count and recovery','reload']},null,2));
+  console.log(`Device approval browser artifacts: ${artifacts}`);
 });

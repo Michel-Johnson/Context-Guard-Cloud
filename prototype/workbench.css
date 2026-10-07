@@ -550,11 +550,13 @@ body.auth-mode .node .add-child,body.auth-mode .node .add-pick{display:none}
 /* ---------- 已取消托盘 ---------- */
 .tray{position:fixed;left:16px;top:calc(var(--chrome-top) + 8px);z-index:29;width:330px;background:var(--paper);
   border:1px solid var(--line);border-radius:10px;box-shadow:0 6px 24px rgba(42,47,43,.14);
-  padding:14px 16px;display:none}
-.tray.open{display:block}
+  padding:14px 16px;display:none;box-sizing:border-box;max-width:calc(100vw - 32px);max-height:calc(100dvh - var(--chrome-top) - 16px)}
+.tray.open{display:flex;flex-direction:column}
+.tray-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-shrink:0}
+.tray-head button{width:36px;height:36px;flex-shrink:0;padding:0;font-size:24px;line-height:1;box-shadow:none}
 .tray h3{margin:0 0 3px;font-size:14px}
-.tray p.hint{margin:0 0 10px;font-size:12px;color:var(--muted)}
-.tray ul{list-style:none;margin:0;padding:0}
+.tray p.hint{margin:0 0 10px;font-size:12px;color:var(--muted);flex-shrink:0}
+.tray ul{list-style:none;margin:0;padding:0;min-height:0;overflow:auto}
 .tray li{padding:9px 0;border-top:1px solid var(--line)}
 .tray li:first-child{border-top:0}
 .tray .t-title{font-size:13px;color:var(--muted);text-decoration:line-through}
@@ -563,6 +565,13 @@ body.auth-mode .node .add-child,body.auth-mode .node .add-pick{display:none}
 .tray .t-actions .danger:hover{border-color:var(--red);color:var(--red)}
 .tray .confirm-row{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12.5px;color:var(--red)}
 .tray .empty{color:var(--muted);font-size:12.5px;padding:6px 0}
+.device-approvals{width:min(520px,calc(100vw - 24px));max-height:calc(100dvh - 24px);box-sizing:border-box;border:2px solid var(--line-ink);border-radius:10px;background:var(--paper);color:var(--ink)}
+.device-approvals[open]{display:flex;flex-direction:column;gap:10px}
+.device-approvals::backdrop{background:rgba(42,47,43,.25)}
+#device-approval-list{min-height:0;overflow:auto;overflow-wrap:anywhere}
+#device-approval-list article{border-top:1px solid var(--line);padding:10px 0}
+#device-approval-list button{margin:4px 8px 0 0}
+#device-approvals-refresh{flex-shrink:0}
 
 /* ---------- 未修 Bug 面板 ---------- */
 #btn-bugs.on,#btn-todos.on,#btn-coordinator[aria-expanded="true"]{background:var(--yellow);font-weight:800}
@@ -896,7 +905,7 @@ html.cg-phone .bug-panel{
   padding-bottom:calc(16px + var(--safe-bottom));
 }
 html.cg-phone .tray{
-  left:8px;right:8px;width:auto;max-height:min(52vh,420px);overflow:auto;
+  left:8px;right:8px;width:auto;max-width:calc(100vw - 16px);max-height:min(52vh,420px,calc(100dvh - var(--chrome-top) - 16px));
   z-index:32
 }
 html.cg-phone .node.module{width:min(252px,86vw);max-width:min(252px,86vw)}

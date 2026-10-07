@@ -459,6 +459,7 @@ export class WorkbenchSync {
         else if (head.version !== this.version) await this.receive(head);
         else if (this.status === 'offline') await this.retry();
         await this.refreshTaskStatuses().catch(() => {});
+        void Promise.resolve().then(()=>this.a.refreshDeviceApprovals?.()).catch(()=>{});
       } catch { if (view === this.viewId && !this.disposed) await this.recoverConnection(); }
       finally { this.heartbeatRunning = false; this.scheduleHeartbeat(); }
     }, 10000);

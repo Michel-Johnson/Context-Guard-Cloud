@@ -19,6 +19,28 @@ const { reconcileMainBaseline, reconcileSessionMap } = await skillImport('script
 const execFileAsync = promisify(execFile);
 const git = async (root, ...args) => (await execFileAsync('git', args, { cwd: root, windowsHide: true })).stdout.trim();
 
+test('device approval refresh never delays or recovers the Map heartbeat', async () => {
+  const source=await fs.readFile(new URL('../prototype/workbench-sync.mjs',import.meta.url),'utf8');
+  const method=source.slice(source.indexOf('  scheduleHeartbeat() {'),source.indexOf('  async recoverConnection('));
+  for(const rejection of [false,true]){
+    const timers=[];
+    const schedule=runInNewContext(`({${method}}).scheduleHeartbeat`,{clearTimeout:()=>{},setTimeout:(callback,ms)=>{timers.push({callback,ms});return timers.length;}});
+    let release,reads=0,recovered=0,refreshes=0;
+    const approval=new Promise((resolve,reject)=>{release=()=>rejection?reject(new Error('approval service failed')):resolve();});
+    const sync={viewId:'main',version:'main-1',dirty:()=>false,status:'synced',
+      call:async()=>{reads++;return {version:'main-1'};},refreshTaskStatuses:async()=>{},
+      recoverConnection:()=>{recovered++;},a:{refreshDeviceApprovals:()=>{refreshes++;return approval;}},scheduleHeartbeat:schedule};
+    schedule.call(sync);
+    assert.equal(timers[0].ms,10000);
+    await timers[0].callback();
+    assert.equal(sync.heartbeatRunning,false);
+    assert.equal(timers.length,2,'the next 10-second heartbeat is scheduled while approval refresh is still pending');
+    assert.equal(timers[1].ms,10000);assert.equal(reads,1);assert.equal(refreshes,1);assert.equal(recovered,0);
+    release();await Promise.resolve();await Promise.resolve();
+    assert.equal(recovered,0,'ancillary approval errors never cause Map recovery');
+  }
+});
+
 test('binding conflict UI distinguishes safe reasons and clears recovery notices after reconnect', async () => {
   const source = await fs.readFile(new URL('../prototype/workbench-sync.mjs', import.meta.url), 'utf8');
   const method = source.slice(source.indexOf('  renderCloudStatus(status) {'), source.indexOf('  async refreshCloudStatus() {'));
