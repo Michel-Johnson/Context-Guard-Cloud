@@ -1,5 +1,48 @@
 # Cloud split acceptance
 
+## SLACK-CURRENT-ADDRESSEE-01 · New addressee after Coordinator discussion (2026-10-08)
+
+- [x] Coordinator: new real-human1.1.7 acceptance exposed a false positive after
+  a successful mixed-recipient discussion. A later native mention and second-
+  person request addressed only to another Bot was mistaken for Coordinator's
+  own invitation. The original decision and actual unsolicited reply are retained.
+  This is not a transport failure and is not corrected by rewriting the receipt.
+- [x] Executor: current explicit address resolves current second-person
+  references without inherited Coordinator ownership. Third-person subjects,
+  owned objects and material sources are not recipients; open project invitations
+  do not require a mention. Product follow-ups use relevant trusted authors.
+  Mixed audiences and transferred/indirect invitations remain possible; no
+  mention-only exclusion, extra model pass or expanded permissions. Final
+  GatewaySHA256:888585c591f5f3e7f0a857252abf5814ec975d81b8c742827db3cf3fb6f3b899.
+  TestSHA256:0b310c81028b62c24e48502935830eba8a9afc77ae806517df982daa597ca261.
+  Executor affected8/8 passed, actualexit0 after implementation.
+- [x] First candidate checkpoint (not completion): Executor7 affected tests and
+  independent7contract+3HTTP passed, actual exits0. Gatewayca188e02 / tests088687a2.
+  First independent receiver-transition106 model run failed: indirect35/40,
+  negatives49correct+1false positive/50, explicit8/8/refusal8/8,0format errors.
+  Three clear indirect misses and a clear history-owner false positive require
+  repair. Two additional indirect misses have genuine ambiguity; preserve original
+  labels, denominator and result, with adjudication separate. No1.1.8 publication.
+- [x] Independent final technical checkpoint: three affected contract cases and
+  three realHTTP identity/mutation/error boundaries passed, actualexit0, exact
+  final hashes unchanged. Existing strict502/503, frozen-ID retry and total3attempt
+  recovery are unchanged; mocks do not establish natural-language accuracy.
+- [x] First independently labelled/frozen v2 held-out106 on the final classifier:
+  indirect39/40 (97.5%), negatives50/50 (0false positives), explicit8/8/refusal8/8,
+  0errors; decisionP50=747ms/P95=1014ms. Preserve the remaining indirect miss and
+  the v1 failed result/labels/denominator. Separately report ambiguous10 with
+  0format errors and one3933ms decision; not a10/10 semantic pass. Dataset labels
+  and private scenario annotations were not sent to the model; no threshold,
+  parser, deadline, budget or permission was relaxed to obtain these results.
+- [x] Independent final semantic audit: exact source/dataset/result identities,
+  unique106 IDs and complete run checked; binary gatepassed with original labels
+  unchanged. Keep the remaining indirect miss and ambiguity reason risks, not
+  a universal accuracy claim. First v1 failed raw files/hashes remain unchanged;
+  no model rerun or label edit. New real human acceptance below remains separate.
+- [ ] Delivery: completeRequired/normalMain/new running release; repeat the real
+  mixed-recipient-to-other-recipient transition and verify no Coordinator reply
+  for the latter. Stop permissions and native phone checks remain separate gates.
+
 ## SLACK-PARTICIPATION-HISTORY-01 · Current input after historical corrections (2026-10-08)
 
 - [x] Coordinator: real human Slack acceptance exposed a false silent decision:
