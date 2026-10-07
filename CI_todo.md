@@ -62,6 +62,11 @@
    outcome now stays with the same in-memory stop request until success, a
    definite server rejection, or a verified terminal/different turn. Regression
    also waits for a real subsequent GET and checks the warning persists.
+   Independent source-level reproduction on 3f5565b found queued steer count
+   still overwrote that warning. Stop uncertainty now takes priority over the
+   pending-input count. CONTROL-01 sends a real held-turn steer first, and then
+   observes a status MutationObserver write after the next GET, so it verifies
+   frontend render rather than only response arrival. No sleep/budget increase.
 
 ## UI-COORDINATOR-MOBILE-02 · Integrate current Main model controls (2026-10-07)
 

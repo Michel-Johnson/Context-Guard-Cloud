@@ -4902,7 +4902,7 @@ async function installCoordinatorPanel(sync){
     consumeNavigationActions(state);
     status.textContent=state.error?'处理暂停：'+state.error.code:stopRequests.get(selected)?.error||reviewFeedback||(pendingError&&pending?'尚未确认提交：'+pendingError:'');
     if(state.status==='interrupted')status.textContent='本轮已停止，已有操作和部分回复已保留；点击重试可继续';
-    else if(state.pendingInputCount)status.textContent=`已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮`;
+    else if(state.pendingInputCount&&!stopRequests.get(selected)?.error)status.textContent=`已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮`;
     const streamingText=String(state.streamingText||'');
     const lastTextMessage=[...(state.messages||[])].reverse().find(message=>message?.text);
     const streamingCommitted=Boolean(streamingText&&lastTextMessage?.role==='assistant'&&lastTextMessage.text===streamingText);

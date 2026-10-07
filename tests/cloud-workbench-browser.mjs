@@ -144,6 +144,9 @@ async function coordinatorControlAcceptance() {
     assert.ok(Math.abs(alignment.bottom - 8) <= .25 && Math.abs(alignment.right - 8) <= .25, JSON.stringify(alignment));
     assert.ok(alignment.center.every(value => value <= .25), 'Mobile multi-line arrow is centered in a single grid cell');
     await panel.locator('.coordinator-input-shell').screenshot({ path: path.join(output, 'coordinator-arrow-multiline-mobile.png') });
+    await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await fixturePage.waitForFunction(() => document.querySelector('textarea[aria-label="发送给 Coordinator"]')?.value === '');
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('已保存 1 条补充'));
     await input.fill('');
     await fixturePage.waitForFunction(() => {
       const send = document.querySelector('.coordinator-send.is-working-ready');
@@ -158,9 +161,16 @@ async function coordinatorControlAcceptance() {
     });
     await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('停止结果尚未确认'));
+    await panel.locator(':scope > [role=status]').evaluate(status => {
+      status.__stopWarningWrites = 0;
+      status.__stopWarningObserver = new MutationObserver(() => status.__stopWarningWrites++);
+      status.__stopWarningObserver.observe(status, { childList: true });
+    });
     await fixturePage.waitForResponse(response => new URL(response.url()).pathname.endsWith('/api/coordinator') && response.request().method() === 'GET');
+    await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.__stopWarningWrites > 0);
     assert.match(await panel.locator(':scope > [role=status]').textContent(), /停止结果尚未确认/,
-      'A normal Coordinator heartbeat must preserve the uncertain stop outcome');
+      'A rendered Coordinator heartbeat must preserve uncertain stop outcome ahead of queued-input status');
+    await panel.locator(':scope > [role=status]').evaluate(status => status.__stopWarningObserver.disconnect());
     await panel.getByRole('button', { name: '停止当前回复', exact: true }).click();
     await panel.getByText('本轮已停止，已有操作和部分回复已保留；点击重试可继续', { exact: true }).waitFor();
     assert.equal(interruptRequests.length, 2); assert.deepEqual(interruptRequests[0], interruptRequests[1]);
