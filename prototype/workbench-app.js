@@ -5163,7 +5163,7 @@ async function installCoordinatorPanel(sync){
   window.addEventListener('pageshow',()=>{stopped=false;if(panel.open) void refresh();});
 }
 function installDeviceApprovals(sync){
-  if(!sync.config.interfaceCapabilities?.deviceAuthorization) return;
+  if(!sync.config?.interfaceCapabilities?.deviceAuthorization) return;
   const trigger=document.getElementById('btn-device-approvals'), panel=document.getElementById('device-approvals');
   const status=document.getElementById('device-approvals-status'), list=document.getElementById('device-approval-list');
   trigger.hidden=false;
