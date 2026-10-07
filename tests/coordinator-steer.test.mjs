@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
+import { CoordinatorConversations, CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
 import { CoordinatorModel } from '../scripts/cloud/coordinator-model.mjs';
 
 const deferred = () => { let resolve; const promise = new Promise(value => { resolve = value; }); return { promise, resolve }; };
@@ -15,6 +15,53 @@ async function directory(t) {
   t.after(() => fs.rm(value, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }));
   return value;
 }
+
+test('Conversation focus survives restart for automatic chats, Main, legacy and Session without creating items', async t => {
+  const root = await directory(t), registry = new CoordinatorConversations(root);
+  const automatic = await registry.createChat('automatic-focus');
+  const manual = await registry.createChat('manual-focus', { executionMode: 'manual' });
+  const session = await registry.ensureSession('focus-session');
+  for (const id of [automatic, manual, 'main', 'legacy', session]) {
+    await registry.setFocus(id, { nodeId: 'N1', kind: 'bug', itemId: 'old-item', title: 'Old topic' });
+    await registry.setFocus(id, { nodeId: 'N2', kind: 'todo', title: 'New topic' });
+    const restarted = new CoordinatorConversations(root), focused = await restarted.get(id);
+    assert.equal(focused.nodeId, 'N2'); assert.equal(focused.kind, 'todo'); assert.equal(focused.title, 'New topic');
+    assert.equal(focused.itemId, undefined, 'Changing node focus must clear an obsolete item identity');
+    assert.equal((await restarted.list()).find(value => value.id === id).nodeId, 'N2');
+  }
+  const saved = await registry.state();
+  assert.deepEqual(saved.items, {}, 'Mounting focus never creates a work item');
+  assert.deepEqual(saved.tasks, {}, 'Mounting focus never creates an execution task');
+  assert.equal((await registry.get(manual)).executionMode, 'manual');
+  assert.equal((await registry.get(automatic)).executionMode, undefined, 'Automatic mode is not downgraded');
+  await assert.rejects(registry.setFocus('unknown', { nodeId: 'N1', kind: 'todo' }), { code: 'FORBIDDEN' });
+  await assert.rejects(registry.setFocus('main', { nodeId: '', kind: 'todo' }), { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(registry.setFocus('main', { nodeId: 'N1', kind: 'unknown' }), { code: 'INVALID_ARGUMENT' });
+  assert.equal((await registry.get('main')).nodeId, 'N2', 'Rejected updates retain the last saved focus');
+});
+
+test('A published terminal turn drains its runner before accepting the next message', { timeout: 10000 }, async t => {
+  const entered = deferred(), release = deferred(), draining = deferred();
+  const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [],
+    execute: async () => {}, model: { next: async () => answer('done') } });
+  t.after(() => { release.resolve(); return service.close(); });
+  const save = service.saveState.bind(service); let terminalWrites = 0;
+  service.saveState = async state => {
+    await save(state);
+    if (state.status === 'waiting-for-user' && !state.activeTurnId && ++terminalWrites === 2) {
+      entered.resolve(); await release.promise;
+    }
+  };
+  await service.submit({ id: 'first', text: 'first message' }); await entered.promise;
+  const runner = service.running;
+  service.running = { then(resolve, reject) { draining.resolve(); return runner.then(resolve, reject); }, catch: runner.catch.bind(runner) };
+  const next = service.submit({ id: 'second', text: 'second message' });
+  await Promise.race([draining.promise, next.then(() => assert.fail('Cannot accept before the old runner exits'))]);
+  release.resolve(); assert.equal((await next).accepted, true); await service.close();
+  const state = await service.state();
+  assert.equal(state.status, 'waiting-for-user');
+  assert.deepEqual(state.messages.filter(message => message.role === 'user').map(message => message.requestId), ['first', 'second']);
+});
 
 test('Steer durably accepts a batch during generation and suppresses stale tool execution', { timeout: 10000 }, async t => {
   const entered = deferred(), release = deferred(), inputs = [], executed = [];

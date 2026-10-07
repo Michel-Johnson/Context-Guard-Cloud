@@ -1,5 +1,38 @@
 # Cloud split acceptance
 
+## COORDINATOR-CONTROLS-FOCUS-01 · Current-main port (2026-10-07)
+
+1. [x] Executor: empty composer ink uses the existing authenticated interrupt
+   endpoint with the captured turn identity and stable retry request ID. Typed
+   supplements retain send/steer. Completed/stale turns cannot stop a newer turn;
+   output, resume identity, original 48-frame hue cycle and one-second transition
+   remain. Multi-line phone send uses one grid cell and bottom/right anchoring.
+2. [x] Executor: automatic chats, Main, legacy and existing Session scopes persist
+   mounting focus and clear obsolete item identity. The next model context reads
+   that node before/after restart. Mounting creates no Main item, task, execution
+   Session or binding; existing binding and Main snapshots remain equal.
+3. [x] Executor: terminal-runner drain outside the submission lock fixes the
+   observed completion-boundary busy race without concurrent transcript writes.
+   A deterministic held-runner test covers acceptance and both message identities.
+4. [x] Executor module evidence: targeted mount checks passed 6/6; combined modules
+   initially failed 3/36 at the completion boundary, retained as failure evidence.
+   After the drain fix the combined run passed 36/36 (zero skips); adding the
+   deterministic race case then passed the full steer module 8/8 (zero skips).
+5. [x] Executor browser controls: real password UI/HTTP/backend/storage with a
+   controlled paid model, and one lost interrupt request. Three checks passed:
+   CONTROL-01 stop/retry/reload/resume, CONTROL-02 phone alignment/supplements,
+   FOCUS-01 persisted Main focus/context and unchanged Main/Session snapshot.
+   Run: output/playwright/browser-ci/cloud-1791386366033-55281d5b-f0de-4312-9367-c94f705d8f7d.
+   Desktop, phone and multi-line screenshots inspected. Initial login URL,
+   post-reload DOM readiness and synthetic missing tool-description failures are
+   preserved in earlier browser output directories; no assertion weakened or
+   waiting budget expanded. Phone ink repaint is observed before its screenshot.
+6. [ ] Independent Tester: review and execute on the exact frozen source SHA,
+   including completion/interrupt races, scope restrictions and no-dispatch.
+7. [ ] Final full Node/browser, unchanged Required gate, normal PR merge and
+   exact merged-SHA Cloud/Slack deployment. Production checks must remain
+   read-only: no test messages, business mutations, provider changes or new data.
+
 ## R3-STATIC-PREVIEW-01 · Device tools tolerate missing server config (2026-10-07)
 
 - [x] Executor: one optional-chain guard in canonical `installDeviceApprovals`
