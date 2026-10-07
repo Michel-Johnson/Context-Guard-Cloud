@@ -109,6 +109,18 @@ and both finish calls. Old full failures are not overwritten. Product files
 remained frozen. Independent final combined-source audit, GitHub Required and
 actual release/human Slack acceptance are still required.
 
+Remote PR12 run37664306084 passed security,Node22,Node18,Slack andpackage. Browser
+dependency installation repeatedly retried the hosted runner's Azure Ubuntu HTTP
+mirror while Ubuntu's official HTTPS archive responded; browser tests had not
+started. CI now maps that mirror to the same official HTTPS archive and bounds
+APT fetch time/retries. Archive signatures, all browser tests and fail-closed
+Required remain unchanged. The observed old run is retained, not called a page
+test failure; updated workflow verification and its new remote run are required.
+Independent workflow review also found that the artifact glob only matched
+results.json while the browser generates result.json; include both names so the
+existing pass/fail JSON evidence is uploaded alongside screenshots. No test or
+artifact content is synthesized to compensate for the missing old glob.
+
 ## COORDINATOR-PARTIAL-HISTORY-01 · Interrupted-output preservation (2026-10-08)
 
 1. [x] Executor: aborted streams persist as display-only records at their native
