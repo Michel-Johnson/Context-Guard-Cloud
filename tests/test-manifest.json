@@ -57,6 +57,7 @@
     "tests/cloud-workbench-browser.mjs",
     "tests/cloud-workbench.test.mjs",
     "tests/coordinator-file.test.mjs",
+    "tests/coordinator-model-settings.test.mjs",
     "tests/coordinator-multimodal.test.mjs",
     "tests/coordinator-steer.test.mjs",
     "tests/helpers/skill.mjs",

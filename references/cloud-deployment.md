@@ -119,6 +119,36 @@ For Slack, configure its optional loopback gateway and independent secret as in
 [slack-integration.md](slack-integration.md). Slack SDK dependencies remain in the
 plugin package; Cloud does not load them.
 
+### Coordinator model selection
+
+The workbench's **模型配置** button selects a server-configured text provider for
+the current project. Keep `coordinator.providerFile` as the original provider for
+legacy in-flight turns and retries. Add an explicit private catalog, for example:
+
+```json
+{
+  "modelProviders": {
+    "glm-5.3": { "label": "GLM 5.3", "providerFile": "/etc/context-guard-cloud/glm-coordinator.json" },
+    "deepseek-flash": { "label": "DeepSeek V4.1 Flash", "providerFile": "/etc/context-guard-cloud/deepseek-flash-coordinator.json" }
+  },
+  "defaultProviderId": "deepseek-flash"
+}
+```
+
+Each provider file is `0600`, readable by the service account and outside Git.
+DeepSeek V4.1 Flash uses `model: "deepseek-flash"`, `protocol: "anthropic"`,
+`baseUrl: "https://api.deepseek.com/anthropic"` and a private `token`.
+Validate streaming and a tool continuation with the actual credentials before
+opening the option. Never enter credentials in browser fields or URLs.
+
+`GET/POST /api/workbench/projects/<project>/api/coordinator/model` requires
+workbench authority. POST accepts only `{id, providerId, baseVersion}` and saves
+versioned, idempotent selection under the project's Coordinator data directory.
+The browser receives only IDs, labels, model names and a settings version.
+Changes apply to subsequent text turns, including Slack, not in-flight turns or
+their retries. Image routing is unchanged. Retain all original providers until
+their unfinished turns are resolved. Removing a selected provider fails closed.
+
 ## 3. Start and connect
 
 The Cloud template listens on `127.0.0.1:8788`, uses private mode and secure cookies.

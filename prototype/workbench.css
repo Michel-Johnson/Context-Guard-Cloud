@@ -949,6 +949,17 @@ html.cg-phone .drawer h2{font-size:18px}
 #coordinator-panel .coordinator-toolbar-action:hover{background:var(--module-soft);color:var(--ink);transform:none}
 #coordinator-panel .coordinator-toolbar-action:focus-visible{outline:2px solid var(--module);outline-offset:2px;background:var(--paper);color:var(--ink);transform:none}
 #coordinator-panel .coordinator-toolbar-action:active{background:var(--focus-soft);transform:scale(.96)}
+#coordinator-panel .coordinator-model-toggle{width:auto;min-width:44px;padding:0 8px;font-size:12px;white-space:nowrap}
+#coordinator-panel .coordinator-recovery{align-self:flex-start;margin:0 0 8px;padding:4px 10px;background:transparent;box-shadow:none;font-size:12px}
+#coordinator-panel .coordinator-recovery[hidden]{display:none}
+.coordinator-model-dialog{width:min(440px,calc(100vw - 32px));box-sizing:border-box;padding:24px;border:2px solid var(--line-ink);border-radius:14px;background:var(--paper);color:var(--ink);box-shadow:var(--shadow)}
+.coordinator-model-dialog::backdrop{background:rgba(35,31,25,.28)}
+.coordinator-model-dialog form{display:grid;gap:12px;margin:0}
+.coordinator-model-dialog h3,.coordinator-model-dialog p{margin:0}
+.coordinator-model-dialog label{font-size:14px;font-weight:700}
+.coordinator-model-dialog select{width:100%;min-width:0;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--paper);color:var(--ink);font:inherit}
+.coordinator-model-dialog p{font-size:13px;line-height:1.6;color:var(--muted)}
+.coordinator-model-dialog .dialog-actions{display:flex;justify-content:flex-end;gap:8px}
 #coordinator-panel .coordinator-history{margin:-4px 0 12px;padding:10px;border:1px solid #dccfaa;border-radius:12px;background:#faf3dc}
 #coordinator-panel .coordinator-history h3{margin:0 0 8px;font-size:13px;color:#746e5e}
 #coordinator-panel .coordinator-history-list{display:grid;gap:6px}

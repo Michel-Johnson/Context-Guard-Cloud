@@ -585,6 +585,17 @@ try {
   let releaseLongSubmission;
   const oneShotLongText='完整长段落。'.repeat(240);
   const coordinatorReads = [];
+  let modelSettings={version:'a'.repeat(64),selectedId:'glm',options:[{id:'glm',label:'GLM 5.3',model:'glm-5.3'},{id:'ds',label:'DeepSeek V4.1 Flash',model:'deepseek-flash'}]};
+  const modelSelections=[];
+  await page.route(/\/api\/coordinator\/model(?:\?|$)/,async route=>{
+    if(route.request().method()==='POST'){
+      const input=route.request().postDataJSON();modelSelections.push(input);
+      assert.deepEqual(Object.keys(input).sort(),['baseVersion','id','providerId']);
+      assert.equal(input.baseVersion,modelSettings.version);
+      modelSettings={...modelSettings,selectedId:input.providerId,version:'b'.repeat(64)};
+    }
+    await route.fulfill({json:modelSettings});
+  });
   let coordinatorReadFailure = false;
   const markdownImageRequests = [];
   const workingBlotRequests = [];
@@ -709,6 +720,28 @@ try {
   const historyAction=coordinator.getByRole('button',{name:'历史 Session',exact:true});
   assert.equal(await historyAction.textContent(),'◷','history uses a symbol-only control');
   assert.equal(await historyAction.evaluate(el=>el.parentElement?.classList.contains('coordinator-toolbar')),true,'history lives in the Coordinator toolbar');
+  assert.equal(await coordinator.locator('.coordinator-toolbar button[aria-label="重试原请求"]').count(),0);
+  assert.equal(await coordinator.locator('.coordinator-toolbar button[aria-label="停止当前回复"]').count(),0);
+  const modelAction=coordinator.getByRole('button',{name:'模型配置',exact:true});
+  await modelAction.click();
+  const modelDialog=page.getByRole('dialog',{name:'模型配置',exact:true});
+  await modelDialog.getByLabel('文字回复模型').waitFor();
+  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='glm');
+  await modelDialog.getByLabel('文字回复模型').selectOption('ds');
+  await modelDialog.getByRole('button',{name:'应用',exact:true}).click();
+  await modelDialog.getByText('已应用，后续文字回复使用 DeepSeek V4.1 Flash。',{exact:true}).waitFor();
+  assert.equal(modelSelections.length,1);
+  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
+  await modelAction.click();
+  await page.waitForFunction(()=>document.querySelector('#coordinator-model-select')?.value==='ds');
+  assert.equal(await modelDialog.locator('input').count(),0,'model settings cannot request credentials or URLs');
+  await modelDialog.screenshot({path:path.join(output,'coordinator-model-settings-desktop.png')});
+  await page.setViewportSize({width:390,height:844});
+  const modelBounds=await modelDialog.boundingBox();
+  assert.ok(modelBounds.x>=0&&modelBounds.x+modelBounds.width<=390,'model configuration fits a phone without horizontal overflow');
+  await page.screenshot({path:path.join(output,'coordinator-model-settings-mobile.png')});
+  await page.setViewportSize({width:1280,height:900});
+  await modelDialog.getByRole('button',{name:'关闭',exact:true}).click();
   const toolbarAppearance=await coordinator.locator('.coordinator-toolbar').evaluate(toolbar=>{
     const action=toolbar.querySelector('.coordinator-toolbar-action'),style=getComputedStyle(action),toolbarStyle=getComputedStyle(toolbar);
     return{width:style.width,height:style.height,fontSize:style.fontSize,borderWidth:style.borderTopWidth,borderRadius:style.borderRadius,background:style.backgroundColor,color:style.color,boxShadow:style.boxShadow,gap:toolbarStyle.gap};
@@ -727,8 +760,8 @@ try {
   await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
   const readRetry=coordinator.getByRole('button',{name:'重试读取',exact:true});
   await readRetry.waitFor();
-  assert.equal(await readRetry.textContent(),'↻','read retry uses the shared symbol-only control');
-  assert.equal(await readRetry.evaluate(el=>el.parentElement?.classList.contains('coordinator-toolbar')),true,'read retry lives in the Coordinator toolbar');
+  assert.equal(await readRetry.textContent(),'重新读取','read recovery is a contextual text action');
+  assert.equal(await readRetry.evaluate(el=>el.parentElement?.id==='coordinator-panel'),true,'recovery stays outside the toolbar');
   await readRetry.click();
   await page.waitForFunction(()=>document.querySelector('#coordinator-panel > [role=status]')?.textContent==='');
   const coordinatorLayout = await coordinator.evaluate(el => {
@@ -1285,8 +1318,8 @@ try {
   assert.equal(await coordinator.locator('.coordinator-send.is-working-ready').count(),1,'stale polling does not reset card-answer ink');
   releaseCardSubmission();
   await coordinator.getByRole('button',{name:'重试原请求',exact:true}).waitFor();
-  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).textContent(),'↻','retry uses a symbol-only control');
-  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).evaluate(el=>el.parentElement===document.querySelector('#coordinator-panel .coordinator-toolbar')),true,'retry lives in the Coordinator toolbar');
+  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).textContent(),'重试','failure recovery remains explicit');
+  assert.equal(await coordinator.getByRole('button',{name:'重试原请求',exact:true}).evaluate(el=>el.parentElement===document.querySelector('#coordinator-panel')),true,'retry remains outside the toolbar');
   assert.equal(submissions.length,1);
   assert.equal(submissions[0].text,'网站构建产物\n\n保留我的补充');
   assert.equal(submissions[0].answerTo,'choice');

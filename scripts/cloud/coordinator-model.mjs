@@ -313,6 +313,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) await onToolStart?.('ask_user');
     const metadata = state.activeInput || {};
     state.messages.push({ role: 'assistant', content: next.content,
+      ...(state.activeModelRoute?.providerId ? { providerId: state.activeModelRoute.providerId } : {}),
+      ...(state.activeModelRoute?.model ? { modelName: next.model || state.activeModelRoute.model } : {}),
       ...(metadata.id ? { requestId: metadata.id, id: `message-${hash(`${metadata.id}:assistant:${state.messages.length}`)}` } : {}),
       ...(metadata.source ? { source: metadata.source } : {}), ...(metadata.actor ? { actor: metadata.actor } : {}) });
     state.pending = next;

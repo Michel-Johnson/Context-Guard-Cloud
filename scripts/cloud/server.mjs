@@ -17,6 +17,7 @@ import { reviewInput, reviewOperations, pendingReviewFeedback } from './task-rev
 import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
 import { validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
 import { CoordinatorModel } from './coordinator-model.mjs';
+import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from './coordinator-service.mjs';
 import { coordinatorTools, coordinatorReferences, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
@@ -457,6 +458,17 @@ export async function startCloudServer({
   }
   const integrationAttachments = integrations ? new IntegrationAttachmentStore({ directory: path.join(dataDir, 'integration-attachments'), maxBytes: 5 * 1024 * 1024 }) : null;
   const manualBriefStores = new Map();
+  const modelSettings = new Map();
+  const modelSettingsFor = project => {
+    if (!modelSettings.has(project.id)) {
+      const config = configuredMemory?.projects?.[project.id]?.coordinator;
+      if (!config?.enabled) protocolFail('COORDINATOR_DISABLED', 'Coordinator is not enabled for this project');
+      const creating = CoordinatorModelSettings.open({ directory: path.join(dataDir, 'coordinators', project.id), config, factory: coordinatorModelFactory });
+      modelSettings.set(project.id, creating);
+      creating.catch(() => { if (modelSettings.get(project.id) === creating) modelSettings.delete(project.id); });
+    }
+    return modelSettings.get(project.id);
+  };
   const manualBriefsFor = project => {
     if (!manualBriefStores.has(project.id)) manualBriefStores.set(project.id, new CoordinatorManualBriefs({
       directory: path.join(dataDir, 'manual-briefs', project.id), projectId: project.id,
@@ -960,8 +972,10 @@ export async function startCloudServer({
         const directory = conversations.conversationDirectory(conversationId);
         const visionProvider = integrations?.visionProviderFile ? await readJson(integrations.visionProviderFile) : null;
         if (visionProvider && visionProvider.model !== 'glm-5.3-flash') throw new MapError('INVALID_VISION_PROVIDER', 'Slack image turns require glm-5.3-flash', 503);
+        const settings = config.modelProviders ? await modelSettingsFor(project) : null;
         const service = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
-          model: coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
+          model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
+          ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
           ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true } : {}),
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
@@ -1102,7 +1116,7 @@ export async function startCloudServer({
       const config = configuredMemory.projects[projectId].coordinator;
       if (!config?.enabled || !path.isAbsolute(config.providerFile || '')) protocolFail('COORDINATOR_DISABLED', 'Coordinator is unavailable for relevance checks');
       const memory = await readMemoryProject(configuredMemory, projectId);
-      const model = coordinatorModelFactory({ ...await readJson(config.providerFile), timeoutMs: 12000 });
+      const { model } = await (await modelSettingsFor(project)).selection({ timeoutMs: 12000 });
       return classifyIntegrationMessage(model, { overview: relevanceOverview(memory.main, config.nodeIds), input });
     }
     if (type === 'project.read') {
@@ -2184,6 +2198,15 @@ export async function startCloudServer({
           if (match && !match[2] && req.method === 'GET') return send(res, 200, attachments.public(await attachments.get(project.id, viewId, match[1])));
           if (match?.[2] && req.method === 'POST') return send(res, 202, await attachments.retry(project.id, viewId, match[1]));
           throw new MapError('NOT_FOUND', 'Attachment route not found', 404);
+        }
+        if (action === '/api/coordinator/model' && project) {
+          const settings = await modelSettingsFor(project);
+          if (req.method === 'GET') return send(res, 200, await settings.state());
+          if (req.method === 'POST') {
+            if (req.headers.origin && req.headers.origin !== (allowedOrigin || `http://${req.headers.host}`)) protocolFail('FORBIDDEN', 'Untrusted model settings origin');
+            return send(res, 200, await settings.select(await requestBody(req)));
+          }
+          protocolFail('INVALID_ARGUMENT', 'Use GET or POST for model settings');
         }
         if (action === '/api/coordinator/sessions' && project && req.method === 'POST') {
           const config = configuredMemory?.projects?.[project.id]?.coordinator;
