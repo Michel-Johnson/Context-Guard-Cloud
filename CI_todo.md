@@ -664,3 +664,24 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   This is real Chromium against isolated local Cloud/backend and the installed
   pinned Skill artifact, not production-domain or Slack acceptance. The earlier
   failure and diagnostic evidence remain retained; no product code was changed.
+
+- [ ] MODEL-SETTINGS-01: Replace Coordinator toolbar retry/stop with model settings.
+  Verify safe server-configured choices, project isolation, CAS/idempotent change,
+  restart persistence, pinned active/retry routes, provider-native thinking
+  boundaries, retained failure recovery and desktop/phone UI. New isolated
+  suite: `tests/coordinator-model-settings.test.mjs` (8 cases); browser checks use
+  synthetic provider replies and do not establish production acceptance.
+  DeepSeek V4.1 Flash (`deepseek-flash`) was tested from the production host with
+  private credentials: simple streamed reply first text 693 ms, and a real
+  two-request `read_map` tool protocol round-trip 2,323 ms, with continuation
+  first text 867 ms. The tool data in that probe was synthetic; it does not
+  establish actual project Map or full Coordinator latency. No credential is
+  in source, browser settings, test fixtures or logs. Required, merged source,
+  production configuration and real workbench acceptance must be recorded
+  separately. Independent Tester/human review remains pending.
+  Local `npm test`: 381 passed, 2 existing skips; Slack: 142 passed; security:
+  39 checks; targeted model/multimodal regression: 19 passed. Real Chromium
+  model switching, reopen persistence and phone layout passed in the workbench
+  suite. A separate initial cross-product sync run failed at the existing local
+  synced-indicator assertion before any Coordinator use; retain the failure and
+  rerun the unchanged full browser command rather than weakening that assertion.
