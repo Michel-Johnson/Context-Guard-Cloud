@@ -18,8 +18,14 @@ test('AUTH-001: approval survives restart, claims once and stores no claim secre
     issueDevice: async () => { issued++; return { credential: 'test-issued-credential', data: { repositoryId: '123' } }; } };
   const grants = new DeviceAuthorization(options);
   const input = { repository: 'https://github.com/example/repo', clientId: 'device', label: 'test computer', deviceCode: randomBytes(32).toString('base64url') };
-  const started = await grants.start(input, 'test');
-  assert.deepEqual(await grants.start(input, 'test'), started);
+  const started = await grants.start(input, 'test', true);
+  assert.deepEqual(await grants.start(input, 'test', true), started);
+  assert.equal(started.persistent, true); assert.equal(started.expiresAt, null); assert.equal(started.expiresIn, null);
+  const before = Date.now(), legacy = await grants.start(input, 'test'), after = Date.now();
+  assert.deepEqual({ requestId: legacy.requestId, userCode: legacy.userCode, status: legacy.status, interval: legacy.interval },
+    { requestId: started.requestId, userCode: started.userCode, status: started.status, interval: started.interval });
+  assert.ok(Number.isInteger(legacy.expiresIn) && legacy.expiresIn >= 1 && legacy.expiresIn <= 600);
+  assert.ok(Date.parse(legacy.expiresAt) >= before + legacy.expiresIn * 1000 && Date.parse(legacy.expiresAt) <= after + legacy.expiresIn * 1000);
   assert.equal((await grants.poll({ deviceCode: input.deviceCode })).data.status, 'pending');
   assert.equal(issued, 0);
   const view = await grants.view(started.userCode, 'test');
@@ -36,7 +42,7 @@ test('AUTH-001: approval survives restart, claims once and stores no claim secre
   await assert.rejects(grants.start({ ...input, role: 'coordinator' }, 'test'), { code: 'INVALID_ARGUMENT' });
 });
 
-test('AUTH-002: denied, expired and revoked authorization cannot issue a credential', async t => {
+test('AUTH-002: persistent pending does not expire while denied, expired claims and revoked authorization cannot issue', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-device-denial-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   let time = 1000, authorized = true, issued = 0;
@@ -46,7 +52,11 @@ test('AUTH-002: denied, expired and revoked authorization cannot issue a credent
   const denied = input(), first = await grants.start(denied, 'test'), view = await grants.view(first.userCode, 'test');
   await grants.decide({ userCode: first.userCode, csrf: view.csrf, decision: 'deny' }, 'test');
   await assert.rejects(grants.poll({ deviceCode: denied.deviceCode }), { code: 'FORBIDDEN' });
-  const expired = input(); await grants.start(expired, 'test'); time = 2001;
+  const expired = input(), pending = await grants.start(expired, 'test'); time = 2001;
+  assert.equal((await grants.poll({ deviceCode: expired.deviceCode })).data.status, 'pending');
+  const refreshed = await grants.detail(pending.requestId, 'example/repo', '123');
+  await grants.decide({ userCode: refreshed.userCode, csrf: refreshed.csrf, decision: 'approve' }, 'test');
+  time = 3002;
   await assert.rejects(grants.poll({ deviceCode: expired.deviceCode }), { code: 'UNAUTHORIZED' });
   const revoked = input(), next = await grants.start(revoked, 'test'), nextView = await grants.view(next.userCode, 'test');
   await grants.decide({ userCode: next.userCode, csrf: nextView.csrf, decision: 'approve' }, 'test'); authorized = false;

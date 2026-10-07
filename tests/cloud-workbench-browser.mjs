@@ -36,6 +36,8 @@ mainMap.root.children[0].bugs=[{id:'B-readonly',title:'Readonly manual bug',stat
 mainMap.root.memories = [{ id: 'M-old-root', text: 'Legacy project evidence <script>window.__legacyExecuted=true</script>', state: 'success',
   files: [{ path: 'docs/legacy-proof.md' }], proposalEvidence: { reason: 'Historical rationale', basis: 'code', files: ['module.mjs'] } }];
 mainMap.root.children[0].memories = [{ id: 'M-old-node', text: 'Legacy node history', state: 'dirty', custom: { retained: true } }];
+mainMap.root.children.push(...Array.from({ length: 16 }, (_, index) => ({ id: `tray-cancelled-${index}`, title: `Cancelled fixture ${index}`,
+  kind: 'work', proposal: 'cancelled', state: 'dirty', memories: [], ideas: [], todos: [], bugs: [], dormant: [], files: [], owns: [], children: [] })));
 const sessionMap = structuredClone(mainMap);
 sessionMap.root.title = 'Session map';
 sessionMap.root.purpose = 'private working state';
@@ -190,6 +192,65 @@ try {
   assert.doesNotMatch((await page.locator('#cg-sync-session option').allTextContents()).join(' '), /session-one/);
   await page.locator('#session-chip').click();
   record('Main is the default view');
+
+  const tray = page.locator('#tray'), trayTrigger = page.locator('#btn-tray');
+  const trayBaseline = await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') });
+  let trayCommits = 0;
+  const countTrayCommit = request => { if (request.method() === 'POST' && request.url().includes('/api/commit')) trayCommits++; };
+  page.on('request', countTrayCommit);
+  const openTray = async () => { await page.locator('#btn-settings').click(); await trayTrigger.click(); await tray.locator('#tray-close').waitFor(); };
+  const closedTray = async () => {
+    assert.equal(await tray.isVisible(), false);
+    assert.equal(await trayTrigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(await trayTrigger.evaluate(button => button.classList.contains('on')), false);
+  };
+  await openTray();
+  assert.equal(await trayTrigger.getAttribute('aria-controls'), 'tray');
+  assert.equal(await trayTrigger.getAttribute('aria-expanded'), 'true');
+  await tray.locator('[data-delete="tray-cancelled-0"]').click();
+  await tray.locator('[data-delete-no]').click();
+  assert.equal(await tray.isVisible(), true, 'internal confirmation controls do not dismiss the tray');
+  await tray.locator('#tray-close').click();
+  await closedTray();
+  assert.equal(await page.locator('#btn-settings').evaluate(button => button === document.activeElement), true);
+  await openTray();
+  await tray.locator('#tray-list').evaluate(list => {
+    const editor = document.createElement('input'); editor.id = 'tray-editor-fixture'; editor.value = '未保存草稿'; list.append(editor); editor.focus();
+  });
+  await page.keyboard.press('Escape');
+  assert.equal(await tray.isVisible(), true, 'Escape in an editor belongs to the editor, not the tray');
+  assert.equal(await tray.locator('#tray-editor-fixture').inputValue(), '未保存草稿');
+  await tray.locator('#tray-close').focus();
+  await page.keyboard.press('Escape');
+  await closedTray();
+  await openTray();
+  await page.locator('#session-chip').click();
+  await closedTray();
+  await page.locator('#session-chip').click();
+  await openTray();
+  await page.locator('#viewport').click({ position: { x: 15, y: 300 } });
+  await closedTray();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openTray();
+  await tray.locator('#tray-list').evaluate(list => { list.scrollTop = list.scrollHeight; });
+  const trayPhone = await tray.locator('#tray-close').evaluate(button => {
+    const rect = button.getBoundingClientRect(), list = document.querySelector('#tray-list');
+    return { visible: rect.top >= 0 && rect.bottom <= innerHeight && rect.left >= 0 && rect.right <= innerWidth,
+      hit: button.contains(document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)),
+      listScrolled: list.scrollTop > 0, trayScrolled: document.querySelector('#tray').scrollTop };
+  });
+  assert.equal(trayPhone.visible && trayPhone.hit && trayPhone.listScrolled, true);
+  assert.equal(trayPhone.trayScrolled, 0, 'only the list scrolls, never the close header');
+  await page.screenshot({ path: path.join(output, 'cancelled-tray-phone.png'), fullPage: true });
+  await tray.locator('#tray-close').click();
+  await closedTray();
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  const trayAfter = await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') });
+  assert.equal(trayCommits, 0);
+  assert.equal(trayAfter.body.snapshot.version, trayBaseline.body.snapshot.version);
+  assert.deepEqual(trayAfter.body.snapshot.memory.map, trayBaseline.body.snapshot.memory.map);
+  page.off('request', countTrayCommit);
+  record('UI-TRAY-CLOSE-01: cancelled tray closes by button, Escape and outside clicks without Map writes; phone header stays reachable');
 
   await page.locator('#session-chip').click();
   await page.locator('#session-menu [data-show-other-sessions]').click();

@@ -75,10 +75,18 @@ Connect once using `context-guard workbench connect --root <project> --url
 URL and code; the human signs in to Cloud and confirms the project/device in the
 browser. The waiting backend saves the device credential without exposing it or
 the password to the Agent. Without `--wait`, the command returns the link at once;
-rerun the same command after approval to finish. Requests expire after ten minutes.
-The backend counts the returned `expiresIn` seconds locally; Cloud's absolute
-`expiresAt` must not require the computer and server clocks to agree.
-Rejection/expiry requires a new request. A claimed reply lost before it was saved
+rerun the same command after approval to finish. Pending requests remain until a
+human allows or denies them. The authenticated project's Workbench Tools exposes
+its device connection requests; this is not the host's tool-execution approval.
+New clients negotiate `X-Context-Guard-Device-Grant: persistent-v1` and receive
+`persistent:true`, `expiresAt:null`, `expiresIn:null` while pending. Older clients
+receive a finite waiting budget and may stop after ten minutes; that does not
+expire or remove the server request. Upgrade the client for persistent waiting.
+An approved request still has a finite one-time claim window. Decision form
+tickets, browser login cookies and issued device credentials retain their own
+expiry and authorization rules. Finite client budgets are counted locally;
+Cloud's absolute `expiresAt` must not require the computer and server clocks to agree.
+Rejection/claim expiry requires a new request. A claimed reply lost before it was saved
 also requires new authorization; consumed grants are never replayed. This is a
 browser device-pairing flow, not a claim of full OAuth interoperability.
 Explicit `--input <private-file|->` remains a compatibility login; JSON contains
