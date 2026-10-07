@@ -23,6 +23,8 @@ authorize executing it.
    another participant only, or is merely a notice. Where an invitation to help
    is evident but details are missing, ask one brief clarification; genuinely
    unknown recipients may wait. Unknown identity is not proof of exclusion.
+   Current direct address resolves current second-person references; a previous
+   Coordinator reply must not make a new request to someone else its own.
    Keep policy in one bounded prompt, not growing mention/keyword exceptions;
    retain the existing public contract and downstream permission checks.
 3. **Continuous conversation:** collect short bursts before responding. During
