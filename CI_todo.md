@@ -23,8 +23,18 @@
   failed and remain preserved. Executor repaired them with stable timestamps,
   acknowledged content hashes and retained uncertainty; modules155/155 passed.
   Tester reran both original probes and three formal cases successfully.
-  Private-message participation still needs the existing conversation's trusted
-  bounded context; that follow-up is in development.
+  Private-message participation now uses its existing conversation's six bounded
+  trusted messages. Modules158/158 passed; independent DM/multipart targets6/6
+  passed. Original Slack thread context remains preferred and retries retain
+  the frozen context rather than impersonating the current user in old messages.
+- [x] Executor (participation recovery): one model classification per batch with
+  gateway-verified identity and native historical-speaker turns. Provider failures
+  return sanitized503, invalid decisions502; neither saves a silent receipt.
+  Durable classification failures have a separate three-attempt budget; original
+  IDs/context survive restart. Authentication/identity/contract failures do not
+  retry and existing business-write retry behavior is unchanged. Slack161/161
+  passed; independent four retry cases and four gateway recovery/deadline cases
+  passed on the frozen source. The deadline cancelled a stalled provider at12s.
 - [ ] Independent Tester: final-source affected modules, HTTP cross-module
   behavior, recovery and identity boundaries; separately labelled Chinese held-out
   invitation recall >=95%, non-participation false positives <=2%, explicit cases
@@ -48,6 +58,12 @@ consumes it. The remaining browser/sync checks were not executed or claimed.
 Keep stop-uncertainty and partial-output assertions when adapting that fixture.
 Main subsequently advanced independently to80f8e96 (interrupted-output preservation
 and model menu); normal integration must preserve those changes before release.
+The normal merge retains Main's display-only interrupted history: aborted steer
+and stop outputs never enter provider/compaction transcripts. Executor steer16/16
+and controls-only passed; independent steer16/16, DM/multipart6/6 and three browser
+controls passed on the same frozen source. Fixture adaptation failures (async
+polling readiness, reload render timing and two separate partial records) remain
+recorded. Current Main UI/menu changes are preserved without modification.
 
 Real-model semantic evaluation uses independent synthetic Chinese inputs and the
 currently selected provider. Initial heldout124 identified39/40 indirect calls
@@ -57,6 +73,68 @@ an adjusted prompt identified40/40 but still falsely joined6/60. Both fail the
 are being evaluated against another frozen independent set; none of these
 model calls create conversations or write project memory. Do not relabel seen
 regressions as new heldout acceptance or count transport errors as correct silence.
+
+The extra receiver-review model call failed to reduce false participation and
+increased latency; it was removed, not stacked onto the final harness. Single-call
+native-speaker regression108:38/40indirect,1/60negative false positives,8/8explicit
+calls,12/12explicit silence,zeroerrors; P50 844ms/P95 1152ms. The independent
+fresh108 first evaluation:40/40indirect,1/60negative false positives,8/8explicit
+calls,12/12explicit silence,one invalid-response error; negative cases comprise
+58correct,1false participation and1error. P50 860ms/P95 1192ms. First error is
+not a silent pass and the original result remains immutable; same-input recovery
+requires separate real-provider evidence. Dataset86f62227/classifier55073384,
+selected deepseek-flash. These synthetic model calls do not create conversations,
+write memory or replace human-authenticated Slack acceptance. A separate real
+provider recovery call on the original failed example produced a valid decision;
+an isolated loopback gateway saved one receipt and same-ID replay made no further
+provider call. The original first-round error remains counted: this follow-up
+does not imply that the original direct evaluator had a gateway operation ID or
+that a real Slack event was tested.
+
+Final full Node24.19 ended exit1:405total,400passed,3failed,2existing separate-suite
+skips,396935ms. Two failures came from an HTTP fixture identifying classification
+by an obsolete PE prefix; it now recognizes the bounded no-tools request and
+reads the final current-input frame. All original no-mutation, invalid502 and
+permission assertions remain; targeted3/3 passed. The other failure was the
+fixed Skill fixture's archive-session command killed by its30s parent deadline;
+Executor is investigating its actual inner request lifecycle before any repair.
+Original failed logs remain. The whole browser command ended exit0: device-login,
+51workbench checks and7Session-sync checks completed. Release/real interaction
+and final all-green Required remain unchecked.
+
+Final traced full regression ended exit0:405total,403passed,zerofailed,2existing
+separate-suite skips,334713ms. The original Hook archive/finish/replay assertions
+passed without changing its deadline or product code; trace retains archive16s
+and both finish calls. Old full failures are not overwritten. Product files
+remained frozen. Independent final combined-source audit, GitHub Required and
+actual release/human Slack acceptance are still required.
+
+## COORDINATOR-PARTIAL-HISTORY-01 · Interrupted-output preservation (2026-10-08)
+
+1. [x] Executor: aborted streams persist as display-only records at their native
+   transcript position. Original retry, later turns and reload retain a stable
+   partial marker; native model/tool transcript and compaction hashes are unchanged.
+   Legacy interrupted buffers are projected and migrated before retry. Committed
+   interrupted tool responses are not duplicated; repeated same-prefix attempts
+   have separate identities and stop replays remain idempotent.
+2. [x] Regression baseline c938c9d: steer module 8/10 passed, 2 failed at the
+   missing partial history assertions (exit 1). Initial implementation passed
+   10/10, zero skips (exit 0); expanded steer module passed 11/11. Combined
+   Coordinator/steer passed 99/100 with one opt-in paid-provider skip, exit 0.
+   Full Node passed 391/393, two existing environment skips; full browser passed
+   BDA-012, 50 workbench checks and Session sync, exit 0. Browser artifacts:
+   output/playwright/browser-ci/cloud-1791390610416-4a376ae9-65b5-4e6f-997f-3958ff461e12.
+   Computer use confirmed ink stop, retry, new turn and reload preserve exactly
+   one marked prior output; screenshot output/computer-use/partial-after-resume-next-turn-reload.jpg.
+3. [ ] Independent Tester: review and test the exact frozen source, including
+   marked output after resume/new turn/reload and model-context exclusion.
+   Additional boundary reproduction on 7d69d10 failed 1/12: a new aborted stream
+   sharing an older committed checkpoint's text was falsely deduplicated. The
+   stream now records its native response position; only that response can count
+   as already committed. Text equality across different attempts is insufficient.
+4. [ ] Full Node/browser, real computer-use stop/resume/new-turn/reload/restart,
+   Required CI, normal PR merge and exact-main Cloud/Slack deployment. Paid model
+   remains controlled only in isolated testing; production smoke is read-only.
 
 ## COORDINATOR-CONTROLS-FOCUS-01 · Current-main port (2026-10-07)
 
@@ -997,3 +1075,20 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   suite. A separate initial cross-product sync run failed at the existing local
   synced-indicator assertion before any Coordinator use; retain the failure and
   rerun the unchanged full browser command rather than weakening that assertion.
+
+- [ ] MODEL-MENU-01: Simplify workbench model selection to an inline dropdown
+  directly below the toolbar button. Click a model to apply; indicate the current
+  model and dismiss on outside click/Escape. Remove the modal, form and separate
+  Apply/Close actions. Frontend only: preserve the existing CAS/idempotent API,
+  project scope and pinned in-flight/retry routes. Browser regression covers
+  current-model no-op, keyboard focus, unknown-outcome same-ID receipt replay,
+  stale-version recovery and unobscured 44px choices at 320/390px phone widths.
+  Isolated API fixtures are not production model acceptance. Local checks,
+  Required/merge/deployment revision and real UI acceptance are recorded
+  separately. Independent Tester/human review remains pending.
+  Local regression passed: `npm test` 388 passed / 2 existing skips; Slack 142
+  passed; security acceptance 39 checks; staged and package scans passed.
+  Full `npm run test:browser` passed, including device login, workbench controls
+  and real isolated local-to-Cloud Session sync. Initial browser attempts found
+  and fixed mobile left-edge clipping; two later fixture races were corrected by
+  waiting for model load and desktop layout completion, without relaxing bounds.

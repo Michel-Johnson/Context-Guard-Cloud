@@ -1124,7 +1124,7 @@ export async function startCloudServer({
       if (!config?.enabled || !path.isAbsolute(config.providerFile || '')) protocolFail('COORDINATOR_DISABLED', 'Coordinator is unavailable for relevance checks');
       const memory = await readMemoryProject(configuredMemory, projectId);
       const { model } = await (await modelSettingsFor(project)).selection({ timeoutMs: 12000 });
-      return classifyIntegrationMessage(model, { overview: relevanceOverview(memory.main, config.nodeIds), input });
+      return classifyIntegrationMessage(model, { overview: relevanceOverview(memory.main, config.nodeIds), input, actor });
     }
     if (type === 'project.read') {
       const memory = await readMemoryProject(configuredMemory, project.id);

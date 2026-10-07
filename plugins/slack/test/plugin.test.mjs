@@ -696,15 +696,85 @@ test('unrelated roots and replies to other people are silent, with no attachment
   assert.equal(f.sent.some(call => !call.method || !['conversations.replies', 'users.info'].includes(call.method)), false);
   assert.equal(Object.keys(f.store.data.threads).length, 1);
 });
-test('relevance failure is recorded privately and cannot start a turn or spam a channel', async t => {
+test('relevance timeouts retry with a durable bounded budget then require private attention without channel spam', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   f.gateway.command = async () => { throw Object.assign(new Error('Controlled classification failure'), { code: 'MODEL_TIMEOUT' }); };
   const envelope = { type: 'events_api', body: { event: event({ text: '相关吗？' }) } };
   await f.store.receive('failed-relevance', envelope);
   await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
+  assert.equal(f.store.data.inbox['failed-relevance'].status, 'pending');
+  assert.equal(f.store.data.inbox['failed-relevance'].relevanceAttempts, 1);
+  assert.equal(f.store.data.inbox['failed-relevance'].relevance, undefined);
+  const frozen = structuredClone(f.store.data.inbox['failed-relevance'].relevanceRequest);
+  await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
+  assert.equal(f.store.data.inbox['failed-relevance'].status, 'pending');
+  await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
   assert.equal(f.store.data.inbox['failed-relevance'].status, 'attention');
+  assert.equal(f.store.data.inbox['failed-relevance'].relevanceAttempts, 3);
+  assert.deepEqual(f.store.data.inbox['failed-relevance'].relevanceRequest, frozen);
   assert.equal(f.store.data.inbox['failed-relevance'].error, 'MODEL_TIMEOUT');
   assert.equal(f.sent.length, 0); assert.equal(Object.keys(f.store.data.threads).length, 0);
+});
+
+test('participation transient HTTP parse network and provider failures recover with the same frozen operation and actual decision', async t => {
+  const failures = [
+    () => { throw new DOMException('Timeout', 'TimeoutError'); },
+    () => { throw new TypeError('Network unavailable'); },
+    () => new Response('<private upstream body>', { status: 502 }),
+    () => new Response(JSON.stringify({ ok: false, error: { code: 'MODEL_UNAVAILABLE' } }), { status: 503 }),
+    () => new Response('{broken JSON', { status: 200 }),
+    () => new Response(JSON.stringify({ ok: true, data: { mainVersion: 'v1' } }), { status: 200 }),
+  ];
+  for (const [index, failure] of failures.entries()) {
+    const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+    const commands = [], original = f.gateway.command; let requests = 0;
+    const client = new Gateway({ url: 'http://127.0.0.1:8790', token: 'synthetic-transient-token', teamId, fetchImpl: async (_url, options) => {
+      commands.push(JSON.parse(options.body)); if (++requests === 1) return failure();
+      return new Response(JSON.stringify({ ok: true, data: { respond: index % 2 === 0, mainVersion: 'v1' } }), { status: 200 });
+    } });
+    f.gateway.command = (type, input) => type === 'conversation.relevance' ? client.command(type, input) : original(type, input);
+    const id = `transient-${index}`, message = event({ text: '请继续分析登录问题' });
+    await f.store.receive(id, { type: 'events_api', body: { event: message } });
+    await f.plugin.runEntry(id, f.store.data.inbox[id]);
+    assert.equal(f.store.data.inbox[id].status, 'pending'); assert.equal(f.store.data.inbox[id].relevance, undefined);
+    assert.ok(f.store.data.inbox[id].next > Date.now(), 'Recovery retains bounded backoff instead of spinning');
+    const frozen = structuredClone(f.store.data.inbox[id].relevanceRequest);
+    const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
+    await f.plugin.runEntry(id, reopened.data.inbox[id]);
+    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].relevance.respond, index % 2 === 0);
+    assert.deepEqual(commands[0], commands[1]); assert.deepEqual(reopened.data.inbox[id].relevanceRequest, frozen);
+    assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, index % 2 === 0 ? 1 : 0);
+    assert.equal(f.sent.some(item => item.method === 'chat.postEphemeral'), false);
+  }
+});
+
+test('participation authorization contract version and identity failures never retry even with malformed bodies or 503 status', async t => {
+  const failures = [
+    () => new Response('<sign in required>', { status: 401 }),
+    () => new Response('{broken', { status: 403 }),
+    ...['INVALID_ARGUMENT', 'VERSION_MISMATCH', 'IDENTITY_MISMATCH', 'MODEL_ROUTE_CHANGED'].map(code => () => new Response(JSON.stringify({ ok: false, error: { code } }), { status: 503 })),
+  ];
+  for (const [index, failure] of failures.entries()) {
+    const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+    const client = new Gateway({ url: 'http://127.0.0.1:8790', token: 'synthetic-negative-token', teamId, fetchImpl: async () => failure() });
+    f.gateway.command = (type, input) => client.command(type, input);
+    const id = `negative-${index}`;
+    await f.store.receive(id, { type: 'events_api', body: { event: event({ text: '是否应该参与？' }) } });
+    await f.plugin.runEntry(id, f.store.data.inbox[id]);
+    assert.equal(f.store.data.inbox[id].status, 'attention'); assert.equal(f.store.data.inbox[id].relevanceAttempts, 1);
+    assert.equal(f.store.data.inbox[id].relevance, undefined); assert.equal(f.sent.length, 0);
+  }
+});
+
+test('classification retry limits do not reduce or expand the existing business submit retry policy', async t => {
+  const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const original = f.gateway.command;
+  f.gateway.command = (type, input) => type === 'conversation.submit'
+    ? Promise.reject(Object.assign(new Error('Business service unavailable'), { code: 'GATEWAY_ERROR' })) : original(type, input);
+  await f.store.receive('business-retry', { type: 'events_api', body: { event: event() } });
+  for (let attempt = 0; attempt < 3; attempt++) await f.plugin.runEntry('business-retry', f.store.data.inbox['business-retry']);
+  assert.equal(f.store.data.inbox['business-retry'].status, 'pending'); assert.equal(f.store.data.inbox['business-retry'].relevanceAttempts, undefined);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 1);
 });
 test('relevance request is durable before calling the gateway and replays unchanged after thread edits', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });

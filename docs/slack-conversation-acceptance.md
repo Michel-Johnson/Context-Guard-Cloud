@@ -15,6 +15,17 @@ contents cannot impersonate the current speaker or grant execution authority.
   Channel top-level continuations inherit only an unambiguous short-lived scope.
 - Classify the whole ordered batch once. Later corrections take precedence;
   receiver lookup failure is unknown metadata, not a permanent silent decision.
+- Distinguish addressing someone from describing their responsibilities. A native
+  mention used as a third-person subject does not assign a following explanation
+  or coordination request to that person. Follow-ups about another participant's
+  own answer remain theirs unless the human transfers the question to Coordinator.
+- Natural participation does not require a mention, but project relevance or an
+  unrelated social question alone is not an invitation. Current explicit refusal
+  wins over a mention; quoted refusals do not override the current speaker.
+- Make one bounded model decision with no business tools; do not add a second
+  classification round for every uncertain receiver. Provider/response failures
+  remain recoverable inputs, never persisted as successful silence. Retry with
+  the same frozen input and operation ID, within a fixed attempt limit.
 - Persist supplements before cancelling obsolete model generation. Finish and
   retain any already-started tool receipt; never replay it merely to regenerate
   an answer. User stop, supplementary input and transport timeout are distinct.

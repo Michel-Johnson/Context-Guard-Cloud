@@ -96,11 +96,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       ...(visionProvider ? { visionProviderFile } : {}) } } : {}),
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push({ system: request.system, messages: request.messages, tools: request.tools, maxTokens: request.maxTokens });
-      if (request.system?.startsWith('你仅判断 Slack 消息')) {
-        const input = JSON.parse(request.messages[0].content);
+      if (request.tools.length === 0 && request.maxTokens === 256) {
+        // Identify the bounded no-tools contract, not a particular PE prefix.
+        const input = JSON.parse(request.messages.at(-1).content);
+        assert.equal(typeof input.message.text, 'string');
         if (input.message.text === 'relevance-tool') return { stop: 'tool_use', content: [{ type: 'tool_use', name: 'edit_map', id: 'forbidden-relevance-tool', input: {} }] };
         return { stop: 'end_turn', content: [{ type: 'text', text: input.message.text === 'invalid-relevance'
-          ? 'not a decision' : JSON.stringify({ respond: input.message.text === '登录刷新 Bug，请分析。', reason: 'Controlled decision' }) }] };
+          ? 'not a decision' : JSON.stringify({ target: input.message.text === '登录刷新 Bug，请分析。' ? 'coordinator' : 'none', intent: input.message.text === '登录刷新 Bug，请分析。' ? 'reply' : 'notice', reason: 'Controlled decision' }) }] };
       }
       const message = request.messages.at(-1), text = typeof message?.content === 'string' ? message.content : '';
       if (text === 'show-node-complete') return { stop: 'tool_use', content: [
@@ -205,7 +207,7 @@ test('relevance endpoint reads current Main but never creates conversations, wor
   assert.equal(result.status, 200);
   assert.deepEqual(result.body.data, { respond: true, reason: 'Controlled decision', mainVersion: before.main.version });
   const request = f.modelCalls.at(-1);
-  assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 160);
+  assert.deepEqual(request.tools, []); assert.equal(request.maxTokens, 256);
   assert.equal(JSON.parse(request.messages[0].content).overview.memory, 'Current project facts');
   assert.deepEqual(await f.main(), before);
   assert.deepEqual(conversationFiles(await fs.readdir(path.join(f.directory, 'coordinators'), { recursive: true }).catch(error => {

@@ -12,7 +12,12 @@ export class Gateway {
     const response = await this.fetch(`${this.url}/v1/command`, { method: 'POST', signal: AbortSignal.timeout(20000),
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ id, teamId: this.teamId, userId, ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
-    const body = await response.json();
+    let body;
+    try { body = await response.json(); }
+    catch { throw new GatewayError('GATEWAY_BAD_RESPONSE', 'Gateway returned invalid JSON', response.status); }
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.ok !== 'boolean') {
+      throw new GatewayError('GATEWAY_BAD_RESPONSE', 'Gateway returned an invalid response envelope', response.status);
+    }
     if (!response.ok || !body.ok) throw new GatewayError(body.error?.code || 'GATEWAY_ERROR', body.error?.message || 'Gateway unavailable', response.status);
     return body.data;
   }

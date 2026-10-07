@@ -4,6 +4,18 @@ import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, section, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
+const participationTransient = error => {
+  // Authentication, identity and contract failures require attention, even when
+  // a proxy supplied an unreadable error body. They are never model silence.
+  if (['UNAUTHORIZED', 'FORBIDDEN', 'AUTH_REQUIRED', 'INVALID_ARGUMENT', 'INVALID_INPUT', 'CONFLICT', 'ID_REUSED',
+    'UPGRADE_REQUIRED', 'VERSION_MISMATCH', 'IDENTITY_MISMATCH', 'MODEL_ROUTE_CHANGED', 'PROTOCOL_MISMATCH',
+    'RELEVANCE_SCOPE_MISMATCH', 'RELEVANCE_ROUTING_LIMIT', 'RELEVANCE_INPUT_LIMIT'].includes(error.code) ||
+    /(?:^|_)(?:AUTH|IDENTITY|VERSION|UPGRADE|PERMISSION)(?:_|$)/.test(error.code || '')) return false;
+  if (Number.isInteger(error.status) && error.status >= 400 && error.status < 500 && error.status !== 429) return false;
+  return Number.isInteger(error.status) && (error.status === 429 || error.status >= 500 && error.status <= 599) ||
+    ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'RELEVANCE_INVALID_RESPONSE', 'GATEWAY_BAD_RESPONSE', 'GATEWAY_ERROR', 'BUSY', 'COORDINATOR_BUSY'].includes(error.code) ||
+    error.name === 'TimeoutError' || error instanceof TypeError;
+};
 // A read action is retained by Cloud for provenance/focus, but has no Slack UI.
 // Preserve actual text, questions, attachments and other presentation actions.
 const hasSlackContent = message => !!(message.text || message.questions?.length || message.attachments?.length ||
@@ -217,13 +229,16 @@ export class SlackPlugin {
       } else await this.process(id, entry.envelope);
       await this.store.update(state => { for (const member of members) { state.inbox[member].status = 'done'; state.inbox[member].doneAt = Date.now(); } });
     } catch (error) {
-      const transient = ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError;
+      const classificationFailure = error.participationFailure === true;
+      const transient = classificationFailure ? participationTransient(error) :
+        ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError;
       const retryAfter = Number(error.retryAfter ?? error.data?.retry_after ?? 0);
       const validDelay = Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 86400;
       await this.store.update(state => {
         for (const member of members) {
           const item = state.inbox[member]; item.attempts++; item.error = error.code || 'PLUGIN_ERROR';
-          item.status = transient && validDelay && item.attempts < 8 ? 'pending' : 'attention';
+          if (classificationFailure) item.relevanceAttempts = (item.relevanceAttempts || 0) + 1;
+          item.status = transient && validDelay && (classificationFailure ? item.relevanceAttempts < 3 : item.attempts < 8) ? 'pending' : 'attention';
           item.next = Date.now() + Math.max(Math.min(60000, 1000 * 2 ** item.attempts), validDelay ? retryAfter * 1000 : 0);
         }
       });
@@ -523,7 +538,7 @@ export class SlackPlugin {
             state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
             state.inbox[id].relevance = decision;
           });
-        } catch (error) { error.silent = true; throw error; }
+        } catch (error) { error.silent = true; error.participationFailure = true; throw error; }
       }
       const currentBinding = this.store.data.threads[existingKey];
       const currentProject = currentBinding?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
