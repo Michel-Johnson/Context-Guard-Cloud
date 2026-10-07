@@ -64,6 +64,12 @@ const request = async (url, options = {}) => {
   const response = await fetch(url, options);
   return { response, body: await response.json() };
 };
+// Ordinary screenshot pages use local fallback fonts. Page routing disables
+// HTTP cache: call after cache acceptance and never on the held-font test page.
+const useScreenshotFallbackFonts = screenshotPage => screenshotPage.route(
+  /^https:\/\/(?:fonts\.googleapis\.com\/css2(?:\?|$)|fonts\.gstatic\.com\/)/,
+  route=>route.abort(),
+);
 
 try {
   assert.deepEqual(await fs.readFile('prototype/vendor/marked.mjs'), await fs.readFile('node_modules/marked/lib/marked.esm.js'), 'vendor lexer must match the locked dependency');
@@ -160,6 +166,7 @@ try {
   assert.equal(new URL(reopened.url()).pathname, '/projects/context-guard');
   await reopened.close();
   record('Persistent cookie keeps login across refresh and a reopened page');
+  await useScreenshotFallbackFonts(page);
   await synchronized();
   assert.match(await page.locator('.node[data-id="T0"]').textContent(), /Main map/);
   // A failed authoritative read must not load an unrelated static/local Map.
@@ -355,6 +362,57 @@ try {
   await page.waitForURL(`${service.url}/projects/context-guard`);
   await synchronized();
   record('Project page has a stable route back to the overview');
+
+  const mobileLayoutPage=await context.newPage();
+  await useScreenshotFallbackFonts(mobileLayoutPage);
+  const layoutBefore=await request(`${service.url}/v1/projects/context-guard/main`,{headers:headers('project-memory-token')});
+  const toolbarFits=async()=>{
+    const geometry=await mobileLayoutPage.evaluate(()=>{
+      const row=document.querySelector('.top-tools'),chip=document.querySelector('#session-chip'),label=document.querySelector('#session-name');
+      const style=getComputedStyle(row),r=row.getBoundingClientRect(),c=chip.getBoundingClientRect(),l=label.getBoundingClientRect();
+      return {contentHeight:row.clientHeight-parseFloat(style.paddingTop)-parseFloat(style.paddingBottom),chipHeight:chip.offsetHeight,
+        contained:c.top>=r.top-.5&&c.bottom<=r.bottom+.5,labelContained:l.top>=c.top-.5&&l.bottom<=c.bottom+.5,
+        centered:Math.abs((l.top+l.bottom-c.top-c.bottom)/2)<1};
+    });
+    assert.ok(geometry.contentHeight>=geometry.chipHeight-.5&&geometry.contained&&geometry.labelContained&&geometry.centered,
+      `toolbar must contain the Session control and centered label: ${JSON.stringify(geometry)}`);
+  };
+  for(const width of [320,390,718]){
+    await mobileLayoutPage.setViewportSize({width,height:900});
+    await mobileLayoutPage.goto(`${service.url}/?phone=1`);
+    await mobileLayoutPage.waitForFunction(()=>document.querySelector('#cg-sync')?.dataset.status==='synced');
+    await mobileLayoutPage.locator('.node[data-id="T0"]').click();
+    assert.equal(await mobileLayoutPage.locator('#detail [data-fold="files"]').count(),0,'overview with no attachments must not render an empty separator section');
+    assert.equal(await mobileLayoutPage.locator('#detail [data-fold="memory-doc"]').count(),1,'memory document remains accessible');
+    await toolbarFits();
+    await mobileLayoutPage.screenshot({path:path.join(output,`mobile-toolbar-${width}.png`),fullPage:true});
+  }
+  await mobileLayoutPage.evaluate(()=>{document.documentElement.dir='rtl';});
+  await toolbarFits();
+  await mobileLayoutPage.evaluate(()=>{document.documentElement.dir='ltr';document.body.style.zoom='2';});
+  await toolbarFits();
+  await mobileLayoutPage.setViewportSize({width:1440,height:1000});
+  await mobileLayoutPage.goto(service.url);
+  await mobileLayoutPage.waitForFunction(()=>document.querySelector('#cg-sync')?.dataset.status==='synced');
+  await toolbarFits();
+  const overview=await request(`${service.url}/api/workbench/overview/api/state`,{headers:headers('browser-token')});
+  const stagedAttachment=await request(`${service.url}/api/workbench/overview/api/commit`,{method:'POST',headers:headers('browser-token'),
+    body:JSON.stringify({baseVersion:overview.body.version,operationId:'layout-existing-attachment',operations:[{type:'update',id:'T0',fields:{files:[{path:'docs/synthetic-existing.txt'}]}}]})});
+  assert.equal(stagedAttachment.response.status,200);
+  await mobileLayoutPage.reload();
+  await mobileLayoutPage.waitForFunction(()=>document.querySelector('#cg-sync')?.dataset.status==='synced');
+  await mobileLayoutPage.locator('.node[data-id="T0"]').click();
+  assert.equal(await mobileLayoutPage.locator('#detail [data-fold="files"]').count(),1,'existing file references survive when upload is disabled');
+  assert.equal(await mobileLayoutPage.locator('#detail [data-act="ask-file"]').count(),0);
+  assert.match(await mobileLayoutPage.locator('#detail [data-fold="files"]').textContent(),/synthetic-existing/);
+  const withFiles=await request(`${service.url}/api/workbench/overview/api/state`,{headers:headers('browser-token')});
+  assert.equal((await request(`${service.url}/api/workbench/overview/api/commit`,{method:'POST',headers:headers('browser-token'),
+    body:JSON.stringify({baseVersion:withFiles.body.version,operationId:'layout-remove-fixture-reference',operations:[{type:'update',id:'T0',fields:{files:overview.body.doc.root.files||[]}}]})})).response.status,200);
+  await mobileLayoutPage.close();
+  const layoutAfter=await request(`${service.url}/v1/projects/context-guard/main`,{headers:headers('project-memory-token')});
+  assert.equal(layoutAfter.body.snapshot.version,layoutBefore.body.snapshot.version);
+  assert.deepEqual(layoutAfter.body.snapshot.memory.map,layoutBefore.body.snapshot.memory.map);
+  record('UI-MOBILE-LAYOUT-01: phone toolbar fits, empty attachment separators disappear and existing attachments/Memory/Main stay intact');
 
   const readonlyBefore=await request(`${service.url}/v1/projects/context-guard/main`,{headers:headers('project-memory-token')});
   assert.equal(readonlyBefore.body.snapshot.version,baselinePublication.body.snapshot.version,'Initial loading has not written a normalized Main');
@@ -586,6 +644,9 @@ try {
   const oneShotLongText='完整长段落。'.repeat(240);
   const coordinatorReads = [];
   let coordinatorReadFailure = false;
+  let coordinatorReadOffline = false;
+  const interrupts = [];
+  let releaseInterrupt;
   const markdownImageRequests = [];
   const workingBlotRequests = [];
   page.on('request', request=>{
@@ -623,6 +684,12 @@ try {
     return route.fulfill({ json: { receiptId: 'human-receipt' } });
   });
   const conversationCreationRequests = [];
+  await page.route(/\/api\/coordinator\/interrupt(?:\?|$)/, async route => {
+    interrupts.push({conversation:new URL(route.request().url()).searchParams.get('conversation'),...route.request().postDataJSON()});
+    await new Promise(resolve=>{releaseInterrupt=resolve;});
+    coordinatorState={...coordinatorState,status:'waiting-for-user',activeTurnId:null};
+    return route.fulfill({json:{accepted:true}});
+  });
   await page.route(/\/api\/coordinator\/conversations\/new(?:\?|$)/, async route => {
     const request = route.request().postDataJSON();conversationCreationRequests.push(request);
     if(conversationCreationRequests.length===1)return route.abort();
@@ -685,7 +752,7 @@ try {
       return route.fulfill({ json: { accepted: true, id: submissions.at(-1).id }, status: 202 });
     }
     const readConversation=new URL(route.request().url()).searchParams.get('conversation');coordinatorReads.push(readConversation);
-    if(coordinatorReadFailure){coordinatorReadFailure=false;return route.abort();}
+    if(coordinatorReadOffline||coordinatorReadFailure){coordinatorReadFailure=false;return route.abort();}
     const responseState=readConversation==='chat-created'?{...coordinatorState,messages:[],approvals:[],acceptances:[],status:'idle'}:runningPreview?{...coordinatorState,status:'running',streamingText:'第一段回复。\n\n第二段回复。\n\n第三段回复。\n\n'}:coordinatorState;
     await route.fulfill({ json: responseState });
   });
@@ -713,7 +780,36 @@ try {
     const action=toolbar.querySelector('.coordinator-toolbar-action'),style=getComputedStyle(action),toolbarStyle=getComputedStyle(toolbar);
     return{width:style.width,height:style.height,fontSize:style.fontSize,borderWidth:style.borderTopWidth,borderRadius:style.borderRadius,background:style.backgroundColor,color:style.color,boxShadow:style.boxShadow,gap:toolbarStyle.gap};
   });
-  assert.deepEqual(toolbarAppearance,{width:'28px',height:'28px',fontSize:'16px',borderWidth:'1px',borderRadius:'8px',background:'rgba(0, 0, 0, 0)',color:'rgb(116, 108, 96)',boxShadow:'none',gap:'0px 12px'},'Coordinator icon actions use the compact neutral button system');
+  assert.deepEqual(toolbarAppearance,{width:'28px',height:'28px',fontSize:'16px',borderWidth:'1px',borderRadius:'8px',background:'rgba(0, 0, 0, 0)',color:'rgb(116, 108, 96)',boxShadow:'none',gap:'8px 12px'},'Coordinator icon actions use the compact neutral button system');
+  // UI-COORDINATOR-MOBILE-01: native hidden state, text controls and composer
+  // geometry are checked with synthetic state, never a user's conversation.
+  const coordinatorGeometry=async(width,label)=>{
+    await page.setViewportSize({width,height:width<820?844:1000});
+    await page.waitForFunction(phone=>document.documentElement.classList.contains('cg-phone')===phone,width<820);
+    const geometry=await coordinator.evaluate(panel=>{
+      const rect=el=>{const r=el.getBoundingClientRect();return{left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height};};
+      const toolbar=panel.querySelector('.coordinator-toolbar'),buttons=[...toolbar.querySelectorAll('button')];
+      const input=panel.querySelector('.coordinator-input-shell textarea'),send=panel.querySelector('.coordinator-send');
+      const visible=buttons.filter(el=>!el.hidden).map(el=>{const range=document.createRange();range.selectNodeContents(el);return{...rect(el),text:rect(range),action:el.classList.contains('coordinator-toolbar-action')};});
+      return{phone:document.documentElement.classList.contains('cg-phone'),toolbar:rect(toolbar),visible,
+        hidden:buttons.filter(el=>el.hidden).map(el=>({display:getComputedStyle(el).display,...rect(el)})),
+        input:rect(input),send:rect(send),padding:parseFloat(getComputedStyle(input).paddingInlineEnd),bottom:send.computedStyleMap().get('bottom').toString()};
+    });
+    const details=`${label} ${width}: ${JSON.stringify(geometry)}`;
+    assert.ok(geometry.hidden.every(el=>el.display==='none'&&el.width===0&&el.height===0),`native hidden controls take no layout space: ${details}`);
+    assert.ok(geometry.visible.every(el=>el.left>=geometry.toolbar.left-.5&&el.right<=geometry.toolbar.right+.5&&el.top>=geometry.toolbar.top-.5&&el.bottom<=geometry.toolbar.bottom+.5&&el.text.left>=el.left-.5&&el.text.right<=el.right+.5&&el.text.top>=el.top-.5&&el.text.bottom<=el.bottom+.5),`toolbar text and controls remain contained: ${details}`);
+    for(let i=0;i<geometry.visible.length;i++)for(const other of geometry.visible.slice(i+1)){
+      const el=geometry.visible[i];assert.ok(el.right<=other.left+.5||other.right<=el.left+.5||el.bottom<=other.top+.5||other.bottom<=el.top+.5,`toolbar targets do not overlap: ${details}`);
+    }
+    if(geometry.phone){
+      assert.ok(geometry.visible.every(el=>el.width>=44&&el.height>=44),`phone targets use actual 44px dimensions: ${details}`);
+      assert.ok(geometry.visible.filter(el=>el.action).every(el=>el.top>=geometry.visible[0].bottom),`phone actions follow the heading row: ${details}`);
+      assert.deepEqual([geometry.send.width,geometry.send.height],[44,44]);
+    }
+    assert.equal(geometry.bottom,'auto','send has only one vertical positioning constraint');
+    assert.ok(Math.abs((geometry.send.top+geometry.send.bottom-geometry.input.top-geometry.input.bottom)/2)<=.5,`single/multiline send stays vertically centered: ${details}`);
+    assert.ok(geometry.send.left>=geometry.input.right-geometry.padding+4&&geometry.send.right<=geometry.input.right&&geometry.send.top>=geometry.input.top&&geometry.send.bottom<=geometry.input.bottom,`send remains inside reserved composer space: ${details}`);
+  };
   await coordinator.getByLabel('发送给 Coordinator').fill('Main 草稿');await historyAction.click();
   await coordinator.getByRole('button',{name:'历史开发 Session',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('#coordinator-panel')?.dataset.conversation==='session:history-one');
@@ -790,6 +886,40 @@ try {
   assert.equal(coordinatorLayout.blotParent,true,'Ready ink mark lives in the composer send control');
   assert.deepEqual([coordinatorLayout.blotWidth,coordinatorLayout.blotPixels],[36,[160,160]],'Ready ink atlas renders in a 36px canvas');
   assert.equal(coordinatorLayout.typingDots,0,'the old dots are removed');
+  for(const width of [320,390,1440]){
+    await coordinatorGeometry(width,'idle empty');
+    assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),false);
+    await coordinator.getByLabel('发送给 Coordinator').fill('Synthetic first line\nSynthetic second line\nSynthetic third line');
+    await coordinatorGeometry(width,'idle multiline');
+    assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),true);
+    await coordinator.getByLabel('发送给 Coordinator').fill('');
+  }
+  coordinatorState={...coordinatorState,status:'running',activeTurnId:'synthetic-mobile-turn'};
+  await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
+  const stopAction=coordinator.getByRole('button',{name:'停止当前轮次',exact:true});
+  await stopAction.waitFor();
+  for(const width of [320,390,1440])await coordinatorGeometry(width,'running');
+  assert.equal(await coordinator.locator('.coordinator-send').isEnabled(),false,'empty running composer retains its disabled send state');
+  coordinatorReadOffline=true;
+  await page.locator('#btn-coordinator').click();await page.locator('#btn-coordinator').click();
+  await coordinator.getByRole('button',{name:'重试读取',exact:true}).waitFor();
+  for(const width of [320,390,1440])await coordinatorGeometry(width,'running read failure, four actions');
+  await page.setViewportSize({width:390,height:844});
+  await coordinator.locator('.coordinator-toolbar').screenshot({path:path.join(output,'coordinator-mobile-toolbar.png')});
+  coordinatorReadOffline=false;
+  await stopAction.click();
+  assert.equal(await stopAction.isEnabled(),false,'the original stop handler disables its in-flight action');
+  assert.equal(interrupts.length,1,'one stop click sends exactly one interrupt');
+  assert.equal(interrupts[0].conversation,'main');assert.equal(interrupts[0].expectedTurnId,'synthetic-mobile-turn');assert.ok(interrupts[0].id);
+  releaseInterrupt();
+  await stopAction.waitFor({state:'hidden'});
+  await coordinatorGeometry(390,'stopped, empty');
+  await coordinator.getByLabel('发送给 Coordinator').fill('Synthetic line one\nSynthetic line two\nSynthetic line three');
+  await coordinatorGeometry(390,'stopped multiline');
+  await coordinator.locator('.coordinator-input-shell').screenshot({path:path.join(output,'coordinator-mobile-multiline.png')});
+  await coordinator.getByLabel('发送给 Coordinator').fill('');
+  await page.setViewportSize({width:1440,height:1000});
+  record('UI-COORDINATOR-MOBILE-01: hidden controls, 44px phone targets, stop behavior and single/multiline composer geometry');
   const historicalMessage=coordinator.locator('.coordinator-message.assistant').first();
   await historicalMessage.evaluate(node=>{node.dataset.historyProbe='kept';});
   runningPreview=true;
@@ -1707,6 +1837,7 @@ try {
   });
   assert.equal(attachmentSeed.response.status, 200, JSON.stringify(attachmentSeed.body));
   attachmentPage = await context.newPage();
+  await useScreenshotFallbackFonts(attachmentPage);
   await attachmentPage.goto(service.url);
   await attachmentPage.waitForFunction(() => window.__CG_SERVER?.root === 'cloud:overview'
     && document.querySelector('.node[data-id="T0"]')?.textContent?.includes('项目地图'));
@@ -1717,6 +1848,7 @@ try {
   await attachmentPage.locator('.node[data-id="T0"]').click();
   const attachmentButton = attachmentPage.getByRole('button', { name: '附件 ＋', exact: true });
   await attachmentButton.waitFor();
+  assert.equal(await attachmentPage.locator('#detail [data-fold="files"]').count(),1,'upload-enabled empty attachment entry is retained');
   const emptyChooser = attachmentPage.waitForEvent('filechooser');
   await attachmentButton.click();
   await (await emptyChooser).setFiles({ name: 'empty.pdf', mimeType: 'application/pdf', buffer: Buffer.alloc(0) });
