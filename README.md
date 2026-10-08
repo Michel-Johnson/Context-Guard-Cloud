@@ -16,6 +16,8 @@ Slack 对话支持人工确认切换已配置的项目默认文字模型，以�
 
 共享设计的唯一源码在 [Skill references/design](https://github.com/Michel-Johnson/Context-Guard-Skill/tree/main/references/design/)。云端专有设计在本仓库 `references/design/` 维护；部署位置不改变源码归属。
 
+Executor 按需读取工具与 hash 树由 Skill 维护。Cloud 只提供经项目与 Session 授权的 `GET /v1/projects/<project>/context` 索引 / 单节点读取接口，默认不传全部正文；用法和收工检查见 [上下文设计](https://github.com/Michel-Johnson/Context-Guard-Skill/blob/main/references/design/design-context-v1.0.0.md)。升级源码不代表生产服务已部署。
+
 ## 交付
 
 修改经过 Review、CI 通过后由 PR 合并。Executor 完成模块验证后写编号 `CI_todo`；独立 Tester 验证准确源码修订后才交付。测试完成不等于人工验收。
