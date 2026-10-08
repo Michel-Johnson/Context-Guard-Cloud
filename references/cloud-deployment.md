@@ -152,7 +152,7 @@ context-guard sync status --root <project> --session <actual-session-id>
 
 保留既有数据与凭据备份机制。新快照排除源码、`node_modules`、候选检出和运行时二进制，只记录对应发布 SHA 等少量元数据。不要把旧混合归档当作源码清理目标；它们可能是业务数据的唯一副本。
 
-`deploy/prune-cloud-backups.mjs` 从 `/var/backups/context-guard-cloud-pre-*.tar[.zst]` 或 `/var/backups/context-guard-cloud/pre-*` 保留最新五份完整快照。默认 dry-run，验证保留快照，拒绝变化的清单和符号链接；最近备份有变动时等待十分钟。脚本不创建备份，既有备份生产流程仍应保存数据与受保护配置。
+`deploy/prune-cloud-backups.mjs` 从 `/var/backups/context-guard-cloud-pre-*.tar[.zst]` 或 `/var/backups/context-guard-cloud/pre-*` 保留最新五份完整快照。核验保留的备份后立即删除更早版本，不等待十分钟。默认 dry-run；清单、文件或目录在核验期间变化，或存在符号链接、损坏归档时，停止清理。脚本不创建备份。
 
 识别原始 `.tar` 和 `.tar.zst` 最终归档。时间戳名称支持既有四至六位时间，以及生产器的精确九位 `HHMMSSmmm` 时间。`.part` 仍不参与保留清理，也不自动删除。若主机已有 `--apply` 定时器，更新发现规则前先检查新增识别的清单、保留 / 过期列表及保留快照完整性。安装新脚本前取得扩大的删除范围授权；获准删除特定 `.part` 不代表获准清理完整快照。
 
@@ -162,12 +162,14 @@ context-guard sync status --root <project> --session <actual-session-id>
 sudo install -D -o root -g root -m 0755 deploy/prune-cloud-backups.mjs /usr/local/libexec/context-guard-cloud-prune.mjs
 sudo install -D -o root -g root -m 0644 deploy/context-guard-cloud-backup-retention.service /etc/systemd/system/context-guard-cloud-backup-retention.service
 sudo install -D -o root -g root -m 0644 deploy/context-guard-cloud-backup-retention.timer /etc/systemd/system/context-guard-cloud-backup-retention.timer
+sudo install -D -o root -g root -m 0644 deploy/context-guard-cloud-backup-retention.path /etc/systemd/system/context-guard-cloud-backup-retention.path
 sudo systemctl daemon-reload
 sudo node /usr/local/libexec/context-guard-cloud-prune.mjs
+sudo systemctl enable --now context-guard-cloud-backup-retention.path
 sudo systemctl enable --now context-guard-cloud-backup-retention.timer
 ```
 
-以 `0600` 权限写入 `.part` 数据归档，核验完整内容后原子改名为可识别的最终名称。保留机制的完整性检查不替代“是否包含所有必需数据与配置”的检查；现有数据、配置目录和归档仍按备份保留策略管理，不属于源码清理。
+以 `0600` 权限写入 `.part` 数据归档，核验必需数据与受保护配置均在其中，再原子改名为最终名称。目录变化会立即触发 `.path` 单元；定时器仅作保底检查。备份生产器在发布最终归档后，还应调用 `sudo systemctl start context-guard-cloud-backup-retention.service`，确认该次清理成功；失败须报告，不删除待恢复数据。保留脚本的 tar 检查不替代备份内容验收。
 
 迁移主机时先停写，复制完整业务数据、状态目录和受保护配置。从 Git 部署相同的已批准 Cloud 版本，核验历史与就绪状态，再通过 `workbench connect` 重连客户端。绝不能只凭最新 Map 重建同步状态。
 

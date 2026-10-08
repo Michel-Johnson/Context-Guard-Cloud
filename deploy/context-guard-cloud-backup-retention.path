@@ -1,0 +1,10 @@
+[Unit]
+Description=Prune Context Guard Cloud backups when a completed snapshot appears
+
+[Path]
+PathChanged=/var/backups
+PathChanged=/var/backups/context-guard-cloud
+Unit=context-guard-cloud-backup-retention.service
+
+[Install]
+WantedBy=multi-user.target

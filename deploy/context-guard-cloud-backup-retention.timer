@@ -1,5 +1,5 @@
 [Unit]
-Description=Rotate Context Guard Cloud backups every 15 minutes
+Description=Fallback check for Context Guard Cloud backup retention
 
 [Timer]
 OnActiveSec=30s
