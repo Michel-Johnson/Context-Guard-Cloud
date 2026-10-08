@@ -34,14 +34,14 @@ export function homeView({ projects, project, cloudOrigin, userId }) {
     blocks.push(section(`*${escape(project.name || project.id)}*\n<${url}|打开完整 Map>`));
     blocks.push({ type: 'actions', elements: [button('开始对话', 'start_chat', { projectId: project.id, text: '你好，我想和你讨论项目。' }), button('讨论 TODO', 'open_item:todo', { projectId: project.id, kind: 'todo' }), button('讨论 Bug', 'open_item:bug', { projectId: project.id, kind: 'bug' }), button('修改记忆', 'open_memory', { projectId: project.id })] });
     const nodes = nodesOf(project.map);
-    blocks.push(section('*节点导航*\n' + nodes.slice(0, 22).map(node => `${'　'.repeat(Math.min(node.depth, 4))}• ${escape(node.title)} \`${escape(node.id)}\``).join('\n')));
+    blocks.push(section('*节点导航*\n' + nodes.slice(0, 22).map(node => `${'　'.repeat(Math.min(node.depth, 4))}• ${escape(node.title)}`).join('\n')));
     if (nodes.length > 22) blocks.push(section(`还有 ${nodes.length - 22} 个节点，请打开完整 Map。`));
     const items = nodes.flatMap(node => ['todos', 'bugs'].flatMap(field => (node[field] || []).map(item => ({ ...item, nodeId: node.id, kind: field === 'bugs' ? 'bug' : 'todo' }))));
     blocks.push(section('*TODO / Bug*'));
     for (const item of items.slice(0, 12)) blocks.push({ ...section(`${item.kind === 'bug' ? '🐞' : '☐'} ${escape(item.title || item.text)} · ${escape(item.status || 'pending')}`), accessory: button('讨论', 'open_item', { projectId: project.id, nodeId: item.nodeId, itemId: item.id, kind: item.kind }) });
-    blocks.push(section('*Session 状态*\n' + (project.sessions || []).slice(0, 12).map(session => `${escape(session.id || session.sessionId)} · ${escape(session.status || session.state || 'unknown')}`).join('\n')));
+    blocks.push(section('*会话状态*\n' + (project.sessions || []).slice(0, 12).map(session => `${escape(session.name || session.title || '未命名会话')} · ${escape(session.status || session.state || 'unknown')}`).join('\n')));
   }
-  blocks.push({ type: 'context', elements: [plain(`操作者 ${userId} · 自动派发暂缓 · 按钮按当前 Main 版本校验`)] });
+  blocks.push({ type: 'context', elements: [plain('自动派发暂缓 · 按钮按当前 Main 版本校验')] });
   return { type: 'home', blocks };
 }
 export function modal({ callback, draftId, title, fields, initial = {} }) {
