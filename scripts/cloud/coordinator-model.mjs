@@ -1,4 +1,5 @@
 import { hash } from '../shared/io.mjs';
+import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
@@ -16,7 +17,10 @@ export function coordinatorInputTokens(usage) {
 }
 export function coordinatorModelMessages(state, { includeMetadata = false } = {}) {
   const compact = state.compaction;
-  const messages = includeMetadata ? state.messages : state.messages.map(({ role, content }) => ({ role, content }));
+  const messages = includeMetadata ? state.messages : state.messages.map(message => {
+    const { role, content } = coordinatorContextMessage(message);
+    return { role, content };
+  });
   if (!compact) return messages;
   if (!Number.isSafeInteger(compact.through) || compact.through < 1 || compact.through > state.messages.length ||
       typeof compact.summary !== 'string' || !compact.summary.trim() ||
@@ -329,12 +333,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   state.messages ||= []; state.toolReceipts ||= {};
   // Source belongs to the accepted server input, never to message text or model
   // tool parameters. Other clients already have their own model settings UI.
-  tools = tools.filter(tool => tool.name !== 'show_model_menu' || state.activeInput?.source === 'slack');
+  const sourceTools = tools.filter(tool => tool.name !== 'show_model_menu' || state.activeInput?.source === 'slack');
   const slackActor = state.activeInput?.actor;
   const trustedSlackInput = state.activeInput?.source === 'slack' && !!state.activeInput.id && slackActor?.kind === 'human' &&
     slackActor.integration === 'slack' && /^[UW][A-Z0-9]{1,31}$/.test(slackActor.userId || '') &&
     /^[TE][A-Z0-9]{1,31}$/.test(slackActor.teamId || '') && slackActor.sessionId === `slack:${slackActor.teamId}:${slackActor.userId}`;
-  tools = tools.filter(tool => tool.name !== 'react_to_user' || trustedSlackInput);
+  const executableTools = sourceTools.filter(tool => tool.name !== 'react_to_user' || trustedSlackInput);
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
   if (state.activeTurnId && state.performance?.turnId !== state.activeTurnId) state.performance = {
@@ -342,7 +346,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   };
   if (!state.pending) {
     const messages = materializeMessages ? await materializeMessages(state) : coordinatorModelMessages(state);
-    const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null };
+    const systemHash = hash(system), toolsHash = hash(JSON.stringify(tools));
+    const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
+      prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
+        historyHash: hash(JSON.stringify(messages)), messageCount: messages.length,
+        ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
     let next;
     try {
@@ -361,7 +369,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       }
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started,
         stop: next.stop, inputTokens: coordinatorInputTokens(next.usage),
-        cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens : null });
+        cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens
+          : Number.isSafeInteger(next.usage?.prompt_tokens_details?.cached_tokens) && next.usage.prompt_tokens_details.cached_tokens >= 0
+            ? next.usage.prompt_tokens_details.cached_tokens : null });
     } catch (cause) {
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started, errorCode: cause.code || 'MODEL_UNAVAILABLE' });
       throw cause;
@@ -402,7 +412,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (!receipt) {
       if (changed.steered || changed.interrupted) receipt = { fingerprint, ...failedTool(changed.interrupted ? 'TURN_INTERRUPTED' : 'INPUT_SUPERSEDED') };
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
-      else if (!tools.some(tool => tool.name === call.name)) receipt = { fingerprint,
+      else if (!executableTools.some(tool => tool.name === call.name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
       else {
         const started = Date.now();

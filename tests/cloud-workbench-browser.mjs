@@ -97,7 +97,9 @@ async function coordinatorControlAcceptance() {
       browserToken: 'fixture-browser', browserPasswordHash: await createWorkbenchPasswordHash('control-password'), privateAccess: true,
       protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'control-fixture', slug: 'example/control-fixture' }] },
       coordinatorModelFactory: () => ({ model: 'fixture-model', next: async input => {
-        modelInputs.push(input); const text = input.messages.at(-1)?.content;
+        modelInputs.push(input);
+        const content = input.messages.at(-1)?.content;
+        const text = typeof content === 'string' ? content.split('[以下为原始输入]\n').at(-1) : content;
         if ((text === '开始停止测试' || text === '第一行补充\n第二行补充') && heldGenerations < 2) {
           heldGenerations++; await input.onText('已经输出的完整段落。\n\n正在生成的尾段');
           return new Promise((resolve, reject) => {
@@ -155,7 +157,7 @@ async function coordinatorControlAcceptance() {
       await new Promise(resolve => setTimeout(resolve, 25));
     }
     assert.equal(heldGenerations, 2, 'The supplement cancels and replaces the active generation before the stop test');
-    assert.deepEqual(modelInputs[1].messages.filter(message => message.role === 'user').map(message => message.content), ['开始停止测试', '第一行补充\n第二行补充']);
+    assert.deepEqual(modelInputs[1].messages.filter(message => message.role === 'user').map(message => message.content.split('[以下为原始输入]\n').at(-1)), ['开始停止测试', '第一行补充\n第二行补充']);
     assert.ok(!JSON.stringify(modelInputs[1].messages).includes('已经输出的完整段落'), 'A superseded fragment is display history, not a complete model message');
     await input.fill('');
     await fixturePage.waitForFunction(() => {
@@ -219,7 +221,7 @@ async function coordinatorControlAcceptance() {
     state = await (await fixtureContext.request.get(stateUrl)).json();
     assert.deepEqual(state.messages.filter(message => message.partial).map(message => message.id), partialIds, 'New turns and another reload retain each original fragment exactly once');
     await panel.screenshot({ path: path.join(output, 'coordinator-partial-after-resume-new-turn-reload.png') });
-    assert.ok(modelInputs.at(-1).system.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
+    assert.ok(modelInputs.at(-1).messages.at(-1).content.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
     assert.ok(!JSON.stringify(modelInputs.at(-1).messages).includes('已经输出的完整段落'), 'Aborted display history never enters later native model requests');
     assert.deepEqual(errors, []);
     record('CONTROL-01 real ink-click stop uses an idempotent original-turn request and preserves text across reload/resume');

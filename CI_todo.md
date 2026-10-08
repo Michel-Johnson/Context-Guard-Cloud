@@ -1,14 +1,16 @@
 # Cloud 验证台账
 
-## SLACK-PROMPT-ORDER-01 · Slack 提示顺序与重复尾部规则（2026-10-08）
+## SLACK-PROMPT-ORDER-01 · Slack 重复呈现规则精简（2026-10-08）
 
 - [x] 保留真实验收结果：Cloud 1.2.2 已能发送原生 clap 与文字；默认 TODO 的共同状态已只报一次，但仍复制 E2E / IF11 / SLACK-NL 等测试前缀，短名称效果未过。不能以已发布角色或表情通过代替该失败。
-- [x] 从 `cd522f881b798bb6aed3854a8a024452886313d0` 开发：仅 Slack 生成调用以 Main 数据→原角色→短运输格式拼接；尾部只保留纯文本、段落空行、短列表、禁 Markdown 标题 / 星号 / 表格和独立代码块，移除重复长度 / TODO / 泛化标识符规则。非 Slack 拼接、原角色字节、promptVersion、工具、权限、身份、分类及队列不变，没有硬截断或短名正则。
-- [x] 候选 Cloud `1.2.3`，仅根 package / lock 版本字段；固定 core `2.1.2`、UI 与 Slack 插件及全部依赖不变，不修改 shared 生成物或新增 core Release。当前设计与验收文档注明 PE 不保证模型合规。
+- [x] 初版 `9aa3652` 在旧 Main 基线上完成两个目标与独立验证、PR #27 Required；未合并上线。并行 PR #28 将缓存前缀迁入 Main `585172866864a077f17413fc20be14978ec794e5`，正常合并因冲突拒绝，原通过证据不冒充新版通过。
+- [x] 合并最新 Main，完整保留稳定 system/tools、按输入冻结的 serverContext、旧格式兼容及执行层来源门禁。仅在现行 `coordinator-prefix` 精简重复长度 / TODO / 泛化标识符规则，保留上下文和来源边界；不搬回旧的逐轮 system 拼接，没有硬截断或短名正则。
+- [x] 候选 Cloud `1.2.4` 避免与新版 Main `1.2.3` 版本重用，固定 core `2.1.2`、UI 与依赖不变，不修改 shared 生成物或新增 core Release。当前设计与验收文档注明 PE 不保证模型合规。
 - [x] 开发后一次两个正式目标（Slack reply policy、按需 role references），真实 terminal exit 0，2/2 passed，0 failed / skipped / cancelled，485.3037 ms；日志 `temp/slack-prompt-order-executor-cd522f8-20261008.log`。校验 Slack 顺序与纯运输尾部、原 Schema 工具、非 Slack 拼接和跨客户端历史；未跑全量 / 旧八目标 / 原端口失败用例。
 - [x] 独立 Tester 核验同一冻结源码与两个目标；不代替本次准确 PR Required、合并与上线。
   - 最终handoff3d4de8bb…/七文件hash测试期间前后相同，角色1df01bb4未变；HEADcd522f8+准确工作树修订，Node24唯一两个受影响正式目标chunk820f99 actualexit0，2/2、0fail/skip，457.5653ms。原日志 `temp/slack-prompt-order-independent-cd522f8-20261008.log` SHA256 `63ecb678c0a65e264b35b5610195b65e10d276e1567082cb3da6db1e8d4f405a`；同名`.md`保留全hash/静态范围/编号ORDER-01..02。运输常量235→80字符、非空Main整条净减153字符，完整事实/role/native Schema/身份分类与非Slack原样；无旧8/端口case/全量/gates/生产调用，不据Mock或PE顺序称真实短名称通过。
 - [ ] 本次准确 PR Required、合并与上线由 Coordinator 完成。
+- [ ] 最新缓存基线迁移后的准确源码及新增用户菜单 / 乱序 badcase 分别核验，不复用旧两个目标的通过结果。
 - [ ] 默认 TODO 的真实短名称 / 共同状态只报一次及全部事项保留仍待新版本复验；不改原失败为通过，不把受控模型输出当成真实模型遵循证据。
 
 ## COORDINATOR-REPLY-FOLLOWUP-01 · 真实聊天回归返工（2026-10-08）
@@ -1516,3 +1518,12 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] Cloud PR Required 与合并后 main CI 待完成。生产部署不在范围；实际模型、Slack 发送不由隔离回归推断已完成。
 - 正式更新到 Skill main `3f00727` fixture 后首次总入口：407 测试，400 通过、5 失败、2 跳过。BDA-002/004 仍断言旧安全提示字段和删除拒绝回执；BDA-016 的有限 TTL fetcher 对已协商持久响应错误断言整数 TTL。现行 Cloud 同步设计已规定 persistent 协商与拒绝回执保留；只更新测试，保持安全字段精确白名单、原请求/终态回执检查、显式重试新身份及真实 Main/Session 权限断言。有限时钟偏差测试显式移除握手能力头模拟旧版，替身边界仅在 start 协商；未修改产品授权逻辑。
 - 修正后正式总入口：407 测试，405 通过、0 失败、2 个既有跳过；正式浏览器三入口通过。此次为执行者自检，不冒充独立人工审查。
+
+## CACHE-PREFIX-001：Coordinator 可复用静态前缀（2026-10-08）
+
+- [x] 用户批准三项优化：动态状态尾置、内容版本化静态前缀、保留原生历史并仅压缩历史。独立候选分支 `codex/coordinator-cache-prefix` 基于 Cloud main `8292042`，未混入 Executor 上下文工作区修改。
+- [x] 新增私有逐轮 serverContext；项目记忆/导航留在 system，Main 版本、事项/焦点状态与来源按接受时快照追加。重试不刷新旧输入，旧格式兼容读取；工具定义稳定，但来源和真实操作者仍由执行层校验。
+- [x] 独立供应商探测 24/24 调用完整结束；20 个变化版本的 fork 后请求中，10 个新版请求 system/tools 均稳定。DeepSeek 缓存 token 占比 9.9%→91.8%，GLM 52.6%→78.6%。不是网页/Slack E2E，不以缓存代替业务验收；样本小，不承诺首词延时或 100% 命中。
+- [ ] 独立 Tester/人工复核准确候选提交：最新状态、节点授权、原身份重试、跨来源工具拒绝、子对话边界、native thinking/工具回执、compaction 哈希。
+- [x] 执行者本地自检：Node v24.18.0 全量 428 项，426 PASS、0 FAIL、2 个既有 SKIP；正式浏览器三入口退出 0；Slack 插件 195/195；安全验收 39 项、staged 127 文件及 package 92 文件扫描通过。测试资料位于候选 temp，未包含在 Git/发布包。
+- [ ] GitHub Required、Node 18/22、独立评审、合并与生产验收尚待执行。未部署，不扩展自动派发。

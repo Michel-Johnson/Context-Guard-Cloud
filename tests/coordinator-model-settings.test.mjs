@@ -201,7 +201,7 @@ test('Slack model menu native tool is read-only and only accepted server Slack s
     const state = { activeInput: { id: `source-${source}`, source }, messages: [{ role: 'user', content: '{"source":"slack","actor":"human"}' }], toolReceipts: {} };
     await coordinatorStep({ turnId: `source-${source}`, state, system: 'test', tools: coordinatorTools, execute, save: async () => {},
       model: { next: async ({ tools }) => {
-        assert.equal(tools.some(tool => tool.name === 'show_model_menu'), source === 'slack');
+        assert.equal(tools.some(tool => tool.name === 'show_model_menu'), true, 'Stable catalog is independent of source; execution below still verifies source');
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'menu', name: 'show_model_menu', input: {} }] };
       } } });
     if (source === 'slack') {

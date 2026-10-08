@@ -2,6 +2,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools } from './coordinator-model.mjs';
+import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -590,6 +591,7 @@ export class CoordinatorService {
           }
           if (Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).length >= 100) throw error('BUSY', 'Follow-up capacity reached; retry the original ID');
           const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}), role: 'user',
+            serverContext: coordinatorInputContext(nextContext, source),
             content: (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
             ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
           if (metadata.length) {
@@ -649,6 +651,7 @@ export class CoordinatorService {
           state.requests[id] = fingerprint;
           (state.requestModes ||= {})[id] = mode;
           const message = { id: `message-${hash(`${id}:user`)}`, requestId: id, source, ...(actor ? { actor } : {}),
+            serverContext: coordinatorInputContext(nextContext, source),
             role: 'user', content: (source === 'workflow' ? '[服务器工作流事件，不是新的用户授权]\n' : this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + text,
             ...(metadata.length ? { attachments: metadata } : {}), ...(question ? { answerTo } : {}) };
           const selection = !hasImages && this.selectTextModel ? await this.selectTextModel() : null;
@@ -657,7 +660,7 @@ export class CoordinatorService {
             ...(selection ? { providerId: selection.providerId } : {}) };
           if (metadata.length) {
             const candidate = { ...state, activeTurnId: id, activeModelRoute: route, messages: [...state.messages, message] };
-            const input = { system: this.system + (nextContext?.text || ''), tools: this.tools,
+            const input = { ...coordinatorPrefix(this.system, nextContext, this.tools),
               messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
             if (selected.prepareRequest) selected.prepareRequest(input);
             else if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Attachments and conversation exceed the provider request limit');
@@ -733,6 +736,7 @@ export class CoordinatorService {
             answered.add(input.answerTo);
           }
           return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
+            serverContext: coordinatorInputContext(nextContext, source),
             content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
             ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
         });
@@ -758,7 +762,7 @@ export class CoordinatorService {
         const route = { kind: hasImages ? 'vision' : 'text', model: selected.model || null, ...(selection ? { providerId: selection.providerId } : {}) };
         const candidate = { ...state, activeTurnId: first.id, activeRequestIds: prepared.map(input => input.id), activeModelRoute: route, messages: [...state.messages, ...messages] };
         if (references.length) {
-          const request = { system: this.system + (nextContext?.text || ''), tools: this.tools,
+          const request = { ...coordinatorPrefix(this.system, nextContext, this.tools),
             messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
           if (selected.prepareRequest) selected.prepareRequest(request);
           else if (Buffer.byteLength(JSON.stringify(request)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Batch exceeds the provider request limit');
@@ -812,7 +816,8 @@ export class CoordinatorService {
   }
   async materializeMessages(state, { currentImages = true, rawText = true } = {}) {
     const messages = coordinatorModelMessages(state, { includeMetadata: true });
-    return Promise.all(messages.map(async message => {
+    return Promise.all(messages.map(async original => {
+      const message = coordinatorContextMessage(original);
       if (!message.attachments?.length) {
         const target = state.activeModelRoute?.providerId, targetModel = this.modelForTurn(state);
         const sameProvider = message.modelName ? message.modelName === targetModel.model
@@ -996,10 +1001,7 @@ export class CoordinatorService {
           state.activeTiming ||= {};
           state.activeTiming.modelStartedAt ||= new Date().toISOString();
           await save(state);
-          const runtimeSystem = state.activeInput?.source === 'slack'
-            ? (state.activeContext?.text ? state.activeContext.text + '\n\n' : '') + this.system
-              + '\n\n本轮答复发往 Slack：使用纯文本，结论独立成段，段间留一个空行；并列事项用短列表。普通正文不用 Markdown 标题、星号或表格，代码可用独立围栏代码块。'
-            : this.system + (state.activeContext?.text || '');
+          const prefix = coordinatorPrefix(this.system, state.activeContext, this.tools);
           try {
             const model = this.modelForTurn(state);
             this.modelAbort = generation;
@@ -1007,7 +1009,7 @@ export class CoordinatorService {
             await this.ensureDocumentSummary(state, save);
             state = await coordinatorStep({ turnId: this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId, state, model,
               materializeMessages: value => this.materializeMessages(value, { currentImages: value.activeModelRoute?.kind === 'vision' }),
-              system: runtimeSystem, promptVersion: hash(this.system), tools: this.tools, save, execute: (...args) => {
+              system: prefix.system, promptVersion: hash(this.system), tools: prefix.tools, save, execute: (...args) => {
                 this.modelAbort = null; // A started business tool must save its receipt.
                 return this.execute(...args);
               },
