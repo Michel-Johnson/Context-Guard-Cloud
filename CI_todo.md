@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## CLOUD-SKILL-CONSUME-INTEGRATION-01 · 合并固定 Skill 消费边界（2026-10-08）
+
+- [x] Coordinator：批准整合 Main `60d2970` 的两仓库边界及固定 core 2.0.2 / workbench 1.1.6；保留本轮 Slack 模型选择、表情和 Coordinator 实例FIFO。Root 操作正常 Git 合并；Executor 仅解决明确文本/版本/链接冲突，不恢复任何已删除共享源码或旧接口测试。
+- [x] Executor：README 与部署保留 Main 的 build:runtime/固定依赖/生成物不可提交规则；root package/lock 除候选1.1.14外语义与Main完全相同，依赖URL/integrity保留，Slack0.1.19未改。完整Slack v1.1.0唯一放 references/design，内容哈希未变；更新4处相关文档链接，精确删除获准旧Cloud v1.0.0与原生成区设计索引，旧版查Git不建备份。生成区旧v1.1.0已随Root合并移除，不写回生成源码；Git冲突索引由Root处理。
+- [ ] Executor 定向验证：目前 node_modules 仍旧依赖，尚未运行安装、build或测试，不以静态JSON核对代替已构建运行。待Root审阅、正常提交准确合并SHA并准备固定包后，再按授权一次验证固定包构建/manifest/生成物边界、Cloud1.1.14和Slack0.1.19锁一致、专有设计唯一与链接，以及模型/表情/FIFO/来源Schema/steer/receipt目标；不随机全仓重跑。
+- [ ] 独立 Tester：最终准确sourceSha核固定release消费及不Git跟踪生成物；不能复用5b/13b旧模块结果作新合并通过。原436/433/1fail/2skip、412/410/1fail/1skip、旧EPERM和C3/C4现场证据保留。
+- [ ] Delivery：依赖构建适配和准确版本部署由Root执行；未发布Skill/shared包、未改变生产授权/模型/API。本次源码整合不是已上线或真人Slack验收。
+
 ## COOR-CONVERSATION-FIFO-01 · 同实例会话文件读写互斥（2026-10-08）
 
 - [x] Coordinator：准确 `13b5a330cb90897de4db99458445d9e916338ca3` 一次 Cloud 全仓 436 总项 / 433 通过 / 1 失败 / 2 既有跳过，actual exit 1，278143.9092 ms。唯一旧后台摘要目标最终 `status=error` 而非 `waiting-for-user`，该轮实际错误码未捕获；原日志及之后另列的首次 Slack 包结果保留，不将旧 EPERM 直接套作本轮根因。
@@ -1430,3 +1438,15 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 迁移三项显示/身份回归和双角色规则检查，增强原通知与 Home 断言；Slack 插件版本 0.1.18，core 角色提示词修复版本 2.0.1。
 - [ ] 本地只执行语法、差异和安全检查，不额外运行功能测试。准确修订的全量 CI 与 Required 尚待执行，不能引用旧候选的成功结果代替。
 - [ ] 模型实际输出和真实 Slack 客户端未复验；不部署生产。共享制品须从全部迁移合入后的 main 构建并固定到 Skill。
+
+## CORE-CONSUMER-01：Cloud 使用 Skill 核心与 UI
+
+- 用户批准源码归属调整。Cloud 服务、账号权限、云端模型与 Slack 留在本库；共享核心、UI、角色、通用设计与 5 份配套测试迁回 Skill。原重复源码从 Git 移除，构建后仍在原路径提供固定包消费副本，源码历史可恢复；未删除业务数据。
+- [x] 候选包本地验证：Node 套件 406 个测试（404 通过、2 个既有跳过）；Cloud 正式浏览器三入口通过；Slack 隔离套件 171 通过，不冒充真实 Slack 或实际模型验收。
+- [x] 包构建器 8 个回归通过，保留固定版本、修改保护、路径穿越与符号链接拒绝、升级断言。首次迁移 fixture 因 scripts 目录已建立导致 EEXIST；修正为幂等建立目录后重跑，不改变预期断言。
+- [x] Skill PR #457 已合并，main `3f00727` 的 13 项 CI 全通过；core 2.0.2、UI 1.1.6 和同 main 客户端 fixture 已发布为固定 GitHub 制品，真实 URL/SRI 已锁定。Cloud 服务包 90 个文件通过精确清单与安全检查。
+- [x] Cloud `d842c6e` 干净归档只安装两个生产依赖，构建 53 个消费文件；真实启动、三项 UI 资源字节比对、版本化地图读取和未授权拒绝通过，不包含完整 Skill 客户端。
+- [x] 本机三客户端 Skill 已更新，93 个文件哈希与 Skill main 一致。doctor 的安装、版本及工作台检查通过；原生 Hook 信任、真实触发和上下文发出未通过，不能报告完整原生验收成功。
+- [ ] Cloud PR Required 与合并后 main CI 待完成。生产部署不在范围；实际模型、Slack 发送不由隔离回归推断已完成。
+- 正式更新到 Skill main `3f00727` fixture 后首次总入口：407 测试，400 通过、5 失败、2 跳过。BDA-002/004 仍断言旧安全提示字段和删除拒绝回执；BDA-016 的有限 TTL fetcher 对已协商持久响应错误断言整数 TTL。现行 Cloud 同步设计已规定 persistent 协商与拒绝回执保留；只更新测试，保持安全字段精确白名单、原请求/终态回执检查、显式重试新身份及真实 Main/Session 权限断言。有限时钟偏差测试显式移除握手能力头模拟旧版，替身边界仅在 start 协商；未修改产品授权逻辑。
+- 修正后正式总入口：407 测试，405 通过、0 失败、2 个既有跳过；正式浏览器三入口通过。此次为执行者自检，不冒充独立人工审查。

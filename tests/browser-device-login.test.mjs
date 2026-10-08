@@ -174,7 +174,9 @@ test('BDA-002: waiting login publishes only a safe approval prompt and finishes 
   assert.equal(prompts.length, 1);
   const saved = JSON.parse(await fs.readFile(device.file, 'utf8'));
   assert.equal(JSON.stringify(prompts).includes(saved.credential), false);
-  assert.deepEqual(Object.keys(prompts[0]).sort(), ['authorizationRequired', 'connected', 'expiresAt', 'userCode', 'verificationUrl']);
+  assert.deepEqual(Object.keys(prompts[0]).sort(), ['authorizationRequired', 'connected', 'expiresAt', 'persistent', 'userCode', 'verificationUrl']);
+  assert.equal(prompts[0].persistent, true);
+  assert.equal(prompts[0].expiresAt, null);
   const reused = await browserLogin(deviceFor(f), { repository, repositoryId,
     fetcher: () => assert.fail('a connected backend should not start another browser grant') });
   assert.equal(reused.connected, true);
@@ -203,14 +205,24 @@ test('BDA-003: unauthenticated, cross-site, missing-origin and forged-CSRF decis
 
 test('BDA-004: a human denial leaves the backend disconnected and the next attempt gets a fresh approval code', async t => {
   const f = await fixture(t), device = deviceFor(f), grant = await browserLogin(device, { repository, repositoryId });
+  const pendingFile = path.join(device.directory, 'browser-login.json');
+  const pending = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
   const cookie = await login(f, new URL(grant.verificationUrl).pathname + new URL(grant.verificationUrl).search);
   const { csrf } = await formFor(f, grant, cookie);
   assert.equal((await decide(f, grant, csrf, cookie, 'deny')).status, 302);
   await assert.rejects(browserLogin(device, { repository, repositoryId }), { code: 'FORBIDDEN' });
   assert.equal(await device.connected(), false);
-  assert.deepEqual(JSON.parse(await fs.readFile(path.join(device.directory, 'browser-login.json'), 'utf8')), { status: 'FORBIDDEN' });
+  const { lastFailure, ...retained } = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
+  assert.deepEqual(retained, { ...pending, status: 'FORBIDDEN' }, '拒绝回执保留原私有请求，不自动重新申请');
+  assert.deepEqual(Object.keys(lastFailure).sort(), ['at', 'code', 'reason']);
+  assert.equal(lastFailure.code, 'FORBIDDEN');
+  assert.equal(lastFailure.reason, 'authorization-denied');
+  assert.ok(Number.isFinite(Date.parse(lastFailure.at)));
   const retry = await browserLogin(device, { repository, repositoryId });
   assert.notEqual(retry.userCode, grant.userCode);
+  const retried = JSON.parse(await fs.readFile(pendingFile, 'utf8'));
+  assert.notEqual(retried.deviceCode, pending.deviceCode);
+  assert.deepEqual(retried.previousOutcome, lastFailure);
 });
 
 test('BDA-005: a pending approval survives Cloud and CLI restarts without creating a new grant', async t => {
@@ -368,16 +380,21 @@ test('BDA-015: simultaneous local invocations share approval and persist only on
   assert.equal((await deviceFor(f).transmit({ v: 2, id: 'verify-concurrent-login', type: 'sync.heartbeat', payload: { sessions: [] } })).sessions.length, 0);
 });
 
-test('BDA-016: server clock skew does not change the local approval window or prevent Main access', async t => {
+test('BDA-016: legacy finite authorization clock skew does not change the local approval window or prevent Main access', async t => {
   for (const offsetMs of [-3600000, 3600000]) {
     await t.test(`server clock offset ${offsetMs / 60000} minutes`, async sub => {
       const f = await fixture(sub), device = deviceFor(f);
       let expiresIn;
       const fetcher = async (url, options) => {
-        const response = await fetch(url, options);
-        if (new URL(url).pathname !== '/api/auth/device/start') return response;
+        if (new URL(url).pathname !== '/api/auth/device/start') return fetch(url, options);
+        // 模拟旧版不支持持久授权协商，仅在 start 握手移除能力标记。
+        // 后续批准、领取和隔离读取仍使用真实 Cloud。
+        const legacyHeaders = new Headers(options.headers);
+        legacyHeaders.delete('X-Context-Guard-Device-Grant');
+        const response = await fetch(url, { ...options, headers: legacyHeaders });
         const body = await response.json();
         assert.equal(body.ok, true);
+        assert.equal(Object.hasOwn(body.data, 'persistent'), false);
         expiresIn = body.data.expiresIn;
         assert.ok(Number.isInteger(expiresIn) && expiresIn >= 1 && expiresIn <= 600);
         body.data.expiresAt = new Date(Date.now() + expiresIn * 1000 + offsetMs).toISOString();
@@ -385,6 +402,7 @@ test('BDA-016: server clock skew does not change the local approval window or pr
         return new Response(JSON.stringify(body), { status: response.status, headers });
       };
       const before = Date.now(), pending = await browserLogin(device, { repository, repositoryId, fetcher }), after = Date.now();
+      assert.equal(pending.persistent, false);
       const deadline = Date.parse(pending.expiresAt);
       assert.ok(deadline >= before + expiresIn * 1000 && deadline <= after + expiresIn * 1000,
         'the local deadline is derived from the relative TTL, not the server wall clock');
