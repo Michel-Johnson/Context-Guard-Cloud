@@ -5,7 +5,7 @@ import { CoordinatorModel, coordinatorInputTokens, coordinatorModelMessages, coo
 import { buildCoordinatorContext } from '../scripts/cloud/coordinator-context.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   coordinatorCompactBoundary, COORDINATOR_COMPACT_AT_TOKENS, COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from '../scripts/cloud/coordinator-service.mjs';
-import { createCoordinatorExecutor, coordinatorReferences, coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
+import { createCoordinatorExecutor, coordinatorReferences, coordinatorReferenceFiles, coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -148,13 +148,14 @@ test('Cloud project approval dispatches once as soon as the fresh Session is reg
 
 test('Coordinator guide references are callable and loaded only after an explicit tool call', async t => {
   const prompt = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
-  const linkedReferences = [...prompt.matchAll(/\]\(references\/([^/)]+)\)/g)]
-    .map(match => match[1]).filter(name => name !== 'design-current.md');
+  const linkedReferences = [...prompt.matchAll(/\]\(references\/([^)]*)\)/g)]
+    .map(match => match[1]).filter(file => file !== 'design/design-memory-current-v1.0.1.md')
+    .map(file => Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file));
   assert.deepEqual([...linkedReferences].sort(), [...coordinatorReferences].sort());
   const referenceReads = [];
   const execute = createCoordinatorExecutor({ readReference: async name => {
     referenceReads.push(name);
-    return { text: await fs.readFile(new URL(`../scripts/shared/references/${name}`, import.meta.url), 'utf8') };
+    return { text: await fs.readFile(new URL(`../scripts/shared/references/${coordinatorReferenceFiles[name]}`, import.meta.url), 'utf8') };
   } });
   for (const name of linkedReferences) {
     const result = await execute('read_reference', { name }, { operationId: `prompt-ref:${name}` });
@@ -190,7 +191,58 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(reply.tool_use_id, 'read-memory-rules');
   assert.equal(reply.is_error, undefined);
   assert.equal(JSON.parse(reply.content).text,
-    await fs.readFile(new URL('../scripts/shared/references/memory-definition.md', import.meta.url), 'utf8'));
+    await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8'));
+});
+
+test('Cloud reads the moved memory design through the unchanged reference identifier', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-design-reference-http-'));
+  let server;
+  t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  const providerFile = path.join(directory, 'provider.json');
+  await fs.writeFile(providerFile, JSON.stringify({ baseUrl: 'https://provider.example', model: 'test', token: 'synthetic' }));
+  const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic', projects: {
+    'context-guard': { root: directory, token: 'synthetic', ref: 'refs/heads/main', coordinator: {
+      enabled: true, providerFile, bindings: {},
+    } },
+  } };
+  const memoryFile = path.join(memoryConfig.dataDir, createHash('sha256').update('context-guard').digest('hex'), 'memory.json');
+  await fs.mkdir(path.dirname(memoryFile), { recursive: true });
+  await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'main-1', memory: { records: {}, map: {
+    v: 1, root: { id: 'T0', title: 'Synthetic project', kind: 'module', owns: [], children: [] },
+  } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
+  const expectedText = await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8');
+  let modelCalls = 0, observed;
+  server = await startCloudServer({ dataDir: directory, port: 0, memoryConfig, browserToken: 'synthetic-browser',
+    protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },
+    coordinatorModelFactory: () => ({ next: async ({ messages }) => {
+      modelCalls++;
+      if (modelCalls === 1) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'memory-design', name: 'read_reference',
+        input: { name: 'memory-definition.md' } }] };
+      const result = messages.at(-1).content.find(block => block.type === 'tool_result');
+      observed = { isError: result.is_error, value: JSON.parse(result.content) };
+      return { stop: 'end_turn', content: [{ type: 'text', text: '已读取记忆设计。' }] };
+    } }),
+  });
+  const headers = { Authorization: 'Bearer synthetic-browser', 'Content-Type': 'application/json' };
+  const endpoint = `${server.url}/api/workbench/projects/context-guard/api/coordinator`;
+  const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ id: 'read-design', text: '读取记忆规范，不修改项目。' }) });
+  assert.equal(response.status, 202, 'Coordinator submission is accepted asynchronously');
+  await response.json();
+  let state;
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    state = await (await fetch(endpoint, { headers })).json();
+    if (!state.activeTurnId && state.messages?.some(message => message.text === '已读取记忆设计。')) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.ok(state.messages.some(message => message.text === '已读取记忆设计。'), JSON.stringify(state.errors));
+  assert.equal(modelCalls, 2);
+  assert.equal(observed.isError, undefined);
+  assert.equal(observed.value.name, 'memory-definition.md');
+  assert.equal(observed.value.text, expectedText);
+  assert.equal(observed.value.version, createHash('sha256').update(expectedText).digest('hex'));
+  const unchangedMemory = JSON.parse(await fs.readFile(memoryFile, 'utf8'));
+  assert.equal(unchangedMemory.main.version, 'main-1');
 });
 
 test('Mount handoff ends the source turn and stale requirements expose a static correction hint', async () => {
@@ -1926,10 +1978,11 @@ test('Coordinator advertises reference names and accepts existing extensionless 
   const names = [];
   const execute = createCoordinatorExecutor({ readReference: async name => { names.push(name); return { name }; } });
   assert.deepEqual(coordinatorTools.find(tool => tool.name === 'read_reference').input_schema.properties.name.enum, coordinatorReferences);
+  assert.equal(coordinatorReferenceFiles['memory-definition.md'], 'design/design-memory-definition-v0.2.0.md');
   for (const name of ['agent-handoff', 'agent-handoff.md', 'references/agent-handoff.md']) {
     assert.deepEqual(await execute('read_reference', { name }, { operationId: 'reference' }), { name: 'agent-handoff.md' });
   }
-  for (const name of ['../agent-handoff.md', 'references/../agent-handoff.md', '/etc/passwd', 'server-memory.md']) {
+  for (const name of ['../agent-handoff.md', 'references/../agent-handoff.md', '/etc/passwd', 'server-memory.md', 'design/../memory-definition.md', 'design/design-memory-server-v1.0.1.md']) {
     await assert.rejects(execute('read_reference', { name }, { operationId: 'denied' }), { code: 'INVALID_ARGUMENT' });
   }
   assert.equal(names.length, 3);

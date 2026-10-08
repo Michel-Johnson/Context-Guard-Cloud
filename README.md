@@ -1,33 +1,21 @@
 # Context Guard Cloud
 
-Operational references: [deployment](references/cloud-deployment.md),
-[Slack](references/slack-integration.md), [attachments](docs/cloud-attachments.md),
-[Coordinator compaction](docs/coordinator-compaction.md).
+操作资料：[部署手册](references/cloud-deployment.md)、[Slack 接入](scripts/shared/references/design/design-slack-integration-v1.0.0.md)、[附件设计](scripts/shared/references/design/design-cloud-attachments-v1.0.0.md)、[Coordinator 压缩](scripts/shared/references/design/design-coordinator-compaction-v1.0.0.md)。全部设计见 [设计目录](scripts/shared/references/design/README.md)。
 
-Cloud workbench, Coordinator and integrations for Context Guard. The client and
-Skill live in [Context-Guard-Skill](https://github.com/Michel-Johnson/Context-Guard-Skill).
+本仓库提供 Context Guard 的 Cloud 工作台、Coordinator 和集成。客户端与 Skill 由 [Context-Guard-Skill](https://github.com/Michel-Johnson/Context-Guard-Skill) 维护。
 
-This repository owns the Cloud service, independent Slack plugin, common runtime
-package and workbench UI package. Application releases do not change project
-repository identities or memory Main versions.
+Cloud 服务、独立 Slack 插件、公共运行时包和工作台 UI 包由本仓库维护。应用发布不改变业务项目仓库身份或记忆 Main 版本。
 
-## Development
+## 开发
 
-Install with `npm ci`. Cloud runs with `npm start`; Slack is an independent
-service with its own dependencies. Configuration, credentials, maps, receipts and
-attachments stay outside the checkout. See `references/cloud-deployment.md`.
+使用 `npm ci` 安装，`npm start` 启动 Cloud。Slack 是独立服务，单独安装依赖。配置、凭据、地图、回执和附件放在源码检出目录之外，见 [部署手册](references/cloud-deployment.md)。
 
-`npm test` runs the Cloud tests. Cross-client tests use a pinned Skill development
-dependency through a test-only package resolver; it never ships in
-Cloud packages. The public packages in `scripts/shared` and `prototype` are the
-only editable source of the common runtime and UI.
+`npm test` 运行 Cloud 测试。跨客户端测试使用固定 Skill 开发依赖和仅供测试的包解析器，不将它们放入 Cloud 发布包。`scripts/shared` 和 `prototype` 是公共运行时与 UI 唯一可编辑的源码来源。
 
-## Delivery
+共享设计在 `scripts/shared/references/design/` 维护，随 core 包导出为安装目录的 `references/design/`；不在两个仓库复制第二份。Skill 自有 Session 同步设计由 Skill 仓库维护。
 
-Changes go through a reviewed PR and successful CI. Executor writes numbered
-`CI_todo` items after module verification; an independent Tester verifies the
-exact source revision before delivery. Test completion is not human acceptance.
+## 交付
 
-Deploy a Git revision into the single configured checkout. Do not create source
-backup directories or permanent candidate services. Preserve live data and data
-backup policy; rollback checks out a recorded source revision or release artifact.
+修改经过 Review、CI 通过后由 PR 合并。Executor 完成模块验证后写编号 `CI_todo`；独立 Tester 验证准确源码修订后才交付。测试完成不等于人工验收。
+
+将准确 Git 修订部署到唯一配置的检出目录，不创建源码备份目录或永久候选服务。保留运行数据和备份策略；回滚到已记录的源码修订或发布产物。

@@ -1,18 +1,20 @@
 # Context Guard 接口设计
 
+文档版本：v1.2.1。
+
 ```
 Context Guard
-├── Agent Interface
-├── Human Interface
-├── Host Interface
-└── Cloud Interface
+├── Agent 接口
+├── 人类接口
+├── 宿主接口
+└── Cloud 接口
 ```
 
-这四层覆盖 multi-agent、多平台和端云同步。表里的角色字母是 C、E、T。
+这四层覆盖 多 Agent 协作、多平台和端云同步。表里的角色字母是 C、E、T。
 
-## Agent Interface
+## Agent 接口
 
-### File
+### 文件读取
 
 小文件、可分层、可链接、按需展开、角色隔离、避免全量读取。
 
@@ -57,7 +59,7 @@ Context Guard
 
 | Agent | 规则 |
 | --- | --- |
-| C | 读：直接 File；写：必须 Tool/CLI |
+| C | 读：直接读文件；写：必须通过工具或 CLI |
 | E | 不设计底层工具，只规定可读上下文、可写范围、交付格式 |
 | T | 同上，只规定输入、测试规范、结果格式 |
 
@@ -65,7 +67,7 @@ Context Guard
 
 CLI 负责写和状态变化。
 
-| Domain | 接口 | Caller | 动作 |
+| 领域 | 接口 | 调用者 | 动作 |
 | --- | --- | --- | --- |
 | map | `edit_map` | Coordinator | 创建、修改、移动、删除 Main 节点，也可按 Main 版本更新项目或节点记忆文档。删除时如果下面还有子页或关联，先问人。人同意就可以删 |
 | file | `write_file` | Coordinator | 在项目仓库检出中新建或替换一个 UTF-8 文本文件。项目须显式允许。一次一个仓库相对路径。不提交、不推送、不改 Main。替换已有文件时必须带当前内容的 SHA-256；同一操作 ID 重试返回原回执 |
@@ -74,7 +76,7 @@ CLI 负责写和状态变化。
 | map | 任务复查 | | 不写入 Main 节点 |
 | map | 挂载 | | 将 Coordinator 挂载到节点；执行 Session 仍须等该事项的 brief 获批后创建，不写入 Main 节点 |
 | todo | `createTodo` `updateTodo` | C / E / T | 创建、更新 TODO 事项记录 |
-| task | 共用流程 | | 以 `kind`（todo 或 bug）、`nodeId`、`itemId` 定位事项；流程附着于 TODO/Bug，不创建独立 Task 实体；各动作仍按本表 Caller 授权 |
+| task | 共用流程 | | 以 `kind`（todo 或 bug）、`nodeId`、`itemId` 定位事项；流程附着于 TODO/Bug，不创建独立 Task 实体；各动作仍按本表调用者授权 |
 | task | 派发 | 人批准指定 brief 版本之后 | 系统为该事项创建新的执行 Session 并派发；人不选择 Session，也不能跳过 brief 审批 |
 | task | 事项与 Session | | 每轮执行创建一个新 Session；同轮重试与返工沿用原 Session，不靠独立 Task 实体区分轮次 |
 | task | `closeTask` | Coordinator | Coordinator 判断是否请求完成；请求本身不代表事项已关闭 |
@@ -100,11 +102,11 @@ CLI 负责写和状态变化。
 | plan | plan-finish | | 需要已有的人审记录 |
 | attachment | 附件 | human、Session | 人和 Session 可以附加文件 |
 
-## Human Interface
+## 人类接口
 
-Workbench Frontend 对 Backend。
+工作台前端与后端的接口。
 
-| Domain | 接口 | Caller | 动作 |
+| 领域 | 接口 | 调用者 | 动作 |
 | --- | --- | --- | --- |
 | map | `getMap` `getNode` | | 读 |
 | map | `createNode` `updateNode` `moveNode` `deleteNode` | human | Cloud 路径改 Main。页面上的修改自动保存。删除时如果下面还有子页或关联，先问人。人同意就可以删 |
@@ -124,11 +126,11 @@ Workbench Frontend 对 Backend。
 | conflict | `getConflict` `resolveConflict` | Agent | 能识别人当前是否正在改，并提醒人 |
 | project | `getProject` `updateSettings` | | |
 
-## Host Interface
+## 宿主接口
 
 Codex、Cursor、Claude 等宿主与 Context Guard 的连接。
 
-| Domain | 接口 | 动作 |
+| 领域 | 接口 | 动作 |
 | --- | --- | --- |
 | session | `sessionStart` `sessionStop` | Session 停止不代表事项完成；完成由 Coordinator 依据回执判断 |
 | session | `interrupt` | 同一事项在同一 Session 和同一 Plan 上继续，不新建事项或 Session |
@@ -142,11 +144,11 @@ Codex、Cursor、Claude 等宿主与 Context Guard 的连接。
 | runtime | `heartbeat` `getRuntimeState` | 宿主持久保存投递；明确未启动或忙碌失败时按原消息 ID、事项与 Session 代次恢复，结果未知时先核对而不重复唤起 Agent；过期投递明确拒绝 |
 | adapter | `normalizeEvent` | |
 
-## Cloud Interface
+## Cloud 接口
 
 本地 Context Guard 与云端交换状态、事件和权限。
 
-| Domain | 接口 | 动作 |
+| 领域 | 接口 | 动作 |
 | --- | --- | --- |
 | project | `connectProject` `disconnectProject` `getProjectState` | |
 | sync | `pullState` `pushOperation` `syncStatus` `checkpoint` | 同步只走 Session。旧的项目地图同步不是接口 |

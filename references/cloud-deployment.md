@@ -1,40 +1,29 @@
-# Cloud deployment
+# Cloud 部署手册
 
-Deploy Cloud only from [Context-Guard-Cloud](https://github.com/Michel-Johnson/Context-Guard-Cloud).
-Skill and its local backend are released independently from Context-Guard-Skill.
-Do not run a Skill checkout as the Cloud service or retain parallel candidate
-source trees. Cloud and Slack share one approved Cloud source revision, but run
-as separate services with separate dependencies and state.
+Cloud 只能从 [Context-Guard-Cloud](https://github.com/Michel-Johnson/Context-Guard-Cloud) 部署。Skill 和本地后端由 Context-Guard-Skill 独立发布，不得用 Skill 检出目录运行 Cloud，也不保留并行候选源码目录。Cloud 与 Slack 使用同一份已审核的 Cloud 源码修订，但分为两个服务，依赖和状态各自独立。
 
-Private memory authority and publication are defined in
-[server-memory.md](../scripts/shared/references/server-memory.md).
-Installing Cloud alone does not migrate Session data or change project identity.
+私有记忆的数据权威与发布规则见 [服务器记忆](../scripts/shared/references/design/design-memory-server-v1.0.1.md)。仅安装 Cloud 不会迁移 Session 数据或改变项目身份。
 
-## 1. Installation layout
+## 1. 安装布局
 
-The templates use Linux systemd **system** services under the `context-guard`
-account. Create this dedicated account before installing the units. Cloud requires
-Node.js >= 18; Slack requires its own Node.js >= 22.19.0 and npm >= 9.6.4.
+模板使用 Linux systemd 系统服务，以 `context-guard` 账户运行；安装单元前先创建该专用账户。Cloud 要求 Node.js >= 18；Slack 使用独立的 Node.js >= 22.19.0 和 npm >= 9.6.4。
 
-| Purpose | Path |
+| 用途 | 路径 |
 | --- | --- |
-| Only Cloud source checkout | `/opt/context-guard-cloud/repository` |
-| Cloud protected environment | `/etc/context-guard-cloud/cloud.env` |
-| Optional existing site overrides | `/etc/context-guard-cloud/public.env` |
-| Private memory configuration | `/etc/context-guard-cloud/memory.json` |
-| Cloud business data | `/var/lib/context-guard-cloud` |
-| Private memory data, for a new installation | `/var/lib/context-guard-cloud/memory` |
-| Business-project Git mirrors | `/var/lib/context-guard-projects/<project>` |
-| Slack source | `/opt/context-guard-cloud/repository/plugins/slack` |
-| Slack protected environment / state | `/etc/context-guard-slack.env` / `/var/lib/context-guard-slack` |
-| Slack Node runtime | `/opt/context-guard-slack/runtime/bin/node` |
+| 唯一 Cloud 源码检出 | `/opt/context-guard-cloud/repository` |
+| Cloud 受保护环境配置 | `/etc/context-guard-cloud/cloud.env` |
+| 可选的既有站点覆盖配置 | `/etc/context-guard-cloud/public.env` |
+| 私有记忆配置 | `/etc/context-guard-cloud/memory.json` |
+| Cloud 业务数据 | `/var/lib/context-guard-cloud` |
+| 新安装的私有记忆数据 | `/var/lib/context-guard-cloud/memory` |
+| 业务项目 Git 镜像 | `/var/lib/context-guard-projects/<project>` |
+| Slack 源码 | `/opt/context-guard-cloud/repository/plugins/slack` |
+| Slack 受保护环境配置 / 状态 | `/etc/context-guard-slack.env` / `/var/lib/context-guard-slack` |
+| Slack Node 运行时 | `/opt/context-guard-slack/runtime/bin/node` |
 
-These are installation defaults, not a data migration command. On an existing
-host retain the verified data/configuration paths and adjust the unit's
-`ReadWritePaths` if needed. Do not move or replace data just to match a template.
+这些是安装默认值，不是数据迁移命令。已有主机保留已核验的数据与配置路径，必要时调整单元的 `ReadWritePaths`；不要为了匹配模板而移动或替换数据。
 
-For a new installation, an administrator installs Git, Node, npm, curl and the
-service account, then creates the only checkout:
+新安装时，管理员先安装 Git、Node、npm、curl 并创建服务账户，再创建唯一的源码检出目录：
 
 ```bash
 sudo git clone https://github.com/Michel-Johnson/Context-Guard-Cloud.git /opt/context-guard-cloud/repository
@@ -42,25 +31,19 @@ cd /opt/context-guard-cloud/repository
 sudo npm ci --omit=dev --ignore-scripts
 ```
 
-Select the reviewed release commit before starting services. The service account
-needs read access to code and protected JSON files, but no write access to source.
-Runtime state and credentials must stay outside the checkout.
+启动服务前选定已审核的发布提交。服务账户需要读取源码和受保护 JSON 文件，但不需要写源码；运行状态和凭据必须放在检出目录之外。
 
-## 2. Protected configuration and project mirrors
+## 2. 受保护配置与项目镜像
 
-Create the writable business-mirror root before starting the system unit:
+启动系统服务前，创建可写的业务项目镜像根目录：
 
 ```bash
 sudo install -d -o context-guard -g context-guard -m 0750 /var/lib/context-guard-projects
 ```
 
-The service allows writes to this directory for Git fetches and explicitly
-enabled project-file operations; the Cloud application's own checkout stays
-read-only. Existing mirrors elsewhere need their exact directory in a reviewed
-`ReadWritePaths` override until migrated. Never grant write access to `/opt` or `/`.
+服务可以在此目录执行 Git 拉取和已明确启用的项目文件操作；Cloud 自身源码保持只读。既有镜像若位于其他位置，迁移前必须在经过审核的 `ReadWritePaths` 覆盖配置中列出其精确目录。绝不授予 `/opt` 或 `/` 的写权限。
 
-Create `/etc/context-guard-cloud/cloud.env` with mode `0600`, root-owned.
-Systemd reads the EnvironmentFile before changing to the service account:
+创建 `/etc/context-guard-cloud/cloud.env`，权限为 `0600`，所有者为 root。systemd 会先读取 EnvironmentFile，再切换为服务账户：
 
 ```dotenv
 CONTEXT_GUARD_CLOUD_TOKEN=<independent-admin-token>
@@ -70,9 +53,7 @@ CONTEXT_GUARD_CLOUD_ORIGIN=https://map.example.com
 CONTEXT_GUARD_MEMORY_CONFIG=/etc/context-guard-cloud/memory.json
 ```
 
-Never put real credentials in Git, command arguments, Maps or copied logs.
-Generate independent tokens with a password manager. Generate the salted password
-hash through private standard input, without placing the password in shell history:
+真实凭据不得进入 Git、命令参数、Map 或复制出的日志。用密码管理器生成相互独立的 Token；通过私有标准输入生成加盐密码哈希，避免密码进入 shell 历史：
 
 ```bash
 node --input-type=module -e '
@@ -83,12 +64,9 @@ node --input-type=module -e '
 '
 ```
 
-Cloud stores the hash, not the password. Human login creates the existing
-HttpOnly/SameSite browser cookie. Execution clients normally use browser-approved
-device authorization, not project-token or password copying.
+Cloud 保存哈希，不保存密码。人登录后使用已有的 HttpOnly/SameSite 浏览器 Cookie；执行客户端通常使用浏览器批准的设备授权，不复制项目 Token 或密码。
 
-Create the protected memory JSON with mode `0600`, readable by the service
-account, for example owned by `context-guard`. Paths are absolute:
+创建权限为 `0600`、服务账户可读的受保护记忆 JSON，例如归 `context-guard` 所有。路径必须为绝对路径：
 
 ```json
 {
@@ -105,25 +83,15 @@ account, for example owned by `context-guard`. Paths are absolute:
 }
 ```
 
-Each `root` is that **business project's** independently maintained Git checkout
-or mirror. It is not the Cloud application repository unless Cloud itself is the
-business project. Fetch its authoritative Main as a deployment/maintenance step.
-The service verifies source commits against that ref; it must not substitute the
-Cloud release SHA for the project's Main SHA.
+每个 `root` 都是该业务项目独立维护的 Git 检出或镜像。除非 Cloud 本身就是业务项目，否则不要指向 Cloud 应用仓库。在部署或维护步骤中拉取其权威 Main；服务按该引用核验源码提交，不能用 Cloud 发布 SHA 替代项目 Main SHA。
 
-The template uses `ProtectSystem=strict`. Omit the memory project's `remote`
-field so the running service does not attempt a fetch into read-only code/mirrors.
-Do not grant source write access to work around publication failures.
+模板使用 `ProtectSystem=strict`。省略记忆项目的 `remote` 字段，避免运行中的服务向只读源码或镜像执行拉取。不得为了绕过发布失败而授予源码写权限。
 
-For Slack, configure its optional loopback gateway and independent secret as in
-[slack-integration.md](slack-integration.md). Slack SDK dependencies remain in the
-plugin package; Cloud does not load them.
+Slack 的可选回环网关与独立凭据配置见 [Slack 接入设计](../scripts/shared/references/design/design-slack-integration-v1.0.0.md)。Slack SDK 依赖留在插件包，Cloud 不加载它们。
 
-### Coordinator model selection
+### Coordinator 模型选择
 
-The workbench's **模型配置** button selects a server-configured text provider for
-the current project. Keep `coordinator.providerFile` as the original provider for
-legacy in-flight turns and retries. Add an explicit private catalog, for example:
+工作台的“模型配置”按钮为当前项目选择服务器已配置的文本供应商。保留 `coordinator.providerFile`，供旧的进行中轮次及其重试使用。显式增加私有供应商目录，例如：
 
 ```json
 {
@@ -135,27 +103,13 @@ legacy in-flight turns and retries. Add an explicit private catalog, for example
 }
 ```
 
-Each provider file is `0600`, readable by the service account and outside Git.
-DeepSeek V4.1 Flash uses `model: "deepseek-flash"`, `protocol: "anthropic"`,
-`baseUrl: "https://api.deepseek.com/anthropic"` and a private `token`.
-Validate streaming and a tool continuation with the actual credentials before
-opening the option. Never enter credentials in browser fields or URLs.
+各供应商文件权限为 `0600`，由服务账户读取，不进入 Git。DeepSeek V4.1 Flash 使用 `model: "deepseek-flash"`、`protocol: "anthropic"`、`baseUrl: "https://api.deepseek.com/anthropic"` 和私有 `token`。开放选项前，用真实凭据验证流式输出和工具接续；不要把凭据填进浏览器字段或 URL。
 
-`GET/POST /api/workbench/projects/<project>/api/coordinator/model` requires
-workbench authority. POST accepts only `{id, providerId, baseVersion}` and saves
-versioned, idempotent selection under the project's Coordinator data directory.
-The browser receives only IDs, labels, model names and a settings version.
-Changes apply to subsequent text turns, including Slack, not in-flight turns or
-their retries. Image routing is unchanged. Retain all original providers until
-their unfinished turns are resolved. Removing a selected provider fails closed.
+`GET/POST /api/workbench/projects/<project>/api/coordinator/model` 要求工作台权限。POST 只接受 `{id, providerId, baseVersion}`，在项目的 Coordinator 数据目录保存带版本、幂等的选择；浏览器只接收 ID、标签、模型名称和设置版本。变更仅作用于后续文本轮次（包括 Slack），不影响进行中的轮次或重试，图片路由不变。保留原供应商直到其未完成轮次全部处理完毕；移除已选供应商时明确拒绝，而不是静默替换。
 
-## 3. Start and connect
+## 3. 启动与连接
 
-The Cloud template listens on `127.0.0.1:8788`, uses private mode and secure cookies.
-Terminate TLS at a reverse proxy; never expose the backend port publicly.
-If an existing container proxy requires a specific private bridge address, retain
-that reviewed host override and firewall boundary. Do not blindly replace it with
-loopback or `0.0.0.0` during migration. Set the exact external HTTPS origin.
+Cloud 模板监听 `127.0.0.1:8788`，启用私有模式和安全 Cookie。在反向代理终止 TLS，不得把后端端口公开。已有容器代理若要求特定私有网桥地址，保留已审核的主机覆盖配置和防火墙边界；迁移时不要盲目改为回环地址或 `0.0.0.0`。配置准确的外部 HTTPS 来源。
 
 ```bash
 sudo install -o root -g root -m 0644 deploy/context-guard-cloud.service /etc/systemd/system/context-guard-cloud.service
@@ -165,17 +119,11 @@ curl --fail http://127.0.0.1:8788/api/health
 sudo systemctl show context-guard-cloud.service -p WorkingDirectory -p ExecStart -p MainPID -p ExecMainStartTimestamp
 ```
 
-Use the actual private bind address for the local health probe if it differs.
-Check the running entrypoint and source revision as well as health; a live process
-or a checkout SHA alone does not prove that the latest code is loaded. Inspect
-private diagnostics without copying credentials, prompts or full journal contents.
+本地健康探测使用实际的私有监听地址。除了健康状态，还要核对运行入口和源码修订；仅进程存活或磁盘 SHA 正确，不能证明已加载最新代码。检查私有诊断时，不复制凭据、提示词或完整 journal。
 
-An administrator enrolls business projects in the existing project directory and
-memory configuration. Preserve existing IDs during the split; do not create new
-projects merely because the Cloud source repository changed. Administrative and
-project API credentials use Authorization headers, not query strings.
+管理员在现有项目目录与记忆配置中登记业务项目。拆仓库时保留已有 ID，不因 Cloud 源码仓库改变而新建项目。管理员和项目 API 凭据放在 Authorization 请求头，不放在查询参数。
 
-Working copies use the installed Skill:
+工作副本使用已安装的 Skill：
 
 ```bash
 context-guard workbench connect --root <project> --url https://map.example.com --session <actual-session-id> --wait
@@ -183,76 +131,31 @@ context-guard workbench --root <project> --session <actual-session-id>
 context-guard sync status --root <project> --session <actual-session-id>
 ```
 
-The human approves the returned browser URL/code; the backend stores the device
-credential. New Sessions reuse the project connection. The old Map-only transport
-has been removed. `UPGRADE_REQUIRED` with pending old data is a reconciliation
-blocker, not permission to erase queues or overwrite Main.
+人批准返回的浏览器 URL / 验证码，后端保存设备凭据；新 Session 复用项目连接。旧 Map-only 传输已删除。存在待处理旧数据时的 `UPGRADE_REQUIRED` 是需要协调的阻塞，不授权清空队列或覆盖 Main。
 
-Install Slack following its [README](../plugins/slack/README.md), then check both
-its initial Socket readiness and a real authorized Slack interaction. Cloud
-health does not establish Slack readiness.
+按 Slack [README](../plugins/slack/README.md) 安装，随后核验初始 Socket 就绪状态，并完成一次真实、已授权的 Slack 交互。Cloud 健康不代表 Slack 已就绪。
 
-## 4. Upgrade, source retirement and rollback
+## 4. 升级、淘汰旧源码与回滚
 
-1. Record the currently running Cloud/Slack source SHA and their data/config paths.
-   Back up **business data and protected configuration** using the established
-   policy. Include private memory, attachments and Slack state/receipts.
-   Do not archive or copy the source checkout.
-   Before stopping either service, verify every required backup source and the
-   actual destination filesystem's available capacity. A missing optional drop-in
-   is not a missing required source. Budget apparent data size plus an explicit
-   reserve for archive overhead, dependencies and concurrent filesystem use;
-   do not assume compression will make an otherwise unsafe deployment fit.
-   Insufficient capacity must leave the running release untouched.
-2. Fetch the Cloud repository and select the exact approved release commit. Stop
-   Slack before Cloud, install root production dependencies and the plugin's
-   independent dependencies, then start Cloud followed by Slack.
-3. Verify entrypoints, process generations and source SHA; perform authenticated
-   read/edit/reload, preserved Session history, reconnect, and Slack readiness.
-   An edit requires an approved test project, not an arbitrary production Map.
-4. Update clients to the compatible Skill release. Verify the installed entry,
-   local/Cloud synchronization and preserved pending data.
-5. Retire obsolete units, overrides and source directories only after confirming
-   no process, service or business-project mirror still references them; unique
-   commits must already be in Git and runtime data must already be outside them.
-   Keep a single fixed source entrypoint. Do not create `*-old` source copies.
+1. 记录当前 Cloud / Slack 源码 SHA 及数据、配置路径。按既有策略备份业务数据和受保护配置，包含私有记忆、附件、Slack 状态与回执，不备份或复制源码检出。停服务前核对必需的备份来源和实际目标文件系统可用容量；缺少可选 drop-in 不等于缺少必需来源。按数据表观大小加上归档开销、依赖和并发占用的明确余量预算，不假定压缩能挽救空间不足。容量不足时，不改变正在运行的版本。
+2. 拉取 Cloud 仓库，选定已批准的准确发布提交。先停 Slack，再停 Cloud；安装根包生产依赖和插件独立依赖，随后先启动 Cloud，再启动 Slack。
+3. 核对入口、进程代次和源码 SHA，验证鉴权读取、编辑、重载、Session 历史保留、重连和 Slack 就绪。编辑必须在已批准的测试项目进行，不任意修改生产 Map。
+4. 将客户端更新到兼容的 Skill 版本，核验安装入口、本地 / Cloud 同步及待处理数据保留。
+5. 只有确认没有进程、服务或业务项目 Git 镜像引用，且独有提交已保存到 Git、运行数据已移出后，才淘汰旧单元、覆盖配置和源码目录。保留单一固定源码入口，不创建 `*-old` 源码副本。
 
-A dirty source checkout is a deployment blocker; do not `reset --hard`, overwrite
-uncommitted changes or promote a candidate directory as a second permanent source.
-Use Git history or the approved release artifact to redeploy a previous compatible
-version at the same entrypoint. Preserve the current business data and receipts.
-If a release requires incompatible data migration, stop for an explicit migration
-and recovery plan; a source rollback must not silently restore stale data.
-Track service stops, source changes and dependency installation separately. A
-backup failure before source/dependency changes only requires restarting services
-that were stopped and verifying the old Cloud release and initial Slack Socket
-readiness. Do not attempt Git/npm rollback for an unchanged release, overwrite
-protected configuration or report recovery solely because a process is active.
+源码目录存在未提交修改时，不得部署；不要执行 `reset --hard`、覆盖修改或把候选目录变成第二个永久源码入口。通过 Git 历史或已批准的发布产物，在原入口重新部署兼容旧版，并保留当前业务数据和回执。若版本需要不兼容数据迁移，先取得明确的迁移与恢复方案，源码回滚不得静默恢复陈旧数据。
 
-## 5. Business-data backup retention
+分别记录停服务、改源码和安装依赖。若备份在源码或依赖变更前失败，只需重启已停服务，核验旧 Cloud 版本和初始 Slack Socket 就绪；不要为未改变的版本执行 Git/npm 回滚，不覆盖受保护配置，也不凭进程活跃宣称恢复。
 
-Keep the existing data/credential backup mechanism. New snapshots exclude source,
-`node_modules`, candidate checkouts and runtime binaries. Record the corresponding
-release SHA as small metadata. Do not delete old mixed archives as source cleanup;
-they may contain the only copy of business data.
+## 5. 业务数据备份保留
 
-`deploy/prune-cloud-backups.mjs` retains the five newest complete snapshots from
-`/var/backups/context-guard-cloud-pre-*.tar[.zst]` or
-`/var/backups/context-guard-cloud/pre-*`. It defaults to dry-run, verifies retained
-snapshots, refuses changed inventories/symlinks, and waits ten minutes after recent
-backup changes. It does not create backups. Keep the existing backup producer
-configured for data and protected configuration.
-Both raw `.tar` and `.tar.zst` final archives are recognized. Timestamp names
-support the existing four-to-six-digit time and the producer's exact nine-digit
-`HHMMSSmmm` time. `.part` files remain excluded, not automatically deleted.
-When updating discovery rules on a host with an active `--apply` timer, inspect
-the newly recognized inventory, retained/stale lists and retained integrity first.
-Obtain authorization for any expanded deletion scope before installing the new
-script; approval to remove specific `.part` files does not authorize pruning
-complete snapshots.
+保留既有数据与凭据备份机制。新快照排除源码、`node_modules`、候选检出和运行时二进制，只记录对应发布 SHA 等少量元数据。不要把旧混合归档当作源码清理目标；它们可能是业务数据的唯一副本。
 
-Install the reviewed retention script and units as **root-owned** files; never
-execute a service-writable checkout script as root:
+`deploy/prune-cloud-backups.mjs` 从 `/var/backups/context-guard-cloud-pre-*.tar[.zst]` 或 `/var/backups/context-guard-cloud/pre-*` 保留最新五份完整快照。默认 dry-run，验证保留快照，拒绝变化的清单和符号链接；最近备份有变动时等待十分钟。脚本不创建备份，既有备份生产流程仍应保存数据与受保护配置。
+
+识别原始 `.tar` 和 `.tar.zst` 最终归档。时间戳名称支持既有四至六位时间，以及生产器的精确九位 `HHMMSSmmm` 时间。`.part` 仍不参与保留清理，也不自动删除。若主机已有 `--apply` 定时器，更新发现规则前先检查新增识别的清单、保留 / 过期列表及保留快照完整性。安装新脚本前取得扩大的删除范围授权；获准删除特定 `.part` 不代表获准清理完整快照。
+
+安装经过审核的保留脚本和单元，所有者必须为 root；不要以 root 执行服务账户可写的检出脚本：
 
 ```bash
 sudo install -D -o root -g root -m 0755 deploy/prune-cloud-backups.mjs /usr/local/libexec/context-guard-cloud-prune.mjs
@@ -263,13 +166,6 @@ sudo node /usr/local/libexec/context-guard-cloud-prune.mjs
 sudo systemctl enable --now context-guard-cloud-backup-retention.timer
 ```
 
-Create data archives with mode `0600` under a `.part` name, verify their complete
-contents, then atomically rename to the recognized final name. Retention integrity
-checks do not replace checking that all required data/configuration was included.
-Existing data/config directories and archives remain governed by this retention
-policy, not by source cleanup.
+以 `0600` 权限写入 `.part` 数据归档，核验完整内容后原子改名为可识别的最终名称。保留机制的完整性检查不替代“是否包含所有必需数据与配置”的检查；现有数据、配置目录和归档仍按备份保留策略管理，不属于源码清理。
 
-For a host move, stop writes and copy the complete business-data/state directories
-and protected configuration. Deploy the same approved Cloud version from Git,
-verify history and readiness, then reconnect clients with `workbench connect`.
-Never reconstruct synchronization state from the latest Map alone.
+迁移主机时先停写，复制完整业务数据、状态目录和受保护配置。从 Git 部署相同的已批准 Cloud 版本，核验历史与就绪状态，再通过 `workbench connect` 重连客户端。绝不能只凭最新 Map 重建同步状态。

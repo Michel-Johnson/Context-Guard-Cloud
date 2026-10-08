@@ -57,7 +57,7 @@ Executor 提交实现与证据后，安排独立 Tester 验证同一提交。测
 
 ## 按需资料
 
-Cloud 用 `read_reference` 读取文件名，本地打开对应链接。首次处理某类操作前读取相关规范；需要或版本变化时重读。启动时不通读全部资料。
+Cloud 用 `read_reference` 读取表中的资料标识，本地打开对应链接。资料标识保持兼容，不一定与归档后的文件名相同。首次处理某类操作前读取相关规范；需要或版本变化时重读。启动时不通读全部资料。
 
 | 当前要做什么 | 阅读哪份规范 |
 | --- | --- |
@@ -67,9 +67,9 @@ Cloud 用 `read_reference` 读取文件名，本地打开对应链接。首次�
 | 派发、交接、恢复、返工或收工 | [agent-handoff.md](references/agent-handoff.md) |
 | 审核 Plan | [plan-review.md](references/plan-review.md) |
 | 核对并解释测试结果 | [test-check.md](references/test-check.md) |
-| 创建、修改、合并或清理项目与节点记忆 | [memory-definition.md](references/memory-definition.md) |
+| 创建、修改、合并或清理项目与节点记忆 | [memory-definition.md](references/design/design-memory-definition-v0.2.0.md) |
 
-产品契约以 [当前设计版本](references/design-current.md) 为准；使用现有工具与宿主能力，不新增 Hook。
+记忆存储与文件格式以 [当前记忆规范](references/design/design-memory-current-v1.0.1.md) 为准；使用现有工具与宿主能力，不新增 Hook。
 
 ## 人工对话模式
 

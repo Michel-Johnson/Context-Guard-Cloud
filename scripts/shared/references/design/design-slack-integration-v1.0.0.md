@@ -1,6 +1,6 @@
 # Slack 插件网关
 
-读者：Cloud 管理员和插件开发者。Slack 与 Cloud 共用独立的 `Context-Guard-Cloud` 仓库和一个发布 SHA，但作为两个服务运行；安装和使用见 [插件 README](../plugins/slack/README.md)。网关默认关闭，只监听本机，不配置公网代理。Slack SDK 只安装在插件包中，不随 Skill 安装。
+读者：Cloud 管理员和插件开发者。Slack 与 Cloud 共用独立的 `Context-Guard-Cloud` 仓库和一个发布 SHA，但作为两个服务运行；安装和使用见 [插件 README](https://github.com/Michel-Johnson/Context-Guard-Cloud/blob/main/plugins/slack/README.md)。网关默认关闭，只监听本机，不配置公网代理。Slack SDK 只安装在插件包中，不随 Skill 安装。
 
 ## 受保护配置
 
@@ -67,7 +67,7 @@ Slack 的普通提交带 `followup:"steer"`，由服务端原子绑定当前轮�
 
 参与判断结合整批当前输入、有限近期上下文和接收对象线索：@ 其他 Bot 不排除 Coordinator，明确或间接请其解释、整理、协调或接续时参与；仅询问别人、明确无需介入或信息不足时保持安静。原生 @ Coordinator 也不能覆盖当前明确的“不回复”。引用行、行内代码和代码块的提及只作上下文。`routing:{coordinatorUserId,mentionedUsers:[{id,isBot}],replyToCoordinator?}` 由插件提供，`isBot:null` 表示核对失败，不猜身份、不作为硬排除或新增授权。其他提及通过有界 `users.info` 核对，缓存最多 256 个、有效期五分钟（失败三十秒），底层在途请求受限且纳入停用清理。安装需要 `users:read`，已有 App 须重新授权 scope；不读取邮箱或用户资料全文。当前静默决定和请求 ID 持久保留，后续新批补充仍可重新判断。
 
-`conversation.relevance` 可带最多 20 条独立 ID 的 `inputs:[{id,text}]`（总文本最多 8000 字符），模型按顺序理解整批更正；旧单条请求保持兼容。参与结果不代表写入、派单或审批授权。私有网关回执记录该判断耗时，公开结果继续为 `respond/reason/mainVersion`。回复以短段落、空行和列表表达；Slack 按段落与代码边界分块保留完整长文，流式与最终更新使用同一消息身份。独立测试标准见 [Slack conversation acceptance](../docs/slack-conversation-acceptance.md)。
+`conversation.relevance` 可带最多 20 条独立 ID 的 `inputs:[{id,text}]`（总文本最多 8000 字符），模型按顺序理解整批更正；旧单条请求保持兼容。参与结果不代表写入、派单或审批授权。私有网关回执记录该判断耗时，公开结果继续为 `respond/reason/mainVersion`。回复以短段落、空行和列表表达；Slack 按段落与代码边界分块保留完整长文，流式与最终更新使用同一消息身份。独立测试标准见 [Slack 对话验收](https://github.com/Michel-Johnson/Context-Guard-Cloud/blob/main/docs/slack-conversation-acceptance.md)。
 
 上述未 @ 判定同时考虑当前用户是否需要回复：项目相关但明确不用回复或无需参与时静默。仅预览、通知、只读或不修改本身不代表静默，仍向 Coordinator 提问时可回应；引用、历史及文件中的“不回复”不覆盖当前用户意图。判断由原模型完成，不用关键词规则代替，也不改变私聊或明确 @ 的入口。
 
@@ -101,7 +101,7 @@ Coordinator 在私有对话状态的 `performance` 中保存本轮模型调用�
 
 ## 发布与恢复
 
-按 [Cloud 部署手册](cloud-deployment.md) 保留 Cloud/记忆数据、受保护配置以及插件状态目录与 EnvironmentFile 的备份机制；原消息和发送回执不得丢弃。只备份业务数据和配置，不创建 checkout 或 `*-old` 源码副本。源码回退使用 Git 中已审核的发布 SHA。
+按 [Cloud 部署手册](https://github.com/Michel-Johnson/Context-Guard-Cloud/blob/main/references/cloud-deployment.md) 保留 Cloud/记忆数据、受保护配置以及插件状态目录与 EnvironmentFile 的备份机制；原消息和发送回执不得丢弃。只备份业务数据和配置，不创建 checkout 或 `*-old` 源码副本。源码回退使用 Git 中已审核的发布 SHA。
 
 Cloud 与 Slack 唯一源码根目录为 `/opt/context-guard-cloud/repository`，来源为 `Michel-Johnson/Context-Guard-Cloud`。按已审核的同一 SHA 更新完整源码，再分别安装根包生产依赖与插件独立依赖。Skill 仓库不是服务端部署来源；不再新增候选目录或候选服务。停旧服务、先启动 Cloud、再启动 Slack，并核对真实运行入口、PID 和版本；仅磁盘代码更新不表示进程已加载。
 

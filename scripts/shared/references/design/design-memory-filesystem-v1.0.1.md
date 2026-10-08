@@ -1,11 +1,13 @@
-# Memory Filesystem v2.1
+# 记忆文件系统 v2.1
+
+文档版本：v1.0.1。
 
 读者：产品角色 Agent（格式与阅读面）；仓库开发 Agent（生成器与迁移缺口）。
 
-**版本：`fs-v2.1`（当前设计版本；底层事务格式仍为 v2）**
+**文件格式版本：`fs-v2.1`；底层事务格式仍为 v2。**
 从何而来：已评审的 Cloud Main / Session 记忆文件结构。
 
-确认：现行存储法只认这一版。下一版必须另开版本号。入口见 [当前设计版本](../design-current.md)。
+确认：现行存储法只认这一版。下一版必须另开格式版本号。入口见 [当前记忆规范](design-memory-current-v1.0.1.md)。
 未升格设计草案不是本版本，不得当存储法。
 
 这是 Cloud Main 与 Session 记忆的已评审目标文件结构。启用 filesystem v2 的服务器提供按版本读取单份 Markdown 的显式 API，Agent 可通过 `context-guard memory file` 读取获授权的文档；这不是本地私有 `content/` 磁盘路径。未启用该投影的项目不能使用此入口，旧记录仍只作兼容传输。Agent 打开模块时默认读哪套目录（FIND.md / snapshot 与本投影如何切换）尚未拍板，不得在本文里选边。
@@ -34,16 +36,16 @@ filesystem-v2/
 ```
 
 节点的 Bug、Todo、Idea 索引直接生成在该节点的 `index.md` 中，不再创建 `bugs-index.json`、`tasks-index.json` 或 Idea JSON 索引。
-项目和节点的记忆正文存于 Main Map 对应节点的 `memoryDocument`，随版本写入并投影为上述 `memory.md`。只有人和 Coordinator 能修改；Executor、Tester 可按已有单文件读取权限查看。项目记忆是 Coordinator 首轮静态上下文，进入节点时只加载最近的相关节点记忆，历史条目仍按需读。文档格式见 [记忆定义](../memory-definition.md)。
+项目和节点的记忆正文存于 Main Map 对应节点的 `memoryDocument`，随版本写入并投影为上述 `memory.md`。只有人和 Coordinator 能修改；Executor、Tester 可按已有单文件读取权限查看。项目记忆是 Coordinator 首轮静态上下文，进入节点时只加载最近的相关节点记忆，历史条目仍按需读。文档格式见 [记忆定义](design-memory-definition-v0.2.0.md)。
 
 ## 文档
 
-- [Node / Module index](Node_Module_Index.md) · [English](Node_Module_Index.en.md)
-- [Bug](Bug.md) · [English](Bug.en.md)
-- [Todo](Todo.md) · [English](Todo.en.md)
-- [Idea](Idea.md) · [English](Idea.en.md)
-- Bug 模式：[Coordinator](Bug_Coordinater.md) · [Executor](Bug_Executor.md) · [Tester](Bug_Tester.md)
-- Todo 模式：[Coordinator](Todo_Coordinater.md) · [Executor](Todo_Executor.md) · [Tester](Todo_Tester.md)
+- [节点 / 模块索引](design-memory-node-index-v1.0.1.md)
+- [Bug 格式与角色分工](design-memory-bug-v1.0.1.md)
+- [TODO 格式与角色分工](design-memory-todo-v1.0.1.md)
+- [Idea 格式](design-memory-idea-v1.0.0.md)
+
+每类事项只维护一份中文规范。角色职责合入 Bug / TODO，不为不同 Agent 复制格式。
 
 ## 代码生成职责
 
