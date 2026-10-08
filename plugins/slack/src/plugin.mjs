@@ -802,7 +802,8 @@ export class SlackPlugin {
       const display = partial ? { ...message, text: `部分回复（已被补充调整，非最终答案）：\n${message.text || ''}` } : message;
       const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
       const content = digest({ format: 'plain-text-v2', message,
-        ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}) }),
+        ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}),
+        ...(message.questions?.length ? { questionRender: blocks } : {}) }),
         prior = this.store.data.threads[key].mirrored[id];
       // Older versions could append an earlier model step after the stream.
       // Rotate those occupied slots forward until a pending reply consumes the

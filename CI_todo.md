@@ -10,6 +10,74 @@
 - [ ] 准确修订通过 Required 后合入 Cloud main，从已合并源码生成并核验 core 包，再发布独立的 shared-v2.0.0 GitHub Release。保留旧产物，不部署线上、不发布 Skill npm。
 - [ ] 独立 Tester 须验证资料路径、越权拒绝、角色入口、core 包内容及新 Skill 固定依赖的联调；未验收前不发布共享包，也不宣称线上已更新。
 
+Combined 1.1.11 / Slack 0.1.17 candidate regression ran once after both exact
+independent module acceptances: Cloud 420 total / 418 passed / 0 failed / 2
+existing separate-suite skips, actual exit 0; Slack 168/168, actual exit 0.
+Boundaries, workflows and test governance passed. These are local regression
+results, not Required/Main CI, deployment or human-client acceptance.
+
+## SLACK-MODEL-STREAM-01 · Protocol termination and cancellation reasons (2026-10-08)
+
+- [x] Coordinator: approved a bounded transport fix for the visible SSE EOF wait
+  and external timeout misclassification. Neither defect establishes the cause
+  of the C4 attention record; preserve its original request and receipts.
+- [x] Executor: complete at validated Anthropic `message_stop` without waiting
+  for HTTP EOF; require matching model, legal stop reason, all started blocks
+  closed and existing native tool validation. Preserve opaque private metadata,
+  JSON/OpenAI contracts, deadlines, byte/token budgets and human/steer semantics.
+  Cleanup must not delay a valid result or replace the original error. Unknown
+  events/pings are ignored. Event and terminal-result checks preserve an already
+  triggered cancellation/deadline after an awaited same-chunk callback.
+  One initial selected run passed 24/24, then static review found that the
+  terminal short-circuit had not covered this callback race. After the bounded
+  follow-up, one final selected run on Node 24.19.0 passed 25/25, actual exit 0
+  (1959.8794 ms), with no skips or provider calls. No old valid fixture needed
+  relaxation; complete native streams and existing rejection/receipt tests remain.
+- [x] Independent Tester: verify exact revision with held-open terminal streams,
+  malformed/missing protocol termination and unfinished tool JSON (zero business
+  effects), valid private tool continuation, late data, pending/rejected cleanup
+  and external TimeoutError/MODEL_TIMEOUT versus human/steer cancellation.
+  Retain native receipt replay and existing deadline tests; local fixtures do
+  not prove provider availability or production classification recovery.
+  Exact model 5ed29d27 / formal cloud test 9442759b verified on Node 24.19.0:
+  one independent affected run, 17/17 passed, actual exit 0 (1345.356 ms),
+  including native JSON/OpenAI, same-chunk callback cancellation, private blocks
+  and original receipt replay. No model/production call; Delivery stays pending.
+- [ ] Delivery: record Required/Main CI, running revision and new authorized
+  real acceptance separately; do not replay or overwrite the original C4 input.
+
+## SLACK-QUESTION-CACHE-01 · Refresh known question displays in place (2026-10-08)
+
+- [x] Coordinator: Cloud 1.1.10 rendered new question blocks correctly, but the
+  old mirror fingerprint contained only the unchanged public message and node
+  links. An already known clarification could therefore retain its old duplicate
+  UI. The original C3 failure and C4 classification attention remain evidence;
+  this item does not replay human inputs, reclassify or change provider budgets.
+- [x] Executor: retain the exact ordinary `plain-text-v2` fingerprint rule and
+  include actual displayed blocks only for messages carrying questions. Update
+  their known Slack timestamps; persist the new fingerprint only after the update
+  acknowledgement. Preserve public message/question IDs, answers, bindings and
+  pending question identity. No new message, model call or tool execution.
+  Plugin SHA256: aac1825c151f8b6440a89eed0cfa1d0385619f083923503378ccb8d1bf395c35.
+  Tests SHA256: 6a27e1a2df299bb969ba7419287ca695ba1bb4d6ff0d705174aff9bc80547b27.
+  One affected-target run on bundled Node 24.19.0 passed 16/16, actual exit 0
+  (641.3105 ms). This selected module run is not a full suite, provider run or
+  production Slack acceptance; independent verification remains pending.
+- [x] Independent Tester: seed the old real `publicMessages` question projection
+  fingerprint and known timestamp, verify exactly one corrected `chat.update`,
+  preserved options/attachments/node links/pending ID, and no additional update
+  after restart. A neighboring ordinary historical message including node links
+  must keep its original fingerprint and timestamp without refresh. Lost update
+  acknowledgements must retain the old fingerprint and retry the same timestamp.
+  Independently verified the exact frozen hashes on Node 24.19.0: one targeted
+  run, 3/3 passed, actual exit 0 (1793.3917 ms), including retained streaming slot
+  finalization. This is local technical acceptance, not production refresh or
+  provider recovery; Delivery remains unchecked and C3/C4 failures are retained.
+- [ ] Delivery: normal Required/Main CI and Cloud/Slack update, then refresh the
+  known question display without generating or replaying a human/model round.
+  Preserve original failed receipts and screenshots. Natural-language provider
+  availability, C4 attention and new human acceptance remain separate gates.
+
 ## SLACK-QUESTION-RENDER-01 · One visible clarification (2026-10-08)
 
 - [x] Coordinator: real-human1.1.9 acceptance found the same clarification twice
