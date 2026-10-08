@@ -1864,11 +1864,14 @@ test('Slack reply policy is supplied as system instructions without changing nat
     kind: 'human', sessionId: 'slack-human', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER',
   } });
   await service.running;
+  assert.ok(calls[0].system.startsWith('\nCurrent Main\n\nrole\n\n'), 'Slack places Main data before the unchanged role');
+  const deliveryPolicy = calls[0].system.slice('\nCurrent Main\n\nrole'.length);
   assert.match(calls[0].system, /本轮答复发往 Slack：使用纯文本/);
   assert.match(calls[0].system, /段间留一个空行/);
   assert.match(calls[0].system, /并列事项用短列表/);
-  assert.match(calls[0].system, /最多 200 字/);
-  assert.match(calls[0].system, /只问 TODO 就只列 TODO，不附 Bug/);
+  assert.match(deliveryPolicy, /不用 Markdown 标题、星号或表格/);
+  assert.match(deliveryPolicy, /代码可用独立围栏代码块/);
+  assert.doesNotMatch(deliveryPolicy, /\d+\s*字|TODO|Bug|短名称|短标题|标识符|ID|brief|风险|确认/);
   assert.deepEqual(calls[0].tools, tools, 'Delivery format does not replace JSON Schema tool definitions');
   await service.submit({ id: 'browser-query', text: '浏览器接续' }); await service.close();
   assert.equal(calls[1].system, 'role\nCurrent Main');

@@ -1,5 +1,16 @@
 # Cloud 验证台账
 
+## SLACK-PROMPT-ORDER-01 · Slack 提示顺序与重复尾部规则（2026-10-08）
+
+- [x] 保留真实验收结果：Cloud 1.2.2 已能发送原生 clap 与文字；默认 TODO 的共同状态已只报一次，但仍复制 E2E / IF11 / SLACK-NL 等测试前缀，短名称效果未过。不能以已发布角色或表情通过代替该失败。
+- [x] 从 `cd522f881b798bb6aed3854a8a024452886313d0` 开发：仅 Slack 生成调用以 Main 数据→原角色→短运输格式拼接；尾部只保留纯文本、段落空行、短列表、禁 Markdown 标题 / 星号 / 表格和独立代码块，移除重复长度 / TODO / 泛化标识符规则。非 Slack 拼接、原角色字节、promptVersion、工具、权限、身份、分类及队列不变，没有硬截断或短名正则。
+- [x] 候选 Cloud `1.2.3`，仅根 package / lock 版本字段；固定 core `2.1.2`、UI 与 Slack 插件及全部依赖不变，不修改 shared 生成物或新增 core Release。当前设计与验收文档注明 PE 不保证模型合规。
+- [x] 开发后一次两个正式目标（Slack reply policy、按需 role references），真实 terminal exit 0，2/2 passed，0 failed / skipped / cancelled，485.3037 ms；日志 `temp/slack-prompt-order-executor-cd522f8-20261008.log`。校验 Slack 顺序与纯运输尾部、原 Schema 工具、非 Slack 拼接和跨客户端历史；未跑全量 / 旧八目标 / 原端口失败用例。
+- [x] 独立 Tester 核验同一冻结源码与两个目标；不代替本次准确 PR Required、合并与上线。
+  - 最终handoff3d4de8bb…/七文件hash测试期间前后相同，角色1df01bb4未变；HEADcd522f8+准确工作树修订，Node24唯一两个受影响正式目标chunk820f99 actualexit0，2/2、0fail/skip，457.5653ms。原日志 `temp/slack-prompt-order-independent-cd522f8-20261008.log` SHA256 `63ecb678c0a65e264b35b5610195b65e10d276e1567082cb3da6db1e8d4f405a`；同名`.md`保留全hash/静态范围/编号ORDER-01..02。运输常量235→80字符、非空Main整条净减153字符，完整事实/role/native Schema/身份分类与非Slack原样；无旧8/端口case/全量/gates/生产调用，不据Mock或PE顺序称真实短名称通过。
+- [ ] 本次准确 PR Required、合并与上线由 Coordinator 完成。
+- [ ] 默认 TODO 的真实短名称 / 共同状态只报一次及全部事项保留仍待新版本复验；不改原失败为通过，不把受控模型输出当成真实模型遵循证据。
+
 ## COORDINATOR-REPLY-FOLLOWUP-01 · 真实聊天回归返工（2026-10-08）
 
 - [x] 真实 Slack 用户消息确认：Cloud 1.2.1 / Slack 0.1.20 已上线、Required 均通过、保护配置未变；但默认 TODO 仍重复状态和测试前缀，要求表情+文字时只返回了表情，验收未全部通过。
