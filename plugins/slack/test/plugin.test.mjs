@@ -33,7 +33,7 @@ test('Coordinator prose is plain text while links code and identifiers remain re
   assert.equal(plainText('[不要打开](javascript:alert(1))'), '不要打开');
   assert.equal(plainText('<https://map.example.com/a|查看 Map>'), '查看 Map（https://map.example.com/a）');
   assert.equal(plainText('目录 foo_bar 和 2 * 3 保留'), '目录 foo_bar 和 2 * 3 保留');
-  assert.equal(plainText('[接口规范](docs/interface.md)'), '接口规范（docs/interface.md）');
+  assert.equal(plainText('[接口规范](scripts/shared/references/design/design-interface-v1.2.1.md)'), '接口规范（scripts/shared/references/design/design-interface-v1.2.1.md）');
   assert.equal(plainText('[日志](file:///tmp/run.log)'), '日志（file:///tmp/run.log）');
   assert.equal(plainText('[邮箱](mailto:test@example.com)'), '邮箱（mailto:test@example.com）');
   assert.equal(plainText('`&lt;div&gt; &amp;`'), '&lt;div&gt; &amp;');

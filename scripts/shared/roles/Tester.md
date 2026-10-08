@@ -50,4 +50,4 @@
 | 核对交接范围和原任务关系 | [agent-handoff.md](references/agent-handoff.md) |
 | 执行结果记录与结论回报 | [test-check.md](references/test-check.md) |
 
-产品契约以 [当前设计版本](references/design-current.md) 为准。执行中的测试记录不改写 Main。
+记忆存储与文件格式以 [当前记忆规范](references/design/design-memory-current-v1.0.1.md) 为准。执行中的测试记录不改写 Main。

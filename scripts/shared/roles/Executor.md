@@ -48,6 +48,6 @@
 | 接收任务、处理信号、交接、返工和收尾 | [agent-handoff.md](references/agent-handoff.md) |
 | 准备或修订 Plan | [plan-review.md](references/plan-review.md) |
 | 提交节点提案或记录事项 | [map-mount.md](references/map-mount.md) |
-| 执行计划、版本化写入和归档命令 | [workbench-interface.md](references/workbench-interface.md) |
+| 执行计划、版本化写入和归档命令 | [工作台接口](references/design/design-workbench-interface-v1.0.1.md) |
 
-产品契约以 [当前设计版本](references/design-current.md) 为准。
+记忆存储与文件格式以 [当前记忆规范](references/design/design-memory-current-v1.0.1.md) 为准。

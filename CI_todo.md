@@ -1,4 +1,12 @@
-# Cloud split acceptance
+# Cloud 验证台账
+
+## DOC-LAYOUT-01 · 共享中文设计与资料读取路径（2026-10-08）
+
+- [x] 从最新 Cloud main `f692b3f` 迁移文档；保留存储设计 fs-v2.2 的完成证明及设备持久授权规则，文件投影仍是 fs-v2.1。
+- [x] 共享设计集中到 `scripts/shared/references/design/`，core 导出后为 `references/design/`；英文 / 角色格式副本移除，角色职责合入中文 Bug / TODO。源码历史仍可从 Git 恢复。
+- [x] Coordinator 的 `memory-definition.md` 资料标识和 Schema 保持不变，只经白名单映射读取归档文件；不开放任意文件路径。
+- [ ] 用户要求本次不运行测试：现有用例的路径已适配，并保留迁移后的 HTTP 读取回归用例，但未执行模块、端到端、Slack、打包或部署验收。
+- [ ] 独立 Tester 须验证资料路径、越权拒绝、角色入口、core 包内容及新 Skill 固定依赖的联调；未验收前不发布共享包，也不宣称线上已更新。
 
 ## SLACK-QUESTION-RENDER-01 · One visible clarification (2026-10-08)
 

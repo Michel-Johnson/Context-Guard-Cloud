@@ -1,5 +1,7 @@
 # Idea.md 格式
 
+文档版本：v1.0.0。
+
 Idea 只由 Coordinator 读写。是否转成 Todo 由用户与 Coordinator 在对话中决定，不记录在 Idea.md。
 
 ## 格式
