@@ -203,9 +203,10 @@ test('Cloud project approval dispatches once as soon as the fresh Session is reg
 
 test('Coordinator guide references are callable and loaded only after an explicit tool call', async t => {
   const prompt = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
-  const linkedReferences = [...prompt.matchAll(/\]\(references\/([^)]*)\)/g)]
-    .map(match => match[1]).filter(file => file !== 'design/design-memory-current-v1.0.1.md')
-    .map(file => Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file));
+  const linkedReferences = [...new Set([...prompt.matchAll(/\]\(references\/([^)]*)\)/g)]
+    .map(match => match[1])
+    .map(file => Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file)))];
+  assert.ok(linkedReferences.every(Boolean), '角色提示里的每个资料链接都必须可调用，不能漏掉文件格式规范');
   assert.deepEqual([...linkedReferences].sort(), [...coordinatorReferences].sort());
   const referenceReads = [];
   const execute = createCoordinatorExecutor({ readReference: async name => {

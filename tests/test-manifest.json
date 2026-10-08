@@ -44,6 +44,7 @@
     }
   ],
   "productFiles": [
+    "tests/executor-context-api.test.mjs",
     "tests/attachments.test.mjs",
     "tests/authorization-boundary.test.mjs",
     "tests/browser-device-login-runner.mjs",
