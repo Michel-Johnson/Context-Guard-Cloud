@@ -15,6 +15,14 @@
 - [ ] Cursor Cloud 私有 API key、真实连接/通讯/小任务、准确修订完整 npm test、Review、Required 与交付验收待完成。
 - 最终只验收连接、通讯、完成任务；复杂恢复、丰富卡片和自动归档后续补。原历史失败及未完成项保留。
 
+## SLACK-CARD-PLAIN-FALLBACK-01 · 程序卡片备用正文（2026-10-09）
+
+- [x] 已确认实际关联卡把项目名包在星号中，mrkdwn block 的文本未经转换就以 mrkdwn:false 发作 fallback；这是程序格式错误，不用追加角色 PE。关联确认改 plain_text，项目名按真实字面保持。
+- [x] 卡片 fallback 根据 text object 类型转换：mrkdwn 沿既有 plainText，plain_text 原样、context 元素同理；空文本过滤，段落/分组/原生 blocks/操作 metadata/回执/失回与多部分恢复路径保持。不新增 Slack/GFM 通用 parser，不为未观察单波浪语法扩范围。
+- [x] 开发后一次正式受影响窄回归，实际 terminal `54b997` exit 0、8/8 passed、0 failed/skipped/cancelled、826.3503ms；日志 `temp/slack-card-plain-fallback-executor-8ce2f5b-20261009.log`。typed 单/多部分 post/update、literal 星号/标识/代码/链接、实际 connectProject→SlackIO 确认无程序星号、原请求不重派及旧段落/失回恢复已覆盖；未跑全量/真实 Slack。原未完成短名称语义验收不混为本轮通过，既有 plainText 并非完整 Slack mrkdwn parser。
+- [ ] 独立 Tester 同准确源码/测试 hash 验证，再 Required/正常合并/发布/生产真实显示验收；目前未上线，不清理或自动编辑既有错误 Slack 消息。本轮无产品 task/Main/审批绑定，不编造回执。
+- [x] 独立 Tester 核对同基线与八文件冻结 hash，唯一同 pattern 正式批次 actual exit 0、8/8 passed、0 failed/skipped/cancelled、754.7467ms；日志 `temp/slack-card-plain-fallback-independent-8ce2f5b-20261009.log` SHA256 `3ae6318fe4216b18db3cb238298a716b59d5e74efeec8468117a1613861c3e2b`。产品源/正式测试没有变更，无静态阻断；仍待 Required 与生产部署，受控 API 不是手机实际显示证据。
+
 ## COORDINATOR-SHORT-TEST-LABELS-02 · 固定核心消费（2026-10-09）
 
 - [x] 从公开固定 core2.1.4 制品安装并构建55个运行文件；Cloud1.3.2/UI1.1.6/Slack0.2.1，生成物未手改。原位短名称规则保留业务日期/版本及工具真值，不改Map标题或模型默认。
