@@ -1,4 +1,5 @@
 import { digest, threadKey } from './store.mjs';
+import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, escape } from './views.mjs';
@@ -330,8 +331,8 @@ export class SlackPlugin {
       await this.store.update(state => { for (const member of members) { state.inbox[member].status = 'done'; state.inbox[member].doneAt = Date.now(); } });
     } catch (error) {
       const classificationFailure = error.participationFailure === true;
-      const transient = classificationFailure ? participationTransient(error) :
-        ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError || error.modelSelectionUncertain === true;
+      const transient = error.historyTransient === true || (classificationFailure ? participationTransient(error) :
+        ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError || error.modelSelectionUncertain === true);
       const retryAfter = Number(error.retryAfter ?? error.data?.retry_after ?? 0);
       const validDelay = Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 86400;
       await this.store.update(state => {
@@ -394,7 +395,8 @@ export class SlackPlugin {
         await this.connectProject(id, body, userId, { requestId, projectId: action.selected_option?.value }, { dynamic: true }); continue;
       }
       let value; try { value = JSON.parse(action.value || '{}'); } catch { throw new Error('Invalid interaction'); }
-      if (/^model_select:\d{1,2}$/.test(action.action_id)) await this.selectModelMenu(id, body, userId, value);
+      if (action.action_id === 'model_open') await this.openModelMenu(id, body, userId, value);
+      else if (/^model_select:\d{1,2}$/.test(action.action_id)) await this.selectModelMenu(id, body, userId, value);
       else if (/^connect_project:\d{1,3}$/.test(action.action_id)) await this.connectProject(id, body, userId, value);
       else if (['open_item', 'open_item:todo', 'open_item:bug', 'start_chat'].includes(action.action_id)) await this.startChat(id, body, userId, value);
       else if (action.action_id === 'open_memory') await this.startChat(id, body, userId, { ...value, kind: 'memory' });
@@ -495,7 +497,37 @@ export class SlackPlugin {
       return this.refreshModelMenu(menu, userId, await this.gateway.command('models.state', { id: operationId(menu.id, 'refresh'), userId, projectId: menu.projectId }));
     }
     await this.store.update(state => { Object.assign(state.modelMenus[menu.id], result, { status: 'applied' }); });
-    await this.io.update(menu.channel, menu.ts, '原模型选择已确认（历史回执），不代表当前项目默认；请用 /cg model 查看当前默认文字模型。', modelChoiceBlocks(this.store.data.modelMenus[menu.id]));
+    await this.io.update(menu.channel, menu.ts, '原模型选择已确认（历史回执），不代表当前项目默认。可打开自己的模型菜单查看当前设置。', modelChoiceBlocks(this.store.data.modelMenus[menu.id]));
+  }
+  async openModelMenu(id, body, userId, value) {
+    const conflict = message => Object.assign(new Error(message), { code: 'CONFLICT' });
+    if (!value || Object.keys(value).some(key => key !== 'menuId') || !/^model-menu-[a-f0-9]{64}$/.test(value.menuId || '') ||
+        !/^[UW][A-Z0-9]{1,31}$/.test(userId || '')) throw conflict('模型菜单入口已失效');
+    const original = this.store.data.modelMenus?.[value.menuId];
+    if (!original || original.channel !== body.channel?.id || !original.ts || body.message?.ts !== original.ts) throw conflict('请在原模型卡打开菜单');
+    const thread = body.message?.thread_ts;
+    if (original.threadTs ? thread !== original.threadTs : thread && thread !== original.ts) throw conflict('模型菜单线程已改变');
+    const binding = original.key && this.store.data.threads[original.key];
+    if (original.key && (!binding || original.key !== threadKey(this.teamId, original.channel, original.threadTs) ||
+        binding.channel !== original.channel || binding.threadTs !== original.threadTs)) throw conflict('模型菜单线程关联已改变');
+    const projectId = binding ? binding.projectId : original.channel.startsWith('D') ? this.store.data.preferences[userId] : this.store.data.channels[original.channel];
+    if (projectId !== original.projectId) throw conflict('当前项目关联已改变');
+    // Opening is read-only. The original uncertain selection remains owned by
+    // its saved operation and Inbox recovery, never by a different clicker.
+    if (original.selection && original.status !== 'applied' && !original.error) throw Object.assign(new Error('请等待原模型选择结果核对'), { code: 'BUSY' });
+    const menuId = `model-menu-${digest([id, original.id, userId])}`;
+    let menu = this.store.data.modelMenus?.[menuId];
+    if (!menu) {
+      const catalog = await this.gateway.command('models.state', { id: operationId(id, 'open-models'), userId, projectId });
+      menu = await this.saveModelMenu(menuId, catalog, { userId, projectId, channel: original.channel,
+        threadTs: original.threadTs || original.ts, ...(original.key ? { key: original.key } : {}) });
+    }
+    if (menu.userId !== userId || menu.projectId !== projectId || menu.channel !== original.channel ||
+        menu.threadTs !== (original.threadTs || original.ts)) throw conflict('模型菜单所属项目已改变');
+    if (menu.ts) return;
+    const ts = await this.io.post({ id: operationId(menuId, 'card'), channel: menu.channel, threadTs: menu.threadTs,
+      text: '项目默认文字模型', blocks: modelChoiceBlocks(menu) });
+    await this.store.update(state => { state.modelMenus[menuId].ts = ts; });
   }
   async refreshModelMenu(menu, userId, catalog) {
     await this.store.update(state => { state.modelMenus[menu.id].error = 'VERSION_CONFLICT'; });
@@ -645,25 +677,67 @@ export class SlackPlugin {
     if (direct) await this.store.update(state => { state.directThreads ||= {}; state.directThreads[directKey] = key; });
     return [key, binding];
   }
-  async recentThreadContext(event) {
-    if (!event.thread_ts) return [];
-    const context = []; let cursor;
-    const seen = new Set();
-    for (let page = 0; page < 4; page++) {
-      const thread = await this.io.call('conversations.replies', { channel: event.channel, ts: event.thread_ts,
-        latest: event.ts, inclusive: false, limit: 100, ...(cursor ? { cursor } : {}) });
-      for (const message of thread.messages || []) {
-        if (!/^\d+\.\d+$/.test(message.ts || '') || Number(message.ts) >= Number(event.ts) || !message.text) continue;
-        context.push({ ts: message.ts, speaker: String(message.user || message.bot_id || 'unknown').slice(0, 80), text: message.text.slice(0, 800) });
+  historyFilter(event, projectId, key, deduplicate = false) {
+    const excluded = new Set(), foreignRoots = new Set();
+    for (const [threadId, thread] of Object.entries(this.store.data.threads)) if (thread.channel === event.channel) {
+      const foreign = projectId && thread.projectId !== projectId;
+      if (foreign) foreignRoots.add(thread.threadTs);
+      if (foreign || deduplicate && threadId === key) {
+        for (const item of Object.values(thread.mirrored || {})) excluded.add(item.ts);
+        if (thread.liveStream) excluded.add(thread.liveStream.ts);
       }
-      context.sort((a, b) => Number(a.ts) - Number(b.ts));
-      context.splice(0, Math.max(0, context.length - 6));
-      const next = thread.response_metadata?.next_cursor;
-      if (!thread.has_more && !next) return context.map(({ speaker, text }) => ({ speaker, text }));
-      if (!next || seen.has(next)) break;
-      seen.add(next); cursor = next;
     }
-    throw Object.assign(new Error('Recent thread context is unavailable within the bounded read; no relevance decision was made'), { code: 'RELEVANCE_CONTEXT_INCOMPLETE' });
+    for (const input of Object.values(this.store.data.reactionInputs || {})) if (input.channel === event.channel &&
+      (projectId && input.projectId !== projectId || deduplicate && input.key === key)) excluded.add(input.timestamp);
+    return message => !excluded.has(message.ts) && !foreignRoots.has(message.thread_ts || message.ts);
+  }
+  async slackHistorySnapshot(id, event, projectId, key) {
+    const scope = { channel: event.channel, threadTs: event.thread_ts || null, beforeTs: event.ts, projectId };
+    const saved = this.store.data.inbox[id]?.historySnapshot;
+    if (saved && !saved.error) {
+      if (digest(saved.scope) !== digest(scope)) throw Object.assign(new Error('Slack history scope changed'), { code: 'HISTORY_UNAVAILABLE' });
+      return saved;
+    }
+    let entries;
+    try { entries = await readSlackHistory(this.io, event, { accept: this.historyFilter(event, projectId, key) }); }
+    catch (error) {
+      await this.store.update(state => {
+        state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+        state.inbox[id].historyUnavailable = { scope, code: 'HISTORY_UNAVAILABLE' };
+      });
+      throw error;
+    }
+    const snapshot = { scope, entries };
+    await this.store.update(state => {
+      state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+      state.inbox[id].historySnapshot = snapshot;
+      delete state.inbox[id].historyUnavailable;
+    });
+    return this.store.data.inbox[id].historySnapshot;
+  }
+  async recentThreadContext(event, id = null, projectId = null, key = null) {
+    if (!event.thread_ts) return [];
+    try {
+      const entries = id && !this.store.data.threads[key]?.historyAccepted ? (await this.slackHistorySnapshot(id, event, projectId, key)).entries :
+        await readSlackHistory(this.io, event, { limit: 6, width: 800, accept: this.historyFilter(event, projectId, key) });
+      return entries.slice(-6).map(({ speaker, text }) => ({ speaker, text: text.slice(0, 800) }));
+    } catch (error) { throw Object.assign(new Error('Recent thread context is unavailable within the bounded read; no relevance decision was made'), {
+      code: 'RELEVANCE_CONTEXT_INCOMPLETE', ...(error.historyTransient ? { historyTransient: true } : {}),
+    }); }
+  }
+  async bindingHistory(id, event, key, binding) {
+    const saved = this.store.data.inbox[id]?.history;
+    if (saved !== undefined) return saved;
+    if (binding.historyAccepted) return undefined;
+    await this.store.update(state => {
+      const thread = state.threads[key];
+      if (thread.projectId !== binding.projectId || thread.channel !== event.channel) throw Object.assign(new Error('Slack history binding changed'), { code: 'HISTORY_UNAVAILABLE' });
+    });
+    const snapshot = await this.slackHistorySnapshot(id, event, binding.projectId, key);
+    const accept = this.historyFilter(event, binding.projectId, key, true);
+    const history = snapshot.entries.filter(item => accept({ ...item, thread_ts: snapshot.scope.threadTs })).map(item => ({ ...item, scope: snapshot.scope }));
+    await this.store.update(state => { state.inbox[id].history ||= history; });
+    return this.store.data.inbox[id].history;
   }
   async privateConversationContext(id, event, binding) {
     const state = await this.command('conversation.state', binding, event.user, operationId(id, 'participation-context'));
@@ -741,7 +815,7 @@ export class SlackPlugin {
           let request = this.store.data.inbox[id]?.relevanceRequest;
           if (!request) {
             const context = direct && !event.thread_ts && existing
-              ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event);
+              ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);
             const routing = await this.mentionRoute(id, { ...event, text });
             routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
             request = { id: operationId(id, 'relevance'), userId: event.user, projectId,
@@ -787,6 +861,7 @@ export class SlackPlugin {
       (batchInputs[index].attachments ||= []).push(reference);
     }
     if (!text.trim() && !attachments.length) return;
+    const history = synthetic ? undefined : await this.bindingHistory(id, event, key, binding);
     const requestId = operationId(id, 'batch-submit');
     let replyContext = this.store.data.inbox[id]?.replyContext;
     if (!replyContext) {
@@ -819,8 +894,11 @@ export class SlackPlugin {
       }
       item.nextPoll = 0;
     });
-    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer' });
-    await this.store.update(state => { state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0; });
+    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', ...(history?.length ? { history } : {}) });
+    await this.store.update(state => {
+      state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0;
+      if (history !== undefined) state.threads[key].historyAccepted = true;
+    });
     if (replyContext?.answerTo) await this.store.update(state => { if (state.threads[key].pendingQuestionId === replyContext.answerTo) delete state.threads[key].pendingQuestionId; });
     for (const item of events) if (!item.ts?.startsWith('command-')) this.readReaction(item);
   }
@@ -1033,8 +1111,39 @@ export class SlackPlugin {
       }
       const requestId = message.requestId || (message.role === 'assistant' ? currentRequest : null);
       const id = message.id || digest(message);
-      return { message, index, requestId, id, userId: requestId === currentRequest ? currentActor : null };
+      const actor = message.actor;
+      const assistantActor = message.role === 'assistant' && !message.partial && message.source === 'slack' &&
+        actor?.kind === 'human' && actor.integration === 'slack' && actor.teamId === this.teamId &&
+        /^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') && actor.sessionId === `slack:${this.teamId}:${actor.userId}` &&
+        !!message.requestId && binding.ownRequests?.includes(message.requestId) ? actor.userId : null;
+      return { message, index, requestId, id, userId: assistantActor || (requestId === currentRequest ? currentActor : null) };
     });
+    const streamIdFor = (turnId, revision) => `stream:${turnId}${Number.isSafeInteger(revision) ? `:${revision}` : ''}`;
+    const ownsStream = (id, turnId) => id === streamIdFor(turnId) ||
+      id.startsWith(`${streamIdFor(turnId)}:`) && /^\d+$/.test(id.slice(streamIdFor(turnId).length + 1));
+    const occupiedSlot = (thread, ts) => Object.entries(thread.mirrored).some(([id, entry]) => !id.startsWith('stream:') && entry.ts === ts);
+    // Older bindings retained only the latest pointer. Recover its real slot,
+    // while the persisted stream keys retain previews from earlier turns.
+    const retained = this.store.data.threads[key].liveStream;
+    if (retained?.turnId && !occupiedSlot(this.store.data.threads[key], retained.ts)) {
+      const slotId = Object.entries(this.store.data.threads[key].mirrored).find(([id, entry]) =>
+        ownsStream(id, retained.turnId) && entry.ts === retained.ts && !entry.consumedBy)?.[0] || streamIdFor(retained.turnId);
+      if (!this.store.data.threads[key].mirrored[slotId] || retained.slotId !== slotId && this.store.data.threads[key].mirrored[slotId].ts === retained.ts) {
+        await this.store.update(data => {
+          const thread = data.threads[key];
+          thread.mirrored[slotId] ||= { ts: retained.ts, turnId: retained.turnId, text: retained.text, interrupted: retained.interrupted };
+          thread.liveStream.slotId = slotId;
+        });
+      }
+    }
+    const streamFor = (turnId, partial = false, slotId = null) => {
+      if (!turnId) return null;
+      const thread = this.store.data.threads[key];
+      const slot = Object.entries(thread.mirrored).find(([id, entry]) => (!slotId || id === slotId) && ownsStream(id, turnId) && !entry.consumedBy &&
+        !occupiedSlot(thread, entry.ts) && !(partial && state.status === 'running' && state.activeTurnId === turnId &&
+          id === streamIdFor(turnId, state.consumedInputRevision)));
+      return slot ? { ...slot[1], slotId: slot[0], turnId } : null;
+    };
     const readyReactions = new Set();
     for (const { message, index, requestId, id, userId } of entries) {
       try { for (const id of await this.queueReactions(key, message, messages)) readyReactions.add(id); }
@@ -1044,7 +1153,7 @@ export class SlackPlugin {
       if (message.role === 'user' && (message.source === 'workflow' || String(message.text || '').trimStart().startsWith('[服务器工作流事件'))) continue;
       if (message.role === 'user' && this.store.data.threads[key].ownRequests.includes(message.requestId)) continue;
       if (!partial && state.status === 'running' && state.streamingText && index === lastAssistant && requestId === state.activeTurnId) continue;
-      const stream = this.store.data.threads[key].liveStream;
+      const stream = message.role === 'assistant' ? streamFor(requestId, partial) : null;
       const settled = !state.activeTurnId && ['waiting-for-user', 'idle'].includes(state.status) && !state.pendingInputCount;
       // A model step can save waiting-for-user before the service clears the
       // turn ID. Keep the existing partial message until that durable boundary
@@ -1076,26 +1185,43 @@ export class SlackPlugin {
       await this.store.update(data => {
         data.threads[key].mirrored[id] = { ts, hash: content };
         for (const menu of modelMenus) data.modelMenus[menu.id].ts = ts;
-        if (moveEarlier) data.threads[key].liveStream.ts = prior.ts;
-        else if (replaceStream || retainPartial) delete data.threads[key].liveStream;
+        if (moveEarlier) {
+          data.threads[key].mirrored[stream.slotId].ts = prior.ts;
+          if (data.threads[key].liveStream?.slotId === stream.slotId) data.threads[key].liveStream.ts = prior.ts;
+        } else if (replaceStream || retainPartial) {
+          data.threads[key].mirrored[stream.slotId].consumedBy = id;
+          if (data.threads[key].liveStream?.slotId === stream.slotId) delete data.threads[key].liveStream;
+        }
       });
     }
     this.drainReactions(readyReactions);
     if (state.streamingText && state.status === 'running') {
-      const streamId = `stream:${state.activeTurnId}${Number.isSafeInteger(state.consumedInputRevision) ? `:${state.consumedInputRevision}` : ''}`, prior = this.store.data.threads[key].mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
-      if (prior?.hash !== content) {
-        const text = `Coordinator：${state.streamingText}`;
-        const blocks = messageBlocks({ text: state.streamingText }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
-        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${streamId}`, 'stream'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
-        await this.store.update(data => { data.threads[key].mirrored[streamId] = { ts, hash: content }; data.threads[key].liveStream = { ts, turnId: state.activeTurnId, text: state.streamingText }; });
+      const streamId = streamIdFor(state.activeTurnId, state.consumedInputRevision), thread = this.store.data.threads[key],
+        prior = thread.mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
+      // A delayed stream never writes over a slot already assigned to a reply.
+      if (!prior?.consumedBy && (!prior || !occupiedSlot(thread, prior.ts))) {
+        let ts = prior?.ts;
+        if (prior?.hash !== content) {
+          const text = `Coordinator：${state.streamingText}`;
+          const blocks = messageBlocks({ text: state.streamingText }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
+          ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${streamId}`, 'stream'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
+        }
+        if (prior?.hash !== content || thread.liveStream?.slotId !== streamId) await this.store.update(data => {
+          data.threads[key].mirrored[streamId] = { ts, hash: content, turnId: state.activeTurnId, revision: state.consumedInputRevision, text: state.streamingText };
+          data.threads[key].liveStream = { ts, slotId: streamId, turnId: state.activeTurnId, text: state.streamingText };
+        });
       }
     }
     if (state.status === 'interrupted') {
-      const stream = this.store.data.threads[key].liveStream;
+      const turnId = state.activeTurnId || binding.lastStateRequestId;
+      const stream = streamFor(turnId, false, streamIdFor(turnId, state.consumedInputRevision)) || streamFor(turnId);
       if (stream && !stream.interrupted) {
-      const partial = stream.text || state.partialText || state.streamingText;
+        const partial = stream.text || state.partialText || state.streamingText;
         if (partial) await this.io.update(binding.channel, stream.ts, `Coordinator 已停止（部分回复，非最终答案）：\n${partial}`);
-        await this.store.update(data => { data.threads[key].liveStream.interrupted = true; });
+        await this.store.update(data => {
+          data.threads[key].mirrored[stream.slotId].interrupted = true;
+          if (data.threads[key].liveStream?.slotId === stream.slotId) data.threads[key].liveStream.interrupted = true;
+        });
       }
       const noticeId = `interrupted:${state.activeTurnId || binding.lastStateRequestId}`;
       if (!this.store.data.threads[key].mirrored[noticeId]) {

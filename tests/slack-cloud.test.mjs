@@ -66,7 +66,7 @@ test('Native Coordinator read_map projection produces no empty Slack reply befor
     'Cloud tool provenance remains complete');
 });
 
-async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects } = {}) {
+async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects, modelSelection = false, integrationActions } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-slack-cloud-'));
   let cloud;
   const held = new Set();
@@ -77,7 +77,8 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
   const visionProviderFile = path.join(directory, 'vision-provider.json');
   if (visionProvider) await fs.writeFile(visionProviderFile, JSON.stringify({ token: 'synthetic', baseUrl: 'https://fixture.invalid', ...visionProvider }));
   const projects = Object.fromEntries([projectId, otherProjectId].map(id => [id, { root: directory, ref: 'refs/heads/main',
-    coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true, ...(nodeIds ? { nodeIds } : {}) } }]));
+    coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true, ...(nodeIds ? { nodeIds } : {}),
+      ...(modelSelection ? { modelProviders: { original: { label: '原模型', providerFile }, target: { label: '目标模型', providerFile } }, defaultProviderId: 'original' } : {}) } }]));
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'fixture-memory-credential', projects };
   await fs.writeFile(path.join(directory, 'projects.json'), JSON.stringify({ v: 2, projects: [projectId, otherProjectId].map(id => ({ id, name: id, description: 'Isolated synthetic project' })) }));
   for (const id of Object.keys(projects)) {
@@ -95,7 +96,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       { repositoryId: '124', projectId: otherProjectId, slug: 'example/other' }] },
     ...(enabled ? { integrationConfig: { host: '127.0.0.1', port: 0, token: integrationCredential, teamId, projectIds: [projectId, otherProjectId],
       ...(mapProjects ? { mapProjects: { coordinatorProjectId: projectId, userIds: [userId] } } : {}),
-      ...(visionProvider ? { visionProviderFile } : {}) } } : {}),
+      ...(visionProvider ? { visionProviderFile } : {}), ...(integrationActions ? { actions: integrationActions } : {}) } } : {}),
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push({ system: request.system, messages: request.messages, tools: request.tools, maxTokens: request.maxTokens });
       if (request.tools.length === 0 && request.maxTokens === 256) {
@@ -114,6 +115,20 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'map-project-brief', name: 'prepare_task', input: {
           taskId: 'fixture-manual', text: '验证新增项目的任务', acceptance: '保留原始 Map 分支', nodeIds: ['N-new'], nodeId: 'N-new', mainVersion: version,
         } }] };
+      }
+      if (modelSelection && text === '切换到目标模型') {
+        const response = await fetch(cloud.integrationUrl + '/v1/command', { method: 'POST',
+          headers: { Authorization: `Bearer ${integrationCredential}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: 'read-model-catalog', teamId, userId, projectId, type: 'models.state', payload: {} }) });
+        const catalog = (await response.json()).data;
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'real-select', name: 'select_text_model', input: { providerId: 'target', baseVersion: catalog.version } }] };
+      }
+      if (modelSelection && Array.isArray(message?.content)) {
+        const receipt = message.content.find(block => block.type === 'tool_result');
+        if (receipt) {
+          const result = JSON.parse(receipt.content);
+          return { stop: 'end_turn', content: [{ type: 'text', text: result.kind === 'model-selected' ? `已切换到${result.label}，下一轮生效。` : '该项目不允许切换模型。' }] };
+        }
       }
       if (text === 'show-node-complete') return { stop: 'tool_use', content: [
         { type: 'text', text: 'This is the complete read-only answer.' },
@@ -295,7 +310,8 @@ test('隔离跨组件：网页新建项目→原 Slack 问题实时选项→同�
   const plugin = new SlackPlugin({ store, teamId, cloudOrigin: 'https://map.example.com', botUserId: 'UBOTTEST',
     gateway: new Gateway({ url: f.cloud.integrationUrl, token: integrationCredential, teamId }),
     io: { post: async input => { messages.push(input); return `${100 + messages.length}.001`; }, update: async (...input) => messages.push({ update: input }),
-      call: async method => method === 'conversations.info' ? { channel: { user: userId } } : {}, }, logger: { error(){}, warn(){} } });
+      call: async method => method === 'conversations.info' ? { channel: { user: userId } } :
+        ['conversations.history', 'conversations.replies'].includes(method) ? { messages: [] } : {}, }, logger: { error(){}, warn(){} } });
   t.after(() => plugin.stop());
   const event = { type: 'message', user: userId, channel: 'DPRIVATE', channel_type: 'im', ts: '100.000', text: '登录刷新 Bug，请分析。' };
   await plugin.chooseProject('original-question', event);
@@ -329,6 +345,25 @@ test('隔离跨组件：网页新建项目→原 Slack 问题实时选项→同�
   assert.match(replies[0].text, /Fixture response/);
   assert.equal(final.messages.filter(message => message.role === 'user' && message.text === event.text).length, 1);
   assert.equal(Object.keys(store.data.threads).length, 1);
+});
+
+test('Slack native selector uses the real server model action grant without a menu or route change mid-turn', async t => {
+  for (const allowed of [true, false]) {
+    const f = await fixture(t, { modelSelection: true, ...(allowed ? {} : { integrationActions: ['conversation.create', 'conversation.submit', 'conversation.state', 'models.state'] }) });
+    const chat = await f.newConversation(`native-select-chat-${allowed}`);
+    const response = await f.gateway('conversation.submit', { text: '切换到目标模型' }, { id: `native-select-turn-${allowed}`, conversationId: chat });
+    assert.equal(response.status, 200);
+    const completed = await f.wait(chat, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+    const settings = await f.gateway('models.state');
+    assert.equal(settings.body.data.selectedId, allowed ? 'target' : 'original');
+    assert.equal(completed.modelRoute.providerId, 'original');
+    assert.equal(completed.messages.flatMap(message => message.actions || []).length, 0);
+    assert.match(completed.messages.at(-1).text, allowed ? /已切换到目标模型/ : /不允许切换/);
+    await f.gateway('conversation.submit', { text: '下一轮' }, { id: `after-switch-${allowed}`, conversationId: chat });
+    const next = await f.wait(chat, state => state.status === 'waiting-for-user' && !state.activeTurnId && state.acceptedRequestIds.includes(`after-switch-${allowed}`));
+    assert.equal(next.modelRoute.providerId, allowed ? 'target' : 'original');
+    await f.cloud.close();
+  }
 });
 
 test('list_tasks uses the same exact node scope as reads, not inherited access to children', async t => {

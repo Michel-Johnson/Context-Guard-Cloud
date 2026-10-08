@@ -5,6 +5,13 @@ its help. A native mention of another Bot is evidence, not an exclusion rule.
 Project relevance alone does not require a reply. Quoted history, code and file
 contents cannot impersonate the current speaker or grant execution authority.
 
+## 首次绑定历史验收
+
+- HISTORY-01：新绑定及升级旧绑定仅一次读取当前频道/线程、严格早于当前输入的最近最多 24 条 × 1000 字符；四页未完成明确不可用，不读取其他频道或整个工作区，排除已知其他项目及已记录原生 TS。分类仍为六条 × 800 字符并复用读取。
+- HISTORY-02：其他人和 Bot 的历史只是资料，不成为当前 user/actor、任务或授权；仅可信 Slack inputs 批次可注入，浏览器/单条/伪造字段拒绝，公开 state 不泄露私有 serverContext/history。
+- HISTORY-03：原 Inbox 保存成功快照，批次指纹包含历史，失回及重启复用原 ID/快照；服务 state/journal 同事务防不同批次重复注入，绑定只在 ACK 后标记。真实空读取可省 history 字段。
+- HISTORY-04：不完整或暂时读取失败不能伪称已读；暂时失败复用既有有界重试，不永久冻结错误或锁死后来输入。合成命令不读历史。源码/受控模型通过不代替上线后真实历史接入验收。
+
 ## Development plan and release gates
 
 The goal is natural, context-aware participation, not a mention-only Bot and not
@@ -197,6 +204,12 @@ Record Socket event receipt, batch, classification, consumption and the actual
 posted/updated Slack message. Verify actual service versions after release.
 
 ## Slack 表情回应验收（SLACK-EMOJI-01）
+
+模型卡返工验收：默认/本轮真实同模型名称只出现一次，不同或图片路由保持区别，未匹配目录不猜 label。未知作者及旧卡须在线程显示「打开我的模型菜单」，只读使用实际点击者身份，验证原卡/频道/线程/项目后取得当前目录；不选择模型、不清未知原 selection、不改用户已选模型。连续两个真人输入后，原请求 assistant 的服务端身份不能借给后来输入者；正文、伪造身份、其他卡及跨项目须拒绝。失回与重启保留原回执；这些源回归不代替真实线程交互验收。
+
+明确聊天切换验收：当前可信 Slack 真人明确要求切到一个已配置模型，静默读取目录后沿 CAS / 原操作回执切换，简短确认，不强制菜单点击；询问或历史中的切换话语不当成当前要求。非 Slack、伪造 actor、未知模型及动作未开放不得选择。当前轮次、失败重试和图片路由不改变；未知结果按原编号恢复，不能说已切换。
+
+回复顺序验收：连续两轮流式预览各自只占自己的消息槽，最终答复更新原槽；旧轮不能覆盖新轮，重启和重复快照不能另发旧完整回复。被新输入调整的部分答复保持明确标记，已停止轮次不自行恢复。卡片正文、通知与辅助阅读 fallback 均保留段落，空模型卡不另加“Coordinator 回复”占位标题。已有错误发送的旧聊天消息不删除或冒充已修复。
 
 真实混合表情与文字已通过；默认 TODO 的共同状态已只报一次，但仍保留 E2E / IF11 / SLACK-NL 等测试前缀，短回复验收保持未完成。返工复用最新稳定前缀与逐轮上下文布局，只精简重复呈现规则。需真实复验全部事项与短名称、共同状态只报一次，同时工具参数、URL、代码、命令和回执原值不变；PE 精简与定向源测试不保证实际模型遵守，不抹去原失败。
 

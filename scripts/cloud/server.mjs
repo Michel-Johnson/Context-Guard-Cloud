@@ -26,7 +26,7 @@ import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
-import { startIntegrationGateway, validateIntegrationConfig, relevanceInput, relevanceOverview, classifyIntegrationMessage } from './integration-gateway.mjs';
+import { startIntegrationGateway, validateIntegrationConfig, validateIntegrationCommand, relevanceInput, relevanceOverview, classifyIntegrationMessage } from './integration-gateway.mjs';
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
 import { releaseIdentity } from './release.mjs';
@@ -786,6 +786,15 @@ export async function startCloudServer({
             return { ...catalog, ...(route ? { currentRoute: { kind: route.kind, model: route.model,
               ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
           },
+          selectModel: async (input, { operationId, actor }) => {
+            // Apply the same project/action grant as a native human menu click.
+            // Identity is supplied by coordinatorStep, not by tool arguments.
+            if (!integrations) protocolFail('FORBIDDEN', 'Slack model selection is not enabled');
+            const { command } = validateIntegrationCommand(integrations, { id: operationId, teamId: actor.teamId,
+              userId: actor.userId, projectId: project.id, type: 'models.select', payload: input });
+            await authorizeIntegrationProject(project.id, actor);
+            return (await modelSettingsFor(project)).selectForTurn({ id: operationId, ...command.payload });
+          },
           pendingBriefApproval: async () => (await store.projectTasks(principal)).some(task =>
             task.conversationId === conversationId && task.stage === 'brief'),
           pendingAcceptanceReview: async () => {
@@ -1139,6 +1148,10 @@ export async function startCloudServer({
     if (!project || !configuredMemory?.projects?.[id]) protocolFail('NOT_FOUND', 'Project is unavailable');
     return project;
   };
+  const authorizeIntegrationProject = async (id, actor) => {
+    if (mapProjects.allowed(actor)) { await mapProjects.get(id); return; }
+    if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+  };
   const requireManualConversation = async (project, id) => {
     if (typeof id !== 'string') protocolFail('INVALID_ARGUMENT', 'Select a linked conversation');
     const conversation = await conversationsFor(project).get(id);
@@ -1231,7 +1244,10 @@ export async function startCloudServer({
     }
     await requireManualConversation(project, conversationId);
     if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
-    if (type === 'conversation.submit') return submitCoordinator(project, conversationId, { ...payload, id: operationId }, { source: 'slack', actor });
+    if (type === 'conversation.submit') {
+      const { history, ...input } = payload;
+      return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...(history !== undefined ? { history } : {}) });
+    }
     if (type === 'conversation.interrupt') {
       if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');
       return (await coordinatorFor(project, conversationId)).interrupt({ ...payload, id: operationId }, { source: 'slack', actor });
@@ -2738,10 +2754,7 @@ export async function startCloudServer({
   server.headersTimeout = 15_000;
   integrationGateway = await startIntegrationGateway({ config: integrations,
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
-    authorizeProject: async (id, actor) => {
-      if (mapProjects.allowed(actor)) { await mapProjects.get(id); return; }
-      if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
-    },
+    authorizeProject: authorizeIntegrationProject,
     logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
     state: async scope => {
       const project = await integrationProject(scope.projectId);
