@@ -2,7 +2,7 @@ import { digest, threadKey } from './store.mjs';
 import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
-import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, escape } from './views.mjs';
+import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 // This narrow boundary repeats the Cloud enum deliberately; contract tests
@@ -634,7 +634,7 @@ export class SlackPlugin {
         }
       });
       await this.io.update(event.channel, entry.projectPromptTs, `已关联 ${selected.name || selected.id}，接下来继续处理刚才的问题。`,
-        [section(`已关联 *${escape(selected.name || selected.id)}*。刚才的问题已排入当前线程，回复会出现在这里。`)]);
+        [{ type: 'section', text: plain(`已关联 ${selected.name || selected.id}。刚才的问题已排入当前线程，回复会出现在这里。`, 2900) }]);
       await this.publishHome(userId, id);
     } finally {
       if (this.messageLanes.get(lane) === id) this.messageLanes.delete(lane);
