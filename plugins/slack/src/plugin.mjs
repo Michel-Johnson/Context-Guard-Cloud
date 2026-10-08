@@ -910,7 +910,7 @@ export class SlackPlugin {
       const node = nodes.find(node => node.id === watch.nodeId), item = node?.[watch.kind === 'bug' ? 'bugs' : 'todos']?.find(item => item.id === itemId);
       const status = item ? item.status || (watch.kind === 'bug' ? 'open' : 'pending') : 'removed';
       if (watch.status && watch.status !== status) await this.io.post({ id: operationId(`${key}:${itemId}:${project.version}:${status}`, 'item-status'), channel: thread.channel, threadTs: thread.threadTs,
-        text: `Main ${watch.kind.toUpperCase()} ${itemId}：${watch.status} → ${status}${item?.title ? `\n${item.title}` : ''}` });
+        text: `${item?.title || (watch.kind === 'bug' ? '已关联 Bug' : '已关联 TODO')}：${watch.status} → ${status}` });
       await this.store.update(data => { data.threads[key].watchedItems[itemId].status = status; });
     }
     await this.store.update(data => { data.threads[key].nextItemPoll = Date.now() + 30000; });
@@ -924,7 +924,9 @@ export class SlackPlugin {
       let url; try { url = new URL(link.url); } catch { continue; }
       if (url.origin !== this.cloudOrigin || url.pathname !== `/projects/${encodeURIComponent(projectId)}`) continue;
       const project = await this.readProject(projectId, event.user, id);
-      unfurls[link.url] = { blocks: [section(`*${escape(project.name || projectId)}*\n${nodesOf(project.map).length} 个 Map 节点 · Main ${escape(project.version)}`)] };
+      unfurls[link.url] = { blocks: [{ ...section(`*${escape(project.name || projectId)}*\n${nodesOf(project.map).length} 个 Map 节点 · Main`),
+        // Keep exact version provenance in non-visible block identity, not prose.
+        block_id: `map-preview:${digest([id, event.channel, event.message_ts, link.url, project.version])}` }] };
     }
     if (Object.keys(unfurls).length) await this.io.call('chat.unfurl', { channel: event.channel, ts: event.message_ts, unfurls });
   }

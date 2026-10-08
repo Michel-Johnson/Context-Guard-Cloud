@@ -175,6 +175,16 @@ test('Manual role is selected explicitly without changing legacy execution instr
     assert.throws(() => coordinatorRolePrompt(malformed, { manual: true }), { code: 'INVALID_COORDINATOR_PROFILE' });
   }
 });
+test('Both Coordinator profiles reserve internal identifiers for tools and explicit technical requests', async () => {
+  const document = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
+  for (const manual of [false, true]) {
+    const prompt = coordinatorRolePrompt(document, { manual });
+    for (const rule of ['普通回复不附节点 ID、TODO/Bug ID、Session ID、测试编号或版本哈希',
+      '用户明确索要编号或版本时再提供', '工具参数、链接、回执和执行提示保留真实标识']) assert.ok(prompt.includes(rule), rule);
+    assert.ok(prompt.includes('同名事项用模块或简短描述区分'));
+  }
+});
+
 test('Manual brief native tool identifies the stored title field without changing validation or automatic tools', () => {
   const before = structuredClone(coordinatorTools);
   const tools = filterManualTools(coordinatorTools);
