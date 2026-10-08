@@ -19,7 +19,8 @@ function freeze(value) {
 }
 export function coordinatorPrefix(system, context, tools) {
   const stable = context?.format === 2 ? context.staticText : context?.text || '';
-  const combined = system + DELIVERY_POLICY + stable;
+  const projectPolicy = '\n本轮提供 list_projects/switch_project 时，可按用户要求列出可访问项目，并在其明确要求切换后调用工具。对用户只显示项目名称，同名按简介澄清；不可凭历史绑定说无法切换。switch_project 是交接请求，只有 Slack 宿主持久保存后才算完成；调用后停止旧项目操作，不把旧记忆或历史复制到目标项目。';
+  const combined = system + DELIVERY_POLICY + projectPolicy + stable;
   const toolsJSON = JSON.stringify(tools);
   const systemHash = hash(combined), toolsHash = hash(toolsJSON);
   const prefixHash = hash(JSON.stringify([systemHash, toolsHash]));

@@ -786,6 +786,29 @@ export async function startCloudServer({
             return { ...catalog, ...(route ? { currentRoute: { kind: route.kind, model: route.model,
               ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
           },
+          listProjects: async ({ operationId, actor }) => {
+            if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');
+            validateIntegrationCommand(integrations, { id: `projects-${digest(operationId)}`, teamId: actor.teamId,
+              userId: actor.userId, type: 'project.list', payload: {} });
+            await authorizeIntegrationProject(project.id, actor);
+            const result = await integrationCommand({ type: 'project.list' }, { actor, operationId });
+            return { currentProjectId: project.id, projects: result.projects.map(({ id, name, description }) => ({ id, name, description })),
+              instruction: '只向用户显示名称；同名时用简介询问，不展示内部 ID。' };
+          },
+          switchProject: async ({ projectId: targetId }, { operationId, actor, requestId }) => {
+            if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');
+            validateIntegrationCommand(integrations, { id: `switch-${digest(operationId)}`, teamId: actor.teamId,
+              userId: actor.userId, projectId: targetId, type: 'conversation.create', payload: {} });
+            await authorizeIntegrationProject(project.id, actor); await authorizeIntegrationProject(targetId, actor);
+            const target = await integrationProject(targetId);
+            if (targetId === project.id) return { kind: 'project-current', name: target.name, message: '已经在这个项目，不更改对话。' };
+            const targetConversation = await conversationsFor(target).createChat(`switch-${digest(operationId)}`, { executionMode: 'manual' });
+            await coordinatorFor(target, targetConversation);
+            return { kind: 'project-switch', actionId: operationId, status: 'pending', requestId, actor,
+              sourceProjectId: project.id, sourceConversationId: conversationId,
+              projectId: target.id, name: target.name, conversationId: targetConversation,
+              ...(isMapProject(target) ? { mapNodeId: target.mapNodeId } : {}) };
+          },
           selectModel: async (input, { operationId, actor }) => {
             // Apply the same project/action grant as a native human menu click.
             // Identity is supplied by coordinatorStep, not by tool arguments.
@@ -1245,7 +1268,7 @@ export async function startCloudServer({
     await requireManualConversation(project, conversationId);
     if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
     if (type === 'conversation.submit') {
-      const { history, ...input } = payload;
+      const { history, slackChannelId: _deliveryChannel, ...input } = payload;
       return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...(history !== undefined ? { history } : {}) });
     }
     if (type === 'conversation.interrupt') {

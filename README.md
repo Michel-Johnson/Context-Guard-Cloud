@@ -1,6 +1,6 @@
 # Context Guard Cloud
 
-操作资料：[部署手册](references/cloud-deployment.md)、[Slack 接入](references/design/design-slack-integration-v1.2.0.md)、[附件设计](references/design/design-cloud-attachments-v1.0.0.md)、[Coordinator 压缩](references/design/design-coordinator-compaction-v1.0.0.md)。全部设计见 [设计目录](references/design/README.md)。
+操作资料：[部署手册](references/cloud-deployment.md)、[Slack 接入](references/design/design-slack-integration-v1.3.0.md)、[附件设计](references/design/design-cloud-attachments-v1.0.0.md)、[Coordinator 压缩](references/design/design-coordinator-compaction-v1.0.0.md)。全部设计见 [设计目录](references/design/README.md)。
 
 本仓库提供 Context Guard 的 Cloud 工作台、Coordinator 和集成。客户端与 Skill 由 [Context-Guard-Skill](https://github.com/Michel-Johnson/Context-Guard-Skill) 维护。
 

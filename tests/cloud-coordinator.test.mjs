@@ -257,7 +257,8 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(calls.length, 2);
   assert.ok(calls[0].system.startsWith(prompt));
   assert.ok(calls[0].system.endsWith(context.staticText || context.text));
-  assert.deepEqual(calls[0].tools, coordinatorTools);
+  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['list_projects', 'switch_project'].includes(tool.name)),
+    '网页来源不提供私聊专用项目工具，其余工具及按需资料入口保持原样');
   assert.match(calls[0].messages[0].content, /Read the memory writing rules\.$/);
   assert.match(calls[0].messages[0].content, /输出来源：human/);
   assert.deepEqual(referenceReads, ['memory-definition.md']);

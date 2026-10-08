@@ -88,7 +88,7 @@ Cloud 保存哈希，不保存密码。人登录后使用已有的 HttpOnly/Same
 
 模板使用 `ProtectSystem=strict`。省略记忆项目的 `remote` 字段，避免运行中的服务向只读源码或镜像执行拉取。不得为了绕过发布失败而授予源码写权限。
 
-Slack 的可选回环网关与独立凭据配置见 [Slack 接入设计](design/design-slack-integration-v1.2.0.md)。Slack SDK 依赖留在插件包，Cloud 不加载它们。
+Slack 的可选回环网关与独立凭据配置见 [Slack 接入设计](design/design-slack-integration-v1.3.0.md)。Slack SDK 依赖留在插件包，Cloud 不加载它们。
 
 ### Coordinator 模型选择
 

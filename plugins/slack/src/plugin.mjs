@@ -641,9 +641,88 @@ export class SlackPlugin {
       this.kick();
     }
   }
+  routedThreadKey(event) {
+    let key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
+    if (!event.channel?.startsWith('D')) return key;
+    const visited = new Set();
+    for (;;) {
+      if (visited.has(key)) throw Object.assign(new Error('项目切换路径出现循环'), { code: 'CONFLICT' });
+      visited.add(key);
+      const route = this.store.data.projectRoutes?.[digest([key, event.user])];
+      if (!route || Number(event.ts) <= Number(route.afterTs)) return key;
+      const target = this.store.data.threads[route.targetKey];
+      if (!target || target.channel !== event.channel || target.userId !== event.user) throw Object.assign(new Error('项目切换记录与私聊不一致'), { code: 'CONFLICT' });
+      key = route.targetKey;
+    }
+  }
+  async applyProjectSwitch(key, message, messages, snapshot) {
+    const action = message.actions?.find(action => action.kind === 'project-switch');
+    if (!action || message.role !== 'assistant' || message.partial || snapshot.activeTurnId || snapshot.pendingInputCount ||
+        !['waiting-for-user', 'idle'].includes(snapshot.status)) return null;
+    const binding = this.store.data.threads[key], actor = action.actor;
+    const input = this.store.data.reactionInputs?.[action.requestId], original = input && this.store.data.inbox[input.inboxId];
+    const event = original?.projectResume?.event || original?.envelope?.body?.event;
+    const source = messages.find(item => item.role === 'user' && item.requestId === action.requestId);
+    if (!binding?.channel.startsWith('D') || actor?.channelId !== binding.channel || actor.kind !== 'human' || actor.integration !== 'slack' ||
+        actor.teamId !== this.teamId || actor.sessionId !== `slack:${this.teamId}:${actor.userId}` ||
+        message.source !== 'slack' || message.requestId !== action.requestId || message.actor?.sessionId !== actor.sessionId ||
+        source?.source !== 'slack' || source.actor?.sessionId !== actor.sessionId || source.actor?.channelId !== binding.channel ||
+        action.sourceProjectId !== binding.projectId || action.sourceConversationId !== binding.conversationId ||
+        !input || input.key !== key || input.projectId !== binding.projectId || input.conversationId !== binding.conversationId ||
+        input.userId !== actor.userId || input.channel !== binding.channel || !binding.ownRequests?.includes(action.requestId) ||
+        !isMessage(event) || event.user !== actor.userId || event.channel !== binding.channel || event.ts !== input.timestamp ||
+        !/^\d+\.\d+$/.test(event.ts || '') || original.envelope?.body?.team_id !== this.teamId || reactionEventHash(event) !== input.eventHash ||
+        action.status !== 'pending' || !action.actionId || !action.projectId || !action.conversationId) {
+      return { status: 'rejected', error: 'UNVERIFIED_INPUT' };
+    }
+    const id = `project-switch-${digest([key, action.actionId])}`, fingerprint = digest(action);
+    let record = this.store.data.projectSwitches?.[id];
+    if (record && record.fingerprint !== fingerprint) throw Object.assign(new Error('项目切换回执内容改变'), { code: 'ID_REUSED' });
+    if (!record) {
+      await this.store.update(state => {
+        state.projectSwitches ||= {};
+        state.projectSwitches[id] ||= { id, fingerprint, status: 'pending', expectedPreference: state.preferences[actor.userId], action };
+      });
+      record = this.store.data.projectSwitches[id];
+    }
+    if (record.status !== 'pending') return record;
+    try {
+      if (this.store.data.preferences[actor.userId] !== record.expectedPreference || record.expectedPreference !== binding.projectId) {
+        throw Object.assign(new Error('私聊已选择另一个项目'), { code: 'CONFLICT' });
+      }
+      const target = (await this.loadProjects(actor.userId, id)).find(project => project.id === action.projectId);
+      if (!target) throw Object.assign(new Error('目标项目已不可用'), { code: 'NOT_FOUND' });
+      const info = await this.io.call('conversations.info', { channel: binding.channel });
+      if (info.channel?.user !== actor.userId) throw Object.assign(new Error('只能切换自己的私聊'), { code: 'FORBIDDEN' });
+      const targetBinding = { channel: binding.channel, userId: actor.userId, projectId: target.id, conversationId: action.conversationId };
+      await this.command('conversation.state', targetBinding, actor.userId, operationId(id, 'target-state'));
+      const root = await this.io.post({ id: operationId(id, 'root'), channel: binding.channel, text: `${target.name || '项目'} · 项目对话` });
+      const targetKey = threadKey(this.teamId, binding.channel, root);
+      await this.store.update(state => {
+        if (state.projectSwitches[id].status === 'applied') return;
+        if (state.preferences[actor.userId] !== record.expectedPreference) throw Object.assign(new Error('切换期间项目选择改变'), { code: 'CONFLICT' });
+        state.threads[targetKey] ||= { ...targetBinding, threadTs: root, mirrored: {}, cursor: null, ownRequests: [], at: Date.now(),
+          projectSwitch: id, ...(target.mapNodeId ? { mapNodeId: target.mapNodeId } : {}) };
+        state.projectRoutes ||= {};
+        state.projectRoutes[digest([key, actor.userId])] = { targetKey, afterTs: input.timestamp, actionId: action.actionId };
+        state.preferences[actor.userId] = target.id;
+        state.directThreads ||= {};
+        state.directThreads[digest([this.teamId, binding.channel, actor.userId, target.id])] = targetKey;
+        Object.assign(state.projectSwitches[id], { status: 'applied', name: target.name, targetKey, root });
+      });
+      return this.store.data.projectSwitches[id];
+    } catch (error) {
+      if (this.store.data.projectSwitches[id]?.status === 'applied') return this.store.data.projectSwitches[id];
+      if (['FORBIDDEN', 'NOT_FOUND', 'CONFLICT', 'UNAUTHORIZED'].includes(error.code)) {
+        await this.store.update(state => { Object.assign(state.projectSwitches[id], { status: 'rejected', error: error.code }); });
+        return this.store.data.projectSwitches[id];
+      }
+      throw error;
+    }
+  }
   async ensureBinding(id, event, expectedProjectId = null) {
     const rootTs = event.thread_ts || event.ts;
-    let key = threadKey(this.teamId, event.channel, rootTs), existing = this.store.data.threads[key];
+    let key = this.routedThreadKey(event), existing = this.store.data.threads[key];
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
     const projectId = direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel];
     const directKey = digest([this.teamId, event.channel, event.user, projectId]);
@@ -802,9 +881,20 @@ export class SlackPlugin {
     if (text.length > 8000 && !synthetic) throw Object.assign(new Error('每批消息正文最多 8000 字符'), { code: 'RELEVANCE_INPUT_LIMIT', silent: !direct && !explicit });
     const inputIds = events.map(item => events.length === 1 ? operationId(id, 'submit') : operationId(envelopeId('events_api', { team_id: this.teamId, event: item }), 'submit'));
     const batchInputs = events.map((item, index) => ({ id: inputIds[index], text: String(item.text || '') }));
+    if (direct && !synthetic) {
+      const currentKey = event.thread_ts ? this.routedThreadKey(event) :
+        this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])];
+      const observedSwitch = this.eventStreams.get(currentKey)?.latest?.messages?.some(message =>
+        message.actions?.some(action => action.kind === 'project-switch'));
+      const pendingSwitch = Object.values(this.store.data.projectSwitches || {}).some(record =>
+        record.status === 'pending' && record.action.sourceProjectId === this.store.data.threads[currentKey]?.projectId &&
+        record.action.sourceConversationId === this.store.data.threads[currentKey]?.conversationId);
+      if (observedSwitch || pendingSwitch) await this.mirror(currentKey);
+    }
     if (!synthetic) {
       const directKey = digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]]);
-      const existingKey = direct && !event.thread_ts ? this.store.data.directThreads?.[directKey] : threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
+      const originalKey = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
+      const existingKey = direct && !event.thread_ts ? this.store.data.directThreads?.[directKey] : this.routedThreadKey(event);
       const existing = this.store.data.threads[existingKey];
       const projectId = existing?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
       if (!projectId) { if (direct || explicit) await this.chooseProject(id, event); return; }
@@ -814,7 +904,7 @@ export class SlackPlugin {
         try {
           let request = this.store.data.inbox[id]?.relevanceRequest;
           if (!request) {
-            const context = direct && !event.thread_ts && existing
+            const context = direct && existing && (!event.thread_ts || existingKey !== originalKey)
               ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);
             const routing = await this.mentionRoute(id, { ...event, text });
             routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
@@ -861,7 +951,7 @@ export class SlackPlugin {
       (batchInputs[index].attachments ||= []).push(reference);
     }
     if (!text.trim() && !attachments.length) return;
-    const history = synthetic ? undefined : await this.bindingHistory(id, event, key, binding);
+    const history = synthetic || binding.projectSwitch ? undefined : await this.bindingHistory(id, event, key, binding);
     const requestId = operationId(id, 'batch-submit');
     let replyContext = this.store.data.inbox[id]?.replyContext;
     if (!replyContext) {
@@ -894,7 +984,7 @@ export class SlackPlugin {
       }
       item.nextPoll = 0;
     });
-    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', ...(history?.length ? { history } : {}) });
+    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', slackChannelId: event.channel, ...(history?.length ? { history } : {}) });
     await this.store.update(state => {
       state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0;
       if (history !== undefined) state.threads[key].historyAccepted = true;
@@ -1146,6 +1236,28 @@ export class SlackPlugin {
     };
     const readyReactions = new Set();
     for (const { message, index, requestId, id, userId } of entries) {
+      if (message.actions?.some(action => action.kind === 'project-switch')) {
+        const switched = await this.applyProjectSwitch(key, message, messages, state);
+        if (switched) {
+          if (switched.announced) continue;
+          const text = switched.status === 'applied' ? `已切换到 ${switched.name}。后续消息会使用该项目的独立上下文，原项目记录保留。` :
+            '项目没有切换：选择已改变、目标不可用或来源无法验证。请重新说要切换到哪个项目。';
+          let resultSlot = switched.resultSlot;
+          if (!resultSlot) {
+            const oldSlot = this.store.data.threads[key].liveStream;
+            resultSlot = oldSlot?.turnId === requestId ? { ts: oldSlot.ts } : { post: true };
+            if (switched.id) await this.store.update(data => { data.projectSwitches[switched.id].resultSlot = resultSlot; });
+          }
+          if (resultSlot.ts) {
+            await this.io.update(binding.channel, resultSlot.ts, text, messageBlocks({ text }, key));
+          } else await this.io.post({ id: operationId(`${key}:${id}`, 'switch-result'), channel: binding.channel, threadTs: binding.threadTs, text, blocks: messageBlocks({ text }, key) });
+          if (switched.id) await this.store.update(data => {
+            data.projectSwitches[switched.id].announced = true;
+            if (data.threads[key].liveStream?.ts === resultSlot.ts) delete data.threads[key].liveStream;
+          });
+        }
+        continue;
+      }
       try { for (const id of await this.queueReactions(key, message, messages)) readyReactions.add(id); }
       catch (error) { this.logger.warn('Slack reaction intent retained in Cloud', { code: error.code || 'REACTION_JOURNAL_ERROR' }); }
       if (!hasSlackContent(message)) continue;
