@@ -1,5 +1,31 @@
 # Cloud split acceptance
 
+## SLACK-QUESTION-RENDER-01 · One visible clarification (2026-10-08)
+
+- [x] Coordinator: real-human1.1.9 acceptance found the same clarification twice
+  in Slack. Backend final-text length alone omitted structured question content
+  and could not prove readable single-question delivery. Original failure evidence
+  is preserved; suggestions are linked to the authorized test project's Main,
+  not discarded as an assumed cross-project hallucination.
+- [x] Executor: use the existing questionOnly projection with strict joined-text
+  equality, preserving per-question ordering, answered history and open options.
+  All-answered history remains visible. Native single-question prose only avoids
+  an extra identical whole visible question; no substring or semantic dedup.
+  Different text, partial prefixes, attachments, node links, approvals and pending
+  question identity remain intact. One affected run12/12 passed, actualexit0.
+  ViewsSHA256:726d6e3943934a32697e30d03bfd9780d3ed7f004a497c51753b18763fe9c02a.
+  TestsSHA256:fa949b2d268613309943e2cfa7949e11aa8b04c4e08e22bd756798d92a83f19a.
+- [x] Independent Tester: verify actual publicMessages projection into Slack
+  blocks, mixed/all-answered questions, preserved options/links/receipts and
+  stream-to-final/pending identity across restart on the exact source hashes.
+  One independent three-target run3/3 passed, actualexit0; source hashes above
+  unchanged. Attachment/navigation/approval compatibility statically reviewed;
+  no claim that the independent run repeated all twelve Executor targets.
+- [ ] Delivery: normal Required/Main CI, actual Cloud/Slack update and a new
+  authenticated-human structured clarification visible once in native Slack UI.
+  Keep original failed receipt/screenshot; no replay rewritten as a success.
+  Stop/resume action authorization and native phone remain separate gates.
+
 ## BACKUP-PRODUCER-FORMAT-01 · Safe release backup discovery (2026-10-08)
 
 - [x] Coordinator: approved Main1.1.8 deployment failed during backup before

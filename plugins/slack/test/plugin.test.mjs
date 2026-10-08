@@ -11,7 +11,7 @@ import { homeView, formValues, messageBlocks, approvalBlocks } from '../src/view
 import { plainText, plainChunks } from '../src/plain-text.mjs';
 import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
 import { startIntegrationGateway } from '../../../scripts/cloud/integration-gateway.mjs';
-import { CoordinatorService } from '../../../scripts/cloud/coordinator-service.mjs';
+import { CoordinatorService, publicMessages } from '../../../scripts/cloud/coordinator-service.mjs';
 import { IntegrationAttachmentStore } from '../../../scripts/cloud/integration-attachments.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
@@ -140,6 +140,90 @@ async function fixture(t) {
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
 function formBody(draftId, values) { return { type: 'view_submission', user: { id: user }, view: { private_metadata: draftId, state: { values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value: { value } }])) } } }; }
+
+function nativeQuestionProjection(questions, { text = '', answered = [], attachments = [], actions = [] } = {}) {
+  const tools = questions.map((question, index) => ({ type: 'tool_use', id: `ask-${index}`, name: 'ask_user', input: question }));
+  const state = { messages: [
+    { role: 'assistant', requestId: 'question-turn', content: [...(text ? [{ type: 'text', text }] : []), ...tools], attachments, actions },
+    { role: 'user', content: tools.map(tool => ({ type: 'tool_result', tool_use_id: tool.id, content: '{"nodes":[]}' })) },
+  ], answers: {} };
+  const initial = publicMessages(state).find(message => message.role === 'assistant');
+  for (const index of answered) state.answers[initial.questions[index].id] = { text: `answer-${index}`, requestId: `answer-request-${index}` };
+  return publicMessages(state).find(message => message.role === 'assistant');
+}
+const blockText = blocks => blocks.map(block => block.text?.text || '').join('\n\n');
+const occurrences = (text, value) => text.split(value).length - 1;
+
+test('Slack question-only render uses the real public ask_user projection without duplicated clarification', () => {
+  const question = '下一步先验收哪个模块？';
+  const message = nativeQuestionProjection([{ question, options: ['阅读模块', '编辑模块'] }]);
+  assert.equal(message.questionOnly, true); assert.equal(message.text, question);
+  const original = structuredClone(message), blocks = messageBlocks(message, 'thread');
+  assert.equal(occurrences(blockText(blocks), question), 1);
+  assert.match(blockText(blocks), /阅读模块/); assert.match(blockText(blocks), /编辑模块/);
+  assert.match(blockText(blocks), /直接在这个线程回复/);
+  assert.deepEqual(message, original, 'Rendering cannot alter the question ID, options or pending answer');
+});
+
+test('Slack question render preserves real multiple mixed and all-answered public histories with only open controls', () => {
+  const questions = [{ question: '先验收哪个模块？', options: ['首页', '文章页'] }, { question: '用哪个设备？', options: ['手机', '桌面'] }];
+  for (const answered of [[], [0], [0, 1]]) {
+    const message = nativeQuestionProjection(questions, { answered }); assert.equal(message.questionOnly, true);
+    const blocks = messageBlocks(message, 'thread'), text = blockText(blocks);
+    for (const question of questions) assert.equal(occurrences(text, question.question), 1);
+    assert.ok(text.indexOf(questions[0].question) < text.indexOf(questions[1].question));
+    assert.equal(occurrences(text, '直接在这个线程回复'), questions.length - answered.length);
+    assert.equal(text.includes('可参考：'), answered.length < questions.length);
+    if (answered.length === 2) assert.equal(text, plainText(message.text), 'All answered history keeps the original joined body rather than empty blocks');
+    if (!answered.length) assert.ok(text.indexOf('文章页') < text.indexOf(questions[1].question), 'Options stay attached to their question');
+  }
+});
+
+test('Slack question render uses only strict whole-text equality and retains actual different prose and partial prefixes', () => {
+  const question = '要先验收手机吗？';
+  const same = nativeQuestionProjection([{ question, options: ['是', '否'] }], { text: question });
+  assert.equal(same.questionOnly, undefined); assert.equal(occurrences(blockText(messageBlocks(same, 'thread')), question), 1);
+  const distinct = nativeQuestionProjection([{ question }], { text: `背景里引用了“${question}”，当前范围尚未确定。` });
+  const distinctText = blockText(messageBlocks(distinct, 'thread'));
+  assert.ok(distinctText.includes(distinct.text)); assert.equal(occurrences(distinctText, question), 2, 'A substring or quote cannot suppress the actual question');
+  const projected = nativeQuestionProjection([{ question }]);
+  const partial = { ...projected, text: `部分回复（非最终答案）：\n${projected.text}`, partial: true };
+  const text = blockText(messageBlocks(partial, 'thread'));
+  assert.ok(text.includes(plainText(partial.text)), 'A prefixed stream is not the exact question-only projection');
+  assert.equal(occurrences(text, question), 2, 'Retain genuine prefixed contents rather than applying fuzzy sentence deduplication');
+});
+
+test('Slack question render preserves attachment node links and approval controls without altering input metadata', () => {
+  const context = { cloudOrigin: 'https://map.example.com', projectId: 'lab' };
+  const message = nativeQuestionProjection([{ question: '选哪个模块？', options: ['A', 'B'] }], {
+    attachments: [{ id: 'attachment-1', filename: 'evidence.txt' }], actions: [{ kind: 'node-navigation', node: { id: 'N1', title: '模块' } }],
+  });
+  const original = structuredClone(message), blocks = messageBlocks(message, 'thread', context);
+  assert.equal(occurrences(blockText(blocks), message.text), 1);
+  assert.ok(blocks.some(block => block.type === 'context' && block.elements[0].text.includes('evidence.txt')));
+  assert.equal(blocks.find(block => block.type === 'actions').elements[0].url, 'https://map.example.com/projects/lab?relation=N1');
+  assert.deepEqual(message, original);
+  const approval = approvalBlocks({ id: 'p1', version: 'v1', text: '已对齐需求', acceptance: '可验收' }, 'thread');
+  assert.deepEqual(approval.find(block => block.type === 'actions').elements.map(element => element.action_id), ['approve_brief', 'reject_brief']);
+});
+
+test('Slack question render finalizes the real public projection in the retained stream and preserves pending ID across restart', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001'), question = '下一步验收哪个模块？';
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'question-render', userId: user, ownRequests: ['question-turn'] });
+  f.gateway.command = async () => ({ status: 'running', activeTurnId: 'question-turn', streamingText: '先确认验收范围。',
+    messages: [{ role: 'user', requestId: 'question-turn', text: '请先澄清' }] });
+  await f.plugin.mirror(key);
+  const streamTs = f.sent[0].channel && f.store.data.threads[key].liveStream.ts;
+  const message = nativeQuestionProjection([{ question, options: ['首页', '文章页'] }]);
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: ['question-turn'], messages: [message] });
+  await f.plugin.mirror(key);
+  const update = f.sent.find(item => item.update).update;
+  assert.equal(update[1], streamTs); assert.equal(occurrences(blockText(update[3]), question), 1);
+  assert.equal(f.store.data.threads[key].pendingQuestionId, message.questions[0].id);
+  f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+  assert.equal(f.sent.length, 2, 'Restart does not duplicate the finalized clarification');
+  assert.equal(f.plugin.store.data.threads[key].pendingQuestionId, message.questions[0].id);
+});
 
 test('durable collection merges other-bot request and unmentioned correction once across restart', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
