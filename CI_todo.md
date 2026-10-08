@@ -1358,3 +1358,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   and real isolated local-to-Cloud Session sync. Initial browser attempts found
   and fixed mobile left-edge clipping; two later fixture races were corrected by
   waiting for model load and desktop layout completion, without relaxing bounds.
+
+## MIGRATE-DRAIN-01 · Coordinator 自有后台任务退出（2026-10-08）
+
+- [x] 静态核对最新 main `fdfd1be`：普通连续对话已使用新版提交事务与等待逻辑，不迁入旧 submit 实现。`close()` 仍只等待首次 running/compacting，而 finally 可继续安排自有任务；仅迁移等待退出循环。
+- [x] 保留 stop 标记及正常错误处理，不重启已停止轮次、不恢复自动派发、不授予新重试身份。服务兼容修复版本为 1.1.12。
+- [x] 迁移确定性第二运行器屏障回归：close 在第二任务结束前不得返回，原身份恢复不重复已确认工具；原始连续对话、批量输入、停止和压缩用例保持。
+- [ ] 未额外运行本地功能测试；准确修订的功能、最低运行时、浏览器、Slack、包内容与 Required 等待 GitHub CI。旧独立测试证据不计作新版通过，静态判断不称运行复现。
+- [ ] 前两项按顺序合入并同步最新 main 后，才合并本项。真实模型和宿主执行未复验，不部署生产。

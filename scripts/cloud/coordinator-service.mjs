@@ -1073,8 +1073,12 @@ export class CoordinatorService {
   }
   async close({ stop = false } = {}) {
     if (stop) this.stopping = true;
-    await this.running?.catch(() => {});
-    await this.compacting?.catch(() => {});
+    // A runner's finally can schedule another owned run or compaction.
+    // Drain those transitions before callers resume or retire this service.
+    while (this.running || this.compacting) {
+      await this.running?.catch(() => {});
+      await this.compacting?.catch(() => {});
+    }
   }
 }
 
