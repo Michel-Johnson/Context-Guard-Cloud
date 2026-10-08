@@ -1,7 +1,7 @@
 import { copy, diffTrees, entries, same, validate } from '../scripts/shared/map-model.mjs';
 export const ALL_SESSIONS = '__all__';
 export const workbenchTimeoutMs = method => ['GET', 'HEAD'].includes(String(method).toUpperCase()) ? 30000 : 10000;
-const labels = { loading: '连接中', readonly: '只读预览 · 请启动本地 Node 工作台', draft: '有未保存草稿', saving: '保存中', persisted: '已落盘 · 等待页面核对', synced: '已同步', conflict: '冲突 · 草稿已保留', offline: '连接中断 · 草稿已保留', error: '保存失败 · 草稿已保留' };
+const labels = { loading: '连接中', readonly: '只读预览 · 请启动本地 Node 工作台', draft: '有未保存草稿', saving: '保存中', busy: '服务暂忙 · 草稿已保留，等待自动重试', persisted: '已落盘 · 等待页面核对', synced: '已同步', conflict: '冲突 · 草稿已保留', offline: '连接中断 · 草稿已保留', error: '保存失败 · 草稿已保留' };
 function stored(key) { try { const raw = localStorage.getItem(key); if (!raw) return null; try { return JSON.parse(raw); } catch { return { invalidJSON: true, raw }; } } catch { return null; } }
 function diagnostic(error, fallback = '服务暂不可用') {
   const message = String(error?.message || fallback).replace(/\s+/g, ' ').trim();
@@ -177,7 +177,9 @@ export class WorkbenchSync {
         }
         const { message: _message, ...details } = result.error || {};
         const e = new Error(diagnostic(result.error, '请求失败'));
-        Object.assign(e, details, { serverResponse: true }); throw e;
+        Object.assign(e, details, { serverResponse: true, retryableBusyCommit:
+          route === '/api/commit' && method === 'POST' && !!body?.operationId &&
+          result.error?.code === 'STATE_BUSY' && result.error.message === 'Shared state is busy; preserve lock and retry' }); throw e;
       }
       return result;
     }
@@ -339,7 +341,7 @@ export class WorkbenchSync {
     this.revision++;
     if (!this.dirty()) return;
     this.saveDraft(); this.presence();
-    if (['conflict', 'offline', 'error'].includes(this.status)) return;
+    if (['conflict', 'offline', 'error', 'busy'].includes(this.status)) return;
     this.setStatus(this.inflight ? 'saving' : 'draft');
     clearTimeout(this.timer); this.timer = setTimeout(() => this.flush(), 100);
   }
@@ -354,7 +356,7 @@ export class WorkbenchSync {
     // An input event must synchronously invalidate an older "synced" indicator.
     // Keep it invalidated while the DOM change is being folded into operations,
     // including the short hand-off where the input draft becomes null.
-    if ((input || hadDraft) && !['conflict', 'offline', 'error'].includes(this.status)) this.setStatus('draft');
+    if ((input || hadDraft) && !['conflict', 'offline', 'error', 'busy'].includes(this.status)) this.setStatus('draft');
     this.presence();
   }
   async start() {
@@ -455,6 +457,7 @@ export class WorkbenchSync {
         const head = await this.call('/api/presence', { clientId: this.id, version: this.version, dirty: this.dirty() });
         if (view !== this.viewId || this.disposed) return;
         if (this.pendingSession) await this.refreshAccess();
+        else if (await this.retryBusyCommit()) { /* Exact pending commit takes precedence over a newer head notice. */ }
         else if (this.pendingRequest && this.status === 'offline') await this.retry();
         else if (head.version !== this.version) await this.receive(head);
         else if (this.status === 'offline') await this.retry();
@@ -521,7 +524,7 @@ export class WorkbenchSync {
   }
   async flush() {
     clearTimeout(this.timer);
-    if (!this.ready || this.serverRecovery || this.composing || ['conflict', 'offline', 'error'].includes(this.status)) return;
+    if (!this.ready || this.serverRecovery || this.composing || ['conflict', 'offline', 'error', 'busy'].includes(this.status)) return;
     if (this.inflight) { await this.inflight; if (!this.inflight && !['conflict', 'offline', 'error'].includes(this.status) && this.operations().length) return this.flush(); return; }
     const operations = this.operations();
     // A preserved request is authoritative even when the current tree no
@@ -537,17 +540,18 @@ export class WorkbenchSync {
         const result = await this.call('/api/commit', request);
         if (!result.committed) throw new Error('操作未提交，请保留草稿并读取磁盘');
         this.version = result.version; this.baseTree = sentTree; this.revision++;
-        this.doc = { ...this.doc, root: copy(sentTree) }; this.pendingRequest = null;
+        this.doc = { ...this.doc, root: copy(sentTree) }; this.pendingRequest = null; this.busyCommit = null;
         this.setStatus('persisted');
       } catch (e) {
         this.saveDraft();
+        if (this.deferBusyCommit(e, request)) return;
         const uncertain = ['TimeoutError', 'AbortError'].includes(e.name);
         this.setStatus(e.code === 'VERSION_CONFLICT' ? 'conflict' : e.serverResponse ? 'error' : 'offline',
           uncertain ? '请求结果待确认；草稿与原操作编号已保留，重试会核对同一请求' : e.message);
       }
     })();
     await this.inflight; this.inflight = null;
-    if (['conflict', 'offline', 'error'].includes(this.status)) return;
+    if (['conflict', 'offline', 'error', 'busy'].includes(this.status)) return;
     if (this.operations().length) { this.saveDraft(); return this.flush(); }
     if (this.deferredState) { const deferred = this.deferredState; this.deferredState = null; await this.receive(deferred); }
     const acknowledgement = await this.presence();
@@ -560,6 +564,23 @@ export class WorkbenchSync {
     if (this.retrying) return this.retrying;
     this.retrying = this.retryNow();
     try { return await this.retrying; } finally { this.retrying = null; }
+  }
+  deferBusyCommit(error, request) {
+    if (!error.retryableBusyCommit || !request || request !== this.pendingRequest) return false;
+    if (this.busyCommit?.request !== request || this.busyCommit?.viewId !== this.viewId)
+      this.busyCommit = { request, viewId: this.viewId, attempts: 0 };
+    this.setStatus(this.busyCommit.attempts < 2 ? 'busy' : 'error', this.busyCommit.attempts < 2
+      ? '草稿已保留，将自动核对原保存请求' : '服务仍忙，草稿已保留；请稍后点击重试');
+    return true;
+  }
+  async retryBusyCommit() {
+    const busy = this.busyCommit;
+    if (this.status !== 'busy' || !busy || busy.request !== this.pendingRequest || busy.viewId !== this.viewId ||
+      busy.attempts >= 2 || this.disposed || this.switchingSession || this.sessionUnavailable || this.serverRecovery || this.composing || this.retrying) return false;
+    busy.attempts++;
+    // Existing heartbeat bounds retries; no separate timer or approval replay.
+    await this.retry();
+    return true;
   }
   async retryNow() {
     if (this.inflight) await this.inflight;
@@ -576,7 +597,7 @@ export class WorkbenchSync {
         // The request may predate later local typing. Never mark that later draft saved.
         const { applyOperations } = await import('../scripts/shared/map-model.mjs');
         this.baseTree = applyOperations({ root: this.baseTree }, this.pendingRequest.operations, { kind: 'human', sessionId: 'workbench' }).doc.root;
-        this.pendingRequest = null; this.revision++;
+        this.pendingRequest = null; this.busyCommit = null; this.revision++;
         if (current.version !== result.version) { this.setStatus('conflict'); return; }
       } else {
         const current = await this.call('/api/state');
@@ -585,8 +606,20 @@ export class WorkbenchSync {
         if (current.version !== this.version && this.dirty()) { this.setStatus('conflict'); return; }
         if (current.version !== this.version) { await this.receive(current); return; }
       }
-      this.setStatus('draft'); await this.flush(); if (!this.dirty()) this.setStatus('synced');
+      this.setStatus('draft'); await this.flush();
+      if (!this.dirty()) {
+        const confirmed = { viewId: this.viewId, captureKey: this.captureKey, version: this.version, revision: this.revision };
+        const acknowledgement = await this.presence();
+        if (this.disposed || confirmed.viewId !== this.viewId || confirmed.captureKey !== this.captureKey ||
+          confirmed.version !== this.version || ['conflict', 'offline', 'error', 'busy'].includes(this.status)) return;
+        if (acknowledgement?.error || acknowledgement?.recovery) { this.setStatus('error', acknowledgement.error?.message || '服务需要恢复'); return; }
+        if (acknowledgement?.synchronized && confirmed.revision === this.revision && !this.dirty()) {
+          localStorage.removeItem(confirmed.captureKey); this.setStatus('synced');
+        } else { this.saveDraft(); this.setStatus('draft'); }
+      }
     } catch (e) {
+      this.saveDraft();
+      if (this.deferBusyCommit(e, this.pendingRequest)) return;
       const uncertain = ['TimeoutError', 'AbortError'].includes(e.name);
       if (uncertain) this.saveDraft();
       this.setStatus(e.code === 'VERSION_CONFLICT' ? 'conflict' : uncertain ? 'offline' : 'error',
