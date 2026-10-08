@@ -1,5 +1,15 @@
 # Cloud 验证台账
 
+## COORDINATOR-REFINEMENT-01 · 固定短回复核心与表情上线（2026-10-08）
+
+- [x] 保留最新 Main 的只读上下文适配，同步本轮参与故障诊断和十种表情；Cloud 1.2.1 / Slack 0.1.20 固定消费已发布 Skill core 2.1.1，UI 1.1.6 与模型、权限不变。短回复只改唯一 Skill 根角色，不编辑消费生成物。
+- [x] Skill PR #460 Required 与合并 Main CI 均通过；固定 core 公开制品 SHA-256 `57775bd3f89e465672523674c9de502f54601203387faf69e685bdce7d4b5a72`。锁文件由公开 URL 生成，构建 54 个消费文件；两种 profile 的必要事实、详细例外、真实技术值和原审核/结束门禁保留。
+- [x] 开发后一次隔离定向：真实 manual HTTP 入口、两个角色、十种表情及原生表情+分段文字，5/5 通过，实际 exit 0；未重新运行本地全量。日志 `temp/coordinator-refinement-executor-6b25770-20261008.log`。此前诊断/表情证据保留原修订，不冒充最新整体测试。
+- [x] 独立 Tester 验证最终准确源码与固定包消费；本仓 PR / Main Required 仍待完成。
+  - HEAD6b25770+冻结版本/锁/role及4正式测试hash前后相同；Node24唯一批准5目标（两profile/真实manual HTTP/native Schema及restart/Cloud十enum/插件clap+分段文字）chunk716547 actualexit0，5/5、0fail/skip，1092.8072ms。日志 `temp/coordinator-refinement-independent-6b25770-20261008.log` SHA256 `6109cc59e54cc7c377eb94f803bb845a0b1083e3d8fbd6a9e52c789358085097`。独立只读固定URL/SRI/coretar及54生成文件实际包字节核验chunk6ca417 actualexit0，role8916bytes与Skill canonical一致；消费日志SHA `66e4577d26815f4d7bc1fcadf809325ead5fbb8dc9aaa3e5bc2060b4467a943b`。完整hash/编号REF-01..05/限制见同名`.md`。诊断model/gateway未变仅静态引用旧冻结结果，不重跑31/422/全量/gates；server上游适配不冒称全文件未变。Required/生产/真实模型效果仍另验。
+- [ ] Cloud / Slack 生产部署、准确运行版本及真实聊天效果待完成；不清空旧故障或修改地图、模型与动作授权。
+
+
 ## SLACK-EMOJI-EXPAND-01 · 十种表情与自然混合回应（2026-10-08）
 
 - [x] Coordinator：人明确要求更多表情、更经常自然互动，并允许表情+文字；审核仅扩Cloud与插件窄enum及Cloud自有工具description，不改变参与/静默与受众门槛。已接受Coordinator回复的轮次才可轻量互动，不强制每条或刷屏，不改共享角色/PE/模型/权限/版本/配置。
