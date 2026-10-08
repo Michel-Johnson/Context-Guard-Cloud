@@ -78,6 +78,7 @@
     "tests/session-publication-completion.test.mjs",
     "tests/test-manifest.json",
     "tests/workbench-cloud-sync.test.mjs",
+    "tests/workbench-ui-sync.test.mjs",
     "tests/session-sync-cloud.test.mjs",
     "tests/hook-cloud.test.mjs"
   ]
