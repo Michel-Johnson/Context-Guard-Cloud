@@ -7,9 +7,9 @@ export class Gateway {
     if (parsed.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(parsed.hostname)) throw new Error('Plugin gateway must be loopback HTTP');
     this.url = parsed.origin; this.token = token; this.teamId = teamId; this.fetch = fetchImpl;
   }
-  async command(type, { id, userId, projectId, conversationId, payload = {} }) {
+  async command(type, { id, userId, projectId, conversationId, payload = {}, timeoutMs = 20000 }) {
     if (!id || !userId) throw new Error('Stable operation ID and real Slack user are required');
-    const response = await this.fetch(`${this.url}/v1/command`, { method: 'POST', signal: AbortSignal.timeout(20000),
+    const response = await this.fetch(`${this.url}/v1/command`, { method: 'POST', signal: AbortSignal.timeout(timeoutMs),
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({ id, teamId: this.teamId, userId, ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
     let body;
