@@ -15,3 +15,8 @@ output/
 __pycache__/
 
 # Client integration tests load a pinned development package, not copied sources.
+# 从固定 Skill 包构建，禁止维护第二份源码。
+/scripts/shared/
+/prototype/
+/.runtime-generated.json
+/docs/interface-contract-v2.json

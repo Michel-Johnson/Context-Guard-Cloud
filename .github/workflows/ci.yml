@@ -26,6 +26,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - run: npm run security:setup
       - run: node .github/scripts/security-scan.mjs ci
       - run: npm run security:test
@@ -43,6 +45,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - run: npm test
   minimum-runtime:
     needs: security
@@ -58,6 +61,7 @@ jobs:
         with:
           python-version: '3.9'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - run: npm test
   slack:
     needs: security
@@ -69,6 +73,8 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - run: npm ci --prefix plugins/slack --ignore-scripts --no-audit --no-fund
       - run: npm run test:slack
   browser:
@@ -85,6 +91,7 @@ jobs:
         with:
           python-version: '3.13'
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - name: Bound browser dependency downloads
         shell: bash
         run: |
@@ -121,6 +128,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13'
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build:runtime
       - run: npm run security:setup
       - shell: bash
         run: |
@@ -129,11 +138,11 @@ jobs:
           npm pack --ignore-scripts --json --pack-destination dist > "$RUNNER_TEMP/cloud-pack.json"
           artifact=$(node -e "process.stdout.write(require(process.argv[1])[0].filename)" "$RUNNER_TEMP/cloud-pack.json")
           node .github/scripts/security-scan.mjs package "dist/$artifact"
-          npm run pack:shared
-          core=$(node -p "'michelj-context-guard-core-'+require('./scripts/shared/package.json').version+'.tgz'")
-          ui=$(node -p "'michelj-context-guard-workbench-'+require('./prototype/package.json').version+'.tgz'")
-          node .github/scripts/security-scan.mjs package "dist/$core" core
-          node .github/scripts/security-scan.mjs package "dist/$ui" workbench
+      - name: 验证 Cloud 仅生产依赖的独立运行
+        run: |
+          npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+          npm run build:runtime
+          node .github/scripts/cloud-installed-smoke.mjs .
   required:
     name: Required
     if: always()

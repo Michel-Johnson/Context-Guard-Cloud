@@ -1,6 +1,6 @@
 {
   "name": "@michelj/context-guard-cloud",
-  "version": "1.1.12",
+  "version": "1.1.13",
   "private": true,
   "type": "module",
   "description": "Context Guard Cloud workbench and Coordinator service",
@@ -15,20 +15,25 @@
     "deploy/**",
     "licenses/**",
     "references/**",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "scripts/build-runtime.mjs"
   ],
   "scripts": {
-    "start": "node scripts/cloud/server.mjs",
+    "start": "node scripts/build-runtime.mjs && node scripts/cloud/server.mjs",
     "test": "node .github/scripts/verify-boundaries.mjs && node .github/scripts/verify-workflows.mjs && node .github/scripts/verify-test-governance.mjs && node .github/scripts/run-node-tests.mjs",
     "test:slack": "npm test --prefix plugins/slack",
     "test:browser": "node tests/browser-device-login-runner.mjs && node tests/cloud-workbench-browser.mjs && node tests/cloud-sync-browser.mjs",
     "security:setup": "node .github/scripts/security-tool.mjs",
     "security:test": "node .github/scripts/security-checks.test.mjs",
-    "pack:shared": "node scripts/release-shared.mjs"
+    "build:runtime": "node scripts/build-runtime.mjs"
   },
   "devDependencies": {
-    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-ea386fe216bc292c00b39268559905e9e0126742/michelj-context-guard-0.6.3.tgz",
+    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-3f00727a8c4350bad6f8f0564da509a47bb84367/michelj-context-guard-0.6.5.tgz",
     "marked": "15.0.12",
     "playwright": "1.62.1"
+  },
+  "dependencies": {
+    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.0.2/michelj-context-guard-core-2.0.2.tgz",
+    "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.1.6/michelj-context-guard-workbench-1.1.6.tgz"
   }
 }
