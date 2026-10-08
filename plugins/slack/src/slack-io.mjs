@@ -2,6 +2,10 @@ import { digest } from './store.mjs';
 import { plainText, plainChunks } from './plain-text.mjs';
 
 const fallbackText = (text, rendered = false) => (rendered ? text : plainText(text)).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const blockFallback = block => {
+  const value = item => typeof item?.text === 'string' ? item.type === 'mrkdwn' ? plainText(item.text) : item.text : '';
+  return block.type === 'context' ? (block.elements || []).map(value).filter(Boolean).join('\n') : value(block.text);
+};
 function messageParts(text, blocks) {
   if (!blocks?.length) return plainChunks(text, 6000).map(value => ({ text: value, rendered: true }));
   const parts = []; let group = [], size = 0;
@@ -14,7 +18,7 @@ function messageParts(text, blocks) {
   // Each message has the content's own fallback for notifications and assistive
   // clients. No 39K slice or 49-block truncation hides the end of an answer.
   return parts.map((group, index) => ({ blocks: group,
-    text: group.map(block => block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '')).filter(Boolean).join('\n\n') || (index ? 'Coordinator · 操作' : plainText(text)), rendered: true }));
+    text: group.map(blockFallback).filter(Boolean).join('\n\n') || (index ? 'Coordinator · 操作' : plainText(text)), rendered: true }));
 }
 
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
