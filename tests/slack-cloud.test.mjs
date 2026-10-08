@@ -104,7 +104,8 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
         return { stop: 'end_turn', content: [{ type: 'text', text: input.message.text === 'invalid-relevance'
           ? 'not a decision' : JSON.stringify({ target: input.message.text === '登录刷新 Bug，请分析。' ? 'coordinator' : 'none', intent: input.message.text === '登录刷新 Bug，请分析。' ? 'reply' : 'notice', reason: 'Controlled decision' }) }] };
       }
-      const message = request.messages.at(-1), text = typeof message?.content === 'string' ? message.content : '';
+      const message = request.messages.at(-1), text = typeof message?.content === 'string'
+        ? message.content.split('[以下为原始输入]\n').at(-1) : '';
       if (text === 'show-node-complete') return { stop: 'tool_use', content: [
         { type: 'text', text: 'This is the complete read-only answer.' },
         { type: 'tool_use', id: 'tool-show-complete', name: 'show_nodes', input: { message: 'Project entry', nodeIds: ['T0'], replyComplete: true } },
@@ -332,10 +333,11 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   await f.wait('main', value => value.status === 'waiting-for-user' && !value.activeTurnId);
   const automaticCall = f.modelCalls.at(-1);
   assert.match(automaticCall.system, /系统为新任务创建独立执行 Session/);
-  assert.doesNotMatch(automaticCall.system, /本轮答复发往 Slack|以下仅用于宿主已声明的人工执行对话/);
-  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }).filter(tool => !['show_model_menu', 'react_to_user'].includes(tool.name)));
-  for (const name of ['show_model_menu', 'react_to_user']) assert.equal(automaticCall.tools.some(tool => tool.name === name), false,
-    `Non-Slack browser inputs must not receive the Slack-only tool ${name}`);
+  assert.doesNotMatch(automaticCall.system, /以下仅用于宿主已声明的人工执行对话/);
+  assert.match(automaticCall.messages.at(-1).content, /输出来源：human/);
+  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }));
+  for (const name of ['show_model_menu', 'react_to_user']) assert.equal(automaticCall.tools.some(tool => tool.name === name), true,
+    `Stable catalog retains ${name}; source authorization is checked at execution`);
   await f.restart();
   assert.equal((await f.gateway('conversation.submit', { text: 'role-after-restart' }, { id: 'role-after-restart', conversationId: conversation })).status, 200);
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);
@@ -458,7 +460,7 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
     memoryDocument: 'MOUNT-FOCUS-UNIQUE-MEMORY', children: [] }] });
   f.options.coordinatorModelFactory = () => ({ next: async request => {
     f.modelCalls.push(request);
-    if (request.messages.at(-1)?.content === 'mount-focus-node') return { stop: 'tool_use', content: [{ type: 'tool_use',
+    if (typeof request.messages.at(-1)?.content === 'string' && request.messages.at(-1).content.endsWith('[以下为原始输入]\nmount-focus-node')) return { stop: 'tool_use', content: [{ type: 'tool_use',
       id: 'mount-focus-tool', name: 'mount_conversation', input: {
         mainVersion: 'main-initial', nodeId: 'N1', kind: 'todo', title: 'Review login', description: 'Keep this discussion focused',
       } }] };
@@ -495,7 +497,7 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
     assert.equal(state.body.conversations.find(value => value.id === id).nodeId, 'N1');
     assert.equal((await f.browser(id, { body: { id: `focused-followup-${restart}`, text: 'followup' } })).status, 202);
     await f.wait(id, value => value.status === 'waiting-for-user' && !value.activeTurnId);
-    assert.ok(f.modelCalls.at(-1).system.includes('MOUNT-FOCUS-UNIQUE-MEMORY'), 'Next turn uses the saved node, not merely a display label');
+    assert.ok(f.modelCalls.at(-1).messages.at(-1).content.includes('MOUNT-FOCUS-UNIQUE-MEMORY'), 'Next turn uses the saved node in trailing snapshot, not merely a display label');
   }
 });
 

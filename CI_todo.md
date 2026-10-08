@@ -1452,3 +1452,12 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] Cloud PR Required 与合并后 main CI 待完成。生产部署不在范围；实际模型、Slack 发送不由隔离回归推断已完成。
 - 正式更新到 Skill main `3f00727` fixture 后首次总入口：407 测试，400 通过、5 失败、2 跳过。BDA-002/004 仍断言旧安全提示字段和删除拒绝回执；BDA-016 的有限 TTL fetcher 对已协商持久响应错误断言整数 TTL。现行 Cloud 同步设计已规定 persistent 协商与拒绝回执保留；只更新测试，保持安全字段精确白名单、原请求/终态回执检查、显式重试新身份及真实 Main/Session 权限断言。有限时钟偏差测试显式移除握手能力头模拟旧版，替身边界仅在 start 协商；未修改产品授权逻辑。
 - 修正后正式总入口：407 测试，405 通过、0 失败、2 个既有跳过；正式浏览器三入口通过。此次为执行者自检，不冒充独立人工审查。
+
+## CACHE-PREFIX-001：Coordinator 可复用静态前缀（2026-10-08）
+
+- [x] 用户批准三项优化：动态状态尾置、内容版本化静态前缀、保留原生历史并仅压缩历史。独立候选分支 `codex/coordinator-cache-prefix` 基于 Cloud main `8292042`，未混入 Executor 上下文工作区修改。
+- [x] 新增私有逐轮 serverContext；项目记忆/导航留在 system，Main 版本、事项/焦点状态与来源按接受时快照追加。重试不刷新旧输入，旧格式兼容读取；工具定义稳定，但来源和真实操作者仍由执行层校验。
+- [x] 独立供应商探测 24/24 调用完整结束；20 个变化版本的 fork 后请求中，10 个新版请求 system/tools 均稳定。DeepSeek 缓存 token 占比 9.9%→91.8%，GLM 52.6%→78.6%。不是网页/Slack E2E，不以缓存代替业务验收；样本小，不承诺首词延时或 100% 命中。
+- [ ] 独立 Tester/人工复核准确候选提交：最新状态、节点授权、原身份重试、跨来源工具拒绝、子对话边界、native thinking/工具回执、compaction 哈希。
+- [x] 执行者本地自检：Node v24.18.0 全量 428 项，426 PASS、0 FAIL、2 个既有 SKIP；正式浏览器三入口退出 0；Slack 插件 195/195；安全验收 39 项、staged 127 文件及 package 92 文件扫描通过。测试资料位于候选 temp，未包含在 Git/发布包。
+- [ ] GitHub Required、Node 18/22、独立评审、合并与生产验收尚待执行。未部署，不扩展自动派发。

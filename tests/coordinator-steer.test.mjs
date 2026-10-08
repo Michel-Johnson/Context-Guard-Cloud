@@ -106,7 +106,7 @@ test('Steer durably accepts a batch during generation and suppresses stale tool 
   await assert.rejects(service.submit({ id: 'stale', text: 'x', followup: 'steer', expectedTurnId: 'other' }), { code: 'STALE_TURN' });
   release.resolve(); await service.close();
   assert.equal(inputs.length, 2); assert.deepEqual(executed, []);
-  const texts = inputs[1].filter(item => typeof item.content === 'string').map(item => item.content);
+  const texts = inputs[1].filter(item => typeof item.content === 'string').map(item => item.content.split('[以下为原始输入]\n').at(-1));
   assert.ok(texts.includes('original')); assert.ok(texts.includes('correction a')); assert.ok(texts.includes('correction b'));
   for (const input of extraInputs) assert.equal(texts.filter(text => text === input.text).length, 1);
   const state = await service.state();
@@ -271,7 +271,7 @@ test('Accepted follow-ups survive a service restart without duplicate transcript
   let observed;
   const restarted = new CoordinatorService({ ...options, model: { next: async ({ messages }) => { observed = messages; return answer('recovered'); } } });
   restarted.kick(); await restarted.close();
-  assert.equal(observed.filter(item => item.content === 'durable correction').length, 1);
+  assert.equal(observed.filter(item => typeof item.content === 'string' && item.content.endsWith('[以下为原始输入]\ndurable correction')).length, 1);
   assert.equal((await restarted.state()).pendingInputCount, 0);
 });
 
@@ -309,7 +309,7 @@ test('Steer aborts a live generation, combines durable originals and rejects lat
   await service.submit(batch, { source: 'slack', actor });
   await service.close();
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[1].filter(message => message.role === 'user').map(message => message.content), ['original', 'first clarification', 'second clarification']);
+  assert.deepEqual(seen[1].filter(message => message.role === 'user').map(message => message.content.split('[以下为原始输入]\n').at(-1)), ['original', 'first clarification', 'second clarification']);
   const state = await service.state();
   assert.equal(state.status, 'waiting-for-user'); assert.equal(state.pendingInputCount, 0);
   assert.equal(state.messages.filter(message => message.text === 'old streamed text' && message.partial).length, 1);
@@ -328,11 +328,11 @@ test('Initial batch is accepted atomically with independent identities, retry an
   const service = new CoordinatorService(options);
   const batch = { id: 'batch-start', inputs: [{ id: 'first-original', text: 'first' }, { id: 'second-original', text: 'second' }] };
   await service.submit(batch, { source: 'slack', actor }); await service.close();
-  assert.deepEqual(observed[0].map(message => message.content), ['first', 'second']);
+  assert.deepEqual(observed[0].map(message => message.content.split('[以下为原始输入]\n').at(-1)), ['first', 'second']);
   const retry = (await service.state()).retryInput;
   assert.equal(retry.id, 'first-original');
   await service.submit({ ...retry, retry: true }, { source: 'slack', actor }); await service.close();
-  assert.deepEqual(observed[1].map(message => message.content), ['first', 'second']);
+  assert.deepEqual(observed[1], observed[0], 'Retry replays the exact accepted request projection');
   const restarted = new CoordinatorService(options);
   await restarted.submit(batch, { source: 'slack', actor }); await restarted.close();
   assert.equal(calls, 2); assert.equal((await restarted.state()).messages.filter(message => message.role === 'user').length, 2);
