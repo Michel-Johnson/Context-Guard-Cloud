@@ -33,7 +33,7 @@
     "playwright": "1.62.1"
   },
   "dependencies": {
-    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.1.2/michelj-context-guard-core-2.1.2.tgz",
+    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.1.4/michelj-context-guard-core-2.1.4.tgz",
     "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.1.6/michelj-context-guard-workbench-1.1.6.tgz"
   }
 }
