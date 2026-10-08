@@ -146,6 +146,12 @@ export function validateIntegrationConfig(config) {
       config.actions !== undefined && (!Array.isArray(config.actions) || config.actions.some(type => !INTEGRATION_COMMANDS.includes(type)))) {
     fail('INVALID_INTEGRATION_CONFIG', 'Integration configuration needs loopback host, workspace, projects and independent credential');
   }
+  const map = config.mapProjects;
+  if (map !== undefined && (!object(map) || Object.keys(map).some(key => !['coordinatorProjectId', 'userIds'].includes(key)) ||
+      !identifier(map.coordinatorProjectId) || !Array.isArray(map.userIds) || !map.userIds.length || map.userIds.length > 100 ||
+      map.userIds.some(id => typeof id !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(id)) || new Set(map.userIds).size !== map.userIds.length)) {
+    fail('INVALID_INTEGRATION_CONFIG', 'Map 项目需要默认模型项目和明确授权的 Slack 用户');
+  }
   return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790, actions: config.actions ?? [...INTEGRATION_COMMANDS] };
 }
 
@@ -160,7 +166,8 @@ export function validateIntegrationCommand(config, input) {
   const actor = integrationActor(config, input);
   if (!config.actions.includes(input.type)) fail('FORBIDDEN', 'Integration action is not enabled', 403);
   if (input.type !== 'project.list' || input.projectId !== undefined) {
-    if (!config.projectIds.includes(input.projectId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
+    if (!identifier(input.projectId) || !config.projectIds.includes(input.projectId) &&
+        !config.mapProjects?.userIds.includes(actor.userId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
   if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
@@ -196,10 +203,11 @@ async function requestBody(req, limit) {
 
 // An optional listener with no Slack dependency. Callbacks reuse Cloud's normal
 // business services; delivery and network failures cannot block Agent execution.
-export async function startIntegrationGateway({ config, command, state, stateDir, pollIntervalMs = 1000,
+export async function startIntegrationGateway({ config, command, state, authorizeProject, stateDir, pollIntervalMs = 1000,
   maxBodyBytes = 12 * 1024 * 1024, maxSubscribers = 32, logger = () => {} } = {}) {
   if (!config) return null;
   const verified = validateIntegrationConfig(config);
+  if (verified.mapProjects && typeof authorizeProject !== 'function') fail('INVALID_INTEGRATION_CONFIG', 'Map 项目必须验证实时访问范围');
   if (typeof command !== 'function' || typeof state !== 'function') fail('INVALID_INTEGRATION_CONFIG', 'Integration callbacks are required');
   if (!stateDir || !path.isAbsolute(stateDir)) fail('INVALID_INTEGRATION_CONFIG', 'Private integration state directory is required');
   const clients = new Set(), handshakes = new Set(), handshakeScopes = new WeakMap(), inflight = new Map();
@@ -213,6 +221,9 @@ export async function startIntegrationGateway({ config, command, state, stateDir
     res.end(JSON.stringify(value));
   };
   const execute = async (input, actor) => {
+    // Revalidate before replaying receipts too: deletion/revocation must not
+    // return old private results through an otherwise valid transport ID.
+    if (input.projectId) await authorizeProject?.(input.projectId, actor);
     if (readOnly.has(input.type)) return command(input, { actor, operationId: input.id });
     const fingerprint = hash(JSON.stringify({ input, actor }));
     const key = hash(JSON.stringify([actor.teamId, input.id]));
@@ -265,7 +276,7 @@ export async function startIntegrationGateway({ config, command, state, stateDir
         const handshake = { scope, dirty: false }; handshakeScopes.set(res, handshake);
         handshakes.add(res);
         let snapshot;
-        try { snapshot = await state(scope, { actor }); }
+        try { await authorizeProject?.(scope.projectId, actor); snapshot = await state(scope, { actor }); }
         finally { handshakes.delete(res); }
         if (closed) fail('STOPPING', 'Integration listener is stopping', 503);
         if (req.destroyed || res.destroyed || res.writableEnded) return;
@@ -301,6 +312,7 @@ export async function startIntegrationGateway({ config, command, state, stateDir
           try {
             do {
               client.dirty = false;
+              await authorizeProject?.(scope.projectId, actor);
               const data = await state(scope, { actor });
               if (closed || res.destroyed || !clients.has(client) || !await write({ type: 'state', data })) return;
             } while (client.dirty);

@@ -1,7 +1,7 @@
 import { digest, threadKey } from './store.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
-import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, modelChoiceBlocks, section, escape } from './views.mjs';
+import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 // This narrow boundary repeats the Cloud enum deliberately; contract tests
@@ -62,6 +62,14 @@ export class SlackPlugin {
   async receive({ type, body, envelope_id, ack }) {
     const team = body.team_id || body.team?.id || body.event?.team;
     if (team !== this.teamId) { await ack(); return; }
+    // Options must be returned in the Socket Mode acknowledgement, not queued
+    // behind model work. Query the current directory for the actual operator.
+    if (type === 'interactive' && body.type === 'block_suggestion') {
+      let options = [];
+      try { options = await this.suggestProjects(body, envelope_id); }
+      catch (error) { this.logger.warn('Slack project options unavailable', { code: error.code || 'PROJECT_OPTIONS_UNAVAILABLE' }); }
+      await ack({ options }); return;
+    }
     const id = envelopeId(type, body, envelope_id);
     if (Object.keys(this.store.data.inbox).length > 50000 && !this.store.data.inbox[id]) throw new Error('Slack journal capacity exceeded');
     const fresh = await this.store.receive(id, safeEnvelope(type, body), { collectMs: this.collectMs, maxCollectMs: this.maxCollectMs });
@@ -376,10 +384,14 @@ export class SlackPlugin {
       if (action.action_id === 'form_project') { await this.selectFormProject(id, body, userId, action.selected_option?.value); continue; }
       if (action.action_id === 'select_project') {
         const projectId = action.selected_option?.value;
-        const projects = this.projects.get(userId) || await this.loadProjects(userId, id);
-        if (!projects.some(project => project.id === projectId)) throw new Error('Project is not available');
+        const projects = await this.loadProjects(userId, id);
+        if (!projects.some(project => project.id === projectId)) throw Object.assign(new Error('项目已删除或停止开放，请重新选择'), { code: 'NOT_FOUND' });
         await this.store.update(state => { state.preferences[userId] = projectId; });
         await this.publishHome(userId, id); continue;
+      }
+      if (action.action_id === 'connect_project_menu') {
+        const requestId = action.block_id?.startsWith('projects:') ? action.block_id.slice('projects:'.length) : '';
+        await this.connectProject(id, body, userId, { requestId, projectId: action.selected_option?.value }, { dynamic: true }); continue;
       }
       let value; try { value = JSON.parse(action.value || '{}'); } catch { throw new Error('Invalid interaction'); }
       if (/^model_select:\d{1,2}$/.test(action.action_id)) await this.selectModelMenu(id, body, userId, value);
@@ -397,7 +409,19 @@ export class SlackPlugin {
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
-  async loadProjects(userId, id) { const result = await this.gateway.command('project.list', { id: operationId(id, 'projects'), userId }); this.projects.set(userId, result.projects || []); return result.projects || []; }
+  async loadProjects(userId, id, timeoutMs = 20000) { const result = await this.gateway.command('project.list', { id: operationId(id, 'projects'), userId, timeoutMs }); this.projects.set(userId, result.projects || []); return result.projects || []; }
+  async suggestProjects(body, id) {
+    if (!['select_project', 'connect_project_menu'].includes(body.action_id)) return [];
+    const userId = body.user?.id;
+    if (body.action_id === 'connect_project_menu') {
+      const requestId = body.block_id?.startsWith('projects:') ? body.block_id.slice('projects:'.length) : '';
+      const original = this.store.data.inbox[requestId];
+      if (!original || original.projectPromptEvent?.user !== userId || body.channel?.id !== original.projectPromptEvent.channel ||
+          body.message?.ts !== original.projectPromptTs || original.projectResume) return [];
+    }
+    const projects = await this.loadProjects(userId, id, 2000);
+    return projectOptions(body.view?.type === 'home' || body.channel?.id?.startsWith('D') ? projects : projects.filter(project => !project.private), body.value || '');
+  }
   validModelCatalog(value) {
     if (!value || !/^[a-f0-9]{64}$/.test(value.version || '') || !Array.isArray(value.options) || !value.options.length || value.options.length > 20 ||
         value.options.some(option => !/^[a-zA-Z0-9_-]{1,128}$/.test(option.id || '') || typeof option.label !== 'string' || !option.label || typeof option.model !== 'string') ||
@@ -501,7 +525,8 @@ export class SlackPlugin {
     const projectId = prior?.projectId || context.projectId || (direct ? this.store.data.preferences[userId] : this.store.data.channels[channel]);
     if (projectId) {
       const projects = await this.loadProjects(userId, id);
-      if (!projects.some(project => project.id === projectId)) throw new Error('项目已停止开放');
+      const selected = projects.find(project => project.id === projectId);
+      if (!selected || selected.private && !direct) throw Object.assign(new Error('此项目无法在该频道访问，请在私聊重新选择'), { code: 'FORBIDDEN' });
       await this.store.update(state => {
         if (prior) return;
         if (!direct && state.channels[channel] && state.channels[channel] !== projectId) throw Object.assign(new Error('频道已关联另一个项目'), { code: 'CONFLICT' });
@@ -527,7 +552,8 @@ export class SlackPlugin {
     return this.io.call('views.publish', { user_id: userId, view: homeView({ projects, project, cloudOrigin: this.cloudOrigin, userId }) });
   }
   async chooseProject(id, event) {
-    const projects = await this.loadProjects(event.user, id), direct = event.channel_type === 'im' || event.channel?.startsWith('D');
+    const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
+    const available = await this.loadProjects(event.user, id), projects = direct ? available : available.filter(project => !project.private);
     await this.store.update(state => {
       state.inbox[id] ||= { status: 'done', attempts: 0, at: Date.now(), next: 0 };
       state.inbox[id].envelope ||= { type: 'events_api', body: { team_id: this.teamId, event: structuredClone(event) } };
@@ -538,16 +564,16 @@ export class SlackPlugin {
     const choices = this.store.data.inbox[id].projectPromptChoices;
     const ts = await this.io.post({ id: operationId(id, 'choose'), channel: event.channel,
       threadTs: event.ts?.startsWith('command-') ? undefined : event.thread_ts || event.ts,
-      text: choices.length ? '请选择要讨论的项目，选好后我会继续处理刚才的问题。' : '目前没有开放的项目，请管理员在插件配置中开放项目。',
+      text: choices.length ? '请选择要讨论的项目，选好后我会继续处理刚才的问题。' : '目前没有开放的项目；新建或授权后，打开下方菜单重新查询。私有项目请在 Coordinator 私聊中选择。',
       blocks: projectChoiceBlocks(choices, id, direct) });
     await this.store.update(state => { state.inbox[id].projectPromptTs = ts; });
   }
-  async connectProject(id, body, userId, value) {
+  async connectProject(id, body, userId, value, { dynamic = false } = {}) {
     const conflict = message => Object.assign(new Error(message), { code: 'CONFLICT' });
     if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['requestId', 'projectId'].includes(key))) throw conflict('项目选择已失效，请重新提问');
     const entry = this.store.data.inbox[value.requestId], event = entry?.projectPromptEvent;
     if (!event || event.user !== userId || body.channel?.id !== event.channel || body.message?.ts !== entry.projectPromptTs) throw conflict('请由原提问者在原消息中选择项目');
-    if (!entry.projectPromptProjects?.includes(value.projectId)) throw conflict('项目不在这条消息的选项中');
+    if (!dynamic && !entry.projectPromptProjects?.includes(value.projectId)) throw conflict('项目不在这条消息的选项中');
     const resumedEvent = event.ts?.startsWith('command-') ? { ...event, ts: entry.projectPromptTs } : event;
     const lane = messageLane(null, resumedEvent);
     if (this.messageLanes.has(lane)) throw Object.assign(new Error('正在处理这条线程，请保留原请求重试'), { code: 'BUSY' });
@@ -556,6 +582,7 @@ export class SlackPlugin {
       const projects = await this.loadProjects(userId, id), selected = projects.find(project => project.id === value.projectId);
       if (!selected) throw conflict('该项目已停止开放，请重新选择');
       const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
+      if (selected.private && !direct) throw conflict('私有 Map 项目请在 Coordinator 私聊中选择');
       const info = await this.io.call('conversations.info', { channel: event.channel });
       if (direct ? info.channel?.user !== userId : !(await this.channelMembers(event.channel)).includes(userId)) throw conflict('只能关联自己所在的频道或自己的私聊');
       await this.store.update(state => {
@@ -593,6 +620,10 @@ export class SlackPlugin {
       if (currentKey && this.store.data.threads[currentKey]) { key = currentKey; existing = this.store.data.threads[key]; }
     }
     if (existing) {
+      if (!direct) {
+        const project = (await this.loadProjects(event.user, id)).find(project => project.id === existing.projectId);
+        if (!project || project.private) throw Object.assign(new Error('此项目无法在该频道访问，请在私聊重新选择'), { code: 'FORBIDDEN' });
+      }
       if (expectedProjectId && existing.projectId !== expectedProjectId) throw Object.assign(new Error('Thread project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
       return [key, existing];
     }
@@ -603,11 +634,14 @@ export class SlackPlugin {
       await this.chooseProject(id, event);
       return [];
     }
+    const selected = (await this.loadProjects(event.user, id)).find(project => project.id === projectId);
+    if (!selected || selected.private && !direct) throw Object.assign(new Error('此项目无法在该频道访问，请在私聊重新选择'), { code: 'FORBIDDEN' });
     // Slash command has no message timestamp. Create a real root message first.
-    const threadTs = rootTs?.startsWith('command-') ? await this.io.post({ id: operationId(id, 'root'), channel: event.channel, text: `Coordinator · ${projectId}` }) : rootTs;
+    const threadTs = rootTs?.startsWith('command-') ? await this.io.post({ id: operationId(id, 'root'), channel: event.channel, text: `Coordinator · ${selected.name || '项目对话'}` }) : rootTs;
     key = threadKey(this.teamId, event.channel, threadTs);
     const created = await this.gateway.command('conversation.create', { id: operationId(id, 'create'), userId: event.user, projectId, payload: { operationId: operationId(id, 'create') } });
-    const binding = await this.store.bind(key, { channel: event.channel, threadTs, projectId, conversationId: created.conversationId, userId: event.user, ownRequests: [] });
+    const binding = await this.store.bind(key, { channel: event.channel, threadTs, projectId, conversationId: created.conversationId, userId: event.user, ownRequests: [],
+      ...(created.mapNodeId ? { mapNodeId: created.mapNodeId } : {}) });
     if (direct) await this.store.update(state => { state.directThreads ||= {}; state.directThreads[directKey] = key; });
     return [key, binding];
   }
@@ -1018,7 +1052,7 @@ export class SlackPlugin {
       if (!partial && stream && message.role === 'assistant' && stream.turnId === requestId && !settled) continue;
       const display = partial ? { ...message, text: `部分回复（已被补充调整，非最终答案）：\n${message.text || ''}` } : message;
       const modelMenus = await this.naturalModelMenus(key, message, userId);
-      const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId, modelMenus });
+      const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId, mapNodeId: binding.mapNodeId, modelMenus });
       const content = digest({ format: 'plain-text-v2', message,
         ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}),
         ...(message.questions?.length ? { questionRender: blocks } : {}), ...(modelMenus.length ? { modelMenuRender: blocks } : {}) }),

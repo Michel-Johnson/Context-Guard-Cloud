@@ -68,7 +68,7 @@ export function manualBriefInput(input) {
     nodeId: input.nodeId || input.nodeIds[0], ...(input.itemId ? { itemId: input.itemId, kind: input.kind } : { kind: 'todo' }) };
 }
 
-export function manualExecutionPrompt({ projectId, proposal, document, version }) {
+export function manualExecutionPrompt({ projectId, proposal, document, version, mapOnly = false }) {
   const index = entries(document.root);
   const projection = buildFilesystemV2({ version, memory: { map: document, records: {} } });
   const navigation = JSON.parse(projection.files.get('map.json'));
@@ -82,15 +82,16 @@ export function manualExecutionPrompt({ projectId, proposal, document, version }
       ...(node.owns?.length ? [`代码范围：${node.owns.join(', ')}`] : [])].filter(Boolean).join('\n\n');
   }).join('\n\n');
   const itemFile = navigation.nodes.find(node => node.id === proposal.nodeId)?.path.replace(/index\.md$/, `${proposal.kind === 'bug' ? 'bugs' : 'todos'}/${proposal.itemId}.md`);
+  if (mapOnly) return `# 执行需求\n\n项目：${document.project}\n工作项：${proposal.kind.toUpperCase()} ${proposal.itemId}\nMap 版本：${version}\n\n## 目标\n\n${proposal.text}\n\n## 验收\n\n${proposal.acceptance}\n\n## Map 切片\n\n${selected}\n\n## 执行边界\n\n这是 Map 项目的需求交接，不代表已经关联代码仓库或执行 Session。以上格式路径仅说明切片结构，不能作为此项目已接通的 CLI/API 读取入口。请由用户确定实际代码仓库后，在该仓库使用已安装的 Skill 确认项目与 Session 绑定；绑定前不写入其他项目的 Session，不自动派发。收工时核对 Map 总览中此项目的最新内容。\n`;
   return `# 执行需求\n\n项目：${projectId}\n工作项：${proposal.kind.toUpperCase()} ${proposal.itemId}\nMain 版本：${version}\n\n## 目标\n\n${proposal.text}\n\n## 验收\n\n${proposal.acceptance}\n\n## Map 切片\n\n${selected}\n\n## 读写路径\n\n- 阅读 Main 的 map.json、上述节点 index.md，以及工作项 ${itemFile}。这些是 fs-v2.1 scope-relative 读取路径，通过 Context Guard 的按版本单文件读取入口使用，不能当作宿主的绝对磁盘路径。\n- 在用户当前打开的项目根目录调用已安装的 Context Guard Skill；Codex、Cursor、Claude 使用同一个工作项 ID。按现有绑定流程确认自己的 Session 身份及最新 Main 版本，不能把 Coordinator 对话 ID 当作执行 Session ID。\n- 若 Main 版本变化，刷新相关切片并核对需求；无法核对时报告冲突，不覆盖新内容。\n- 只把代码结果、attempt 结论、验收证据和受影响节点写入自己的 Session；使用现有 Skill/hooks 的 Session 写回入口，不直接覆盖 Main。\n- 执行结束后汇报工作项 ID、Session ID、改动和验收证据，交由用户在工作台审核后进入 Main。\n`;
 }
 
 // Proposals are conversational state, not a second Task system. Approval uses
 // the same Main CAS callback as the workbench and never creates an Agent Session.
 export class CoordinatorManualBriefs {
-  constructor({ directory, projectId, readMain, commitMain }) {
+  constructor({ directory, projectId, readMain, commitMain, mapOnly = false }) {
     if (!path.isAbsolute(directory || '') || !identifier(projectId) || typeof readMain !== 'function' || typeof commitMain !== 'function') throw new Error('Manual brief storage and Main services are required');
-    Object.assign(this, { projectId, readMain, commitMain });
+    Object.assign(this, { projectId, readMain, commitMain, mapOnly });
     this.file = path.join(directory, 'manual-briefs.json');
   }
   async state() { return readJSON(this.file, { proposals: {}, operations: {}, reviews: {} }); }
@@ -190,7 +191,7 @@ export class CoordinatorManualBriefs {
           if (error.code === 'VERSION_CONFLICT') { delete proposal.intent; await atomicWrite(this.file, encode(state)); }
           throw error;
         }
-        prompt = manualExecutionPrompt({ projectId: this.projectId, proposal, document: intent.document, version: receipt.version });
+        prompt = manualExecutionPrompt({ projectId: this.projectId, proposal, document: intent.document, version: receipt.version, mapOnly: this.mapOnly });
       }
       const result = { decision: input.decision, proposalId: proposal.id, itemId: proposal.itemId, nodeId: proposal.nodeId,
         kind: proposal.kind, version: receipt?.version || proposal.mainVersion, ...(prompt ? { prompt } : {}), executionMode: 'manual',
