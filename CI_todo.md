@@ -1,5 +1,23 @@
 # Cloud 验证台账
 
+## COOR-CONVERSATION-FIFO-01 · 同实例会话文件读写互斥（2026-10-08）
+
+- [x] Coordinator：准确 `13b5a330cb90897de4db99458445d9e916338ca3` 一次 Cloud 全仓 436 总项 / 433 通过 / 1 失败 / 2 既有跳过，actual exit 1，278143.9092 ms。唯一旧后台摘要目标最终 `status=error` 而非 `waiting-for-user`，该轮实际错误码未捕获；原日志及之后另列的首次 Slack 包结果保留，不将旧 EPERM 直接套作本轮根因。
+- [x] Executor：两次批准的私有合成目录诊断均原目标通过，根因结论仍 incomplete。第一次捕获7次真实 EPERM/rename；第二次两固定读者最多2秒（实际411.7344 ms退出）捕获36次真实 EPERM/rename，均原350 ms重试恢复，未观察 lock acquisition/release EPERM 或最终 error。这是实际同会话 atomic replacement 风险，不是原全仓失败完整因果、AV根因或“所有 EPERM 修复”证据；不重跑随机诊断求绿。
+- [x] Executor：经审核仅 `CoordinatorService` 实例内一个 Promise FIFO，覆盖该类全部八处同 `conversation.json` 读取及 `saveState` 写入；排队前冻结 encode 快照，成功后队列释放才通知 observer，原异常传给调用者，失败不毒死后续操作。仅短文件操作入队，模型/网络/业务整个事务不入队；跨进程 submit/run 锁、350 ms replacement 与5秒 acquisition原预算、sharedIO、依赖、身份、权限、模型、Schema、生产配置均未改。多实例、外部进程或 AV 不受此实例门闩保证。
+  - 开发后一次窄目标15/15通过、0跳过、actual exit 0，1442.412 ms，`temp/coordinator-conversation-fifo-targets-20261008.log`；包含确定held-reader/写入FIFO/快照冻结、永久错误原对象、observer回读、原摘要拒绝过时快照、steer/close/schema及工具回执。
+  - 后经静态审核仅将两新测试改用公共 `service.state()` 验证旧文本，加入新测试10秒边界（不改变任何原runtime budget），开发后仅这两目标一次2/2、0跳过、actual exit 0，633.3501 ms，`temp/coordinator-conversation-fifo-public-bounded-targets-20261008.log`。旧15日志保留，不能拼作最终同一测试修订15项通过；准确哈希在私有 `temp/coordinator-conversation-fifo-executor-handoff-20261008.md`。
+- [ ] 独立 Tester：最终准确修订核所有八处内部读/写确走实例FIFO；公共state held-handle与rename不重叠、写写排序和预冻快照、永久异常原对象/调用者可见、失败observer不通知、后续读写恢复及observer不死锁；原摘要/steer/close/模型工具Schema/receipt均保留。核 sharedIO/依赖/350ms/5秒预算/权限没有改动，区分本实例保护与外部争用限制；原全仓失败不可改写。
+- [ ] Delivery：准确源码独立验证、Required及真实Cloud/Slack验收未完成。此防护不扩大模型选择action授权，不切换模型、不对生产写入；Executor没有Git写入、部署或全仓重跑。
+
+## SLACK-CANDIDATE-FULL-01 · 13b5a33 集中回归（2026-10-08）
+
+- [x] Coordinator：在独立模块收口后一次集中回归准确 sourceSha `13b5a330cb90897de4db99458445d9e916338ca3`；Cloud 主阶段 session 23342 actual exit 1，436 总项 / 433 通过 / 1 失败 / 2 既有分套跳过，278143.9092 ms。唯一后台摘要并发目标 `tests/cloud-coordinator.test.mjs:1518` 状态 error≠waiting-for-user；日志没有原 fs cause，不能断言本次就是 EPERM。原 Cloud 日志 `temp/slack-model-emoji-full-13b5a33-20261008-cloud.log` SHA256 `89499a08e174a2296eec9dcfdf9cf5b27052d3e4687e454c3bbe618d19dbfa9e` 保留。
+- [x] Slack 包首次独立完整阶段：因前序 Cloud 失败尚未执行，另运行 session 86250 actual exit 0；195/195、0 跳过/失败，10276.8256 ms；原日志 `temp/slack-model-emoji-full-13b5a33-20261008-slack.log` SHA256 `9c57fcd6bb08e4b634ddb9052b2a444ab5dd48a6f07cf0ec15b6952317eba2b5`。这一结果不代表组合回归成功。
+- [x] 独立 Tester：只读核对原日志、准确源码和旧风险，保存 `temp/slack-model-emoji-full-13b5a33-independent-failure-review-20261008.md`。不重跑、不修改正式断言或业务；原 b729 FIN-01..10 的模块收口 passed 不回改，本次全仓回归另列 `failed`。
+- [ ] 原 Executor 定位具体 syscall/cause 后提交最小修复 Plan；不得以绿色重跑、增加超时/权限或吞异常宣称解决。原 Windows EPERM、5≠6 及当前安全化 error 证据全部保留。
+- [ ] 回归修复、Required/Main 与真实上线验收；当前集中回归失败，不推进假通过或部署。
+
 ## SLACK-EMOJI-01 · Slack 原生表情回应（2026-10-08）
 
 - [x] Coordinator：审核仅可信 Slack 真人输入的 `react_to_user({emoji})`；固定 👍、❤️、😄，不接受频道/目标/用户/地址参数，不新增 scope、网关动作、供应商配置或共享角色指令。当前未发布设计 v1.1.0 兼容补充，验收见 EMOJI-01..09。

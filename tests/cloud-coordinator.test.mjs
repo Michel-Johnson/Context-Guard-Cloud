@@ -1493,6 +1493,66 @@ test('Coordinator keeps tool pairs and raw history when compaction fails', async
   assert.equal(saved.messages.length, 4);
 });
 
+test('Coordinator conversation FIFO waits for its held reader and freezes queued write snapshots in order', { timeout: 10000 }, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-conversation-fifo-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const service = new CoordinatorService({ directory, system: 'role', tools: [], execute: async () => {}, model: { next: () => assert.fail('Filesystem FIFO must not call models') } });
+  const state = text => ({ status: 'idle', requests: {}, toolReceipts: {}, messages: [{ role: 'user', content: text }] });
+  await fs.writeFile(service.file, JSON.stringify(state('old')));
+  const readFile = fs.readFile, rename = fs.rename, open = fs.open;
+  let entered, release, readerHeld = false, replaces = [];
+  const held = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { entered = resolve; });
+  fs.readFile = async (...args) => {
+    if (args[0] !== service.file || readerHeld) return readFile(...args);
+    const handle = await open(service.file, 'r'); readerHeld = true; entered();
+    try { await held; return await handle.readFile(args[1]); }
+    finally { await handle.close(); readerHeld = false; }
+  };
+  fs.rename = async (...args) => {
+    if (args[1] === service.file) { assert.equal(readerHeld, false, 'Own held reader must close before replace'); replaces.push(JSON.parse(await readFile(args[0], 'utf8')).messages[0].content); }
+    return rename(...args);
+  };
+  let reading, firstWrite, secondWrite;
+  try {
+    reading = service.state(); await started;
+    const first = state('first'), second = state('second');
+    firstWrite = service.saveState(first); secondWrite = service.saveState(second);
+    first.messages[0].content = 'mutated-after-enqueue'; second.messages[0].content = 'also-mutated';
+    await Promise.resolve(); assert.deepEqual(replaces, [], 'No rename runs while reader owns this instance FIFO');
+    release(); const old = await reading; await firstWrite; await secondWrite;
+    assert.equal(old.messages[0].text, 'old'); assert.deepEqual(replaces, ['first', 'second']);
+    assert.equal((await service.readConversation(null)).messages[0].content, 'second');
+  } finally {
+    release(); await Promise.allSettled([reading, firstWrite, secondWrite].filter(Boolean)); fs.readFile = readFile; fs.rename = rename;
+  }
+});
+
+test('Coordinator conversation FIFO propagates the original permanent error and releases before observer reads', { timeout: 10000 }, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-conversation-fifo-failure-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  let service, observed, fail = true, notifications = 0;
+  const notification = new Promise(resolve => { observed = resolve; });
+  service = new CoordinatorService({ directory, system: 'role', tools: [], execute: async () => {}, model: {}, onStateChange: async () => {
+    notifications++; const state = await service.state(); observed(state);
+  } });
+  const baseline = { status: 'idle', requests: {}, toolReceipts: {}, messages: [] };
+  await fs.writeFile(service.file, JSON.stringify(baseline));
+  const rename = fs.rename, denied = Object.assign(new Error('synthetic permanent replacement denial'), { code: 'EACCES', syscall: 'rename', dest: service.file });
+  fs.rename = async (...args) => {
+    if (args[1] === service.file && fail) { denied.path ||= args[0]; throw denied; }
+    return rename(...args);
+  };
+  try {
+    await assert.rejects(service.saveState({ ...baseline, status: 'running' }), cause => cause === denied);
+    assert.equal(notifications, 0, 'A failed write cannot notify a persisted state');
+    assert.equal((await service.readConversation(null)).status, 'idle', 'Failed tail does not poison the next read');
+    fail = false;
+    await service.saveState({ ...baseline, messages: [{ role: 'user', content: 'recovered' }] });
+    const visible = await notification;
+    assert.equal(notifications, 1); assert.equal(visible.messages[0].text, 'recovered');
+  } finally { fs.rename = rename; }
+});
+
 test('A background summary cannot overwrite a newer Coordinator turn', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-compact-race-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
