@@ -116,6 +116,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
         const block = message.content.find(block => block.type === 'tool_result');
         if (block) {
           const result = JSON.parse(block.content);
+          if (result.projects) assert.equal(result.total, result.projects.length, '目录工具提供权威总数，不从展示行估算');
           if (result.projects && request.messages.some(m => typeof m.content === 'string' && m.content.includes('切换到另一个项目'))) {
             return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch-project', name: 'switch_project', input: {
               projectId: result.projects.find(project => project.id !== result.currentProjectId).id } }] };

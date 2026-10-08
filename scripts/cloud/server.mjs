@@ -792,8 +792,9 @@ export async function startCloudServer({
               userId: actor.userId, type: 'project.list', payload: {} });
             await authorizeIntegrationProject(project.id, actor);
             const result = await integrationCommand({ type: 'project.list' }, { actor, operationId });
-            return { currentProjectId: project.id, projects: result.projects.map(({ id, name, description }) => ({ id, name, description })),
-              instruction: '只向用户显示名称；同名时用简介询问，不展示内部 ID。' };
+            const projects = result.projects.map(({ id, name, description }) => ({ id, name, description }));
+            return { currentProjectId: project.id, total: projects.length, projects,
+              instruction: '总数以 total 为准，同名项目已各计一次；只列名称，同名才用简介澄清，不展示内部 ID。' };
           },
           switchProject: async ({ projectId: targetId }, { operationId, actor, requestId }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');

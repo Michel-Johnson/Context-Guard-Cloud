@@ -1885,6 +1885,41 @@ test('Slack reply policy is supplied as system instructions without changing nat
   assert.ok(calls[1].messages.some(m => typeof m.content === 'string' && m.content.endsWith('有哪些TODO')), 'Cross-client history remains shared');
 });
 
+test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复不扩大群组权限', async t => {
+  for (const channelId of ['DTESTDM', 'GTESTGROUP']) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-project-directory-policy-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const actor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', channelId,
+      sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
+    const calls = [], executions = [];
+    const service = new CoordinatorService({ directory, system: 'Coordinator', tools: coordinatorTools,
+      context: async () => ({ text: '\nSynthetic project facts.' }),
+      execute: createCoordinatorExecutor({ listProjects: async options => { executions.push(options); return {
+        currentProjectId: 'project-blog', total: 2, projects: [{ id: 'project-blog', name: '博客' }, { id: 'project-model', name: '模型实验' }],
+      }; } }), model: { next: async request => {
+        calls.push(request);
+        if (calls.length === 1) return { stop: 'end_turn', content: [{ type: 'text', text: '我看不到全局配置，只能在宿主切换。' }] };
+        assert.match(request.system, /私聊中新发消息/);
+        assert.match(request.system, /不要声称.*看不到项目.*宿主改绑定/);
+        assert.match(request.system, /总数直接使用工具 total/);
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'DTESTDM');
+        if (channelId === 'GTESTGROUP') return { stop: 'end_turn', content: [{ type: 'text', text: '完整项目目录和切换仅在私聊提供，请私聊 Coordinator 重新询问。' }] };
+        if (calls.length === 2) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-directory', name: 'list_projects', input: {} }] };
+        const result = JSON.parse(request.messages.at(-1).content[0].content);
+        assert.deepEqual(result.projects.map(project => project.name), ['博客', '模型实验']);
+        return { stop: 'end_turn', content: [{ type: 'text', text: '博客、模型实验。' }] };
+      } } });
+    t.after(() => service.close());
+    await service.submit({ id: 'old-query', text: '之前有哪些项目' }, { source: 'slack', actor }); await service.running;
+    await service.submit({ id: 'new-query', text: '一共有哪些项目' }, { source: 'slack', actor }); await service.close();
+    const result = await service.state();
+    assert.equal(result.status, 'waiting-for-user');
+    assert.match(result.messages.at(-1).text, channelId === 'DTESTDM' ? /博客、模型实验/ : /仅在私聊提供/);
+    assert.equal(executions.length, channelId === 'DTESTDM' ? 1 : 0);
+    assert.ok(result.messages.some(message => message.text?.includes('我看不到全局配置')), '保留旧历史，不通过删除掩盖错误');
+  }
+});
+
 test('Private timing persists failures and resumes pending tools with their original operation ID', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-timing-recovery-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
