@@ -2689,6 +2689,7 @@ export async function startCloudServer({
   server.headersTimeout = 15_000;
   integrationGateway = await startIntegrationGateway({ config: integrations,
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
+    logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
     state: async scope => {
       const project = integrationProject(scope.projectId);
       await requireManualConversation(project, scope.conversationId);

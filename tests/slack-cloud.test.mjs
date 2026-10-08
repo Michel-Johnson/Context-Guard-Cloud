@@ -231,6 +231,21 @@ test('unrelated and invalid relevance decisions cannot become submitted turns', 
   assert.equal(invalid.body.data, undefined); assert.deepEqual(await f.main(), before);
 });
 
+test('Cloud connects the real integration failure logger using only fixed private diagnostic fields', async t => {
+  const f = await fixture(t), logs = [], warn = console.warn;
+  console.warn = (...args) => logs.push(args);
+  try {
+    const failed = await f.gateway('conversation.relevance', { text: 'invalid-relevance' }, { id: 'private-original-request' });
+    assert.equal(failed.status, 502); assert.deepEqual(Object.keys(failed.body.error).sort(), ['code', 'message']);
+    const entry = logs.find(log => log[0] === 'Context Guard integration failure')?.[1];
+    assert.ok(entry, 'Exercise startCloudServer logger wiring, not a standalone supplied logger');
+    assert.equal(entry.code, 'RELEVANCE_INVALID_RESPONSE'); assert.equal(entry.phase, 'decision-parse'); assert.equal(entry.causeCode, 'MODEL_INVALID_RESPONSE');
+    assert.match(entry.idHash, /^[a-f0-9]{64}$/); assert.ok(Number.isSafeInteger(entry.durationMs) && entry.durationMs >= 0);
+    assert.deepEqual(Object.keys(entry).sort(), ['causeCode', 'code', 'durationMs', 'idHash', 'phase']);
+    assert.doesNotMatch(JSON.stringify(entry), /private-original-request|invalid-relevance|provider|token|model|project|prompt/);
+  } finally { console.warn = warn; }
+});
+
 test('relevance input, workspace, project and conversation boundaries are checked before the model', async t => {
   const f = await fixture(t), calls = f.modelCalls.length;
   for (const payload of [{ text: '' }, { text: 'x', tool: 'map.write' }, { text: 'x', context: [{ speaker: userId, text: 'x'.repeat(801) }] },

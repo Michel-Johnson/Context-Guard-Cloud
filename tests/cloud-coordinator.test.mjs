@@ -43,7 +43,12 @@ test('Slack reaction tools reject untrusted source and actor even when a model g
 });
 test('Slack reaction enum and target-free schema reject approval-like emoji and arbitrary destinations', async () => {
   const execute = createCoordinatorExecutor({});
-  for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
+  const tool = coordinatorTools.find(item => item.name === 'react_to_user');
+  assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray']);
+  assert.match(tool.description, /already accepted Coordinator reply turn/); assert.match(tool.description, /more readily/);
+  assert.match(tool.description, /accompany text or be the only reply/); assert.match(tool.description, /Do not react to every message, spam, bypass participation/);
+  for (const emoji of tool.input_schema.properties.emoji.enum) assert.equal((await execute('react_to_user', { emoji }, { operationId: `enum:${emoji}` })).emoji, emoji);
+  for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'eyes' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
     await assert.rejects(execute('react_to_user', input, { operationId: 'original' }), { code: 'INVALID_ARGUMENT' });
 });
 test('Slack reaction native receipt retains original actor and input across a pending-step restart', async () => {
@@ -64,7 +69,7 @@ test('Slack reaction alongside business or a failed tool never finishes outstand
       execute: async (name, input, options) => name === 'react_to_user' ? native(name, input, options) : fail ?
         Promise.reject(Object.assign(new Error('denied'), { code: 'FORBIDDEN' })) : { accepted: true },
       model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'text', text: '必要解释仍保留。' },
-        { type: 'tool_use', id: 'react', name: 'react_to_user', input: { emoji: 'thumbsup' } },
+        { type: 'tool_use', id: 'react', name: 'react_to_user', input: { emoji: 'muscle' } },
         { type: 'tool_use', id: 'work', name: 'business', input: {} }] }) } });
     assert.equal(state.status, 'running'); assert.equal(state.messages[0].content[0].text, '必要解释仍保留。');
   }
@@ -940,6 +945,39 @@ test('Explicit temporary billing waiver accepts only GitHub jobs that never star
 
 const text = { model: 'test-model', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ready' }] };
 const config = { baseUrl: 'https://provider.example/api/anthropic', model: 'test-model', token: 'synthetic-private-value' };
+
+test('Coordinator failure diagnostics distinguish transport phases without serializing private provider data', async () => {
+  const source = 'private-prompt-and-upstream-secret';
+  const cases = [
+    { phase: 'fetch', code: 'MODEL_UNAVAILABLE', fetch: async () => { throw new Error(source); } },
+    { phase: 'fetch', code: 'UNKNOWN_MODEL_ERROR', outcome: 'MODEL_private-secret', fetch: async () => { throw Object.assign(new Error(source), { code: 'MODEL_private-secret' }); } },
+    { phase: 'http', code: 'MODEL_HTTP_503', fetch: async () => new Response(source, { status: 503 }) },
+    { phase: 'response-json', code: 'MODEL_INVALID_RESPONSE', fetch: async () => new Response(source) },
+    { phase: 'response-stream', code: 'MODEL_INVALID_RESPONSE', fetch: async () => new Response('data: private-invalid-frame\n\n', { headers: { 'content-type': 'text/event-stream' } }) },
+    { phase: 'response-validation', code: 'MODEL_INVALID_RESPONSE', fetch: async () => Response.json({ ...text, model: 'substituted-secret-model' }) },
+  ];
+  for (const fixture of cases) {
+    const model = new CoordinatorModel({ ...config, fetch: fixture.fetch });
+    await assert.rejects(model.next({ system: source, messages: [] }), error => {
+      assert.equal(error.code, fixture.outcome || (fixture.code === 'UNKNOWN_MODEL_ERROR' ? 'MODEL_UNAVAILABLE' : fixture.code));
+      assert.equal(error.modelDiagnostic.code, fixture.code); assert.equal(error.modelDiagnostic.phase, fixture.phase);
+      assert.ok(Number.isSafeInteger(error.modelDiagnostic.durationMs) && error.modelDiagnostic.durationMs >= 0);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, 'modelDiagnostic'), false);
+      assert.doesNotMatch(JSON.stringify(error.modelDiagnostic), /private|secret|provider\.example|synthetic/);
+      return true;
+    });
+  }
+});
+
+test('Coordinator failure diagnostics retain the real response-stream timeout without changing stream budgets', async () => {
+  const model = new CoordinatorModel({ ...config, timeoutMs: 20, fetch: async () => new Response(new ReadableStream({ start() {}, cancel() {} }), {
+    headers: { 'content-type': 'text/event-stream' },
+  }) });
+  await assert.rejects(model.next({ system: '', messages: [] }), error => {
+    assert.equal(error.code, 'MODEL_TIMEOUT'); assert.equal(error.modelDiagnostic.code, 'MODEL_TIMEOUT');
+    assert.equal(error.modelDiagnostic.phase, 'response-stream'); assert.ok(Number.isSafeInteger(error.modelDiagnostic.durationMs)); return true;
+  });
+});
 test('Coordinator context carries the full static directory and only the mounted ancestry memories', () => {
   const snapshot = { version: 'main-v2', memory: { map: { root: { id: 'T0', title: 'Root', purpose: 'Whole project', memories: [{ text: 'root memory' }], children: [
     { id: 'N1', title: 'Reader', purpose: 'Public reading', memories: [{ text: 'reader memory' }], children: [

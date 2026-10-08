@@ -12,6 +12,23 @@ const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9
 const object = value => !!value && typeof value === 'object' && !Array.isArray(value);
 const errorBody = error => ({ code: typeof error.code === 'string' ? error.code : 'INTEGRATION_ERROR',
   message: error instanceof MapError || Number.isInteger(error.status) ? error.message : 'Integration command failed' });
+const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
+const diagnosticPhases = new Set(['model', 'fetch', 'http', 'response-stream', 'response-json', 'response-validation', 'decision-parse']);
+const safeCauseCode = code => diagnosticCodes.has(code) || typeof code === 'string' && /^MODEL_HTTP_[45]\d\d$/.test(code) ? code : 'UNKNOWN_MODEL_ERROR';
+function participationFailure(code, message, status, cause, phase, startedAt) {
+  const failure = new MapError(code, message, status), elapsed = Date.now() - startedAt;
+  try {
+    let causeCode = 'UNKNOWN_MODEL_ERROR', selectedPhase = phase;
+    const metadata = Object.getOwnPropertyDescriptor(cause || {}, 'modelDiagnostic')?.value;
+    causeCode = safeCauseCode(cause?.code);
+    if (diagnosticPhases.has(metadata?.phase)) selectedPhase = metadata.phase;
+    Object.defineProperty(failure, 'participationDiagnostic', { value: {
+      causeCode, phase: selectedPhase,
+      ...(Number.isSafeInteger(elapsed) && elapsed >= 0 ? { durationMs: elapsed } : {}),
+    } });
+  } catch {} // Diagnostic access must not replace the fixed public failure.
+  throw failure;
+}
 
 export function relevanceInput(payload) {
   const text = payload?.text ?? '', context = payload?.context ?? [], files = payload?.files ?? [], inputs = payload?.inputs;
@@ -75,6 +92,7 @@ export async function classifyIntegrationMessage(model, { overview, input, actor
     return { respond: false, reason: '当前只有引用或代码，没有当前参与请求', mainVersion: overview.version };
   }
   const signal = AbortSignal.timeout(12000);
+  const startedAt = Date.now();
   let result;
   try {
     result = await model.next({ tools: [], maxTokens: 256, signal,
@@ -92,8 +110,9 @@ export async function classifyIntegrationMessage(model, { overview, input, actor
           content: JSON.stringify({ historicalSpeaker: item.speaker, historicalRole: item.role, text: item.text }) })),
         { role: 'user', content: JSON.stringify({ message, evidence }) },
       ] });
-  } catch {
-    fail('RELEVANCE_UNAVAILABLE', 'Participation decision is temporarily unavailable; the original input remains pending', 503);
+  } catch (cause) {
+    participationFailure('RELEVANCE_UNAVAILABLE', 'Participation decision is temporarily unavailable; the original input remains pending', 503,
+      signal.aborted && cause === signal.reason && signal.reason?.name === 'TimeoutError' ? { code: 'MODEL_TIMEOUT' } : cause, 'model', startedAt);
   }
   const parse = result => {
     let decision;
@@ -104,11 +123,13 @@ export async function classifyIntegrationMessage(model, { overview, input, actor
         !block || !['text', 'thinking', 'redacted_thinking'].includes(block.type) ||
         block.type === 'text' && typeof block.text !== 'string')) throw new Error();
       decision = JSON.parse(result.content.filter(block => block.type === 'text').map(block => block.text).join(''));
-    } catch { fail('RELEVANCE_INVALID_RESPONSE', 'Message relevance was not determined; no reply was submitted', 502); }
+    } catch { participationFailure('RELEVANCE_INVALID_RESPONSE', 'Message relevance was not determined; no reply was submitted', 502,
+      { code: 'MODEL_INVALID_RESPONSE' }, 'decision-parse', startedAt); }
     if (!object(decision) || Object.keys(decision).some(key => !['target', 'intent', 'reason'].includes(key)) ||
       !['coordinator', 'other', 'none'].includes(decision.target) || !['reply', 'notice', 'quoted', 'unclear'].includes(decision.intent) ||
       typeof decision.reason !== 'string' || decision.reason.length > 200) {
-      fail('RELEVANCE_INVALID_RESPONSE', 'Message relevance was not determined; no reply was submitted', 502);
+      participationFailure('RELEVANCE_INVALID_RESPONSE', 'Message relevance was not determined; no reply was submitted', 502,
+        { code: 'MODEL_INVALID_RESPONSE' }, 'decision-parse', startedAt);
     }
     return decision;
   };
@@ -283,7 +304,10 @@ export async function startIntegrationGateway({ config, command, state, stateDir
               const data = await state(scope, { actor });
               if (closed || res.destroyed || !clients.has(client) || !await write({ type: 'state', data })) return;
             } while (client.dirty);
-          } catch (error) { logger({ code: errorBody(error).code }); res.end(); finish(); }
+          } catch (error) {
+            try { Promise.resolve(logger({ code: 'INTEGRATION_ERROR' })).catch(() => {}); } catch {}
+            res.end(); finish();
+          }
           finally {
             client.polling = false;
             if (!closed && clients.has(client)) { client.timer = setTimeout(poll, Math.max(250, pollIntervalMs)); client.timer.unref(); }
@@ -300,7 +324,21 @@ export async function startIntegrationGateway({ config, command, state, stateDir
     } catch (error) {
       if (res.headersSent) { res.end(); return; }
       const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
-      if (status >= 500) logger({ code: errorBody(error).code });
+      if (status >= 500) {
+        // Logging is optional private observation, not a second failure path.
+        try {
+          const code = errorBody(error).code;
+          const participating = ['RELEVANCE_UNAVAILABLE', 'RELEVANCE_INVALID_RESPONSE'].includes(code);
+          const metadata = participating ? Object.getOwnPropertyDescriptor(error, 'participationDiagnostic')?.value : null;
+          const entry = { code: participating ? code : 'INTEGRATION_ERROR',
+            ...(id ? { idHash: hash(id) } : {}) };
+          if (object(metadata)) Object.assign(entry, {
+            phase: diagnosticPhases.has(metadata.phase) ? metadata.phase : 'model', causeCode: safeCauseCode(metadata.causeCode),
+            ...(Number.isSafeInteger(metadata.durationMs) && metadata.durationMs >= 0 ? { durationMs: metadata.durationMs } : {}),
+          });
+          Promise.resolve(logger(entry)).catch(() => {});
+        } catch {}
+      }
       send(res, status, { id, ok: false, error: errorBody(error) });
     }
   });

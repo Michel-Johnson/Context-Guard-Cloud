@@ -269,6 +269,7 @@ export class CoordinatorModel {
     if (signal?.aborted) cancel();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => abort.abort(timeoutProblem()), this.timeoutMs);
+    let phase = 'fetch';
     try {
       const response = await this.fetch(this.endpoint, {
         method: 'POST', redirect: 'error', signal: abort.signal,
@@ -276,10 +277,12 @@ export class CoordinatorModel {
         body,
       });
       if (!response.ok) {
+        phase = 'http';
         cancelReader(response.body);
         // Provider error bodies may echo credentials or private prompt data.
         throw problem(`MODEL_HTTP_${response.status}`, `Coordinator provider returned HTTP ${response.status}`);
       }
+      phase = this.protocol !== 'openai' && (response.headers.get('content-type') || '').includes('text/event-stream') ? 'response-stream' : 'response-json';
       const result = this.protocol === 'openai' ? openAiResult(await readBoundedJson(response, deadlineAt, abort), this.model)
         : (response.headers.get('content-type') || '').includes('text/event-stream')
           ? await readEventStream(response, onText, onToolStart, deadlineAt, abort) : await readBoundedJson(response, deadlineAt, abort);
@@ -288,6 +291,7 @@ export class CoordinatorModel {
         if (text) await onText?.(text);
         for (const call of result.content.filter(block => block.type === 'tool_use')) await onToolStart?.(call.name);
       }
+      phase = 'response-validation';
       if (result.model !== this.model || !Array.isArray(result.content) || !['end_turn', 'tool_use'].includes(result.stop_reason)) {
         throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned a different model or an incomplete turn');
       }
@@ -301,9 +305,18 @@ export class CoordinatorModel {
     } catch (error) {
       const wasAborted = abort.signal.aborted;
       abort.abort();
-      if (wasAborted) throw interruptionProblem(abort.signal);
-      if (String(error.code || '').startsWith('MODEL_') || error.code === 'CONTEXT_TOO_LARGE') throw error;
-      throw problem('MODEL_UNAVAILABLE', 'Coordinator model connection failed; no automatic retry was made');
+      const failure = wasAborted ? interruptionProblem(abort.signal) : String(error.code || '').startsWith('MODEL_') || error.code === 'CONTEXT_TOO_LARGE'
+        ? error : problem('MODEL_UNAVAILABLE', 'Coordinator model connection failed; no automatic retry was made');
+      // Private metadata only: provider exception text and arbitrary codes are
+      // never diagnostic data. Preserve the original outcome if metadata fails.
+      try {
+        const safeCodes = ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE'];
+        const code = safeCodes.includes(failure.code) || /^MODEL_HTTP_[45]\d\d$/.test(failure.code || '') ? failure.code : 'UNKNOWN_MODEL_ERROR';
+        const elapsed = Date.now() - (deadlineAt - this.timeoutMs);
+        Object.defineProperty(failure, 'modelDiagnostic', { value: { code, phase,
+          ...(Number.isSafeInteger(elapsed) && elapsed >= 0 ? { durationMs: elapsed } : {}) }, configurable: true });
+      } catch {}
+      throw failure;
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }
   }
 }

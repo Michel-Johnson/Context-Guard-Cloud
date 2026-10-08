@@ -1,5 +1,26 @@
 # Cloud 验证台账
 
+## SLACK-EMOJI-EXPAND-01 · 十种表情与自然混合回应（2026-10-08）
+
+- [x] Coordinator：人明确要求更多表情、更经常自然互动，并允许表情+文字；审核仅扩Cloud与插件窄enum及Cloud自有工具description，不改变参与/静默与受众门槛。已接受Coordinator回复的轮次才可轻量互动，不强制每条或刷屏，不改共享角色/PE/模型/权限/版本/配置。
+- [x] Executor：同步允许thumbsup/heart/smile/clap/tada/raised_hands/thinking_face/muscle/wave/pray（👍❤️😄👏🎉🙌🤔💪👋🙏）；white_check_mark与eyes仍不允许模型选择，自动👀仅收件。明确reaction可与文字同用或单独用，不能代替风险/必要说明/审批。原Inbox目标、可信human、稳定编号、8槽/429/原重试/失败语义不改；三处现有文档就地更新，不重复记忆、不复制/删除/改名设计、不升发布版本。
+  - 开发后唯一极小定向Node24，两现有test文件7/7、0fail/skip、actual terminal exit0，563.8173ms；原日志 `temp/slack-emoji-expanded-executor-8292042-20261008.log`。仅核10项精确enum/工具指引、Cloud纯reaction/权限/新增muscle混合业务保护、插件10项纯reaction零post及clap+完整段落文字/目标拒绝。既有真实publicMessages混合投影本轮未运行，不宣称新增混合全链路已验收；不加跑完整suite、31或422。
+  - 基线HEAD仍8292042，原DIAG产品3文件与gateway/slack-cloud测试字节保留；cloud-coordinator测试仅改reaction部分并另冻结新hash。旧DIAG/422/31结果不能冒充此新整体测试修订通过，原C4/attention及首次失败证据保留。
+- [x] 独立 Tester：只在最终冻结字节极小核enum同步/10项接受、纯与文字+reaction不丢正文、Cloud工具description仅在已接受回复内鼓励自然互动、不替代必要说明/业务/审批、不越来源/目标权限；不追加任何额外全量。本地受控fixtures不证明模型实际上更频繁发出或真实Slack已验收。
+  - HEAD829+产品2/测试2冻结hash前后匹配，Node24唯一3正式目标（Cloud enum/混合业务不提前完成、插件enum/纯reaction及clap+分段文字）actualexit0，chunk7dcfe8，3/3、0fail/skip，784.3137ms。原日志 `temp/slack-emoji-expanded-independent-frozen-8292042-20261008.log` SHA256 `4a8ecf42908f2e771130084337563975ae00548ac3369883bdbc0b96e5d50520`；同名`.md`保留EXP-01..03/准确hash/静态边界/未运行项。只改enum/Cloud工具description，不改参与PE/来源绑定/8槽/重试；未跑真实publicMessages旧目标/31/422/全量/gates或生产，不拿旧失败/旧通过冒充新全套。
+- [ ] Delivery/真人：待人确认提交/上线；Executor未Git/生产操作/安装/备份/删除/版本bump/真实模型调用。真实使用频率、Slack展示与既有NAT/C4验收仍未完成。
+
+## DIAG-NAT19-01 · Slack 参与故障私有元数据（2026-10-08）
+
+- [x] Coordinator：审核当前 `8292042e8d583922d80dc67d836e0dbb27d06952` 失败路径：classification原catch丢供应商安全cause，网关只成功回执记耗时且server未接logger。允许最小私有code/phase/durationMs/idHash观察，不调用生产模型、不重排C4，不扩大12秒或三次参与重试，不改PE/权限/真实模型/配置。
+- [x] Executor：native transport失败只附non-enumerable安全元数据，原SSE/message_stop/取消/计时起点/结果不变；分类503/502保留原公开code/message，分别标可信模型阶段与decision-parse。causeCode仅固定名单和MODEL_HTTP_[45]xx，任意MODEL_前缀/秘密字符串映射UNKNOWN_MODEL_ERROR；固定phase、有限非负安全整数耗时，无异常正文/stack/token/prompt/模型/端点。网关唯一失败出口只提取参与私有metadata，原操作只hash；非参与及SSE其他异常日志固定INTEGRATION_ERROR。loggerthrow/rejection/诊断getter不得替换原响应；server接固定标签/字段console.warn。失败仍无成功/静默回执，同ID恢复保持原策略。
+  - 开发后唯一一次Node24定向3个现有formal test文件，真实session74548 actualexit0，25/25、0fail/skip、12459.4459ms，保留原12秒deadline和native流终止/清理回归。原日志 `temp/slack-participation-diagnostics-executor-8292042-20261008.log` SHA256 `f29bb00d5dd09de19b1c50deaaad7284478ae6509b3132c71eaa5e2bd82d2167`。其中真实startCloudServer logger连接在tests/slack-cloud.test.mjs验证，不是仅传logger替身；无真实供应商调用。
+  - 经Coordinator批准测试-only收口：恶意metadata getter用例原logger内assert.fail会被刻意隔离的logger异常吞掉，改为调用计数并在logger外assert0。产品未变，不重复Executor测试；原25pass对应旧测试hash，不冒称增强后的fixture已运行。旧integration测试SHA `ce4d2b6e041500741eb001908ef28e323f48d0f0e83c7e5d9c4b81e901106f7e`及另外两测试hash保存在私有交接，最终计数增强交独立Tester验证。
+- [x] 独立 Tester：按最终产品3+测试3冻结hash验证native fetch/HTTP/JSON/stream/validation、分类parse/12秒timeout安全metadata；任意code/phase/getter/非参与伪diagnostic和logger同步throw/异步reject不泄漏或改公开结果；实际server固定日志出口、同原ID失败无成功receipt、重启恢复一次；最终计数增强必须真的运行。核PE/12秒/三次预算/来源权限/真实配置未改。
+  - 基线HEAD `8292042e8d583922d80dc67d836e0dbb27d06952` + 最终六文件hash（model cc27312b、gateway7d0b07a5、server5c8b141a；formalcloud fde85370、integration ccea2393、slack a3d04bdc）定义本地准确未提交修订，不把修改冒充829已包含。Node24.19.0一次独立25最终正式目标+6私有边界：session21615 actualexit0、31/31、0fail/skip、12499.6996ms；最终logger外计数真实运行，另验证frozenError、inherited/own getter、恶意causecodegetter、非法duration、HTTP own getter及SSE loggerthrow/reject。原log `temp/slack-participation-diagnostics-independent-frozen-8292042-20261008.log` SHA256 `78b930155d5f7ae628ef93c58e753c405c0f14b87ff028da1845d8de5d90e97c`。3治理gate各exit0；完整命令、前后全hash、编号DIAG-01..09及限制见同名`.md`。不覆盖Executor原25/旧ce4d测试结果，不以定向代替Required/上线/C4根因或恢复。
+  - 一次正式 Cloud 本地完整回归：同 HEAD829+最终六hash 前后不变，Node24.19.0调用真实npm-cli `test`，隔离子进程home/凭据环境、正式15分钟/concurrency2不改；session72585、terminal2018ac actualexit0，424总项/422pass/0fail/2既有skip，202158.7955ms。原log `temp/slack-participation-full-regression-independent-root-8292042-20261008.log` SHA256 `ed7e927d5e03d517c20ba2df17d9c4ebeafb2dd4a619d056f9bdd20a60bbe984`，同名`.md`保留准确hash/隔离/命令。用户运行中收敛验证：尚未启动Slack追加全量为not-run，未再启动任何suite/target/gates；不合称Required/真实恢复通过，不改13b/412原failed或C4三次attention。
+- [ ] Delivery/真人验收：本次只是可安全观察缺口修复，不是原C4根因已确认或恢复完成。原三次attention及C3/C4证据不改，NAT-19/C4、持续通信、真实Slack与手机验收未关闭；本轮不Git/推送/生产模型/生产配置，不伪造产品任务/Plan/Main回执。
+
 ## CLOUD-SKILL-CONSUME-INTEGRATION-01 · 合并固定 Skill 消费边界（2026-10-08）
 
 - [x] Coordinator：批准整合 Main `60d2970` 的两仓库边界及固定 core 2.0.2 / workbench 1.1.6；保留本轮 Slack 模型选择、表情和 Coordinator 实例FIFO。Root 操作正常 Git 合并；Executor 仅解决明确文本/版本/链接冲突，不恢复任何已删除共享源码或旧接口测试。
