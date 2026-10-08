@@ -81,13 +81,28 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId } = {}) {
   return blocks;
 }
 export function messageBlocks(message, key, context) {
-  const blocks = plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'));
-  blocks.push(...nodeLinkBlocks(message.actions, context));
-  for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
-  for (const question of message.questions || []) if (!question.answer) {
-    blocks.push(...plainSections(question.text));
+  const questions = message.questions || [], open = questions.filter(question => !question.answer);
+  // Cloud's question-only projection already supplies the exact joined question
+  // text. Render those questions with their own options once, preserving order
+  // and answered history. A partial-prefix or genuine prose is not that projection.
+  const projectedQuestions = message.questionOnly === true && open.length > 0 &&
+    message.text === questions.map(question => question.text).join('\n\n');
+  const body = plainText(message.text || '');
+  const sameWholeQuestion = questions.length === 1 && body && body === plainText(questions[0].text);
+  const blocks = projectedQuestions ? [] : plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'));
+  const questionControls = question => {
     if (question.options?.length) blocks.push(...plainSections('可参考：\n' + question.options.map(option => `• ${option}`).join('\n')));
     blocks.push(...plainSections('直接在这个线程回复即可，不需要填写表单。'));
+  };
+  if (projectedQuestions) for (const question of questions) {
+    blocks.push(...plainSections(question.text));
+    if (!question.answer) questionControls(question);
+  }
+  blocks.push(...nodeLinkBlocks(message.actions, context));
+  for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
+  if (!projectedQuestions) for (const question of open) {
+    if (!sameWholeQuestion) blocks.push(...plainSections(question.text));
+    questionControls(question);
   }
   return blocks;
 }
