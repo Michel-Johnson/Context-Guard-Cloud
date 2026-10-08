@@ -2,6 +2,10 @@
 
 ## CURSOR-WORKBENCH-01 · Cursor Cloud 首版适配（进行中）
 
+- [x] Cloud `4253814` 准确完整 npm test 实际 467 项、465通过、0失败、2既有跳过、91212.169959ms，独立自有接口8/8通过；PR #33 初次 Required/完整七项 CI `37827680426` 全绿，保留旧固定消费范围，不冒称真实厂商验收。
+- [x] 从已合 Skill main `2ccae20` 的公开不可变共享 Release，经包管理器固定 core2.2.0/UI1.2.0并更新锁完整性；构建57文件，未编辑生成物。Cloud候选1.4.0，新功能次版本；旧测试客户端fixture0.7.1不变。新增公共配对HTTP用例：实际设备认证/绑定/心跳→真人POST入队→设备sync.read→原生result HTTP回显→同Session追问/重放/未绑定拒绝，Cursor公共工作台两项实际2/2 exit0，原生模型边界为合成接收器。
+- [ ] 当前固定新包准确修订的全量、独立Review/Required、Cloud真实配对Cursor、Cursor Cloud API key与真实任务仍待完成；不部署或宣称交付。
+
 - [x] 独立 `codex/cursor-workbench` 工作树已同步至 main `2ab3c71`；未修改共享生成物、生产配置、既有目录或第三方 Hook。
 - [x] 官方 REST v1 提供方实现连接检查、固定仓库/SHA 建 Agent、同 Agent 追问、Run 状态/结果读取及取消。默认新分支，禁用自动 PR；保留未知结果，不盲目重投写请求。
 - [x] 正式 `tests/cursor-provider.test.mjs` 4/4、实际退出 0；真实 loopback HTTP 提供方为合成 Cursor，不是厂商服务。覆盖线协议、分支边界、错误/冲突、未知接收及跨 Agent/Run 拒绝；同步 main 后原四项再次通过。
