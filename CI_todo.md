@@ -1366,3 +1366,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   and real isolated local-to-Cloud Session sync. Initial browser attempts found
   and fixed mobile left-edge clipping; two later fixture races were corrected by
   waiting for model load and desktop layout completion, without relaxing bounds.
+
+## MIGRATE-READABLE-01 · 对用户隐藏内部标识（2026-10-08）
+
+- [x] 基于最新 main `fdfd1be` 迁移 Slack Home、事项通知和 Map 预览的名称显示；内部定位、按钮参数、链接和版本身份保持不变，明确索要技术编号的回复不裁切。
+- [x] Coordinator 两种角色补充不展示测试前缀和内部编号的规则；保留 main 新增的排版、单文件写入、资料白名单及自然对话逻辑。没有迁移旧对话 submit 实现，没有改自动派发。
+- [x] 迁移三项显示/身份回归和双角色规则检查，增强原通知与 Home 断言；Slack 插件版本 0.1.18，core 角色提示词修复版本 2.0.1。
+- [ ] 本地只执行语法、差异和安全检查，不额外运行功能测试。准确修订的全量 CI 与 Required 尚待执行，不能引用旧候选的成功结果代替。
+- [ ] 模型实际输出和真实 Slack 客户端未复验；不部署生产。共享制品须从全部迁移合入后的 main 构建并固定到 Skill。
