@@ -31,6 +31,8 @@ import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
 import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
+import { CursorCloudProvider } from './cursor-provider.mjs';
+import { CursorCloudSessions } from './cursor-sessions.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -42,6 +44,7 @@ const workbenchAssetTypes = new Map([
   ['prototype/attachments.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/coordinator-markdown.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/coordinator-working-blot.mjs', 'text/javascript; charset=utf-8'],
+  ['prototype/cursor-chat.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/vendor/marked.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/working-blot-atlas.png', 'image/png'],
   ['scripts/shared/map-model.mjs', 'text/javascript; charset=utf-8'],
@@ -410,6 +413,8 @@ export async function startCloudServer({
   publicOrigin = process.env.CONTEXT_GUARD_CLOUD_ORIGIN || '',
   memoryConfig,
   protocolConfig,
+  cursorConfigFile = process.env.CONTEXT_GUARD_CURSOR_CONFIG || '',
+  cursorProviderFactory = config => new CursorCloudProvider(config),
   coordinatorModelFactory = config => new CoordinatorModel(config),
   integrationConfig,
   attachmentProvider,
@@ -421,7 +426,11 @@ export async function startCloudServer({
   const workbenchAssets = new Map();
   const assetHash = createHash('sha256');
   for (const [file, contentType] of workbenchAssetTypes) {
-    const body = await fs.readFile(path.join(root, file));
+    const body = await fs.readFile(path.join(root, file)).catch(cause => {
+      if (file === 'prototype/cursor-chat.mjs' && cause.code === 'ENOENT') return null;
+      throw cause;
+    });
+    if (!body) continue; // Older fixed UI versions do not import Cursor chat.
     assetHash.update(file).update(body);
     workbenchAssets.set(file, { body, contentType });
   }
@@ -431,6 +440,24 @@ export async function startCloudServer({
     (_match, attribute, file) => `${attribute}="/assets/${assetVersion}/prototype/${file}"`,
   );
   const registryFile = path.join(dataDir, 'projects.json');
+  if (cursorConfigFile && !path.isAbsolute(cursorConfigFile)) throw new MapError('INVALID_CURSOR_CONFIG', 'Cursor configuration requires an absolute private file');
+  const cursorConfiguration = cursorConfigFile ? await readJson(cursorConfigFile) : null;
+  const cursorServices = new Map();
+  const cursorFor = async project => {
+    const config = cursorConfiguration?.projects?.[project.id];
+    if (!config) throw new MapError('CURSOR_NOT_CONFIGURED', '服务器尚未配置此项目的 Cursor Cloud', 503);
+    if (cursorServices.has(project.id)) return cursorServices.get(project.id);
+    if (!path.isAbsolute(config.apiKeyFile || '') || Object.keys(config).some(key => !['apiKeyFile', 'repositoryUrl', 'startingRef', 'model'].includes(key))) throw new MapError('INVALID_CURSOR_CONFIG', '配置私有密钥文件、仓库和固定提交', 503);
+    let apiKey;
+    try {
+      const secret = (await fs.readFile(config.apiKeyFile, 'utf8')).trim();
+      apiKey = secret.startsWith('{') ? JSON.parse(secret).CURSOR_API_KEY : secret;
+    } catch { throw new MapError('CURSOR_AUTH_REQUIRED', '无法读取 Cursor 私有密钥，请检查服务器配置', 503); }
+    const service = new CursorCloudSessions({ directory: path.join(dataDir, 'cursor', digest(project.id)),
+      provider: cursorProviderFactory({ apiKey }), repositoryUrl: config.repositoryUrl, startingRef: config.startingRef, model: config.model });
+    cursorServices.set(project.id, service);
+    return service;
+  };
   const mapsDir = path.join(dataDir, 'maps');
   const eventsDir = path.join(dataDir, 'events');
   const operationsDir = path.join(dataDir, 'operations');
@@ -2269,6 +2296,40 @@ export async function startCloudServer({
         const action = workbench[3];
         if (action === '/bootstrap' && req.method === 'GET') { requirePrivateRead(req, url); return send(res, 200, { root: project ? `cloud:${project.id}` : 'cloud:overview', protocol: 3, apiBase: route.slice(0, -'/bootstrap'.length), authenticated: !!cookieValue(req), interfaceCapabilities: { deviceAuthorization: !!project && !!deviceAuthorization && !!interfaceConfig?.repositories?.find(item => item.projectId === project.id), sessionCompletion: !!project && !!configuredMemory?.projects?.[project.id], attachments: !!project && !!configuredMemory?.projects?.[project.id] && !!attachments, taskDispatch: !!project && !!interfaceConfig, humanReview: !!project && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[project?.id]?.coordinator?.enabled } }); }
         requireWorkbench(req, url);
+        if (action === '/api/cursor-chat') {
+          if (!project) throw new MapError('PROJECT_REQUIRED', 'Select a project before opening Cursor', 409);
+          if (req.headers.origin && req.headers.origin !== (allowedOrigin || `http://${req.headers.host}`)) throw new MapError('ORIGIN_REJECTED', 'Cross-origin Cursor request rejected', 403);
+          if (req.method === 'GET' && !url.searchParams.get('session')) {
+            const local = (await memorySessions(project)).filter(session => session.platform === 'cursor').map(session => ({ id: session.id, name: session.name || 'Cursor 本地', kind: 'local' }));
+            const configured = !!cursorConfiguration?.projects?.[project.id];
+            const cloud = configured ? await (await cursorFor(project)).list() : [];
+            return send(res, 200, { sessions: [...local, ...cloud], canCreateCloud: configured });
+          }
+          const input = req.method === 'POST' ? await requestBody(req) : null;
+          if (input && Object.keys(input).some(key => !['id', 'text', 'sessionId', 'action'].includes(key))) throw new MapError('INVALID_ARGUMENT', 'Use a Session, message ID and text');
+          if (input?.action !== undefined && input.action !== 'create') throw new MapError('INVALID_ARGUMENT', 'Only explicit Cursor creation is supported');
+          if (input?.action === 'create') return send(res, 202, await (await cursorFor(project)).create({ id: input.id, text: input.text }));
+          const sessionId = input?.sessionId || url.searchParams.get('session');
+          if (typeof sessionId !== 'string' || !sessionId) throw new MapError('SESSION_REQUIRED', 'Select a Cursor Session');
+          if (sessionId.startsWith('cloud:')) {
+            const service = await cursorFor(project), nativeSessionId = sessionId.slice(6);
+            if (req.method === 'GET') return send(res, 200, await service.conversation(nativeSessionId));
+            if (req.method === 'POST') return send(res, 202, await service.followUp(nativeSessionId, { id: input.id, text: input.text }));
+            throw new MapError('INVALID_ARGUMENT', 'Use GET or POST');
+          }
+          const local = (await memorySessions(project)).find(session => session.id === sessionId && session.platform === 'cursor');
+          if (!local) throw new MapError('FORBIDDEN', 'Select a bound Cursor receiver in this project', 403);
+          const { store, principal } = interfaceProject(project), binding = await store.registeredBinding(principal, sessionId);
+          if (!binding || typeof store.nativeConversation !== 'function') throw new MapError('CURSOR_UPGRADE_REQUIRED', '升级共享核心与本机 Skill 后再连接 Cursor', 503);
+          const session = { id: sessionId, generation: binding.generation };
+          if (req.method === 'GET') {
+            const conversation = await store.nativeConversation(principal, session);
+            const terminal = conversation.messages.at(-1)?.status;
+            return send(res, 200, { ...conversation, configured: true, status: conversation.pending ? local.execution?.status || 'unknown' : ['failed', 'interrupted'].includes(terminal) ? terminal : 'stopped' });
+          }
+          if (req.method !== 'POST') throw new MapError('INVALID_ARGUMENT', 'Use GET or POST');
+          return send(res, 202, (await store.handle(principal, { v: 2, id: input.id, type: 'native.prompt', session, payload: { text: input.text } })).data);
+        }
         if (action.startsWith('/api/coordinator/attachments/') && project && req.method === 'GET') {
           if (!integrationAttachments) protocolFail('NOT_FOUND', 'Coordinator attachments are unavailable');
           const id = decodeURIComponent(action.slice('/api/coordinator/attachments/'.length));
@@ -2818,6 +2879,7 @@ export async function startCloudServer({
     clearTimeout(initialPublication);
     const coordinatorShutdown = (async () => {
       await integrationShutdown;
+      await Promise.all([...cursorServices.values()].map(service => service.close()));
       await Promise.all([...coordinators.values()].map(async pending => {
         const service = await pending.catch(() => null);
         if (!service) return;

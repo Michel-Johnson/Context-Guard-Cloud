@@ -44,6 +44,9 @@
     }
   ],
   "productFiles": [
+    "tests/cursor-provider.test.mjs",
+    "tests/cursor-sessions.test.mjs",
+    "tests/cursor-workbench.test.mjs",
     "tests/executor-context-api.test.mjs",
     "tests/attachments.test.mjs",
     "tests/authorization-boundary.test.mjs",
