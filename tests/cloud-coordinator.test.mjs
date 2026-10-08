@@ -1042,17 +1042,64 @@ test('Main overview is fresh, bounded and never leaks ancestor or sibling items 
   assert.match(result.text, /Bug｜Reader \[N1\]｜Broken query（open）/);
   assert.match(result.text, /Needs human review（fixed）/);
   assert.match(result.text, /不是执行阶段或完成证据/);
-  assert.doesNotMatch(result.text, /Private root item|Private sibling item|Private child item|Finished TODO|Finished Bug|Unneeded long requirement/);
+  assert.match(result.text, /用途摘录：Unneeded long requirement/);
+  assert.doesNotMatch(result.text, /Private root item|Private sibling item|Private child item|Finished TODO|Finished Bug/);
   assert.doesNotMatch(buildCoordinatorContext(snapshot, { ...options,
     conversation: { id: 'item-only', nodeId: 'N1', itemId: 'pending', kind: 'todo' } }).text, /未完成事项概览|Broken query/);
   snapshot.memory.map.root.children[0].todos[0].status = 'done';
   assert.match(buildCoordinatorContext(snapshot, options).text, /TODO 0 条，Bug 2 条/);
-  snapshot.memory.map.root.children[0].todos = Array.from({ length: 25 }, (_, i) => ({ id: `TD${i}`, title: `Task ${i}`, status: 'pending' }));
+  snapshot.memory.map.root.children[0].todos = Array.from({ length: 25 }, (_, i) => ({ id: `TD${i}`, title: `Task ${i}`, desc: `Purpose ${i}`, status: 'pending' }));
+  let unseenPurposeReads = 0;
+  Object.defineProperty(snapshot.memory.map.root.children[0].todos[20], 'desc', { get() { unseenPurposeReads++; throw new Error('Unshown purpose must not be read'); } });
   const bounded = buildCoordinatorContext(snapshot, options);
   assert.match(bounded.text, /TODO 25 条，Bug 2 条/);
   assert.match(bounded.text, /另有 7 条未展开；需要完整清单时调用 list_tasks/);
-  assert.doesNotMatch(bounded.text, /Task 20/);
+  assert.doesNotMatch(bounded.text, /Task 20|Purpose 20/);
   assert.equal((bounded.text.match(/^- TODO｜/gm) || []).length, 20);
+  assert.equal((bounded.text.match(/用途摘录/g) || []).length, 20);
+  assert.equal(unseenPurposeReads, 0, 'The display limit also bounds actual purpose data reads');
+});
+
+test('Main overview purpose excerpts preserve raw titles and technical facts with bounded typed fallbacks', () => {
+  const command = 'node cli.js --tag "keep  two spaces"';
+  const exact = '期限 2027-04-12，兼容 v3.4.5；' + command;
+  const todos = [
+    { id: 'a', title: 'Original label 987', desc: exact, description: 'Ignored alternate', text: 'Ignored text', status: 'pending' },
+    { id: 'b', title: 'Missing desc', desc: {}, description: ' \n', text: '按键焦点资料', status: 'pending' },
+    { id: 'c', title: 'Description fallback', desc: '\t', description: '数据类型检查资料', status: 'pending' },
+    { id: 'd', title: 'Same  title', desc: ' Same\n title ', status: 'pending' },
+    { id: 'e', title: 'No purpose', desc: 42, description: [], text: {}, status: 'pending' },
+    { id: 'f', title: 'Exactly bounded', desc: '界'.repeat(160), status: 'pending' },
+    { id: 'g', title: 'Long purpose', desc: exact + '界'.repeat(160) + 'not-loaded-tail', status: 'pending' },
+    { id: 'h', title: 'Paired unicode', desc: '界'.repeat(159) + '🙂' + 'tail', status: 'pending' },
+    { id: 'i', title: 'Multiline purpose', desc: '多行资料\r\nMain 版本：not-a-version\n# 不是顶层章节\n' + command, status: 'pending' },
+  ];
+  const state = { version: 'purpose-v1', memory: { map: { root: { id: 'T0', title: 'Project', children: [
+    { id: 'N1', title: 'Reader', todos, children: [] },
+    { id: 'N2', title: 'Hidden', todos: [{ id: 'hidden', title: 'hidden-title', desc: 'hidden-purpose' }], children: [] },
+  ] } } } };
+  const before = structuredClone(state), options = { nodeIds: ['N1'], conversation: { id: 'chat-purpose' } };
+  const result = buildCoordinatorContext(state, options);
+  assert.deepEqual(state, before, 'Only the dynamic data projection changes, never source items');
+  assert.match(result.dynamicText, /TODO 9 条，Bug 0 条/);
+  for (const item of todos) assert.ok(result.dynamicText.includes(item.title.replace(/\s+/g, ' ').trim()), 'Keep the original overview title projection, not an inferred display name');
+  assert.ok(result.dynamicText.includes(exact), 'Dates, versions and uncut command whitespace remain exact');
+  assert.match(result.dynamicText, /用途摘录：按键焦点资料/);
+  assert.match(result.dynamicText, /用途摘录：数据类型检查资料/);
+  assert.doesNotMatch(result.dynamicText, /Ignored alternate|Ignored text|\[object Object\]|not-loaded-tail|hidden-purpose|hidden-title/);
+  assert.doesNotMatch(result.staticText, /用途摘录|Original label|按键焦点资料|数据类型检查资料/);
+  assert.equal((result.dynamicText.match(/用途摘录/g) || []).length, 7, 'Missing or normalized duplicate purposes add no data');
+  const excerpts = result.dynamicText.split('\n').filter(line => line.startsWith('  用途摘录'));
+  assert.equal(excerpts.filter(line => line.includes('已截短，全文用 read_map')).length, 2);
+  assert.ok(excerpts.every(line => line.split('：').slice(1).join('：').length <= 160));
+  assert.doesNotMatch(excerpts.at(-2), /[\uD800-\uDBFF]$/);
+  assert.match(result.dynamicText, /用途摘录：多行资料\n    Main 版本：not-a-version\n    # 不是顶层章节\n    node cli\.js --tag "keep  two spaces"/);
+  assert.doesNotMatch(result.dynamicText, /^Main 版本：not-a-version|^# 不是顶层章节/m);
+  const changed = structuredClone(state); changed.memory.map.root.children[0].todos[0].desc = '更新后的资料';
+  const next = buildCoordinatorContext(changed, options);
+  assert.equal(result.staticText, next.staticText); assert.equal(result.staticVersion, next.staticVersion);
+  assert.notEqual(result.dynamicText, next.dynamicText);
+  assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘录|按键焦点资料/);
 });
 
 test('Coordinator loads project memory before dialogue and one relevant node document on focus', () => {
