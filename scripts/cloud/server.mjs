@@ -483,7 +483,7 @@ export async function startCloudServer({
     const principal = await interfaceAuth.authenticate(credential);
     const repository = interfaceConfig.repositories.find(item => item.repositoryId === principal.repositoryId);
     if (principal.role !== 'device' || repository?.projectId !== projectId) return false;
-    if (sessionId) return !!await interfaceStorage(principal).store.registeredBinding(principal, sessionId);
+    if (sessionId) return await interfaceStorage(principal).store.registeredBinding(principal, sessionId) || false;
     return ['GET', 'POST'].includes(method) && ['main', 'preferences'].includes(scope) &&
       (method === 'GET' || scope === 'preferences');
   } }) : null;

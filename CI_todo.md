@@ -21,6 +21,17 @@
   - 一次正式 Cloud 本地完整回归：同 HEAD829+最终六hash 前后不变，Node24.19.0调用真实npm-cli `test`，隔离子进程home/凭据环境、正式15分钟/concurrency2不改；session72585、terminal2018ac actualexit0，424总项/422pass/0fail/2既有skip，202158.7955ms。原log `temp/slack-participation-full-regression-independent-root-8292042-20261008.log` SHA256 `ed7e927d5e03d517c20ba2df17d9c4ebeafb2dd4a619d056f9bdd20a60bbe984`，同名`.md`保留准确hash/隔离/命令。用户运行中收敛验证：尚未启动Slack追加全量为not-run，未再启动任何suite/target/gates；不合称Required/真实恢复通过，不改13b/412原failed或C4三次attention。
 - [ ] Delivery/真人验收：本次只是可安全观察缺口修复，不是原C4根因已确认或恢复完成。原三次attention及C3/C4证据不改，NAT-19/C4、持续通信、真实Slack与手机验收未关闭；本轮不Git/推送/生产模型/生产配置，不伪造产品任务/Plan/Main回执。
 
+## EXECUTOR-CONTEXT-01 · Cloud 只读上下文适配（2026-10-08）
+
+- [x] `tests/executor-context-api.test.mjs` 前 5 项以真实 loopback HTTP 和合成数据通过：导航、切片、版本冲突、项目 / Session 授权、Idea / 其他事项隔离、权限撤销；未使用生产配置。
+- [x] 固定 Skill CLI → 真实 Cloud 服务第 6 项闭环通过；最终公开 Skill 0.7.1（main `98ed928`）/ core 2.1.0 重新安装，定向 13 项、完整 422 项（420 通过、0 失败、2 个既有跳过）。日志分别为 `temp/executor-context-cloud-071-targeted.log` 与 `temp/executor-context-cloud-071-full.log`。
+- [x] 保留发布前第 6 项失败：旧 Skill 0.6.5 落入旧注册路径并返回 `UNKNOWN_SESSION`。更新公开 0.7.0 后原断言通过；最终 0.7.1 再次通过，不以旧失败或前 5 项代替客户端闭环。
+- [x] 锁文件已由公开固定 URL 重新生成并核对 SHA-512 integrity，不使用本地包或相邻源码交付。Skill 包 SHA-256 为 `156a7f254bdd499fb4b92b1e5e90e8159cf6a61c4edb757884ba631198930ca8`；core 与 UI 制品版本互相独立，未改变 fs-v2.1 / 事务 v2 格式。
+- [ ] PR / main 待完成；生产部署与真实项目验收未执行，不在本轮部署范围内。
+- [x] 保留首轮完整结果：422 项，418 通过、2 失败、2 跳过。新资料链接白名单 / 去重已修复；Skill PR #459 修复旧 Session 延迟加载误跳过基线检查。资料不可遗漏和基线 409 原断言保留；公开 0.7.1 下完整重跑通过。
+- [x] 本机 Codex / Cursor / Claude 安装的 95 个文件逐项哈希与 Skill main 一致，三平台安装 CLI → 隔离真实 Cloud 的读取、缓存、检查、接受变化通过；未下载完整 Map。39 项安全检查和 91 文件 Cloud 制品扫描通过。原生 Codex Hook 未信任 / 未启用，不能将安装 CLI 自检称为原生触发验收。
+- [x] 正式浏览器三入口通过（Device 登录、工作台、真实隔离 Session 同步），日志 `temp/executor-context-cloud-browser.log`；准确 Cloud PR Required / main 待完成。未做真实项目、模型或生产部署验收。
+
 ## CLOUD-SKILL-CONSUME-INTEGRATION-01 · 合并固定 Skill 消费边界（2026-10-08）
 
 - [x] Coordinator：批准整合 Main `60d2970` 的两仓库边界及固定 core 2.0.2 / workbench 1.1.6；保留本轮 Slack 模型选择、表情和 Coordinator 实例FIFO。Root 操作正常 Git 合并；Executor 仅解决明确文本/版本/链接冲突，不恢复任何已删除共享源码或旧接口测试。

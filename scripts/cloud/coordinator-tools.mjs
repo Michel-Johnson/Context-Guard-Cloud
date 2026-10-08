@@ -9,11 +9,11 @@ const definition = (name, description, properties, required = Object.keys(proper
 const executionSessionId = { type: 'string', minLength: 1,
   description: 'Copy from list_sessions; never use a Coordinator conversation ID.' };
 const task = { executionSessionId, taskId: string };
-export const coordinatorReferences = ['map-read.md', 'map-mount.md', 'user-reply.md', 'agent-handoff.md', 'plan-review.md', 'test-check.md', 'memory-definition.md'];
+export const coordinatorReferences = ['map-read.md', 'map-mount.md', 'user-reply.md', 'agent-handoff.md', 'plan-review.md', 'test-check.md', 'memory-definition.md', 'memory-filesystem.md'];
 // 资料标识保持兼容；只映射白名单文件，不接受模型提供的磁盘路径。
 export const coordinatorReferenceFiles = Object.freeze(Object.fromEntries(
-  coordinatorReferences.map(name => [name, name === 'memory-definition.md'
-    ? 'design/design-memory-definition-v0.2.0.md' : name])));
+  coordinatorReferences.map(name => [name, ({ 'memory-definition.md': 'design/design-memory-definition-v0.2.0.md',
+    'memory-filesystem.md': 'design/design-memory-filesystem-v1.0.1.md' })[name] || name])));
 const fail = (message) => { throw Object.assign(new Error(message), { code: 'INVALID_ARGUMENT', toolHint: message }); };
 export const slackReactionEmojis = Object.freeze(['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray']);
 

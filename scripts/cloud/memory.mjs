@@ -13,6 +13,7 @@ import { applyOperations, entries, MapError, validate, restoreSessionWorkItemOpe
 import { translateChanges, operationGrants } from '../shared/protocol-map.mjs';
 import { validateMemory } from '../shared/memory-schema.mjs';
 import { buildFilesystemV2 } from '../shared/filesystem-v2.mjs';
+import { buildContextTree, contextDocument, contextSlice, publicContextTree } from '../shared/context-tree.mjs';
 import { memoryReadViews } from './memory-read-view.mjs';
 import { ensureFilesystemProjection, projectMemoryFile, projectMemoryLockFile, readFilesystemDocument, writeProjectMemory } from './memory-filesystem.mjs';
 const exec = promisify(execFile);
@@ -506,6 +507,7 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
   validateOptions({ dataDir, adminToken });
   const hub = memoryHub(configuration);
   const eventClients = new Set();
+  const contextTrees = new Map();
   const handler = async (req, res) => {
     const send = (code, value) => {
       let body = Buffer.from(JSON.stringify(value));
@@ -517,9 +519,33 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
     };
     const url = new URL(req.url, 'http://localhost');
     const filesystemRoute = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/filesystem\/(main|sessions\/([^/]+))\/(.+)$/);
+    const contextRoute = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/context$/);
     const route = url.pathname.match(/^\/v1\/projects\/([a-z0-9-]+)\/(main|preferences|sessions\/([^/]+)(?:\/(map|changes|events|complete))?|publish|history|restore)$/);
-    if (!route && !filesystemRoute) return false;
+    if (!route && !filesystemRoute && !contextRoute) return false;
     try {
+      if (contextRoute) {
+        if (req.method !== 'GET') throw new MapError('METHOD', '只支持读取', 405);
+        const projectId = contextRoute[1], sessionId = url.searchParams.get('session');
+        if (!validSessionId(sessionId)) throw new MapError('INVALID_SESSION', '需要有效的 Session', 400);
+        const credential = req.headers.authorization?.replace(/^Bearer /, '') || '';
+        const project = projects[projectId], admin = equal(credential, adminToken);
+        const legacy = !!project?.token && equal(credential, project.token);
+        // Device 必须确实绑定该 Session，不能只凭项目登录读取其他 Session 的事项。
+        const binding = !admin && !legacy && await authorizeDevice?.({ credential, projectId, sessionId,
+          scope: `sessions/${encodeURIComponent(sessionId)}`, method: 'GET' });
+        if (!project || !admin && !legacy && !binding) throw new MapError('UNAUTHORIZED', '需要项目与 Session 的读取权限', 401);
+        const state = await readMemoryView(configuration, projectId);
+        const snapshot = contextDocument(state.main, { sessionId, agentId: binding?.agentId || sessionId });
+        const pinned = url.searchParams.get('version');
+        if (pinned && pinned !== snapshot.version) throw new MapError('VERSION_CONFLICT', '上下文版本已变化，请重新读取', 409);
+        const node = url.searchParams.get('node');
+        if (node) return send(200, { projectId, sessionId, version: snapshot.version, content: contextSlice(snapshot, node) });
+        const key = `${projectId}\0${sessionId}\0${binding?.agentId || sessionId}`;
+        const tree = buildContextTree(snapshot, contextTrees.get(key));
+        contextTrees.delete(key); contextTrees.set(key, tree);
+        if (contextTrees.size > 16) contextTrees.delete(contextTrees.keys().next().value);
+        return send(200, { projectId, sessionId, tree: publicContextTree(tree) });
+      }
       if (filesystemRoute) {
         const [, projectId, rawScope, rawSession, rawName] = filesystemRoute;
         let sessionId = '';
