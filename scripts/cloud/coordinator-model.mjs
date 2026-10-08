@@ -31,9 +31,15 @@ const failedTool = (code, toolHint) => ({ isError: true, result: { error: { code
 const toolReply = (call, receipt) => ({ type: 'tool_result', tool_use_id: call.id, content: JSON.stringify(receipt.result), ...(receipt.isError ? { is_error: true } : {}) });
 
 const timeoutProblem = () => problem('MODEL_TIMEOUT', 'Coordinator model timed out');
-const interruptionProblem = signal => signal?.reason?.code === 'MODEL_STEERED'
-  ? problem('MODEL_STEERED', 'Coordinator generation was superseded by new input')
-  : problem('MODEL_INTERRUPTED', 'Coordinator generation was explicitly stopped');
+const interruptionProblem = signal => signal?.reason?.name === 'TimeoutError' || signal?.reason?.code === 'MODEL_TIMEOUT'
+  ? timeoutProblem() : signal?.reason?.code === 'MODEL_STEERED'
+    ? problem('MODEL_STEERED', 'Coordinator generation was superseded by new input')
+    : problem('MODEL_INTERRUPTED', 'Coordinator generation was explicitly stopped');
+function cancelReader(reader) {
+  // Cleanup may stall or fail. It must never postpone a valid terminal result
+  // or replace the original protocol/transport error.
+  try { void reader.cancel().catch(() => {}); } catch {}
+}
 // Conversation history is persisted separately from the model's compacted view.
 // Keep a transport guard, but do not confuse bytes with the token threshold.
 const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
@@ -72,16 +78,16 @@ function openAiResult(value, model) {
 async function readChunk(reader, deadlineAt, abort) {
   if (abort.signal.aborted) throw abort.signal.reason;
   const remaining = deadlineAt - Date.now();
-  if (remaining <= 0) { abort.abort(); throw timeoutProblem(); }
+  if (remaining <= 0) { abort.abort(timeoutProblem()); throw timeoutProblem(); }
   let timer, cancel;
   try {
     return await Promise.race([
       reader.read(),
       new Promise((_, reject) => {
-        cancel = () => { void reader.cancel().catch(() => {}); reject(abort.signal.reason); };
+        cancel = () => { cancelReader(reader); reject(abort.signal.reason); };
         abort.signal.addEventListener('abort', cancel, { once: true });
       }),
-      new Promise((_, reject) => { timer = setTimeout(() => { abort.abort(); reject(timeoutProblem()); }, remaining); }),
+      new Promise((_, reject) => { timer = setTimeout(() => { abort.abort(timeoutProblem()); reject(timeoutProblem()); }, remaining); }),
     ]);
   } finally { clearTimeout(timer); abort.signal.removeEventListener('abort', cancel); }
 }
@@ -94,7 +100,7 @@ async function readBoundedJson(response, deadlineAt, abort) {
       const { done, value } = await readChunk(reader, deadlineAt, abort);
       if (done) break;
       size += value.length;
-      if (size > 4 * 1024 * 1024) { await reader.cancel(); throw problem('MODEL_RESPONSE_TOO_LARGE', 'Coordinator response exceeds 4 MiB'); }
+      if (size > 4 * 1024 * 1024) { cancelReader(reader); throw problem('MODEL_RESPONSE_TOO_LARGE', 'Coordinator response exceeds 4 MiB'); }
       chunks.push(value);
     }
   } finally { try { reader.releaseLock(); } catch {} }
@@ -112,14 +118,26 @@ function validatePrivateBlock(block) {
 async function readEventStream(response, onText, onToolStart, deadlineAt, abort) {
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = '', size = 0, model = '', stopReason = '', usage = {}, visibleText = '';
-  const blocks = [];
+  const blocks = [], openBlocks = new Set();
+  let started = false, terminal = false;
+  const invalidStream = () => problem('MODEL_INVALID_RESPONSE', 'Coordinator returned an incomplete or invalid event stream');
+  const checkActive = () => {
+    if (abort.signal.aborted) throw abort.signal.reason;
+    if (Date.now() >= deadlineAt) { abort.abort(timeoutProblem()); throw abort.signal.reason; }
+  };
   const event = async source => {
+    checkActive();
     const data = source.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
     if (!data || data === '[DONE]') return;
     let value; try { value = JSON.parse(data); } catch { throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned invalid event data'); }
     if (value.type === 'error') throw problem('MODEL_UNAVAILABLE', 'Coordinator provider returned a stream error');
-    if (value.type === 'message_start') { model = value.message?.model || ''; usage = value.message?.usage || {}; }
+    if (value.type === 'message_start') {
+      if (started) throw invalidStream();
+      started = true; model = value.message?.model || ''; usage = value.message?.usage || {};
+    }
     if (value.type === 'content_block_start') {
+      if (!started || !Number.isSafeInteger(value.index) || value.index !== blocks.length) throw invalidStream();
+      openBlocks.add(value.index);
       const block = value.content_block || {};
       validatePrivateBlock(block);
       blocks[value.index] = block.type === 'tool_use' ? { type: 'tool_use', id: block.id, name: block.name, input: block.input || {}, _json: '' }
@@ -128,6 +146,7 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
       if (block.type === 'text' && block.text) { visibleText += block.text; await onText?.(visibleText); }
     }
     if (value.type === 'content_block_delta') {
+      if (!openBlocks.has(value.index)) throw invalidStream();
       const block = blocks[value.index], delta = value.delta || {};
       if (block?.type === 'text' && delta.type === 'text_delta') { block.text += delta.text || ''; visibleText += delta.text || ''; await onText?.(visibleText); }
       if (block?.type === 'tool_use' && delta.type === 'input_json_delta') block._json += delta.partial_json || '';
@@ -144,35 +163,42 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
       }
     }
     if (value.type === 'content_block_stop') {
+      if (!openBlocks.has(value.index)) throw invalidStream();
       const block = blocks[value.index];
       if (block?.type === 'tool_use' && block._json) {
         try { block.input = JSON.parse(block._json); } catch { throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned invalid tool input'); }
       }
       if (block) delete block._json;
+      openBlocks.delete(value.index);
     }
-    if (value.type === 'message_delta') { stopReason = value.delta?.stop_reason || stopReason; usage = { ...usage, ...(value.usage || {}) }; }
+    if (value.type === 'message_delta') {
+      if (!started) throw invalidStream();
+      stopReason = value.delta?.stop_reason || stopReason; usage = { ...usage, ...(value.usage || {}) };
+    }
+    if (value.type === 'message_stop') {
+      if (!started || openBlocks.size || !['end_turn', 'tool_use'].includes(stopReason)) throw invalidStream();
+      terminal = true;
+    }
   };
   try {
-    for (;;) {
+    while (!terminal) {
       const { done, value } = await readChunk(reader, deadlineAt, abort);
       if (done) break;
       size += value.length;
-      if (size > 4 * 1024 * 1024) { await reader.cancel(); throw problem('MODEL_RESPONSE_TOO_LARGE', 'Coordinator response exceeds 4 MiB'); }
+      if (size > 4 * 1024 * 1024) throw problem('MODEL_RESPONSE_TOO_LARGE', 'Coordinator response exceeds 4 MiB');
       buffer += decoder.decode(value, { stream: true });
       let boundary;
-      while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
+      while (!terminal && (boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
         const raw = buffer.slice(0, boundary), match = buffer.slice(boundary).match(/^\r?\n\r?\n/);
         buffer = buffer.slice(boundary + match[0].length); await event(raw);
       }
     }
-    buffer += decoder.decode(); if (buffer.trim()) await event(buffer);
-  } catch (cause) {
-    // Parsing failures must cancel the still-open response. Cleanup itself can
-    // stall or reject; initiate it without replacing or delaying the original
-    // failure. The outer transport also aborts its request signal.
-    void reader.cancel().catch(() => {});
-    throw cause;
-  } finally { try { reader.releaseLock(); } catch {} }
+    if (!terminal) {
+      buffer += decoder.decode(); if (buffer.trim()) await event(buffer);
+    }
+    if (!terminal) throw invalidStream();
+    checkActive();
+  } finally { cancelReader(reader); try { reader.releaseLock(); } catch {} }
   return { model, stop_reason: stopReason, content: blocks.filter(Boolean), usage };
 }
 
@@ -242,7 +268,7 @@ export class CoordinatorModel {
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) cancel();
     const deadlineAt = Date.now() + this.timeoutMs;
-    const timer = setTimeout(() => abort.abort(), this.timeoutMs);
+    const timer = setTimeout(() => abort.abort(timeoutProblem()), this.timeoutMs);
     try {
       const response = await this.fetch(this.endpoint, {
         method: 'POST', redirect: 'error', signal: abort.signal,
@@ -250,7 +276,7 @@ export class CoordinatorModel {
         body,
       });
       if (!response.ok) {
-        await response.body?.cancel();
+        cancelReader(response.body);
         // Provider error bodies may echo credentials or private prompt data.
         throw problem(`MODEL_HTTP_${response.status}`, `Coordinator provider returned HTTP ${response.status}`);
       }
@@ -273,10 +299,9 @@ export class CoordinatorModel {
       if ((result.stop_reason === 'tool_use') !== Boolean(calls.length)) throw problem('MODEL_INVALID_RESPONSE', 'Coordinator stop reason does not match its tool calls');
       return { content: result.content, stop: result.stop_reason, usage: result.usage || {}, model: result.model, requestId: response.headers.get('request-id') || '' };
     } catch (error) {
-      const timedOut = abort.signal.aborted;
+      const wasAborted = abort.signal.aborted;
       abort.abort();
-      if (signal?.aborted) throw interruptionProblem(signal);
-      if (timedOut) throw problem('MODEL_TIMEOUT', 'Coordinator model timed out; no automatic retry was made');
+      if (wasAborted) throw interruptionProblem(abort.signal);
       if (String(error.code || '').startsWith('MODEL_') || error.code === 'CONTEXT_TOO_LARGE') throw error;
       throw problem('MODEL_UNAVAILABLE', 'Coordinator model connection failed; no automatic retry was made');
     } finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }

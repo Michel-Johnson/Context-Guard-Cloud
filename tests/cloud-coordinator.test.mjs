@@ -933,6 +933,131 @@ test('Coordinator streams text deltas while retaining one complete assistant mes
   assert.equal(result.stop, 'end_turn');
 });
 
+test('Coordinator completes a verified message_stop without EOF or waiting for cleanup', async () => {
+  const privateBlock = { type: 'thinking', thinking: 'synthetic private', signature: 'opaque-signature', extra: { preserved: true } };
+  for (const stopReason of ['end_turn', 'tool_use']) for (const cleanup of ['resolved', 'rejected', 'pending']) {
+    const finalBlock = stopReason === 'tool_use' ? { type: 'tool_use', id: 'native-call', name: 'read_map', input: {} }
+      : { type: 'text', text: 'complete reply' };
+    const events = [
+      { type: 'ping' }, { type: 'future_event', ignored: true },
+      { type: 'message_start', message: { model: config.model } },
+      { type: 'content_block_start', index: 0, content_block: privateBlock }, { type: 'content_block_stop', index: 0 },
+      { type: 'content_block_start', index: 1, content_block: finalBlock },
+      ...(stopReason === 'tool_use' ? [{ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"nodeId":"N1"}' } }] : []),
+      { type: 'content_block_stop', index: 1 }, { type: 'message_delta', delta: { stop_reason: stopReason } },
+      { type: 'message_stop' }, { type: 'error', error: { message: 'late private error' } },
+    ].map(value => `data: ${JSON.stringify(value)}\n\n`).join('');
+    let cancellations = 0, deadline;
+    const model = new CoordinatorModel({ ...config, timeoutMs: 1000, fetch: async () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(Buffer.from(events)); },
+      cancel() { cancellations++; if (cleanup === 'rejected') return Promise.reject(new Error('private cleanup'));
+        if (cleanup === 'pending') return new Promise(() => {}); },
+    }), { headers: { 'content-type': 'text/event-stream' } }) });
+    try {
+      const result = await Promise.race([model.next({ system: '', messages: [] }), new Promise((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('Protocol completion waited for EOF or cleanup')), 500);
+      })]);
+      assert.equal(result.stop, stopReason); assert.equal(cancellations, 1);
+      assert.deepEqual(result.content[0], privateBlock);
+      assert.deepEqual(result.content[1], stopReason === 'tool_use' ? { ...finalBlock, input: { nodeId: 'N1' } } : finalBlock);
+    } finally { clearTimeout(deadline); }
+  }
+});
+
+test('Coordinator rejects incomplete SSE protocol termination before any business tool executes', async () => {
+  const start = { type: 'message_start', message: { model: config.model } };
+  const block = { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'native-call', name: 'read_map', input: {} } };
+  const stopBlock = { type: 'content_block_stop', index: 0 }, end = { type: 'message_stop' };
+  const reason = value => ({ type: 'message_delta', delta: { stop_reason: value } });
+  for (const values of [
+    [end], [start, block, reason('tool_use'), end], [start, block, stopBlock, end],
+    [start, block, stopBlock, reason('max_tokens'), end], [start, block, stopBlock, reason('tool_use')],
+    [start, block, { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"nodeId":' } }, stopBlock, reason('tool_use'), end],
+    [start, block, stopBlock, reason('end_turn'), end], [start, { ...block, index: 2 }, stopBlock, reason('tool_use'), end],
+    [start, block, stopBlock, { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } }, reason('tool_use'), end],
+  ]) {
+    let executions = 0, saves = 0;
+    const events = values.map(value => `data: ${JSON.stringify(value)}\n\n`).join('');
+    const model = new CoordinatorModel({ ...config, fetch: async () => new Response(events, { headers: { 'content-type': 'text/event-stream' } }) });
+    const state = { messages: [{ role: 'user', content: 'Read the node' }] };
+    await assert.rejects(coordinatorStep({ turnId: 'synthetic-turn', state, model, system: '', tools: [{ name: 'read_map' }],
+      save: async () => { saves++; }, execute: async () => { executions++; } }), { code: 'MODEL_INVALID_RESPONSE' });
+    assert.equal(executions, 0); assert.equal(saves, 0); assert.equal(state.pending, undefined);
+  }
+});
+
+test('Coordinator external deadlines remain timeouts while human stop and steer keep their reasons', async () => {
+  for (const [reason, code] of [
+    [new DOMException('synthetic external deadline', 'TimeoutError'), 'MODEL_TIMEOUT'],
+    [Object.assign(new Error('synthetic deadline'), { code: 'MODEL_TIMEOUT' }), 'MODEL_TIMEOUT'],
+    [undefined, 'MODEL_INTERRUPTED'], [Object.assign(new Error('synthetic steer'), { code: 'MODEL_STEERED' }), 'MODEL_STEERED'],
+  ]) for (const phase of ['headers', 'body']) {
+    const controller = new AbortController(); let entered;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const model = new CoordinatorModel({ ...config, timeoutMs: 1000, fetch: async (_url, options) => {
+      entered();
+      if (phase === 'headers') return new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+      return new Response(new ReadableStream({}), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const result = model.next({ system: '', messages: [], signal: controller.signal });
+    await ready; controller.abort(reason); await assert.rejects(result, { code });
+  }
+  let deadline;
+  try {
+    const signal = AbortSignal.timeout(20);
+    const model = new CoordinatorModel({ ...config, timeoutMs: 1000, fetch: async () => new Response(new ReadableStream({}), { headers: { 'content-type': 'text/event-stream' } }) });
+    await Promise.race([assert.rejects(model.next({ system: '', messages: [], signal }), { code: 'MODEL_TIMEOUT' }), new Promise((_resolve, reject) => {
+      deadline = setTimeout(() => reject(new Error('External timeout was not released')), 500);
+    })]);
+  } finally { clearTimeout(deadline); }
+});
+
+test('Coordinator terminal cannot bypass cancellation or deadline during same-chunk callbacks', async () => {
+  for (const callback of ['text', 'tool']) for (const [reason, code] of [
+    [new DOMException('synthetic external deadline', 'TimeoutError'), 'MODEL_TIMEOUT'],
+    [undefined, 'MODEL_INTERRUPTED'], [Object.assign(new Error('synthetic steer'), { code: 'MODEL_STEERED' }), 'MODEL_STEERED'],
+    ['internal-deadline', 'MODEL_TIMEOUT'],
+  ]) {
+    const controller = new AbortController(); let internalSignal, called = 0, deadline;
+    const block = callback === 'text' ? { type: 'text', text: 'visible text' }
+      : { type: 'tool_use', id: 'synthetic-call', name: 'read_map', input: {} };
+    const events = [
+      { type: 'message_start', message: { model: config.model } },
+      { type: 'content_block_start', index: 0, content_block: block }, { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: callback === 'text' ? 'end_turn' : 'tool_use' } }, { type: 'message_stop' },
+    ].map(value => `data: ${JSON.stringify(value)}\n\n`).join('');
+    const onProgress = async () => {
+      called++;
+      if (reason === 'internal-deadline') await new Promise(resolve => internalSignal.addEventListener('abort', resolve, { once: true }));
+      else controller.abort(reason);
+    };
+    const model = new CoordinatorModel({ ...config, timeoutMs: reason === 'internal-deadline' ? 20 : 1000,
+      fetch: async (_url, options) => { internalSignal = options.signal;
+        return new Response(new ReadableStream({ start(stream) { stream.enqueue(Buffer.from(events)); } }), { headers: { 'content-type': 'text/event-stream' } }); } });
+    try {
+      await Promise.race([assert.rejects(model.next({ system: '', messages: [], signal: controller.signal,
+        ...(callback === 'text' ? { onText: onProgress } : { onToolStart: onProgress }) }), { code }), new Promise((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('Terminal accepted or waited after a canceled callback')), 500);
+      })]);
+      assert.equal(called, 1);
+    } finally { clearTimeout(deadline); }
+  }
+});
+
+test('Coordinator HTTP error cleanup cannot delay or replace its original status', async () => {
+  for (const cleanup of ['rejected', 'pending']) {
+    let deadline;
+    const model = new CoordinatorModel({ ...config, timeoutMs: 1000, fetch: async () => new Response(new ReadableStream({
+      cancel() { return cleanup === 'pending' ? new Promise(() => {}) : Promise.reject(new Error('private cleanup error')); },
+    }), { status: 503 }) });
+    try {
+      await Promise.race([assert.rejects(model.next({ system: '', messages: [] }), { code: 'MODEL_HTTP_503' }), new Promise((_resolve, reject) => {
+        deadline = setTimeout(() => reject(new Error('HTTP status waited for cleanup')), 500);
+      })]);
+    } finally { clearTimeout(deadline); }
+  }
+});
+
 test('Coordinator retains split thinking and signatures without exposing them as streamed text', async () => {
   const thinking = { type: 'thinking', thinking: '私有测试推理：先核对，再回答。', signature: 'synthetic-signature-part-1-part-2' };
   const redacted = { type: 'redacted_thinking', data: 'synthetic-opaque-redacted-data' };

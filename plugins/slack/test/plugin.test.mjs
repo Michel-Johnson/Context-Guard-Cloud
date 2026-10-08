@@ -225,6 +225,66 @@ test('Slack question render finalizes the real public projection in the retained
   assert.equal(f.plugin.store.data.threads[key].pendingQuestionId, message.questions[0].id);
 });
 
+test('Slack question cache migrates only a real public question projection in place and remains settled after restart', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  const context = { cloudOrigin: 'https://map.example.com', projectId: 'lab' };
+  const question = nativeQuestionProjection([{ question: '下一步先验收哪个模块？', options: ['首页', '文章页'] }], {
+    attachments: [{ id: 'evidence-1', filename: 'evidence.txt' }], actions: [{ kind: 'node-navigation', node: { id: 'N1', title: '模块' } }],
+  });
+  const ordinary = { id: 'ordinary-history', requestId: 'old-turn', role: 'assistant', text: '原普通历史回复。',
+    actions: [{ kind: 'node-navigation', node: { id: 'N2', title: '另一个模块' } }] };
+  const legacyHash = message => {
+    const blocks = messageBlocks(message, key, context);
+    return digest({ format: 'plain-text-v2', message,
+      ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}) });
+  };
+  const original = structuredClone(question), oldQuestionHash = legacyHash(question), oldOrdinaryHash = legacyHash(ordinary);
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'question-cache', userId: user, ownRequests: [] });
+  await f.store.update(state => {
+    state.threads[key].mirrored[question.id] = { ts: '8.0', hash: oldQuestionHash };
+    state.threads[key].mirrored[ordinary.id] = { ts: '7.0', hash: oldOrdinaryHash };
+    state.threads[key].pendingQuestionId = question.questions[0].id;
+  });
+  f.gateway.command = async (type, input) => {
+    assert.equal(type, 'conversation.state'); assert.equal(input.conversationId, 'question-cache');
+    return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: ['question-turn'], messages: [ordinary, question] };
+  };
+  f.io.post = async () => assert.fail('A known Slack timestamp must be updated, never posted again');
+  await f.plugin.mirror(key);
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0].update[1], '8.0');
+  assert.equal(occurrences(blockText(f.sent[0].update[3]), question.text), 1);
+  assert.match(blockText(f.sent[0].update[3]), /首页/);
+  assert.ok(f.sent[0].update[3].some(block => block.type === 'context' && block.elements[0].text.includes('evidence.txt')));
+  assert.notEqual(f.store.data.threads[key].mirrored[question.id].hash, oldQuestionHash);
+  assert.deepEqual(f.store.data.threads[key].mirrored[ordinary.id], { ts: '7.0', hash: oldOrdinaryHash });
+  assert.equal(f.store.data.threads[key].pendingQuestionId, question.questions[0].id); assert.deepEqual(question, original);
+  f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.length, 1, 'The acknowledged rendering fingerprint remains stable across restart and repeated polls');
+  assert.equal(f.plugin.store.data.threads[key].mirrored[question.id].ts, '8.0');
+  assert.equal(f.plugin.store.data.threads[key].pendingQuestionId, question.questions[0].id);
+});
+
+test('Slack question cache retains the old fingerprint on lost update ACK and retries the same timestamp', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  const question = nativeQuestionProjection([{ question: '是否先验收手机？', options: ['是', '否'] }]);
+  const oldHash = digest({ format: 'plain-text-v2', message: question });
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'question-cache-retry', userId: user, ownRequests: [] });
+  await f.store.update(state => { state.threads[key].mirrored[question.id] = { ts: '9.0', hash: oldHash }; });
+  f.gateway.command = async type => {
+    assert.equal(type, 'conversation.state');
+    return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: ['question-turn'], messages: [question] };
+  };
+  let attempts = 0;
+  f.io.update = async (...args) => { f.sent.push({ update: args }); if (++attempts === 1) throw new TypeError('Slack update ACK lost after application'); };
+  f.io.post = async () => assert.fail('Lost update ACK cannot allocate a replacement message');
+  await assert.rejects(f.plugin.mirror(key), /ACK lost/);
+  assert.deepEqual(f.store.data.threads[key].mirrored[question.id], { ts: '9.0', hash: oldHash });
+  f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+  assert.equal(f.sent.length, 2); assert.deepEqual(f.sent[0].update, f.sent[1].update);
+  assert.equal(f.sent[1].update[1], '9.0'); assert.notEqual(f.plugin.store.data.threads[key].mirrored[question.id].hash, oldHash);
+  await f.plugin.mirror(key); assert.equal(f.sent.length, 2);
+});
+
 test('durable collection merges other-bot request and unmentioned correction once across restart', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const options = { collectMs: 800, maxCollectMs: 2000 };
