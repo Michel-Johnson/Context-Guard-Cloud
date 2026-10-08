@@ -314,6 +314,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   if (state.promptVersion && state.promptVersion !== promptVersion) throw problem('PROMPT_CHANGED', 'Resume with the same Coordinator prompt version');
   state.promptVersion = promptVersion;
   state.messages ||= []; state.toolReceipts ||= {};
+  // Source belongs to the accepted server input, never to message text or model
+  // tool parameters. Other clients already have their own model settings UI.
+  tools = tools.filter(tool => tool.name !== 'show_model_menu' || state.activeInput?.source === 'slack');
+  const slackActor = state.activeInput?.actor;
+  const trustedSlackInput = state.activeInput?.source === 'slack' && !!state.activeInput.id && slackActor?.kind === 'human' &&
+    slackActor.integration === 'slack' && /^[UW][A-Z0-9]{1,31}$/.test(slackActor.userId || '') &&
+    /^[TE][A-Z0-9]{1,31}$/.test(slackActor.teamId || '') && slackActor.sessionId === `slack:${slackActor.teamId}:${slackActor.userId}`;
+  tools = tools.filter(tool => tool.name !== 'react_to_user' || trustedSlackInput);
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
   if (state.activeTurnId && state.performance?.turnId !== state.activeTurnId) state.performance = {
@@ -386,7 +394,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else {
         const started = Date.now();
         let errorCode = null;
-        try { receipt = { fingerprint, result: await execute(call.name, call.input, { operationId }) }; }
+        try {
+          const result = await execute(call.name, call.input, { operationId });
+          receipt = { fingerprint, result: call.name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
+            ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result };
+        }
         catch (error) {
           errorCode = error.code || 'TOOL_FAILED';
           if (!correctableToolError(error.code)) throw error;
@@ -403,7 +415,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (!receipt.isError && receipt.result?.kind === 'map-read' && receipt.result.node?.id) visible.push({
       kind: 'node-read', actionId: receipt.result.actionId, node: { id: receipt.result.node.id, title: receipt.result.node.title || '' },
     });
-    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'conversation-mounted', 'map-action'].includes(receipt.result?.kind)) visible.push(receipt.result);
+    else if (!receipt.isError && call.name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
+    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'conversation-mounted', 'map-action', 'model-selection'].includes(receipt.result?.kind)) visible.push(receipt.result);
     if (!receipt.isError && receipt.result?.kind === 'conversation-mounted') transferred = true;
     responses.push(toolReply(call, receipt));
   }
@@ -418,13 +431,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
       ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
+  const reactionOnly = !failed && responses.length > 0 && next.content.filter(block => block.type === 'tool_use').every(call => call.name === 'react_to_user');
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
     const response = state.messages.at(-2);
     if (response?.role === 'assistant') response.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) ? 'waiting-for-user' : 'running';
+    transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' && ['ask_user', 'show_model_menu'].includes(block.name))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }

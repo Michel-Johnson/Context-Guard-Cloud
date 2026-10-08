@@ -1,5 +1,62 @@
 # Cloud 验证台账
 
+## CLOUD-SKILL-CONSUME-INTEGRATION-01 · 合并固定 Skill 消费边界（2026-10-08）
+
+- [x] Coordinator：批准整合 Main `60d2970` 的两仓库边界及固定 core 2.0.2 / workbench 1.1.6；保留本轮 Slack 模型选择、表情和 Coordinator 实例FIFO。Root 操作正常 Git 合并；Executor 仅解决明确文本/版本/链接冲突，不恢复任何已删除共享源码或旧接口测试。
+- [x] Executor：README 与部署保留 Main 的 build:runtime/固定依赖/生成物不可提交规则；root package/lock 除候选1.1.14外语义与Main完全相同，依赖URL/integrity保留，Slack0.1.19未改。完整Slack v1.1.0唯一放 references/design，内容哈希未变；更新4处相关文档链接，精确删除获准旧Cloud v1.0.0与原生成区设计索引，旧版查Git不建备份。生成区旧v1.1.0已随Root合并移除，不写回生成源码；Git冲突索引由Root处理。
+- [x] Executor 定向验证：Root 正常合并准确 `6dded19fc50bb6d84285aa5384bb4fe9e60b8391` 后已安装锁定依赖（actual exit0 added6）并 build-runtime（actual exit0 Materialized53）。本次起止HEAD相同、源码工作树干净，Node24.19.0一次定向 command 实际终端exit0；boundary/workflow/governance各exit0，固定包builder、模型/表情/FIFO、原摘要/steer/close/来源Schema/receipt等67/67通过、0skip/0fail，4326.816ms。未运行全仓或生产，不拼5b/13b旧结果。
+  - 四原日志 `temp/cloud-skill-consume-6dded19-20261008-{boundaries,workflows,governance,targets}.log` 保留。目标log SHA256 `b2aef87cf4a1d3e513ca1a7d74b816d5ec75f368056a446caf8d79f8a8b110d9`；详细command/实际exit与四哈希见私有 `temp/cloud-fixed-skill-consume-final-validation-handoff-20261008.md`。这里只新增验证证据，产品源码/正式测试/依赖/权限未修改。Required与上线仍是独立后续门禁。
+- [x] 独立 Tester：最终准确sourceSha核固定release消费及不Git跟踪生成物；不能复用5b/13b旧模块结果作新合并通过。原436/433/1fail/2skip、412/410/1fail/1skip、旧EPERM和C3/C4现场证据保留。
+  - sourceSha `6dded19fc50bb6d84285aa5384bb4fe9e60b8391`，Node24.19.0；独立boundary/workflow/governance各actualexit0，31自动文件/4独立suite/1helper。一次最终67正式目标+1私有只读parity目标 actualexit0（chunk29c082），68/68、0fail/skip/cancelled、4342.5359ms；所有53生成文件实际SHA匹配manifest且字节匹配已安装固定core2.0.2/UI1.1.6，URL/version/lockintegrity核验、Git生成区未跟踪，未编辑生成物。日志 `temp/cloud-fixed-consume-independent-6dded19-targets-20261008.log` SHA256 `32e1a807c637bf68c275548f5695a876b2140a8c39f93d00740050c755be10a8`；完整命令、3gate/loghash/sourcehash及限制见私有 `temp/cloud-fixed-consume-independent-final-6dded19-20261008.md`。本定向passed不替代Required全集/生产构建或真人验收，不声称原13b根因或全部EPERM解决。
+- [ ] Delivery：依赖构建适配和准确版本部署由Root执行；未发布Skill/shared包、未改变生产授权/模型/API。本次源码整合不是已上线或真人Slack验收。
+
+## COOR-CONVERSATION-FIFO-01 · 同实例会话文件读写互斥（2026-10-08）
+
+- [x] Coordinator：准确 `13b5a330cb90897de4db99458445d9e916338ca3` 一次 Cloud 全仓 436 总项 / 433 通过 / 1 失败 / 2 既有跳过，actual exit 1，278143.9092 ms。唯一旧后台摘要目标最终 `status=error` 而非 `waiting-for-user`，该轮实际错误码未捕获；原日志及之后另列的首次 Slack 包结果保留，不将旧 EPERM 直接套作本轮根因。
+- [x] Executor：两次批准的私有合成目录诊断均原目标通过，根因结论仍 incomplete。第一次捕获7次真实 EPERM/rename；第二次两固定读者最多2秒（实际411.7344 ms退出）捕获36次真实 EPERM/rename，均原350 ms重试恢复，未观察 lock acquisition/release EPERM 或最终 error。这是实际同会话 atomic replacement 风险，不是原全仓失败完整因果、AV根因或“所有 EPERM 修复”证据；不重跑随机诊断求绿。
+- [x] Executor：经审核仅 `CoordinatorService` 实例内一个 Promise FIFO，覆盖该类全部八处同 `conversation.json` 读取及 `saveState` 写入；排队前冻结 encode 快照，成功后队列释放才通知 observer，原异常传给调用者，失败不毒死后续操作。仅短文件操作入队，模型/网络/业务整个事务不入队；跨进程 submit/run 锁、350 ms replacement 与5秒 acquisition原预算、sharedIO、依赖、身份、权限、模型、Schema、生产配置均未改。多实例、外部进程或 AV 不受此实例门闩保证。
+  - 开发后一次窄目标15/15通过、0跳过、actual exit 0，1442.412 ms，`temp/coordinator-conversation-fifo-targets-20261008.log`；包含确定held-reader/写入FIFO/快照冻结、永久错误原对象、observer回读、原摘要拒绝过时快照、steer/close/schema及工具回执。
+  - 后经静态审核仅将两新测试改用公共 `service.state()` 验证旧文本，加入新测试10秒边界（不改变任何原runtime budget），开发后仅这两目标一次2/2、0跳过、actual exit 0，633.3501 ms，`temp/coordinator-conversation-fifo-public-bounded-targets-20261008.log`。旧15日志保留，不能拼作最终同一测试修订15项通过；准确哈希在私有 `temp/coordinator-conversation-fifo-executor-handoff-20261008.md`。
+- [x] 独立 Tester：最终准确修订核所有八处内部读/写确走实例FIFO；公共state held-handle与rename不重叠、写写排序和预冻快照、永久异常原对象/调用者可见、失败observer不通知、后续读写恢复及observer不死锁；原摘要/steer/close/模型工具Schema/receipt均保留。核 sharedIO/依赖/350ms/5秒预算/权限没有改动，区分本实例保护与外部争用限制；原全仓失败不可改写。
+  - 准确sourceSha `5b05133e8a816e49960b43a022e0350dff74e5c9`，service SHA256 `1a926517f8e0703e4026554f8b27aeb051720190bf26b2a90c74835a4063bdf1`、正式Cloud测试 `b0bde3bd47ad69d64792075d07a097094c6991324ab84faca450f0075369d19f`、未改sharedIO `4865bc8dcb24eb1726408363d57656d485cf1ae2c66bbba62a62e6cd744e6dfa`。一次批准定向 actual exit 0（chunk58fb71），26/26、0跳过/失败、2524.1434ms；原15范围加来源/模型/表情合同，`^Steer`同时选中既有插件partial-slot目标，按实际26记录。日志 `temp/coordinator-conversation-fifo-independent-5b05133-20261008.log` SHA256 `ba30e46df502453d448c97a0592b6fcc725894408a74e0c38df969f40a00c893`，完整只读路径审核及编号FIFO-01..07见同名`.md`。本次定向passed不代表13b根因已解决、所有EPERM已修复、全仓或并发最新Main整合通过；Required全套/真实验收另列。
+- [ ] Delivery：准确源码独立验证、Required及真实Cloud/Slack验收未完成。此防护不扩大模型选择action授权，不切换模型、不对生产写入；Executor没有Git写入、部署或全仓重跑。
+
+## SLACK-CANDIDATE-FULL-01 · 13b5a33 集中回归（2026-10-08）
+
+- [x] Coordinator：在独立模块收口后一次集中回归准确 sourceSha `13b5a330cb90897de4db99458445d9e916338ca3`；Cloud 主阶段 session 23342 actual exit 1，436 总项 / 433 通过 / 1 失败 / 2 既有分套跳过，278143.9092 ms。唯一后台摘要并发目标 `tests/cloud-coordinator.test.mjs:1518` 状态 error≠waiting-for-user；日志没有原 fs cause，不能断言本次就是 EPERM。原 Cloud 日志 `temp/slack-model-emoji-full-13b5a33-20261008-cloud.log` SHA256 `89499a08e174a2296eec9dcfdf9cf5b27052d3e4687e454c3bbe618d19dbfa9e` 保留。
+- [x] Slack 包首次独立完整阶段：因前序 Cloud 失败尚未执行，另运行 session 86250 actual exit 0；195/195、0 跳过/失败，10276.8256 ms；原日志 `temp/slack-model-emoji-full-13b5a33-20261008-slack.log` SHA256 `9c57fcd6bb08e4b634ddb9052b2a444ab5dd48a6f07cf0ec15b6952317eba2b5`。这一结果不代表组合回归成功。
+- [x] 独立 Tester：只读核对原日志、准确源码和旧风险，保存 `temp/slack-model-emoji-full-13b5a33-independent-failure-review-20261008.md`。不重跑、不修改正式断言或业务；原 b729 FIN-01..10 的模块收口 passed 不回改，本次全仓回归另列 `failed`。
+- [ ] 原 Executor 定位具体 syscall/cause 后提交最小修复 Plan；不得以绿色重跑、增加超时/权限或吞异常宣称解决。原 Windows EPERM、5≠6 及当前安全化 error 证据全部保留。
+- [ ] 回归修复、Required/Main 与真实上线验收；当前集中回归失败，不推进假通过或部署。
+
+## SLACK-EMOJI-01 · Slack 原生表情回应（2026-10-08）
+
+- [x] Coordinator：审核仅可信 Slack 真人输入的 `react_to_user({emoji})`；固定 👍、❤️、😄，不接受频道/目标/用户/地址参数，不新增 scope、网关动作、供应商配置或共享角色指令。当前未发布设计 v1.1.0 兼容补充，验收见 EMOJI-01..09。
+- [x] Executor：工具回执只表示意图，服务端将原 `activeInput` 与真人身份固定在原工具回执；插件提交前耐久保存私有 Inbox 关联并再次核对项目/线程/操作者。纯表情不发占位、不请求模型复述，混合业务/失败不提前结束。原目标调用前持久保存；精确 `already_reacted` 幂等确认，未知最多八次指数退避，明确永久拒绝及原 SDK 两次 429 重试耗尽保留失败。共用八个表情槽，饱和不丢意图、不挡正文，停用收拢；未发过时意图不启动，合法未知原意图仍恢复。候选 Cloud 1.1.13 / Slack 0.1.19，不等于已上线。
+  - 原基线 `fdfd1be8a2ae92687c3d24a576c0aba9a3e2a547`、Node 24.19.0；开发后一次受影响模块实际 exit 1：246 总项 / 242 通过 / 3 失败 / 1 既有跳过，38420.1008 ms，原日志 `temp/slack-emoji-affected-20261008.log`（SHA256 `60acd1ac5f5a0433e9be8e503354ac5eca92a66048a71f7e91f8112de0b704a9`）保留。18 个表情目标最终覆盖原意图/真实投影/批次/身份/失回/槽位/停止/正文及 fresh-state 回归；首次 16 个新目标通过，但两个旧 Slack 目标因可选映射误挡业务失败，另一个既有后台摘要并发断言 5≠6。
+  - 经 Coordinator 审核返工：只从真实私有 Inbox 建表情关联；等价 `message/app_mention` 只规范类型，无可信关联只禁用表情，不改变正文提交或原测试。饱和/重启未启动意图先读既有有界最新线程状态并完整核对 partial，不能 tick 抢发；已开始未知结果仍核对原目标。开发后仅一次 18 个表情目标 + 3 个原失败目标定向复验：21/21 通过、0 跳过、actual exit 0，1202.9579 ms，`temp/slack-emoji-rework-targets-20261008.log`。原两轮日志不覆盖；一次摘要通过不能证明 Windows 并发问题已消除。源码 SHA256 在私有 `temp/slack-emoji-executor-handoff-20261008.md`。
+  - 并发最新 Main 为 `b39c190`，上述本地模块结果仍属于 fdfd 基线与本地准确源码，不能当作合并后修订、Required 或真实 Slack 验收。Executor 未做 Git、合并、真实消息、模型切换或部署；Root 保留上游变更后交独立 Tester 验证最终准确修订。
+  - 最后经 Coordinator 审核，仅表情 journal 登记故障记录私有错误码并继续正文；未持久意图不发，Cloud 原动作留待既有轮询，原业务错误不吞。开发后仅新增正式故障目标 1/1 通过、0 跳过、actual exit 0，268.8228 ms，`temp/slack-emoji-journal-target-20261008.log`；原 246 / 21 日志保留。最终产品源码已改变，不能把此前 21 项直接记作最终同一修订全绿，独立 Tester 必须验证最终源码全部相关目标。
+  - 独立准确提交 `24f77467c6ce719cd0e90cc9c4479f26d02cd366` 一次集中受影响模块：actual exit 1，412 总项 / 410 通过 / 1 失败 / 1 既有跳过，43529.4761 ms，原日志 `temp/slack-model-emoji-independent-24f7746-20261008.log` SHA256 `5e1d21bc90e410221ae7f656c32caadfb65befe97624e4e9a7ba0ba0c51986e3` 保留。唯一失败是 `tests/slack-cloud.test.mjs` 非 Slack tools 旧期待只移除 `show_model_menu`；实际运行正确移除它及 `react_to_user`。该修订总体 failed，不以19表情/10模型/原3目标通过冒充整体通过。
+  - Coordinator 批准最小测试返工：只同步非 Slack 完整 Schema 期待移除两个 Slack 专属工具，另明确断言可信 Slack 两者可用、非 Slack 两者不可用；未改变 runtime 来源、权限、Schema、PE 或其余断言。开发后仅一次原失败目标 1/1、0 跳过、actual exit 0，1035.0701 ms；`temp/slack-emoji-non-slack-contract-rework-20261008.log` 保留。最终新提交仍须独立验证，旧24f结果不跨修订拼接。
+- [x] 独立 Tester：按冻结源码验证 EMOJI-01..09、真实 `coordinatorStep→publicMessages→plugin` 投影与原工具回执恢复；核对批次首条原 Inbox、正文/他人/项目/线程/合成 Slash 不可伪造目标；纯表情零额外 post，混合文字完整，业务失败不结束；原编号改内容拒绝、失回/重启精确幂等、永久拒绝与未知分开、SDK 429 不扩大、八槽/停用和饱和恢复无回归。保持原模型选择首次失败及 C3/C4 证据，不据绿色复测宣称旧故障消失。
+  - 独立集中受影响模块：sourceSha `24f77467c6ce719cd0e90cc9c4479f26d02cd366`，Node 24.19.0，session 24613 actual exit 1；412 总项 / 410 通过 / 1 失败 / 1 既有真实供应商跳过，43529.4761 ms。全部十九表情目标及三原失败目标本次通过；总体 `failed`。唯一失败为 `tests/slack-cloud.test.mjs:334` 非 Slack 普通执行 Schema 期望只过滤菜单、遗漏同样 Slack-only 的表情工具；须原 Executor 最小同步合同期望，不放宽来源检查。日志 `temp/slack-model-emoji-independent-24f7746-20261008.log` SHA256 `5e1d21bc90e410221ae7f656c32caadfb65befe97624e4e9a7ba0ba0c51986e3`；完整独立报告同名 `.md`。原失败证据保留，旧摘要本次通过不代表 Windows 风险已修复；待新准确修订复验后才打勾。
+  - 最小返工独立收口：sourceSha `b729933a969f121c365998ca2717e1cbb3a5de4c` 对24f仅变正式期待与台账，产品及其他测试 hash 全未变；按批准范围一次复验 FIN-01..10，10/10、0 跳过/失败、actual exit 0（chunk ebe11f）、1594.6857 ms。日志 `temp/slack-model-emoji-independent-b729933-20261008.log` SHA256 `ef70df86202eaf907a0c37cc2e5af25f0e665dba29354cc5d0cdff36c77bb599`，最终独立报告 `temp/slack-model-emoji-independent-final-b729933-20261008.md`。勾选表示旧集中失败证据+未变源码审核+准确新修订最小复验的组合收口，不宣称新修订412整轮或线上已通过；Required/集中全量及真人验收仍待执行。
+- [ ] Delivery：独立验证和集中回归后由 Coordinator 按已明确授权提交 PR、通过 Required、正常合并并部署准确版本；真实 Slack 客户端验收仍需另列实际结果，受控传输不是线上 evidence。生产仍 1.1.11 / 0.1.17，Executor 未做 Git、生产 API 写入、模型切换或部署。
+
+## SLACK-MODEL-SELECT-01 · Slack 人工确认模型选择（2026-10-08）
+
+- [x] Coordinator：批准复用同一 `CoordinatorModelSettings` 安全目录、CAS、原操作回执和固定轮次路由。新增 `models.state/models.select`、显式 `/cg model` 与只读原生 `show_model_menu`；只在服务端已接受的 `activeInput.source=slack` 提供后者。正文、模型工具参数及浏览器 JSON 不能伪造来源；不修改共享角色指令、不新增供应商或探测健康。
+- [x] Executor：菜单绑定可信项目、原人类、原频道/线程和已确认 Slack 时间戳；一次原生确认后选择已配置模型。保存选择编号和设置版本后发送，失回或重启先重放原结果，不能把已经匹配的默认值当作未知操作的成功。设置冲突展示新的观察目录，保留原选择。卡片区分项目默认文字模型与当前可信对话 `modelRoute` 的安全字段 `kind/model/providerId`；没有对话的显式命令不猜实际模型。下一文字轮次生效，当前轮次、失败重试和图片路由保留，普通历史镜像指纹不变。设计兼容升为 v1.1.0，同主题只保留当前文件。
+  - 基线：`fdfd1be8a2ae92687c3d24a576c0aba9a3e2a547`。插件 SHA256 `f230f2e0e2984f822b9220ba06bb868028a6ec334b9d1d5fa75130746e43bc52`；视图 `04e2c26d0a12909b1fef0c1b55e7ebc514eaa5d553a047529f7c73eb72c64545`；插件正式测试 `6b7450eb57bb9bd82e13b4480bbaaddf3a771b10637fc2698652f436925b0ae6`。
+  - 首轮受影响模块：Node 24.19.0，344 总项 / 341 通过 / 2 失败 / 1 既有真实供应商跳过，实际退出 1。新图片测试误传完整附件元数据，被现有 `{id}` 引用校验拒绝；已按真实视觉摘要与菜单轮次契约修正新测试，未放宽业务检查。另一失败为既有后台摘要并发测试；私有最小诊断记录 Windows `EPERM`、原轮次保留，未改存储代码或削弱原断言。
+  - 仅复验九个新菜单目标与上述既有失败目标：10/10 通过，0 跳过，实际退出 0，796.786 ms。保留两个原日志 `temp/slack-model-select-affected-20261008.log`、`temp/slack-model-select-corrected-targets-20261008.log`。这不是整仓全量测试或生产 Slack 验收；第二次通过不能证明 Windows 并发写入风险已修复。准确完整哈希与命令在私有 Executor 交接记录。
+  - 独立初审返工：旧选择 A 已保存但回复丢失，之后另操作者切到 B，原 A 回执仍必须返回 A，不能冒充当前默认或承诺下一轮是 A。只修 applied 卡与通知兜底文案，明确「历史回执，不代表当前项目默认，/cg model 查看」；未增加查询或改 CAS。真实设置正式测试核对 B、revision 和全部 receipts 不再变化，原 A 编号/内容不变，同时间戳更新且不重发。开发后一次菜单目标 10/10、0 跳过，actual exit 0，825.7083 ms；新日志 `temp/slack-model-select-late-receipt-20261008.log`，原日志和首次冻结哈希保留。新插件 SHA256 `332f6a045d1d9feeddf1e408655fd5fa7c71ab1d4c2a17f0b052cf0203c82330`；视图 `70fcf377f86bca314e211e7a3f5e358eb2f50a1c6254da93e7446b6c1578b358`；插件测试 `77947ee3fdc1e853e2aab48d82b601fff03a9743e48f980e89ff3a3bcaa6c8d4`。其余功能源码未变，等待独立准确修订验收。
+- [x] 独立 Tester：按当前准确源码，验证真实 HTTP 与真实 `publicMessages` 投影；菜单展示不切换、不探测、不重跑，原生人类确认才写同一设置。覆盖未绑定项目接续、配置动作白名单、来源/身份/跨项目/原卡/未知模型拒绝、同当前值只读、CAS 冲突、失回与重启原编号回放、native 文字与图片实际路由区别、视觉附件及工具配对保留、普通历史和问题缓存/流式原位镜像无回归。重复确认不得再次改设置或发新卡；原配置、原输入与 C3/C4 失败证据不得改写。另核既有 Windows 摘要并发 `EPERM`，不能以一次绿色重跑宣称消除。
+  - 同一独立集中运行 `24f77467` 的十个菜单目标、真实 HTTP/CAS/来源与固定路由目标通过，但普通执行 Schema 回归失败，整体待返工。准确 session、统计、日志 hash 见上述 SLACK-EMOJI-01 独立记录；不得把单模块通过冒充组合修订已通过或线上模型已切换。
+  - `b729933a969f121c365998ca2717e1cbb3a5de4c` 最小收口与上述 FIN-01..10 同一次10/10运行；复核真实设置HTTP、CAS、actor/项目/动作白名单、同ID改内容及可信来源。其余产品/正式菜单测试未变，前轮证据仍绑定24f准确提交；组合审核通过不是新整轮或真实模型切换证明。完整命令、编号、所有产品未变hash及限制见最终独立报告；Windows历史失败仍保留。
+- [ ] Delivery：独立验收后单独 PR、Required CI、正常 Main 合并、准确版本部署，再由已授权真人在 Slack 确认新选择并区分本轮实际模型/默认值；当前任务没有切换任何真实供应商、改变配置/权限或部署。旧 RENDER/CACHE Delivery 记录保持原样，C3 已由真人回答不能作为未答迁移样本，C4 原待处理记录不重试冒充成功。
+
 ## MIGRATE-BUSY-01 · 暂时忙保存恢复（2026-10-08）
 
 - [x] 在最新 main `fdfd1be` 上，仅迁移旧本地候选的 Map commit 恢复和草稿保护；旧目录及其未提交内容未修改。连续对话的旧 submit 补丁、Slack 显示、旧设计文档和宣传产物不在本 PR。

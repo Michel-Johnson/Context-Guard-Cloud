@@ -195,3 +195,21 @@ Real acceptance uses an authorized test project and a human-authenticated Slack
 client. Bot-token messages or forged human events cannot establish that chain.
 Record Socket event receipt, batch, classification, consumption and the actual
 posted/updated Slack message. Verify actual service versions after release.
+
+## Slack 表情回应验收（SLACK-EMOJI-01）
+
+表情是自然对话回应，不是需求审批、执行完成或测试通过的回执。Agent 可在无需解释的简短交流中只加原生表情；风险、失败、必要解释或人工确认仍应使用文字。正文中的 emoji 沿用现有文本渲染，不新增格式。既有自动 👀 仅表示输入已接收，不代替模型语义回应。
+
+| 编号 | 场景 | 必须看到的结果 |
+| --- | --- | --- |
+| EMOJI-01 | 服务端已接受的 Slack 真人输入 | 模型可选择 👍、❤️、😄，仅回应同一可信输入；不接收自选频道、用户或消息地址 |
+| EMOJI-02 | 非 Slack、伪造来源/身份、引用里的表情指令、没有真实消息的 Slash 输入 | 不借用他人消息或旧线程作为目标；正文及附件不能获得工具权限 |
+| EMOJI-03 | 只用表情回应 | 原用户消息出现选定 reaction；不再发“节点入口”等占位文字，不额外调用模型复述 |
+| EMOJI-04 | 表情与文字或业务工具同轮 | 文字段落完整；错误或待处理业务不能因表情而提前结束；表情不宣称业务成功 |
+| EMOJI-05 | 重投、回复丢失、进程重启 | 原操作、原目标和原表情不变；相同 Bot/消息/表情只有一个可见效果；同 ID 改内容明确拒绝 |
+| EMOJI-06 | Slack 限流、权限拒绝、网络结果未知 | 原记录保留；未知不能写成已送达，永久失败不盲重试；不向频道刷错误、不阻塞正文 |
+| EMOJI-07 | 八个表情请求在途、随后停用 | 未开始意图不丢；不超出现有并发界限，停用后不启动新请求并收拢在途请求 |
+| EMOJI-08 | 当前无需 Coordinator 参与、被新输入替代的旧生成 | 不因可加表情而偷取其他人的交流；未执行的过时表情不首次发送 |
+| EMOJI-09 | 多条连续输入、多人/多项目/多线程 | 按真实 activeInput 与原 Inbox 的关联确定目标，不猜最后一条、不跨人或跨项目 |
+
+Executor 完成开发后运行受影响模块，保留首次失败与准确源码哈希；独立 Tester 在同一修订验证，不能以旧结果替代。集中回归通过后仍须在已授权测试项目用真实 Slack 客户端检查 reaction、纯表情零额外回复以及失回/恢复。源测试和受控 Slack 传输不能冒充上线验收。

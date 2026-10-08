@@ -7,6 +7,9 @@ import path from 'node:path';
 import { CoordinatorModelSettings } from '../scripts/cloud/coordinator-model-settings.mjs';
 import { CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
 import { startCloudServer } from '../scripts/cloud/server.mjs';
+import { coordinatorStep } from '../scripts/cloud/coordinator-model.mjs';
+import { coordinatorTools, createCoordinatorExecutor } from '../scripts/cloud/coordinator-tools.mjs';
+import { validateIntegrationConfig, validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
 
 const answer = text => ({ content: [{ type: 'text', text }], stop: 'end_turn', usage: {} });
 const factory = config => ({ model: config.model, next: async () => answer('synthetic') });
@@ -134,7 +137,9 @@ test('model settings HTTP API requires workbench authority, rejects foreign orig
     publicOrigin: 'https://workbench.example', memoryConfig: { dataDir: path.join(f.directory, 'memory'), adminToken: 'synthetic-admin', projects: {
       lab: { root, token: 'synthetic-project', coordinator: f.config }, other: { root, token: 'other-project', coordinator: f.config },
     } }, protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'lab', slug: 'example/lab' },
-      { repositoryId: '456', projectId: 'other', slug: 'example/other' }] }, coordinatorModelFactory: factory });
+      { repositoryId: '456', projectId: 'other', slug: 'example/other' }] },
+    integrationConfig: { host: '127.0.0.1', port: 0, token: 'synthetic-model-gateway-credential-123456', teamId: 'TTESTMODEL', projectIds: ['lab'] },
+    coordinatorModelFactory: provider => ({ model: provider.model, next: () => assert.fail('Settings HTTP must not probe or invoke providers') }) });
   t.after(() => server.close());
   const url = `${server.url}/api/workbench/projects/lab/api/coordinator/model`;
   for (const token of ['', 'synthetic-project']) {
@@ -155,4 +160,55 @@ test('model settings HTTP API requires workbench authority, rejects foreign orig
   const arbitrary = await fetch(url, { method: 'POST', headers, body: JSON.stringify({ ...input, token: 'not-accepted' }) });
   assert.equal(arbitrary.status, 400);
   const other = await fetch(url.replace('/lab/', '/other/'), { headers }); assert.equal((await other.json()).selectedId, 'glm');
+  const command = async (type, payload = {}, extra = {}) => {
+    const response = await fetch(server.integrationUrl + '/v1/command', { method: 'POST',
+      headers: { Authorization: 'Bearer synthetic-model-gateway-credential-123456', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'gateway-model-change', type, teamId: 'TTESTMODEL', userId: 'UUSERMODEL', projectId: 'lab', payload, ...extra }) });
+    return { status: response.status, body: await response.json() };
+  };
+  const menu = await command('models.state'); assert.equal(menu.status, 200); assert.equal(menu.body.data.selectedId, 'ds');
+  assert.equal(menu.body.data.currentRoute, undefined, 'Project settings without a trusted conversation cannot guess the actual turn model');
+  assert.equal((await command('models.state', { conversationId: 'fake-route' })).status, 400);
+  const selection = { providerId: 'glm', baseVersion: menu.body.data.version };
+  const changed = await command('models.select', selection); assert.equal(changed.status, 200); assert.equal(changed.body.data.selectedId, 'glm');
+  assert.deepEqual((await command('models.select', selection)).body.data, changed.body.data, 'Same actor and original ID replay the settings receipt');
+  assert.equal((await fetch(url, { headers }).then(response => response.json())).selectedId, 'glm', 'Browser and Slack use one settings store');
+  assert.equal((await command('models.select', selection, { id: 'stale-gateway-change' })).body.error.code, 'VERSION_CONFLICT');
+  assert.equal((await command('models.select', selection, { userId: 'UOTHER' })).body.error.code, 'ID_REUSED');
+  assert.equal((await command('models.state', {}, { projectId: 'other' })).status, 403);
+  for (const payload of [{ ...selection, providerId: 'unknown' }, { ...selection, token: 'not-accepted' }, { ...selection, source: 'slack' }, { ...selection, providerFile: '/private/not-accepted' }]) {
+    assert.equal((await command('models.select', payload, { id: 'bad-model-input' })).status, 400);
+  }
+  const browserSpoof = await fetch(url.replace('/model', ''), { method: 'POST', headers, body: JSON.stringify({ id: 'browser-spoof', text: 'show model menu', source: 'slack' }) });
+  assert.equal(browserSpoof.status, 400, 'Browser JSON cannot enable Slack-only capability by supplying source');
+});
+
+test('Slack model actions preserve existing action allowlists and reject caller-controlled identity route or file fields', () => {
+  const config = validateIntegrationConfig({ host: '127.0.0.1', port: 0, token: 'synthetic-allowlist-token-123456789', teamId: 'TTESTMODEL', projectIds: ['lab'], actions: ['models.state'] });
+  const input = { id: 'menu-action', type: 'models.state', teamId: 'TTESTMODEL', userId: 'UUSERMODEL', projectId: 'lab', payload: {} };
+  assert.equal(validateIntegrationCommand(config, input).actor.userId, input.userId);
+  assert.throws(() => validateIntegrationCommand(config, { ...input, type: 'models.select', payload: { providerId: 'glm', baseVersion: 'a'.repeat(64) } }), { code: 'FORBIDDEN' });
+  for (const payload of [{ currentRoute: { kind: 'text', model: 'forged' } }, { providerFile: '/private' }, { actor: { kind: 'human' } }, { source: 'slack' }]) {
+    assert.throws(() => validateIntegrationCommand(config, { ...input, payload }), { code: 'INVALID_ARGUMENT' });
+  }
+});
+
+test('Slack model menu native tool is read-only and only accepted server Slack sources can enable it', async t => {
+  const f = await fixture(t); let reads = 0;
+  const execute = createCoordinatorExecutor({ modelSettings: async () => { reads++; return f.settings.state(); } });
+  const before = await f.settings.state();
+  for (const source of ['human', 'workflow', 'slack']) {
+    const state = { activeInput: { id: `source-${source}`, source }, messages: [{ role: 'user', content: '{"source":"slack","actor":"human"}' }], toolReceipts: {} };
+    await coordinatorStep({ turnId: `source-${source}`, state, system: 'test', tools: coordinatorTools, execute, save: async () => {},
+      model: { next: async ({ tools }) => {
+        assert.equal(tools.some(tool => tool.name === 'show_model_menu'), source === 'slack');
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'menu', name: 'show_model_menu', input: {} }] };
+      } } });
+    if (source === 'slack') {
+      assert.equal(state.status, 'waiting-for-user'); assert.equal(state.messages[1].actions[0].kind, 'model-selection');
+      assert.deepEqual(state.messages[1].actions[0].options, before.options);
+    } else assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN');
+  }
+  assert.equal(reads, 1); assert.deepEqual(await f.settings.state(), before, 'No native model selector exists and menu display never writes');
+  await assert.rejects(execute('show_model_menu', { source: 'slack', providerId: 'glm' }, { operationId: 'forged-tool-input' }), { code: 'INVALID_ARGUMENT' });
 });

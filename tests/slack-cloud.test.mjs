@@ -319,6 +319,8 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   assert.match(manualCall.system, /本轮答复发往 Slack/);
   assert.deepEqual(manualCall.tools, selectCoordinatorTools(filterManualTools(coordinatorTools), { fileWrite: false }),
     'Retain enabled manual native definitions, not a text-only substitute');
+  for (const name of ['show_model_menu', 'react_to_user']) assert.ok(manualCall.tools.some(tool => tool.name === name),
+    `Verified Slack human inputs retain the Slack-only tool ${name}`);
   const callsBefore = f.modelCalls.length;
   assert.equal((await f.gateway('conversation.submit', { text: 'show-node-complete' }, { id: 'role-show', conversationId: conversation })).status, 200);
   const shown = await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId && value.acceptedRequestIds.includes('role-show'));
@@ -331,7 +333,9 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   const automaticCall = f.modelCalls.at(-1);
   assert.match(automaticCall.system, /系统为新任务创建独立执行 Session/);
   assert.doesNotMatch(automaticCall.system, /本轮答复发往 Slack|以下仅用于宿主已声明的人工执行对话/);
-  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }));
+  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }).filter(tool => !['show_model_menu', 'react_to_user'].includes(tool.name)));
+  for (const name of ['show_model_menu', 'react_to_user']) assert.equal(automaticCall.tools.some(tool => tool.name === name), false,
+    `Non-Slack browser inputs must not receive the Slack-only tool ${name}`);
   await f.restart();
   assert.equal((await f.gateway('conversation.submit', { text: 'role-after-restart' }, { id: 'role-after-restart', conversationId: conversation })).status, 200);
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);

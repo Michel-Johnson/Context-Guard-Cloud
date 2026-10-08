@@ -346,10 +346,22 @@ export class CoordinatorService {
     this.onStateChange = onStateChange;
     this.textModels = textModels; this.selectTextModel = selectTextModel;
     this.steerSettleMs = steerSettleMs;
+    // Serialize only this instance's short conversation-file operations. Model,
+    // network and transaction locks stay outside this local FIFO.
+    this.conversationFileTail = Promise.resolve();
+  }
+  conversationFileIO(operation) {
+    const result = this.conversationFileTail.then(operation);
+    this.conversationFileTail = result.catch(() => {});
+    return result; // The caller still receives the original failure.
+  }
+  readConversation(fallback) {
+    return this.conversationFileIO(() => readJSON(this.file, fallback));
   }
   async saveState(state) {
     retainInterruptedOutput(state);
-    await atomicWrite(this.file, encode(state));
+    const snapshot = encode(state); // Freeze before waiting behind a reader.
+    await this.conversationFileIO(() => atomicWrite(this.file, snapshot));
     // Persist first. Optional observers are notifications, not transactions:
     // never await their network work or let a rejected observer fail a turn.
     if (this.onStateChange) queueMicrotask(() => {
@@ -357,7 +369,7 @@ export class CoordinatorService {
     });
   }
   async state() {
-    const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
+    const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
     const inputs = await this.inputJournal();
     const mounts = await readJSON(this.mountFile, { receipts: {}, byProposal: {} });
     return { status: state.status, error: state.error || null, activeTurnId: state.activeTurnId || null,
@@ -492,7 +504,7 @@ export class CoordinatorService {
         if (prior.fingerprint !== fingerprint) throw error('ID_REUSED', 'Stop request identity differs');
         return { accepted: true, id, turnId: prior.turnId, replayed: true };
       }
-      const state = await readJSON(this.file, null);
+      const state = await this.readConversation(null);
       if (!state?.activeTurnId || state.activeTurnId !== expectedTurnId || !['running', 'error', 'interrupted'].includes(state.status)) {
         throw error('STALE_TURN', 'Stop targets a different or completed turn');
       }
@@ -548,7 +560,7 @@ export class CoordinatorService {
     for (;;) {
       let finishingRunner;
       await withFileLock(this.file + '.submit.lock', async () => {
-        const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
+        const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
         const journal = await this.inputJournal();
         if (state.batches?.[id] || journal.batches?.[id]) throw error('ID_REUSED', 'This identity belongs to an accepted batch');
         const queued = journal.requests[id];
@@ -690,7 +702,7 @@ export class CoordinatorService {
     for (;;) {
       let finishingRunner;
       await withFileLock(this.file + '.submit.lock', async () => {
-        const state = await readJSON(this.file, { messages: [], requests: {}, status: 'idle', toolReceipts: {} });
+        const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
         const journal = await this.inputJournal();
         const previous = state.batches?.[id] || journal.batches?.[id];
         if (previous) {
@@ -867,7 +879,7 @@ export class CoordinatorService {
     }
   }
   async compactCompleted() {
-    const source = await readJSON(this.file, null);
+    const source = await this.readConversation(null);
     if (!source || source.status !== 'waiting-for-user' || source.activeTurnId || source.pending ||
         !Number.isSafeInteger(source.lastInputTokens) || source.lastInputTokens < this.compactAtTokens) return false;
     // Validate any earlier summary against the untouched transcript before
@@ -912,7 +924,7 @@ export class CoordinatorService {
     const sourceHash = hash(JSON.stringify(source.messages.slice(0, through)));
     let committed = false;
     await withFileLock(this.file + '.submit.lock', async () => {
-      const latest = await readJSON(this.file, null);
+      const latest = await this.readConversation(null);
       if (!latest || latest.status !== 'waiting-for-user' || latest.activeTurnId || latest.pending ||
           latest.lastInputTokens !== source.lastInputTokens ||
           hash(JSON.stringify(latest.compaction || null)) !== hash(JSON.stringify(previous)) ||
@@ -935,7 +947,7 @@ export class CoordinatorService {
         try { await this.compactCompleted(); }
         catch (cause) {
           await withFileLock(this.file + '.submit.lock', async () => {
-            const state = await readJSON(this.file, null);
+            const state = await this.readConversation(null);
             if (!state || state.activeTurnId || state.status !== 'waiting-for-user') return;
             state.compactionError = { code: cause.code || 'COMPACTION_FAILED', at: new Date().toISOString() };
             await this.saveState(state);
@@ -962,7 +974,7 @@ export class CoordinatorService {
   }
   async run() {
     return withFileLock(this.file + '.run.lock', async () => {
-      let state = await readJSON(this.file, null);
+      let state = await this.readConversation(null);
       if (!state?.activeTurnId) return false;
       if (state.status === 'interrupted') return false;
       this.turnAbort = new AbortController();
