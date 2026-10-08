@@ -20,7 +20,7 @@
 | 本机工作台 | [design-workbench-v1.0.1.md](design-workbench-v1.0.1.md) | 项目命名、Session 绑定和进程复用 |
 | Cloud 同步 | [design-cloud-sync-v1.0.1.md](https://github.com/Michel-Johnson/Context-Guard-Skill/blob/main/references/design/design-cloud-sync-v1.0.1.md) | Session 同步、兼容传输、冲突和授权 |
 | Coordinator 压缩 | [design-coordinator-compaction-v1.0.0.md](design-coordinator-compaction-v1.0.0.md) | 普通 Cloud 对话的历史压缩与原文保留 |
-| Slack 插件 | [design-slack-integration-v1.0.0.md](design-slack-integration-v1.0.0.md) | 插件隔离、网关、自然语言对话和人工执行模式 |
+| Slack 插件 | [design-slack-integration-v1.1.0.md](design-slack-integration-v1.1.0.md) | 插件隔离、网关、自然语言对话、人工执行模式、模型选择与表情回应 |
 | Cloud 附件 | [design-cloud-attachments-v1.0.0.md](design-cloud-attachments-v1.0.0.md) | 夸克附件权限、持久流程和失败边界；继续暂缓 |
 
 ## 记忆格式与角色分工

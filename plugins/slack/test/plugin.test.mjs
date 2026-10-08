@@ -13,6 +13,10 @@ import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
 import { startIntegrationGateway } from '../../../scripts/cloud/integration-gateway.mjs';
 import { CoordinatorService, publicMessages } from '../../../scripts/cloud/coordinator-service.mjs';
 import { IntegrationAttachmentStore } from '../../../scripts/cloud/integration-attachments.mjs';
+import { CoordinatorModelSettings } from '../../../scripts/cloud/coordinator-model-settings.mjs';
+import { coordinatorStep } from '../../../scripts/cloud/coordinator-model.mjs';
+import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cloud/coordinator-tools.mjs';
+import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 
@@ -139,7 +143,397 @@ async function fixture(t) {
   return { plugin, store, gateway, io, calls, sent, directory };
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
+
+async function reactionFixture(t, original = event()) {
+  const f = await fixture(t), inboxId = envelopeId('events_api', { team_id: teamId, event: original });
+  await f.store.update(state => { state.channels[channel] = 'lab'; });
+  await f.store.receive(inboxId, { type: 'events_api', body: { team_id: teamId, event: original } });
+  await f.plugin.runEntry(inboxId, f.store.data.inbox[inboxId]);
+  const key = Object.keys(f.store.data.threads)[0], requestId = f.store.data.threads[key].ownRequests[0];
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, sessionId: `slack:${teamId}:${user}` };
+  const input = { role: 'user', requestId, source: 'slack', actor, text: original.text };
+  const message = { id: 'native-reaction-message', role: 'assistant', requestId, source: 'slack', actor, text: '',
+    actions: [{ kind: 'slack-reaction', actionId: 'native-original-action', status: 'intent', requestId, actor, emoji: 'heart' }] };
+  f.gateway.command = async type => type === 'conversation.state' ? { status: 'waiting-for-user', acceptedRequestIds: [requestId], messages: [input, message], approvals: [] } : {};
+  f.sent.length = 0;
+  return { ...f, key, requestId, input, message };
+}
+async function settleReactions(plugin) {
+  await Promise.allSettled([...plugin.reactions]); await plugin.store.tail;
+}
+async function stageReactions(plugin, key, message, messages) {
+  plugin.drainReactions(new Set(await plugin.queueReactions(key, message, messages)));
+}
+test('native Slack reaction adds only the chosen emoji and never posts a placeholder', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.deepEqual(f.sent, [{ method: 'reactions.add', input: { channel, timestamp: '123.001', name: 'heart' } }]);
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'sent');
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin); assert.equal(f.sent.length, 1);
+});
+test('native Slack reaction uses real publicMessages projection without inventing a delivery receipt', async t => {
+  const f = await reactionFixture(t), state = { activeInput: { id: f.requestId, source: 'slack', actor: f.input.actor }, messages: [{ ...f.input, content: f.input.text }], toolReceipts: {} };
+  await coordinatorStep({ turnId: 'trusted-projection', state, system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}), save: async () => {},
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'react', name: 'react_to_user', input: { emoji: 'smile' } }] }) } });
+  const projected = publicMessages(state); assert.equal(projected.filter(m => m.actions?.length).length, 1);
+  f.gateway.command = async () => ({ status: state.status, acceptedRequestIds: [f.requestId], messages: projected, approvals: [] });
+  f.plugin.stopped = false; await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.deepEqual(f.sent, [{ method: 'reactions.add', input: { channel, timestamp: '123.001', name: 'smile' } }]);
+});
+test('native Slack reaction contract enum stays aligned and necessary emoji text remains intact', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  const emojis = coordinatorTools.find(tool => tool.name === 'react_to_user').input_schema.properties.emoji.enum;
+  assert.deepEqual(emojis, ['thumbsup', 'heart', 'smile']);
+  for (const emoji of emojis) {
+    const message = structuredClone(f.message); message.actions[0].emoji = emoji; message.actions[0].actionId = emoji;
+    await stageReactions(f.plugin, f.key, message, [f.input, message]);
+  }
+  await settleReactions(f.plugin);
+  assert.deepEqual(f.sent.map(call => call.input.name), emojis);
+  f.message.text = '❤️ 感谢反馈。\n\n仍需人工确认，表情不代表已完成。';
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  const post = f.sent.find(call => call.text); assert.match(post.text, /❤️ 感谢反馈。\n\n仍需人工确认/);
+});
+test('native Slack reaction never borrows untrusted, other-user, synthetic or partial input', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  for (const mutate of [m => { m.source = 'human'; }, m => { m.actions[0].actor.userId = 'UOTHER'; },
+    m => { m.actions[0].requestId = 'old-request'; }, m => { m.actions[0].emoji = 'white_check_mark'; }, m => { m.partial = true; }]) {
+    const message = structuredClone(f.message); mutate(message);
+    await stageReactions(f.plugin, f.key, message, [f.input, message]);
+  }
+  await settleReactions(f.plugin); assert.equal(f.sent.length, 0); assert.equal(Object.keys(f.store.data.reactionOutbox || {}).length, 0);
+  await f.store.update(state => { const id = state.reactionInputs[f.requestId].inboxId; state.inbox[id].envelope.body.event.ts = 'command-synthetic'; });
+  await stageReactions(f.plugin, f.key, f.message, [f.input, f.message]); await settleReactions(f.plugin);
+  assert.equal(f.sent.length, 0);
+});
+test('native Slack reaction refuses cross-project or thread mappings', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  for (const [field, value] of [['projectId', 'another-project'], ['conversationId', 'another-chat'], ['key', 'another-thread']]) {
+    const original = structuredClone(f.store.data.reactionInputs[f.requestId]);
+    await f.store.update(state => { state.reactionInputs[f.requestId][field] = value; });
+    await stageReactions(f.plugin, f.key, f.message, [f.input, f.message]); await settleReactions(f.plugin);
+    await f.store.update(state => { state.reactionInputs[f.requestId] = original; });
+  }
+  assert.equal(f.sent.length, 0);
+});
+test('native Slack reaction in a real collected batch targets the actual first active input, not the final message', async t => {
+  const f = await fixture(t), originals = [event(), event({ ts: '123.002', text: `<@${bot}> 补充说明` })];
+  await f.store.update(state => { state.channels[channel] = 'lab'; });
+  const ids = originals.map(original => envelopeId('events_api', { team_id: teamId, event: original }));
+  for (const [index, original] of originals.entries()) await f.store.receive(ids[index], { type: 'events_api', body: { team_id: teamId, event: original } }, { collectMs: 1000, maxCollectMs: 2000 });
+  await f.store.update(state => { state.messageBatches[ids[0]].readyAt = 0; });
+  await f.plugin.runEntry(ids[0], f.store.data.inbox[ids[0]]);
+  const key = Object.keys(f.store.data.threads)[0], requests = f.store.data.threads[key].ownRequests;
+  assert.equal(requests.length, 2);
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, sessionId: `slack:${teamId}:${user}` };
+  const inputs = requests.map(requestId => ({ role: 'user', requestId, source: 'slack', actor }));
+  const message = { role: 'assistant', source: 'slack', actor, requestId: requests[0], actions: [{ kind: 'slack-reaction', actionId: 'batch-react', status: 'intent', requestId: requests[0], actor, emoji: 'thumbsup' }] };
+  f.plugin.stopped = false; await stageReactions(f.plugin, key, message, [...inputs, message]); await settleReactions(f.plugin);
+  assert.equal(f.sent.at(-1).input.timestamp, '123.001');
+});
+test('native Slack reaction persists original target and survives lost acknowledgement and restart', async t => {
+  const f = await reactionFixture(t), attempts = []; f.plugin.stopped = false;
+  f.io.call = async (method, input) => { attempts.push({ method, input }); throw Object.assign(new Error('may be applied'), { code: 'slack_webapi_platform_error', data: { error: 'internal_error' } }); };
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  const [id, record] = Object.entries(f.store.data.reactionOutbox)[0]; assert.equal(record.status, 'unknown');
+  await f.plugin.stop(); const reopened = await new Store(f.directory).open();
+  const restarted = new SlackPlugin({ ...f.plugin, store: reopened, io: { ...f.io, call: async (method, input) => {
+    attempts.push({ method, input }); throw Object.assign(new Error('exists'), { code: 'slack_webapi_platform_error', data: { error: 'already_reacted' } });
+  } }, logger: { warn() {}, error() {} } });
+  t.after(() => restarted.stop()); await reopened.update(state => { state.reactionOutbox[id].next = 0; }); restarted.stopped = false;
+  restarted.drainReactions(); await settleReactions(restarted);
+  assert.equal(reopened.data.reactionOutbox[id].status, 'sent'); assert.equal(reopened.data.reactionOutbox[id].attempts, 2);
+  assert.deepEqual(attempts[1], attempts[0]); assert.equal(attempts[0].input.timestamp, '123.001');
+  const changed = structuredClone(f.message); changed.actions[0].emoji = 'smile';
+  await assert.rejects(stageReactions(restarted, f.key, changed, [f.input, changed]), { code: 'ID_REUSED' });
+});
+test('native Slack permanent rejection and exhausted rate limit stay recorded without blocking text', async t => {
+  for (const error of [Object.assign(new Error('scope'), { code: 'slack_webapi_platform_error', data: { error: 'missing_scope' } }),
+    Object.assign(new Error('rate exhausted'), { code: 'slack_webapi_rate_limited_error', retryAfter: 10 })]) {
+    const f = await reactionFixture(t); f.plugin.stopped = false;
+    let calls = 0; f.io.call = async () => { calls++; throw error; }; f.message.text = '请先修复权限；当前没有送达确认。';
+    await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+    assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'failed');
+    assert.ok(f.sent.some(call => call.text?.includes('当前没有送达确认'))); f.plugin.drainReactions(); await settleReactions(f.plugin); assert.equal(calls, 1);
+  }
+});
+test('native Slack unknown outcomes remain bounded to original eight attempts', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false; let calls = 0;
+  f.io.call = async () => { calls++; throw new Error('unknown'); };
+  await stageReactions(f.plugin, f.key, f.message, [f.input, f.message]); await settleReactions(f.plugin);
+  const id = Object.keys(f.store.data.reactionOutbox)[0];
+  for (let attempt = 1; attempt < 10; attempt++) {
+    await f.store.update(state => { state.reactionOutbox[id].next = 0; }); f.plugin.drainReactions(); await settleReactions(f.plugin);
+  }
+  assert.equal(calls, 8); assert.equal(f.store.data.reactionOutbox[id].status, 'attention');
+});
+test('native Slack eight occupied slots preserve pending intent, suppress superseded work and drain on stop', async t => {
+  const f = await reactionFixture(t), releases = []; f.plugin.stopped = false;
+  f.io.call = () => new Promise(resolve => releases.push(resolve));
+  for (let index = 0; index < 8; index++) f.plugin.readReaction(event({ ts: `123.${index}` }));
+  await Promise.resolve();
+  await stageReactions(f.plugin, f.key, f.message, [f.input, f.message]);
+  assert.equal(f.plugin.reactions.size, 8); assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'pending');
+  const partial = { ...f.message, partial: true }; await stageReactions(f.plugin, f.key, partial, [f.input, partial]);
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'superseded');
+  let finished = false; const stopping = f.plugin.stop().then(() => { finished = true; });
+  await Promise.resolve(); assert.equal(finished, false); f.plugin.drainReactions(); assert.equal(releases.length, 8);
+  for (const release of releases) release({}); await stopping; assert.equal(finished, true);
+});
+test('native Slack pending intent resumes after saturation without delaying an unrelated text answer', async t => {
+  const f = await reactionFixture(t), releases = []; f.plugin.stopped = false;
+  f.io.call = (method, input) => input.name === 'eyes' ? new Promise(resolve => releases.push(resolve)) : (f.sent.push({ method, input }), Promise.resolve({}));
+  for (let index = 0; index < 8; index++) f.plugin.readReaction(event({ ts: `123.${index}` }));
+  f.message.text = '必要正文照常显示。';
+  await f.plugin.mirror(f.key); assert.ok(f.sent.some(call => call.text?.includes('必要正文')));
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'pending');
+  for (const release of releases) release({}); await settleReactions(f.plugin);
+  await f.store.update(state => { state.threads[f.key].nextPoll = 0; }); await f.plugin.tick(); await settleReactions(f.plugin);
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'sent');
+});
+test('native Slack tick checks fresh partial state before starting an intent released from eight-slot saturation', async t => {
+  const f = await reactionFixture(t), releases = []; f.plugin.stopped = false;
+  f.io.call = (method, input) => input.name === 'eyes' ? new Promise(resolve => releases.push(resolve)) : (f.sent.push({ method, input }), Promise.resolve({}));
+  for (let index = 0; index < 8; index++) f.plugin.readReaction(event({ ts: `123.${index}` }));
+  await f.plugin.mirror(f.key); assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'pending');
+  f.message.partial = true;
+  for (const release of releases) release({}); await settleReactions(f.plugin);
+  await f.store.update(state => { state.threads[f.key].nextPoll = 0; }); await f.plugin.tick(); await settleReactions(f.plugin);
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'superseded');
+  assert.equal(f.sent.some(call => call.method === 'reactions.add'), false);
+});
+test('native Slack restart never sends a pending intent before its fresh authoritative state is read', async t => {
+  const f = await reactionFixture(t);
+  await f.plugin.queueReactions(f.key, f.message, [f.input, f.message]);
+  const reopened = await new Store(f.directory).open(); let reads = 0;
+  const restarted = new SlackPlugin({ ...f.plugin, store: reopened, io: { ...f.io, call: () => assert.fail('Superseded intent must never be sent') },
+    gateway: { command: async type => { assert.equal(type, 'conversation.state'); reads++; return { status: 'waiting-for-user', acceptedRequestIds: [f.requestId], messages: [f.input, { ...f.message, partial: true }], approvals: [] }; } },
+    logger: { warn() {}, error() {} } });
+  t.after(() => restarted.stop()); restarted.stopped = false;
+  restarted.drainReactions(); await settleReactions(restarted); assert.equal(reads, 0);
+  await reopened.update(state => { state.threads[f.key].nextPoll = 0; }); await restarted.tick(); await settleReactions(restarted);
+  assert.equal(reads, 1); assert.equal(Object.values(reopened.data.reactionOutbox)[0].status, 'superseded');
+});
+test('native Slack reaction journal-only failure does not block text or invent a receipt and later recovers', async t => {
+  const f = await reactionFixture(t), warnings = [], update = f.store.update.bind(f.store); let failed = false;
+  f.store.update = operation => update(async state => {
+    const before = Object.keys(state.reactionOutbox || {}).length, result = await operation(state);
+    if (!failed && Object.keys(state.reactionOutbox || {}).length > before) {
+      failed = true; throw Object.assign(new Error('injected journal failure'), { code: 'EIO' });
+    }
+    return result;
+  });
+  f.message.text = '说明与风险仍正常显示。'; f.plugin.stopped = false; f.plugin.logger.warn = (message, details) => warnings.push(details);
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.equal(failed, true); assert.ok(f.sent.some(call => call.text?.includes('说明与风险')));
+  assert.equal(f.sent.some(call => call.method === 'reactions.add'), false);
+  assert.equal(Object.keys(f.store.data.reactionOutbox || {}).length, 0); assert.deepEqual(warnings, [{ code: 'EIO' }]);
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'sent');
+  assert.equal(f.sent.filter(call => call.text?.includes('说明与风险')).length, 1);
+  assert.equal(f.sent.filter(call => call.method === 'reactions.add').length, 1);
+});
 function formBody(draftId, values) { return { type: 'view_submission', user: { id: user }, view: { private_metadata: draftId, state: { values: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, { value: { value } }])) } } }; }
+
+async function modelMenuFixture(t) {
+  const f = await fixture(t), first = path.join(f.directory, 'first-provider.json'), second = path.join(f.directory, 'second-provider.json');
+  await fs.writeFile(first, '{"model":"first-model"}'); await fs.writeFile(second, '{"model":"second-model"}');
+  const settings = await CoordinatorModelSettings.open({ directory: path.join(f.directory, 'models'), config: {
+    providerFile: first, defaultProviderId: 'first', modelProviders: { first: { label: '第一模型', providerFile: first }, second: { label: '第二模型', providerFile: second } },
+  }, factory: provider => ({ model: provider.model, next: () => assert.fail('Model menus must not probe providers') }) });
+  await f.store.update(state => { state.channels[channel] = 'lab'; state.preferences[user] = 'lab'; });
+  const original = f.gateway.command; let lost = false;
+  f.gateway.command = async (type, input) => {
+    if (type === 'models.state') { f.calls.push({ type, ...input }); return settings.state(); }
+    if (type === 'models.select') {
+      f.calls.push({ type, ...input }); const result = await settings.select({ id: input.id, ...input.payload });
+      if (lost) { lost = false; throw new TypeError('Selection committed but reply lost'); }
+      return result;
+    }
+    return original(type, input);
+  };
+  return { ...f, settings, loseSelection: () => { lost = true; } };
+}
+const modelCommand = { command: '/cg', text: 'model', user_id: user, channel_id: channel };
+function modelClick(menu, providerId, actor = user) {
+  return { type: 'block_actions', user: { id: actor }, channel: { id: menu.channel }, message: { ts: menu.ts },
+    actions: [{ action_id: 'model_select:0', value: JSON.stringify({ menuId: menu.id, providerId }) }] };
+}
+
+test('Slack models explicit command opens only configured choices with one native confirmation and no model or classification', async t => {
+  const f = await modelMenuFixture(t), before = await f.settings.state();
+  await f.plugin.process('model-explicit', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0];
+  assert.equal(menu.userId, user); assert.equal(menu.projectId, 'lab'); assert.equal(menu.version, before.version);
+  assert.deepEqual(f.calls.map(call => call.type), ['models.state']);
+  const choice = f.sent[0].blocks.find(block => block.type === 'actions').elements[0];
+  assert.ok(choice.confirm); assert.equal(JSON.parse(choice.value).providerId, 'second');
+  assert.match(blockText(f.sent[0].blocks), /下一文字轮次/); assert.match(blockText(f.sent[0].blocks), /图片继续/);
+  assert.deepEqual(await f.settings.state(), before, 'Opening or canceling the native confirmation is not a selection');
+  await f.plugin.process('human-confirm', { type: 'interactive', body: modelClick(menu, 'second') });
+  assert.equal((await f.settings.state()).selectedId, 'second'); assert.equal(f.store.data.modelMenus[menu.id].status, 'applied');
+  assert.equal(f.sent.at(-1).update[1], menu.ts);
+});
+
+test('Slack models unbound explicit command resumes its menu after project choice without starting a model conversation', async t => {
+  const f = await modelMenuFixture(t); await f.store.update(state => { delete state.channels[channel]; delete state.preferences[user]; });
+  await f.plugin.process('unbound-model', { type: 'slash_commands', body: modelCommand });
+  await f.plugin.process('choose-model-project', { type: 'interactive', body: projectChoice(f, 'unbound-model') });
+  await runPluginCycle(f.plugin);
+  assert.equal(Object.values(f.store.data.modelMenus).length, 1);
+  assert.equal(f.calls.some(call => ['conversation.create', 'conversation.submit', 'conversation.relevance'].includes(call.type)), false);
+});
+
+test('Slack models reject another user card destination project association and unknown provider before selection', async t => {
+  const f = await modelMenuFixture(t); await f.plugin.process('model-scope', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0], before = await f.settings.state();
+  const wrongMessage = modelClick(menu, 'second'); wrongMessage.message.ts = 'not-the-card';
+  const wrongChannel = modelClick(menu, 'second'); wrongChannel.channel.id = 'C000002';
+  for (const body of [modelClick(menu, 'second', 'UOTHER'), wrongMessage, wrongChannel, modelClick(menu, 'not-configured')]) {
+    await assert.rejects(f.plugin.process('reject-model', { type: 'interactive', body }), error => ['FORBIDDEN', 'CONFLICT', 'INVALID_ARGUMENT'].includes(error.code));
+  }
+  await f.store.update(state => { state.channels[channel] = 'other'; });
+  await assert.rejects(f.plugin.process('stale-project-model', { type: 'interactive', body: modelClick(menu, 'second') }), { code: 'CONFLICT' });
+  assert.deepEqual(await f.settings.state(), before); assert.equal(f.calls.some(call => call.type === 'models.select'), false);
+});
+
+test('Slack models lost selection reply freezes the original operation across restart before same-current no-op', async t => {
+  const f = await modelMenuFixture(t); await f.plugin.process('model-replay', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0]; f.loseSelection();
+  await assert.rejects(f.plugin.process('lost-model-click', { type: 'interactive', body: modelClick(menu, 'second') }), /reply lost/);
+  const selected = await f.settings.state(), saved = structuredClone(f.store.data.modelMenus[menu.id].selection);
+  assert.equal(selected.selectedId, 'second'); assert.equal(f.store.data.modelMenus[menu.id].status, 'open');
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.process('retry-model-click', { type: 'interactive', body: modelClick(f.plugin.store.data.modelMenus[menu.id], 'second') });
+  assert.deepEqual(await f.settings.state(), selected); assert.deepEqual(f.plugin.store.data.modelMenus[menu.id].selection, saved);
+  const writes = f.calls.filter(call => call.type === 'models.select'); assert.deepEqual(writes[0], writes[1]);
+  await f.plugin.process('same-receipt-click', { type: 'interactive', body: modelClick(f.plugin.store.data.modelMenus[menu.id], 'second') });
+  assert.equal(f.calls.filter(call => call.type === 'models.select').length, 3, 'An existing receipt is replayed even when the menu now shows the selected ID');
+  assert.deepEqual(await f.settings.state(), selected);
+});
+
+test('Slack models late acknowledgement replays historical choice without overwriting or claiming the newer default', async t => {
+  const f = await modelMenuFixture(t); await f.plugin.process('late-model-receipt', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0], originalPosts = f.sent.length;
+  assert.match(blockText(f.sent.at(-1).blocks), /选择后从下一文字轮次生效/);
+  f.loseSelection();
+  await assert.rejects(f.plugin.process('late-receipt-first-click', { type: 'interactive', body: modelClick(menu, 'second') }), /reply lost/);
+  const originalSelection = structuredClone(f.store.data.modelMenus[menu.id].selection), savedA = await f.settings.state();
+  assert.equal(savedA.selectedId, 'second');
+  await f.settings.select({ id: 'other-human-newer-default', providerId: 'first', baseVersion: savedA.version });
+  const newerB = await f.settings.state(), diskB = JSON.parse(await fs.readFile(f.settings.file, 'utf8'));
+  assert.equal(newerB.selectedId, 'first'); assert.notEqual(newerB.version, savedA.version);
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.process('late-receipt-after-restart', { type: 'interactive', body: modelClick(f.plugin.store.data.modelMenus[menu.id], 'second') });
+  assert.deepEqual(await f.settings.state(), newerB);
+  assert.deepEqual(JSON.parse(await fs.readFile(f.settings.file, 'utf8')), diskB, 'Historical replay cannot increment revision or replace any stored receipt');
+  assert.deepEqual(f.plugin.store.data.modelMenus[menu.id].selection, originalSelection);
+  assert.equal(f.plugin.store.data.modelMenus[menu.id].selectedId, 'second', 'The original receipt records the old choice, not a fabricated current value');
+  const writes = f.calls.filter(call => call.type === 'models.select'); assert.deepEqual(writes[0], writes[1]);
+  const update = f.sent.at(-1).update; assert.equal(update[0], menu.channel); assert.equal(update[1], menu.ts);
+  assert.equal(f.sent.filter(message => !message.update).length, originalPosts, 'The receipt updates the original message, never posts another selection');
+  for (const text of [update[2], blockText(update[3])]) {
+    assert.match(text, /历史回执/); assert.match(text, /不代表当前项目默认/); assert.match(text, /\/cg model/);
+    assert.doesNotMatch(text, /下一文字轮次生效/);
+  }
+  assert.match(blockText(update[3]), /本次已确认的文字模型选择：第二模型/);
+});
+
+test('Slack models fresh current choice is a read-only no-op and stale choices create a new observed version menu', async t => {
+  const f = await modelMenuFixture(t); await f.plugin.process('model-noop', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0], before = await f.settings.state();
+  await f.plugin.process('current-model-click', { type: 'interactive', body: modelClick(menu, 'first') });
+  assert.deepEqual(await f.settings.state(), before); assert.equal(f.calls.some(call => call.type === 'models.select'), false);
+  await f.plugin.process('model-conflict', { type: 'slash_commands', body: modelCommand });
+  const stale = Object.values(f.store.data.modelMenus).find(item => item.id !== menu.id);
+  await f.settings.select({ id: 'browser-model-change', providerId: 'second', baseVersion: before.version });
+  await f.plugin.process('stale-model-click', { type: 'interactive', body: modelClick(stale, 'second') });
+  const menus = Object.values(f.store.data.modelMenus); assert.equal(menus.length, 3);
+  assert.equal(menus.at(-1).selectedId, 'second'); assert.equal(menus.at(-1).version, (await f.settings.state()).version);
+  assert.equal(f.store.data.modelMenus[stale.id].selection.baseVersion, before.version);
+});
+
+test('Slack models native tool menu binds the actual accepted actor and preserves mirror receipts across restart', async t => {
+  const f = await modelMenuFixture(t), key = threadKey(teamId, channel, '123.001');
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'native-model'), system: 'Test Coordinator', tools: coordinatorTools,
+    execute: createCoordinatorExecutor({ modelSettings: async () => ({ ...(await f.settings.state()), currentRoute: (await service.state()).modelRoute }) }), model: { model: 'actual-pinned-native-model', next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'native-model-menu', name: 'show_model_menu', input: {} },
+    ] }) } });
+  try {
+    await service.submit({ id: 'model-user-input', text: '更换项目默认文字模型' }, { source: 'slack', actor: { kind: 'human', teamId, userId: user } }); await service.close();
+    const state = await service.state(); assert.equal(state.status, 'waiting-for-user'); assert.equal(state.messages.at(-1).actions[0].kind, 'model-selection');
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'native-model', userId: 'UOLDOWNER', ownRequests: ['model-user-input'] });
+    const command = f.gateway.command;
+    f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(state) : command(type, input);
+    const before = await f.settings.state(); await f.plugin.mirror(key);
+    const menu = Object.values(f.store.data.modelMenus)[0]; assert.equal(menu.userId, user); assert.notEqual(menu.userId, 'UOLDOWNER');
+    assert.deepEqual(menu.currentRoute, { kind: 'text', model: 'actual-pinned-native-model' });
+    assert.match(blockText(f.sent.at(-1).blocks), /本卡展示轮次的实际模型（文字）：actual-pinned-native-model/);
+    assert.match(blockText(f.sent.at(-1).blocks), /项目默认文字模型：第一模型/);
+    assert.deepEqual(await f.settings.state(), before);
+    f.plugin.store = await new Store(f.directory).open(); const count = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+    await f.plugin.process('native-human-select', { type: 'interactive', body: modelClick(menu, 'second') });
+    assert.equal((await f.settings.state()).selectedId, 'second');
+  } finally { await service.close({ stop: true }); }
+});
+
+test('Slack models real image turn menu reports its pinned vision route separately from the default text catalog', async t => {
+  const f = await modelMenuFixture(t), key = threadKey(teamId, channel, '124.001'), bytes = Buffer.from('synthetic image');
+  const image = { id: 'model-menu-image', filename: 'screen.png', mimeType: 'image/png', size: bytes.length, hash: hash(bytes) };
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'vision-menu'), system: 'Test Coordinator', tools: coordinatorTools,
+    model: { model: 'unrelated-text-model', next: async () => assert.fail('An image turn cannot use the default text route') },
+    visionModel: { model: 'GLM-5.3-Flash', next: async ({ messages, tools }) => {
+      assert.ok(messages.some(message => Array.isArray(message.content) && message.content.some(block => block.type === 'image')));
+      if (!tools.length) return { stop: 'end_turn', content: [{ type: 'text', text: '合成截图中有一个按钮。' }] };
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'vision-menu', name: 'show_model_menu', input: {} }] };
+    } },
+    resolveAttachment: async (id, context) => { assert.equal(id, image.id); return { ...image, ...(!context.metadataOnly ? { base64: bytes.toString('base64') } : {}) }; },
+    execute: createCoordinatorExecutor({ modelSettings: async () => ({ ...(await f.settings.state()), currentRoute: (await service.state()).modelRoute }) }) });
+  try {
+    await service.submit({ id: 'image-model-query', text: '这轮使用什么模型？', attachments: [{ id: image.id }] }, { source: 'slack', actor: { kind: 'human', teamId, userId: user } }); await service.close();
+    const state = await service.state(); assert.equal(state.status, 'waiting-for-user');
+    assert.deepEqual(state.modelRoute, { kind: 'vision', model: 'GLM-5.3-Flash' });
+    assert.equal(state.messages.find(message => message.role === 'user').attachments[0].id, image.id);
+    await f.store.bind(key, { channel, threadTs: '124.001', projectId: 'lab', conversationId: 'vision-menu', ownRequests: ['image-model-query'] });
+    const command = f.gateway.command; f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(state) : command(type, input);
+    await f.plugin.mirror(key);
+    const menu = Object.values(f.store.data.modelMenus)[0], text = blockText(f.sent.at(-1).blocks);
+    assert.deepEqual(menu.currentRoute, state.modelRoute); assert.match(text, /本卡展示轮次的实际模型（图片）：GLM-5.3-Flash/);
+    assert.match(text, /项目默认文字模型：第一模型/); assert.equal(menu.userId, user);
+    await f.plugin.process('vision-human-select', { type: 'interactive', body: modelClick(menu, 'second') });
+    assert.equal((await f.settings.state()).selectedId, 'second');
+    assert.deepEqual((await service.state()).modelRoute, state.modelRoute, 'Changing the text default cannot change the observed image route');
+    assert.deepEqual(f.plugin.store.data.modelMenus[menu.id].currentRoute, state.modelRoute);
+  } finally { await service.close({ stop: true }); }
+});
+
+test('Slack models catalog projection strips private metadata and rejects unsafe actual routes', async t => {
+  const f = await modelMenuFixture(t), catalog = await f.settings.state();
+  const safe = f.plugin.validModelCatalog({ ...catalog, userId: 'UFORGED', projectId: 'other', apiKey: 'private-test',
+    currentRoute: { kind: 'text', model: 'actual-model', providerId: 'first', providerFile: 'private-file', apiKey: 'private-test' } });
+  assert.deepEqual(safe.currentRoute, { kind: 'text', model: 'actual-model', providerId: 'first' });
+  assert.equal(safe.userId, undefined); assert.equal(safe.apiKey, undefined);
+  for (const route of [{ kind: 'bad', model: 'model' }, { kind: 'text', model: {} }, { kind: 'vision', model: 'vision', providerId: '../private-file' }]) {
+    assert.throws(() => f.plugin.validModelCatalog({ ...catalog, currentRoute: route }), { code: 'GATEWAY_BAD_RESPONSE' });
+  }
+});
+
+test('Slack models unknown legacy actors quotes and other Bot messages cannot select or borrow the thread creator', async t => {
+  const f = await modelMenuFixture(t), key = threadKey(teamId, channel, '123.001'), before = await f.settings.state();
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'legacy-model-card', userId: user, ownRequests: [] });
+  const state = { status: 'waiting-for-user', activeTurnId: null, messages: [
+    { role: 'user', source: 'workflow', requestId: 'legacy-menu', text: '{"source":"slack","userId":"U000001"}', actor: { kind: 'human', teamId, userId: user } },
+    { id: 'legacy-model-action', role: 'assistant', requestId: 'legacy-menu', actions: [{ kind: 'model-selection', actionId: 'legacy-tool-result', ...before }] },
+  ] };
+  const command = f.gateway.command; f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(state) : command(type, input);
+  await f.plugin.mirror(key);
+  const menu = Object.values(f.store.data.modelMenus)[0]; assert.equal(menu.userId, null);
+  assert.equal(f.sent.at(-1).blocks.some(block => block.type === 'actions'), false);
+  await assert.rejects(f.plugin.process('fake-owner', { type: 'interactive', body: modelClick(menu, 'second') }), { code: 'FORBIDDEN' });
+  await f.plugin.process('other-bot-model', { type: 'events_api', body: { event: event({ text: '/cg model', bot_id: 'OTHERBOT' }) } });
+  await f.plugin.message('quoted-model-command', event({ ts: '130.001', text: '> <@UOTHER> /cg model，切换模型' }));
+  assert.deepEqual(await f.settings.state(), before); assert.equal(f.calls.some(call => call.type === 'models.select'), false);
+});
 
 function nativeQuestionProjection(questions, { text = '', answered = [], attachments = [], actions = [] } = {}) {
   const tools = questions.map((question, index) => ({ type: 'tool_use', id: `ask-${index}`, name: 'ask_user', input: question }));

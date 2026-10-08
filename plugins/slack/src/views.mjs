@@ -6,6 +6,27 @@ export const section = text => ({ type: 'section', text: { type: 'mrkdwn', text:
 export const textSections = text => { const value = String(text || '—'); return Array.from({ length: Math.ceil(value.length / 2800) }, (_, index) => section(value.slice(index * 2800, (index + 1) * 2800))); };
 export const plainSections = text => plainChunks(text).map(value => ({ type: 'section', text: plain(value, 2800) }));
 export const button = (label, action, value, style) => ({ type: 'button', text: plain(label, 75), action_id: action, value: JSON.stringify(value), ...(style ? { style } : {}) });
+export function modelChoiceBlocks(menu) {
+  const selected = menu.options.find(option => option.id === menu.selectedId);
+  const route = menu.currentRoute;
+  const actual = route ? `\n本卡展示轮次的实际模型（${route.kind === 'vision' ? '图片' : '文字'}）：${route.model || '服务端未提供模型名称'}${route.providerId ? ` · ${route.providerId}` : ''}` :
+    menu.status === 'applied' ? '\n本卡仅记录原操作回执，不推测当前轮次的实际模型。' : '\n此菜单仅展示项目默认设置，不推测当前轮次的实际模型。';
+  const footer = menu.status === 'applied' ? '原选择已确认（历史回执），不代表当前项目默认。请用 /cg model 查看当前默认文字模型。' :
+    '选择后从下一文字轮次生效；当前轮次和原失败重试保留固定模型路由，图片继续使用现有视觉模型。';
+  const blocks = plainSections(`项目：${menu.projectName || menu.projectId}\n${menu.status === 'applied' ? '本次已确认的文字模型选择' : '项目默认文字模型'}：${selected?.label || menu.selectedId}${actual}\n已配置模型：${menu.options.map(option => option.label).join('、')}\n\n${footer}`);
+  if (menu.status === 'applied') return blocks;
+  if (menu.status === 'unchanged') return [...blocks, ...plainSections('当前模型未改变。')];
+  if (menu.error) return [...blocks, ...plainSections(`此菜单的选择未确认（${menu.error}），请重新输入 /cg model。`)];
+  if (menu.selection) return [...blocks, ...plainSections('正在确认原模型选择结果，请保留当前操作。')];
+  if (!menu.userId) return [...blocks, ...plainSections('请由用户在 Slack 输入 /cg model 打开自己的选择菜单。')];
+  const choices = menu.options.filter(option => option.id !== menu.selectedId);
+  for (let index = 0; index < choices.length; index += 5) blocks.push({ type: 'actions', elements: choices.slice(index, index + 5).map((option, offset) => ({
+    ...button(`切换到 ${option.label}`, `model_select:${index + offset}`, { menuId: menu.id, providerId: option.id }),
+    confirm: { title: plain('更换项目默认文字模型', 100), text: plain(`确认选择 ${option.label}？当前轮次和失败重试不切换，图片模型不变。`, 250), confirm: plain('确认'), deny: plain('取消') },
+  })) });
+  if (!choices.length) blocks.push(...plainSections('当前项目只配置了这一种文字模型。'));
+  return blocks;
+}
 export function projectChoiceBlocks(projects, requestId, direct) {
   const blocks = [section('你好，我可以帮你讨论项目、分析 Bug 和整理任务。先选择这次要聊的项目，选好后我会继续处理刚才的问题。')];
   if (!projects.length) return [...blocks, section('目前没有开放的项目，请管理员在插件配置中开放项目后再试。')];
@@ -99,6 +120,7 @@ export function messageBlocks(message, key, context) {
     if (!question.answer) questionControls(question);
   }
   blocks.push(...nodeLinkBlocks(message.actions, context));
+  for (const menu of context?.modelMenus || []) blocks.push(...modelChoiceBlocks(menu));
   for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
   if (!projectedQuestions) for (const question of open) {
     if (!sameWholeQuestion) blocks.push(...plainSections(question.text));

@@ -1,9 +1,15 @@
 import { digest, threadKey } from './store.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
-import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, section, escape } from './views.mjs';
+import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, modelChoiceBlocks, section, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
+// This narrow boundary repeats the Cloud enum deliberately; contract tests
+// keep it aligned without importing the whole Cloud tool catalogue.
+const slackReactionEmojis = ['thumbsup', 'heart', 'smile'];
+const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
+  'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
+const reactionEventHash = event => digest({ ...event, type: 'message' });
 const participationTransient = error => {
   // Authentication, identity and contract failures require attention, even when
   // a proxy supplied an unreadable error body. They are never model silence.
@@ -19,7 +25,7 @@ const participationTransient = error => {
 // A read action is retained by Cloud for provenance/focus, but has no Slack UI.
 // Preserve actual text, questions, attachments and other presentation actions.
 const hasSlackContent = message => !!(message.text || message.questions?.length || message.attachments?.length ||
-  message.actions?.some(action => action && !['map-read', 'node-read'].includes(action.kind)));
+  message.actions?.some(action => action && !['map-read', 'node-read', 'slack-reaction'].includes(action.kind)));
 const isMessage = event => ['message', 'app_mention'].includes(event?.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share');
 const indirectMessage = (event, botUserId) => isMessage(event) && event.user !== botUserId &&
   event.channel_type !== 'im' && !event.channel?.startsWith('D') && !explicitlyAddressed(event, botUserId);
@@ -48,6 +54,7 @@ export class SlackPlugin {
     this.classifying = new Set();
     this.messageLanes = new Map();
     this.reactions = new Set();
+    this.reactionActions = new Set();
     this.userIdentities = new Map();
     this.identityTasks = new Set();
     this.eventStreams = new Map(); this.eventRetry = new Map(); this.eventTasks = new Set(); this.kickRequested = false;
@@ -84,6 +91,90 @@ export class SlackPlugin {
       .catch(() => {}).finally(() => this.reactions.delete(pending));
     this.reactions.add(pending);
   }
+  async queueReactions(key, message, messages) {
+    const ready = [];
+    if (message.role !== 'assistant') return ready;
+    if (message.partial) {
+      for (const action of message.actions || []) if (action.kind === 'slack-reaction') {
+        const id = `reaction-${digest([key, action.actionId])}`;
+        if (this.store.data.reactionOutbox?.[id]?.status === 'pending') await this.store.update(state => {
+          if (state.reactionOutbox[id].status === 'pending') state.reactionOutbox[id].status = 'superseded';
+        });
+      }
+      return ready;
+    }
+    const binding = this.store.data.threads[key];
+    for (const action of message.actions || []) {
+      if (action.kind !== 'slack-reaction') continue;
+      const actor = action.actor, input = this.store.data.reactionInputs?.[action.requestId];
+      const original = input && this.store.data.inbox[input.inboxId];
+      const event = original?.projectResume?.event || original?.envelope?.body?.event;
+      const source = messages.find(item => item.role === 'user' && item.requestId === action.requestId);
+      if (!action.actionId || !slackReactionEmojis.includes(action.emoji) || action.status !== 'intent' ||
+          message.source !== 'slack' || message.requestId !== action.requestId || source?.source !== 'slack' ||
+          actor?.kind !== 'human' || actor.integration !== 'slack' || actor.teamId !== this.teamId ||
+          actor.sessionId !== `slack:${this.teamId}:${actor.userId}` || source.actor?.userId !== actor.userId ||
+          source.actor?.teamId !== this.teamId || source.actor?.kind !== 'human' || source.actor?.integration !== 'slack' ||
+          source.actor?.sessionId !== actor.sessionId || message.actor?.sessionId !== actor.sessionId ||
+          !input || input.key !== key || input.projectId !== binding.projectId || input.conversationId !== binding.conversationId ||
+          !binding.ownRequests?.includes(action.requestId) || input.userId !== actor.userId || !isMessage(event) ||
+          event.user !== actor.userId || event.channel !== binding.channel || input.channel !== binding.channel || event.ts !== input.timestamp ||
+          !/^\d+\.\d+$/.test(event.ts || '') || original.envelope?.body?.team_id !== this.teamId ||
+          reactionEventHash(event) !== input.eventHash) continue;
+      const id = `reaction-${digest([key, action.actionId])}`;
+      const target = { key, requestId: action.requestId, projectId: binding.projectId, conversationId: binding.conversationId,
+        channel: input.channel, timestamp: input.timestamp, userId: input.userId, emoji: action.emoji };
+      await this.store.update(state => {
+        const previous = (state.reactionOutbox ||= {})[id], fingerprint = digest(target);
+        if (previous && previous.fingerprint !== fingerprint) throw Object.assign(new Error('Reaction intent changed'), { code: 'ID_REUSED' });
+        state.reactionOutbox[id] ||= { ...target, fingerprint, status: 'pending', attempts: 0, next: 0 };
+      });
+      ready.push(id);
+    }
+    return ready;
+  }
+  drainReactions(ready = new Set()) {
+    if (this.stopped) return;
+    for (const [id, record] of Object.entries(this.store.data.reactionOutbox || {})) {
+      if (this.reactions.size >= 8) break;
+      if (this.reactionActions.has(id) || !['pending', 'sending', 'unknown'].includes(record.status) || record.next > Date.now()) continue;
+      // A never-started intent needs this cycle's fresh public state. Bootstrap
+      // and saturation must not race ahead of a saved superseded generation.
+      if (record.status === 'pending' && !ready.has(id)) continue;
+      const binding = this.store.data.threads[record.key];
+      if (!binding || binding.projectId !== record.projectId || binding.conversationId !== record.conversationId || binding.channel !== record.channel) continue;
+      this.reactionActions.add(id);
+      const pending = (async () => {
+        // Persist the original destination before any platform call. A crash or
+        // lost acknowledgement replays only this same user/message/emoji.
+        if (record.attempts >= 8) {
+          await this.store.update(state => { state.reactionOutbox[id].status = 'attention'; });
+          return;
+        }
+        await this.store.update(state => { const item = state.reactionOutbox[id]; item.status = 'sending'; item.attempts++; });
+        if (this.stopped) {
+          await this.store.update(state => { state.reactionOutbox[id].status = 'pending'; state.reactionOutbox[id].attempts--; });
+          return;
+        }
+        try {
+          await this.io.call('reactions.add', { channel: record.channel, timestamp: record.timestamp, name: record.emoji });
+          await this.store.update(state => { state.reactionOutbox[id].status = 'sent'; });
+        } catch (error) {
+          const confirmed = error.code === 'slack_webapi_platform_error' && error.data?.error === 'already_reacted';
+          // Platform fatal/internal errors may have applied the reaction. Only
+          // precise permanent rejections and exhausted SDK 429 are non-delivery.
+          const known = error.code === 'slack_webapi_rate_limited_error' || error.code === 'slack_webapi_platform_error' && reactionRejected.has(error.data?.error);
+          await this.store.update(state => {
+            const item = state.reactionOutbox[id];
+            item.status = confirmed ? 'sent' : known ? 'failed' : item.attempts >= 8 ? 'attention' : 'unknown';
+            if (!confirmed) { item.error = error.code || 'REACTION_UNCERTAIN'; item.next = Date.now() + Math.min(60000, 1000 * 2 ** item.attempts); }
+          });
+        }
+      })().catch(error => this.logger.warn('Slack reaction retained', { code: error.code || 'REACTION_JOURNAL_ERROR' }))
+        .finally(() => { this.reactions.delete(pending); this.reactionActions.delete(id); });
+      this.reactions.add(pending);
+    }
+  }
   kick() {
     if (this.stopped) return;
     if (this.active) { this.kickRequested = true; return; }
@@ -106,6 +197,7 @@ export class SlackPlugin {
       `${event.channel}:${event.thread_ts || batch?.rootTs || event.ts}`;
   }
   async tick() {
+    this.drainReactions();
     const occupied = new Set(this.messageLanes.keys());
     const pending = Object.entries(this.store.data.inbox).filter(([id, item]) => {
       if (item.status !== 'pending' || this.processing.has(id)) return false;
@@ -231,7 +323,7 @@ export class SlackPlugin {
     } catch (error) {
       const classificationFailure = error.participationFailure === true;
       const transient = classificationFailure ? participationTransient(error) :
-        ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError;
+        ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError || error.modelSelectionUncertain === true;
       const retryAfter = Number(error.retryAfter ?? error.data?.retry_after ?? 0);
       const validDelay = Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 86400;
       await this.store.update(state => {
@@ -249,7 +341,8 @@ export class SlackPlugin {
   async command(type, binding, userId, id, payload = {}) { return this.gateway.command(type, { ...contextFrom(binding, userId, id), payload }); }
   async process(id, { type, body }) {
     const resumed = this.store.data.inbox[id]?.projectResume;
-    if (resumed) return this.message(id, resumed.event, resumed.projectId);
+    if (resumed) return this.store.data.inbox[id]?.modelMenuIntent
+      ? this.showModelMenu(id, resumed.event, resumed.projectId) : this.message(id, resumed.event, resumed.projectId);
     const userId = body.user?.id || body.user_id || body.event?.user;
     if (type === 'events_api') {
       if (body.event?.type === 'app_home_opened') return this.publishHome(userId, id);
@@ -259,6 +352,11 @@ export class SlackPlugin {
     }
     if (type === 'slash_commands') {
       if (body.command !== '/cg') return;
+      if (body.text?.trim() === 'model') {
+        const event = { type: 'app_mention', channel: body.channel_id, user: userId, ts: `command-${digest(id).slice(0, 12)}`, text: '/cg model' };
+        await this.store.update(state => { state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 }; state.inbox[id].modelMenuIntent = true; });
+        return this.showModelMenu(id, event);
+      }
       if (/^stop(?:\s|$)/.test(body.text?.trim() || '')) return this.stopChat(id, body, userId);
       if (/^resume(?:\s|$)/.test(body.text?.trim() || '')) return this.resumeChat(id, body, userId);
       const projectId = this.store.data.channels[body.channel_id] || this.store.data.preferences[userId];
@@ -284,7 +382,8 @@ export class SlackPlugin {
         await this.publishHome(userId, id); continue;
       }
       let value; try { value = JSON.parse(action.value || '{}'); } catch { throw new Error('Invalid interaction'); }
-      if (/^connect_project:\d{1,3}$/.test(action.action_id)) await this.connectProject(id, body, userId, value);
+      if (/^model_select:\d{1,2}$/.test(action.action_id)) await this.selectModelMenu(id, body, userId, value);
+      else if (/^connect_project:\d{1,3}$/.test(action.action_id)) await this.connectProject(id, body, userId, value);
       else if (['open_item', 'open_item:todo', 'open_item:bug', 'start_chat'].includes(action.action_id)) await this.startChat(id, body, userId, value);
       else if (action.action_id === 'open_memory') await this.startChat(id, body, userId, { ...value, kind: 'memory' });
       else if (action.action_id === 'open_binding') await this.startChat(id, body, userId, { ...value, text: '你好，我想和你讨论项目。' });
@@ -299,6 +398,98 @@ export class SlackPlugin {
     }
   }
   async loadProjects(userId, id) { const result = await this.gateway.command('project.list', { id: operationId(id, 'projects'), userId }); this.projects.set(userId, result.projects || []); return result.projects || []; }
+  validModelCatalog(value) {
+    if (!value || !/^[a-f0-9]{64}$/.test(value.version || '') || !Array.isArray(value.options) || !value.options.length || value.options.length > 20 ||
+        value.options.some(option => !/^[a-zA-Z0-9_-]{1,128}$/.test(option.id || '') || typeof option.label !== 'string' || !option.label || typeof option.model !== 'string') ||
+        new Set(value.options.map(option => option.id)).size !== value.options.length || !value.options.some(option => option.id === value.selectedId)) {
+      throw Object.assign(new Error('已配置模型目录暂不可用'), { code: 'GATEWAY_BAD_RESPONSE' });
+    }
+    const route = value.currentRoute;
+    if (route && (!['text', 'vision'].includes(route.kind) || route.model !== null && (typeof route.model !== 'string' || route.model.length > 2048) ||
+        route.providerId !== undefined && !/^[a-zA-Z0-9_-]{1,128}$/.test(route.providerId))) {
+      throw Object.assign(new Error('当前模型路由暂不可用'), { code: 'GATEWAY_BAD_RESPONSE' });
+    }
+    return { version: value.version, selectedId: value.selectedId, options: value.options.map(({ id, label, model }) => ({ id, label, model })),
+      ...(route ? { currentRoute: { kind: route.kind, model: route.model, ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
+  }
+  async saveModelMenu(id, catalog, context) {
+    await this.store.update(state => {
+      state.modelMenus ||= {};
+      state.modelMenus[id] ||= { id, ...context, ...this.validModelCatalog(catalog), status: 'open' };
+    });
+    return this.store.data.modelMenus[id];
+  }
+  async showModelMenu(id, event, expectedProjectId = null) {
+    const direct = event.channel?.startsWith('D'), projectId = expectedProjectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
+    if (!projectId) return this.chooseProject(id, event);
+    const menuId = `model-menu-${digest(id)}`;
+    let menu = this.store.data.modelMenus?.[menuId];
+    if (!menu) {
+      const catalog = await this.gateway.command('models.state', { id: operationId(id, 'models'), userId: event.user, projectId });
+      menu = await this.saveModelMenu(menuId, catalog, { projectId, userId: event.user, channel: event.channel,
+        threadTs: event.ts?.startsWith('command-') ? undefined : event.thread_ts || event.ts });
+    }
+    if (menu.projectId !== projectId || menu.userId !== event.user || menu.channel !== event.channel) throw Object.assign(new Error('模型菜单所属项目已改变'), { code: 'CONFLICT' });
+    const ts = await this.io.post({ id: operationId(menuId, 'card'), channel: menu.channel, threadTs: menu.threadTs,
+      text: '项目默认文字模型', blocks: modelChoiceBlocks(menu) });
+    await this.store.update(state => { state.modelMenus[menuId].ts = ts; });
+  }
+  async selectModelMenu(id, body, userId, value) {
+    const conflict = message => Object.assign(new Error(message), { code: 'CONFLICT' });
+    if (!value || Object.keys(value).some(key => !['menuId', 'providerId'].includes(key))) throw conflict('模型选择卡已失效');
+    let menu = this.store.data.modelMenus?.[value.menuId];
+    if (!menu || menu.userId !== userId || menu.channel !== body.channel?.id) throw Object.assign(new Error('只能确认自己在原项目打开的模型菜单'), { code: 'FORBIDDEN' });
+    if (!menu.ts) throw Object.assign(new Error('模型菜单仍在发送，请等待原消息确认'), { code: 'BUSY' });
+    if (body.message?.ts !== menu.ts) throw conflict('请在原模型选择卡确认');
+    const currentProject = menu.key ? this.store.data.threads[menu.key]?.projectId : menu.channel.startsWith('D') ? this.store.data.preferences[userId] : this.store.data.channels[menu.channel];
+    if (currentProject !== menu.projectId) throw conflict('当前项目关联已改变，请重新打开模型菜单');
+    if (!menu.options.some(option => option.id === value.providerId)) throw Object.assign(new Error('只能选择已配置模型'), { code: 'INVALID_ARGUMENT' });
+    // An unknown earlier write must replay its original receipt before a current
+    // selection can be called a no-op. Only a genuinely new choice may read it.
+    if (!menu.selection && value.providerId === menu.selectedId) {
+      const current = this.validModelCatalog(await this.gateway.command('models.state', { id: operationId(id, 'current-model'), userId, projectId: menu.projectId }));
+      if (current.version !== menu.version) return this.refreshModelMenu(menu, userId, current);
+      await this.store.update(state => { Object.assign(state.modelMenus[menu.id], current, { status: 'unchanged' }); });
+      return this.io.update(menu.channel, menu.ts, '当前模型未改变。', modelChoiceBlocks(this.store.data.modelMenus[menu.id]));
+    }
+    await this.store.update(state => {
+      const current = state.modelMenus[menu.id];
+      if (current.selection && current.selection.providerId !== value.providerId) throw conflict('原模型选择尚需核对，请勿替换原操作');
+      current.selection ||= { id: operationId(`${menu.id}:${userId}:${value.providerId}`, 'model-select'), providerId: value.providerId, baseVersion: menu.version };
+    });
+    menu = this.store.data.modelMenus[menu.id];
+    let result;
+    try {
+      result = this.validModelCatalog(await this.gateway.command('models.select', { id: menu.selection.id, userId, projectId: menu.projectId,
+        payload: { providerId: menu.selection.providerId, baseVersion: menu.selection.baseVersion } }));
+    } catch (error) {
+      if (error.code !== 'VERSION_CONFLICT') {
+        error.modelSelectionUncertain = !['INVALID_ARGUMENT', 'ID_REUSED', 'INVALID_COORDINATOR_CONFIG', 'MODEL_SETTINGS_UNAVAILABLE'].includes(error.code) && participationTransient(error);
+        if (!error.modelSelectionUncertain) await this.store.update(state => { state.modelMenus[menu.id].error = error.code || 'MODEL_SELECTION_FAILED'; });
+        throw error;
+      }
+      return this.refreshModelMenu(menu, userId, await this.gateway.command('models.state', { id: operationId(menu.id, 'refresh'), userId, projectId: menu.projectId }));
+    }
+    await this.store.update(state => { Object.assign(state.modelMenus[menu.id], result, { status: 'applied' }); });
+    await this.io.update(menu.channel, menu.ts, '原模型选择已确认（历史回执），不代表当前项目默认；请用 /cg model 查看当前默认文字模型。', modelChoiceBlocks(this.store.data.modelMenus[menu.id]));
+  }
+  async refreshModelMenu(menu, userId, catalog) {
+    await this.store.update(state => { state.modelMenus[menu.id].error = 'VERSION_CONFLICT'; });
+    const refreshed = await this.saveModelMenu(`model-menu-${digest([menu.id, catalog.version])}`, catalog, {
+      userId, projectId: menu.projectId, channel: menu.channel, threadTs: menu.threadTs, ...(menu.key ? { key: menu.key } : {}),
+      ...(menu.currentRoute ? { currentRoute: menu.currentRoute } : {}) });
+    const ts = await this.io.post({ id: operationId(refreshed.id, 'card'), channel: menu.channel, threadTs: menu.threadTs,
+      text: '模型设置已改变，请按当前目录重新选择。', blocks: modelChoiceBlocks(refreshed) });
+    await this.store.update(state => { state.modelMenus[refreshed.id].ts = ts; });
+  }
+  async naturalModelMenus(key, message, userId) {
+    const binding = this.store.data.threads[key], menus = [];
+    for (const action of message.actions || []) if (action.kind === 'model-selection') {
+      const id = `model-menu-${digest([key, message.id || digest(message), action.actionId])}`;
+      menus.push(await this.saveModelMenu(id, action, { key, userId, projectId: binding.projectId, channel: binding.channel, threadTs: binding.threadTs }));
+    }
+    return menus;
+  }
   async startChat(id, body, userId, context = {}) {
     let channel = body.channel?.id || body.channel_id;
     if (!channel) channel = (await this.io.call('conversations.open', { users: userId })).channel?.id;
@@ -574,7 +765,26 @@ export class SlackPlugin {
       await this.store.update(state => { state.inbox[id] ||= { status: 'done', attempts: 0, at: Date.now(), next: 0 }; state.inbox[id].replyContext = replyContext; });
     }
     if (replyContext?.answerTo) batchInputs[0].answerTo = replyContext.answerTo;
-    await this.store.update(state => { const item = state.threads[key]; for (const inputId of inputIds) if (!item.ownRequests.includes(inputId)) item.ownRequests.push(inputId); item.nextPoll = 0; });
+    await this.store.update(state => {
+      const item = state.threads[key];
+      for (const [index, inputId] of inputIds.entries()) {
+        if (!item.ownRequests.includes(inputId)) item.ownRequests.push(inputId);
+        const original = events[index];
+        if (/^\d+\.\d+$/.test(original.ts || '') && isMessage(original)) {
+          const inboxId = events.length === 1 ? id : envelopeId('events_api', { team_id: this.teamId, event: original });
+          const received = state.inbox[inboxId], receivedEvent = received?.projectResume?.event || received?.envelope?.body?.event;
+          if (!isMessage(receivedEvent) || received.envelope?.body?.team_id !== this.teamId || reactionEventHash(receivedEvent) !== reactionEventHash(original)) continue;
+          const target = { key, projectId: binding.projectId, conversationId: binding.conversationId, channel: original.channel,
+            timestamp: original.ts, userId: original.user, eventHash: reactionEventHash(original), inboxId };
+          const previous = (state.reactionInputs ||= {})[inputId];
+          // Optional reactions must not reject an existing business submission.
+          // An ambiguous mapping is not rewritten or borrowed as a new target.
+          if (previous && digest(previous) !== digest(target)) continue;
+          state.reactionInputs[inputId] ||= target;
+        }
+      }
+      item.nextPoll = 0;
+    });
     await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer' });
     await this.store.update(state => { state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0; });
     if (replyContext?.answerTo) await this.store.update(state => { if (state.threads[key].pendingQuestionId === replyContext.answerTo) delete state.threads[key].pendingQuestionId; });
@@ -780,14 +990,21 @@ export class SlackPlugin {
     // durably settled cannot become a partial stream again (including restart).
     if (state.activeTurnId && binding.settledRequestIds?.includes(state.activeTurnId)) return;
     const lastAssistant = messages.findLastIndex(message => message.role === 'assistant');
-    let currentRequest = null;
+    let currentRequest = null, currentActor = null;
     const entries = messages.map((message, index) => {
-      if (message.role === 'user') currentRequest = message.requestId;
+      if (message.role === 'user') {
+        currentRequest = message.requestId;
+        currentActor = message.source === 'slack' && message.actor?.kind === 'human' && message.actor.teamId === this.teamId &&
+          /^[UW][A-Z0-9]{1,31}$/.test(message.actor.userId || '') ? message.actor.userId : null;
+      }
       const requestId = message.requestId || (message.role === 'assistant' ? currentRequest : null);
       const id = message.id || digest(message);
-      return { message, index, requestId, id };
+      return { message, index, requestId, id, userId: requestId === currentRequest ? currentActor : null };
     });
-    for (const { message, index, requestId, id } of entries) {
+    const readyReactions = new Set();
+    for (const { message, index, requestId, id, userId } of entries) {
+      try { for (const id of await this.queueReactions(key, message, messages)) readyReactions.add(id); }
+      catch (error) { this.logger.warn('Slack reaction intent retained in Cloud', { code: error.code || 'REACTION_JOURNAL_ERROR' }); }
       if (!hasSlackContent(message)) continue;
       const partial = message.role === 'assistant' && message.partial === true;
       if (message.role === 'user' && (message.source === 'workflow' || String(message.text || '').trimStart().startsWith('[服务器工作流事件'))) continue;
@@ -800,10 +1017,11 @@ export class SlackPlugin {
       // settles, rather than posting a second final and later updating both.
       if (!partial && stream && message.role === 'assistant' && stream.turnId === requestId && !settled) continue;
       const display = partial ? { ...message, text: `部分回复（已被补充调整，非最终答案）：\n${message.text || ''}` } : message;
-      const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
+      const modelMenus = await this.naturalModelMenus(key, message, userId);
+      const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId, modelMenus });
       const content = digest({ format: 'plain-text-v2', message,
         ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}),
-        ...(message.questions?.length ? { questionRender: blocks } : {}) }),
+        ...(message.questions?.length ? { questionRender: blocks } : {}), ...(modelMenus.length ? { modelMenuRender: blocks } : {}) }),
         prior = this.store.data.threads[key].mirrored[id];
       // Older versions could append an earlier model step after the stream.
       // Rotate those occupied slots forward until a pending reply consumes the
@@ -814,7 +1032,7 @@ export class SlackPlugin {
           hasSlackContent(entry.message) &&
           !this.store.data.threads[key].mirrored[entry.id]);
       if (prior?.hash === content && !moveEarlier) continue;
-      const text = `${message.role === 'user' ? '工作台用户' : 'Coordinator'}：${display.text || (message.actions?.length ? '节点入口' : '附件')}`;
+      const text = `${message.role === 'user' ? '工作台用户' : 'Coordinator'}：${display.text || (modelMenus.length ? '项目默认文字模型菜单' : message.actions?.length ? '节点入口' : '附件')}`;
       // The retained placeholder has the earliest Slack timestamp. Finalize
       // it with the first pending reply, then append later model steps in order.
       const retainPartial = partial && !!stream && !prior && stream.turnId === requestId;
@@ -823,10 +1041,12 @@ export class SlackPlugin {
       const ts = existingTs ? (await this.io.update(binding.channel, existingTs, text, blocks), existingTs) : await this.io.post({ id: operationId(`${key}:${id}`, 'mirror'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
       await this.store.update(data => {
         data.threads[key].mirrored[id] = { ts, hash: content };
+        for (const menu of modelMenus) data.modelMenus[menu.id].ts = ts;
         if (moveEarlier) data.threads[key].liveStream.ts = prior.ts;
         else if (replaceStream || retainPartial) delete data.threads[key].liveStream;
       });
     }
+    this.drainReactions(readyReactions);
     if (state.streamingText && state.status === 'running') {
       const streamId = `stream:${state.activeTurnId}${Number.isSafeInteger(state.consumedInputRevision) ? `:${state.consumedInputRevision}` : ''}`, prior = this.store.data.threads[key].mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
       if (prior?.hash !== content) {
@@ -900,6 +1120,7 @@ export class SlackPlugin {
       const pending = this.eventStreams.get(key);
       thread.nextPoll = pending?.latest && !pending.controller.signal.aborted && pending.projectId === thread.projectId && pending.conversationId === thread.conversationId
         ? 0 : Date.now() + (thread.live || thread.awaitingReplyId ? this.pollMs : 15000); thread.error = null;
+      if (Object.values(data.reactionOutbox || {}).some(item => item.key === key && item.status === 'pending')) thread.nextPoll = Math.min(thread.nextPoll, Date.now() + this.pollMs);
       thread.pendingQuestionId = openQuestions.length === 1 ? openQuestions[0].id : null;
     });
   }

@@ -331,7 +331,7 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   const automaticCall = f.modelCalls.at(-1);
   assert.match(automaticCall.system, /系统为新任务创建独立执行 Session/);
   assert.doesNotMatch(automaticCall.system, /本轮答复发往 Slack|以下仅用于宿主已声明的人工执行对话/);
-  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }));
+  assert.deepEqual(automaticCall.tools, selectCoordinatorTools(coordinatorTools, { fileWrite: false }).filter(tool => tool.name !== 'show_model_menu'));
   await f.restart();
   assert.equal((await f.gateway('conversation.submit', { text: 'role-after-restart' }, { id: 'role-after-restart', conversationId: conversation })).status, 200);
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);

@@ -15,8 +15,11 @@ export const coordinatorReferenceFiles = Object.freeze(Object.fromEntries(
   coordinatorReferences.map(name => [name, name === 'memory-definition.md'
     ? 'design/design-memory-definition-v0.2.0.md' : name])));
 const fail = (message) => { throw Object.assign(new Error(message), { code: 'INVALID_ARGUMENT', toolHint: message }); };
+export const slackReactionEmojis = Object.freeze(['thumbsup', 'heart', 'smile']);
 
 export const coordinatorTools = [
+  definition('react_to_user', 'Express a brief social acknowledgement to the current trusted Slack human input with one native emoji. This queues an intent, not a delivery receipt, approval, completed task or passed test. Do not replace necessary explanation, risk or failure text with a reaction. No target may be supplied.', { emoji: { type: 'string', enum: slackReactionEmojis } }),
+  definition('show_model_menu', 'Read the actual current conversation turn model route and show the configured project default text models in Slack. The actual turn model is distinct from the project default. This only displays a menu: a real user must confirm a Slack choice before selection changes. Current and failed-retry routes stay pinned; image turns retain the separate vision model.', {}),
   definition('list_tasks', 'List project requirements and unfinished Main TODO/Bug items.', {}),
   definition('list_sessions', 'List assigned execution Sessions and their exact executionSessionId.', {}),
   definition('list_conversations', 'List saved Coordinator conversations; their IDs are not executionSessionId.', {}),
@@ -81,7 +84,9 @@ export function createCoordinatorExecutor(ctx) {
       name: input.name.replace(/^references\//, '').replace(/\.md$/, '') + '.md' };
     validateInput(tool, input);
     await ctx.authorizeTool?.(name, input, options);
+    if (name === 'react_to_user') return { kind: 'slack-reaction', actionId: operationId, emoji: input.emoji, status: 'intent' };
     if (name === 'list_tasks') return ctx.listTasks();
+    if (name === 'show_model_menu') return { kind: 'model-selection', actionId: operationId, ...(await ctx.modelSettings()) };
     if (name === 'list_sessions') return ctx.listSessions();
     if (name === 'list_conversations') return ctx.listConversations();
     if (name === 'read_map') return { ...(await ctx.readMap(input.nodeId)), kind: 'map-read', actionId: operationId };

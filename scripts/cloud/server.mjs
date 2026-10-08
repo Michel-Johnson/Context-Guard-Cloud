@@ -758,6 +758,11 @@ export async function startCloudServer({
             return { sessions };
           },
           listConversations: async () => ({ conversations: (await conversations.list()).map(({ id, ...item }) => ({ conversationId: id, ...item })) }),
+          modelSettings: async () => {
+            const catalog = await (await modelSettingsFor(project)).state(), route = (await service.state()).modelRoute;
+            return { ...catalog, ...(route ? { currentRoute: { kind: route.kind, model: route.model,
+              ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
+          },
           pendingBriefApproval: async () => (await store.projectTasks(principal)).some(task =>
             task.conversationId === conversationId && task.stage === 'brief'),
           pendingAcceptanceReview: async () => {
@@ -1117,6 +1122,8 @@ export async function startCloudServer({
     if (type === 'project.list') return { projects: registry.projects.filter(project => integrations.projectIds.includes(project.id) &&
       configuredMemory?.projects?.[project.id]?.coordinator?.enabled).map(({ id, name, description }) => ({ id, name, description })) };
     const project = integrationProject(projectId);
+    if (type === 'models.state') return (await modelSettingsFor(project)).state();
+    if (type === 'models.select') return (await modelSettingsFor(project)).select({ id: operationId, ...payload });
     if (type === 'conversation.relevance') {
       const input = relevanceInput(payload);
       if (conversationId) await requireManualConversation(project, conversationId);

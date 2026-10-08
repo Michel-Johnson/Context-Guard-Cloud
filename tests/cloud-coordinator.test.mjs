@@ -15,6 +15,61 @@ import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 
+const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
+function reactionState(source = 'slack', actor = reactionActor) {
+  return { activeInput: { id: 'original-human-input', source, actor }, messages: [], toolReceipts: {} };
+}
+test('Slack reaction intent binds server actor and input and completes without a second model round', async () => {
+  const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
+  await coordinatorStep({ turnId: 'reaction-turn', state, system: 'role', tools: coordinatorTools, save: async () => {}, execute,
+    model: { next: async ({ tools }) => { calls++; assert.ok(tools.some(tool => tool.name === 'react_to_user'));
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'social', name: 'react_to_user', input: { emoji: 'heart' } }] }; } } });
+  assert.equal(calls, 1); assert.equal(state.status, 'waiting-for-user');
+  assert.deepEqual(state.messages[0].actions[0], { kind: 'slack-reaction', actionId: Object.keys(state.toolReceipts)[0], emoji: 'heart', status: 'intent', requestId: 'original-human-input', actor: reactionActor });
+  assert.equal(state.messages[1].content[0].type, 'tool_result');
+  assert.doesNotMatch(JSON.stringify(state.toolReceipts), /delivered|approved|passed/);
+});
+test('Slack reaction tools reject untrusted source and actor even when a model guesses the tool', async () => {
+  for (const [source, actor] of [['human', reactionActor], ['workflow', reactionActor], ['slack', null],
+    ['slack', { ...reactionActor, kind: 'bot' }], ['slack', { ...reactionActor, integration: 'browser' }], ['slack', { ...reactionActor, sessionId: 'someone-else' }]]) {
+    const state = reactionState(source, actor);
+    await coordinatorStep({ turnId: 'untrusted', state, system: 'role', tools: coordinatorTools, save: async () => {},
+      execute: () => assert.fail('Untrusted tool must never execute'), model: { next: async ({ tools }) => {
+        assert.equal(tools.some(tool => tool.name === 'react_to_user'), false);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'forged', name: 'react_to_user', input: { emoji: 'heart' } }] };
+      } } });
+    assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN'); assert.equal(state.messages[0].actions, undefined);
+  }
+});
+test('Slack reaction enum and target-free schema reject approval-like emoji and arbitrary destinations', async () => {
+  const execute = createCoordinatorExecutor({});
+  for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
+    await assert.rejects(execute('react_to_user', input, { operationId: 'original' }), { code: 'INVALID_ARGUMENT' });
+});
+test('Slack reaction native receipt retains original actor and input across a pending-step restart', async () => {
+  let saved;
+  const state = reactionState(), options = { turnId: 'original-turn', system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}),
+    save: async value => { if (value.pending && Object.keys(value.toolReceipts).length) saved = structuredClone(value); },
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'native', name: 'react_to_user', input: { emoji: 'heart' } }] }) } };
+  await coordinatorStep({ ...options, state }); assert.ok(saved);
+  await coordinatorStep({ ...options, state: saved, model: { next: () => assert.fail('Pending tool pair must not request the model again') },
+    execute: () => assert.fail('Durable receipt must not repeat the intent') });
+  assert.deepEqual(saved.messages[0].actions[0], state.messages[0].actions[0]);
+  assert.equal(Object.values(saved.toolReceipts)[0].result.requestId, 'original-human-input');
+});
+test('Slack reaction alongside business or a failed tool never finishes outstanding work', async () => {
+  for (const fail of [false, true]) {
+    const state = reactionState(), native = createCoordinatorExecutor({});
+    await coordinatorStep({ turnId: 'mixed', state, system: 'role', tools: [...coordinatorTools, { name: 'business' }], save: async () => {},
+      execute: async (name, input, options) => name === 'react_to_user' ? native(name, input, options) : fail ?
+        Promise.reject(Object.assign(new Error('denied'), { code: 'FORBIDDEN' })) : { accepted: true },
+      model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'text', text: '必要解释仍保留。' },
+        { type: 'tool_use', id: 'react', name: 'react_to_user', input: { emoji: 'thumbsup' } },
+        { type: 'tool_use', id: 'work', name: 'business', input: {} }] }) } });
+    assert.equal(state.status, 'running'); assert.equal(state.messages[0].content[0].text, '必要解释仍保留。');
+  }
+});
+
 test('Project requirements survive restart, reserve capacity atomically and dispatch only the approved fresh Session', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-project-task-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -184,7 +239,7 @@ test('Coordinator guide references are callable and loaded only after an explici
 
   assert.equal(calls.length, 2);
   assert.equal(calls[0].system, prompt + context.text);
-  assert.deepEqual(calls[0].tools, coordinatorTools);
+  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['show_model_menu', 'react_to_user'].includes(tool.name)));
   assert.deepEqual(calls[0].messages, [{ role: 'user', content: 'Read the memory writing rules.' }]);
   assert.deepEqual(referenceReads, ['memory-definition.md']);
   const reply = calls[1].messages.at(-1).content.find(block => block.type === 'tool_result');
