@@ -22,6 +22,14 @@
 - [ ] 独立 Tester：按当前准确源码，验证真实 HTTP 与真实 `publicMessages` 投影；菜单展示不切换、不探测、不重跑，原生人类确认才写同一设置。覆盖未绑定项目接续、配置动作白名单、来源/身份/跨项目/原卡/未知模型拒绝、同当前值只读、CAS 冲突、失回与重启原编号回放、native 文字与图片实际路由区别、视觉附件及工具配对保留、普通历史和问题缓存/流式原位镜像无回归。重复确认不得再次改设置或发新卡；原配置、原输入与 C3/C4 失败证据不得改写。另核既有 Windows 摘要并发 `EPERM`，不能以一次绿色重跑宣称消除。
 - [ ] Delivery：独立验收后单独 PR、Required CI、正常 Main 合并、准确版本部署，再由已授权真人在 Slack 确认新选择并区分本轮实际模型/默认值；当前任务没有切换任何真实供应商、改变配置/权限或部署。旧 RENDER/CACHE Delivery 记录保持原样，C3 已由真人回答不能作为未答迁移样本，C4 原待处理记录不重试冒充成功。
 
+## MIGRATE-BUSY-01 · 暂时忙保存恢复（2026-10-08）
+
+- [x] 在最新 main `fdfd1be` 上，仅迁移旧本地候选的 Map commit 恢复和草稿保护；旧目录及其未提交内容未修改。连续对话的旧 submit 补丁、Slack 显示、旧设计文档和宣传产物不在本 PR。
+- [x] 仅明确返回暂时 `STATE_BUSY` 的 `/api/commit` 可在既有心跳中额外恢复两轮；复用原 payload 与 operationId。保留版本冲突、人工修复、切换与退出保护，不删除锁，不重放 brief，不改自动派发。
+- [x] 迁移六个同步回归场景及真实隔离 Cloud 浏览器的恢复路径；浏览器只替换忙响应，后续保存通过真实事务落盘并核对 Session 与 Main 不变。测试入口和单设备授权 Fixture 随方法扩展同步，断言不放宽。
+- [ ] 未额外运行本地功能测试。准确提交的功能、最低运行时、浏览器、Slack、包内容与 Required 由 GitHub CI 验证，历史候选结果不代表本修订通过。
+- [ ] 实际生产锁持有者和真实用户页面仍未复现；不部署生产，不把隔离忙响应测试称为线上复现。共享 UI 为兼容修复升至 1.1.5，待全部迁移合入后发布固定制品并更新 Skill 依赖。
+
 ## DOC-LAYOUT-01 · 共享中文设计与资料读取路径（2026-10-08）
 
 - [x] 从最新 Cloud main `f692b3f` 迁移文档；保留存储设计 fs-v2.2 的完成证明及设备持久授权规则，文件投影仍是 fs-v2.1。
@@ -1380,3 +1388,20 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
   and real isolated local-to-Cloud Session sync. Initial browser attempts found
   and fixed mobile left-edge clipping; two later fixture races were corrected by
   waiting for model load and desktop layout completion, without relaxing bounds.
+
+## MIGRATE-DRAIN-01 · Coordinator 自有后台任务退出（2026-10-08）
+
+- [x] 静态核对最新 main `fdfd1be`：普通连续对话已使用新版提交事务与等待逻辑，不迁入旧 submit 实现。`close()` 仍只等待首次 running/compacting，而 finally 可继续安排自有任务；仅迁移等待退出循环。
+- [x] 保留 stop 标记及正常错误处理，不重启已停止轮次、不恢复自动派发、不授予新重试身份。服务兼容修复版本为 1.1.12。
+- [x] 迁移确定性第二运行器屏障回归：close 在第二任务结束前不得返回，原身份恢复不重复已确认工具；原始连续对话、批量输入、停止和压缩用例保持。
+- [ ] 未额外运行本地功能测试；准确修订的功能、最低运行时、浏览器、Slack、包内容与 Required 等待 GitHub CI。旧独立测试证据不计作新版通过，静态判断不称运行复现。
+- [ ] 前两项按顺序合入并同步最新 main 后，才合并本项。真实模型和宿主执行未复验，不部署生产。
+- [ ] 保留首次 CI `37735385125`：Node 22 通过，最低 Node 的既有 `hook-cloud.test.mjs:281` 读取隔离记忆服务返回 `MEMORY_UNAVAILABLE`。同期可读展示的最低运行时通过同一用例，当前根因未决，不伪称已修复。同步前两项 main 后完整重验，不增大超时、不加请求重试、不修改 Hook 或记忆接口。
+
+## MIGRATE-READABLE-01 · 对用户隐藏内部标识（2026-10-08）
+
+- [x] 基于最新 main `fdfd1be` 迁移 Slack Home、事项通知和 Map 预览的名称显示；内部定位、按钮参数、链接和版本身份保持不变，明确索要技术编号的回复不裁切。
+- [x] Coordinator 两种角色补充不展示测试前缀和内部编号的规则；保留 main 新增的排版、单文件写入、资料白名单及自然对话逻辑。没有迁移旧对话 submit 实现，没有改自动派发。
+- [x] 迁移三项显示/身份回归和双角色规则检查，增强原通知与 Home 断言；Slack 插件版本 0.1.18，core 角色提示词修复版本 2.0.1。
+- [ ] 本地只执行语法、差异和安全检查，不额外运行功能测试。准确修订的全量 CI 与 Required 尚待执行，不能引用旧候选的成功结果代替。
+- [ ] 模型实际输出和真实 Slack 客户端未复验；不部署生产。共享制品须从全部迁移合入后的 main 构建并固定到 Skill。

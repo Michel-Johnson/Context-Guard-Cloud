@@ -64,6 +64,28 @@ test('A published terminal turn drains its runner before accepting the next mess
   assert.deepEqual(state.messages.filter(message => message.role === 'user').map(message => message.requestId), ['first', 'second']);
 });
 
+test('Close drains the runner scheduled during interruption before explicit original-identity resume', { timeout: 10000 }, async t => {
+  const toolEntered = deferred(), toolRelease = deferred(), secondEntered = deferred(), secondRelease = deferred();
+  let models = 0, runs = 0, toolCalls = 0, closed = false;
+  const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [{ name: 'write' }],
+    execute: async () => { toolCalls++; toolEntered.resolve(); await toolRelease.promise; return { saved: true }; },
+    model: { next: async () => ++models === 1 ? { stop: 'tool_use', content: [tool('first')] } : answer('resumed') } });
+  t.after(async () => { toolRelease.resolve(); secondRelease.resolve(); await service.close({ stop: true }); });
+  const run = service.run.bind(service);
+  service.run = async () => { if (++runs === 2) { secondEntered.resolve(); await secondRelease.promise; } return run(); };
+  await service.submit({ id: 'original', text: 'original message' }); await toolEntered.promise;
+  await service.interrupt({ id: 'stop', expectedTurnId: 'original' });
+  toolRelease.resolve();
+  const draining = service.close().then(() => { closed = true; });
+  await secondEntered.promise; await new Promise(resolve => setImmediate(resolve));
+  assert.equal(closed, false, 'Close must not return while its follow-up runner still owns the service');
+  secondRelease.resolve(); await draining;
+  assert.equal(service.running, null); assert.equal((await service.state()).status, 'interrupted');
+  await service.submit({ id: 'original', text: 'original message', retry: true }); await service.close();
+  assert.equal(toolCalls, 1, 'Resume never repeats the confirmed tool');
+  assert.equal((await service.state()).status, 'waiting-for-user');
+});
+
 test('Steer durably accepts a batch during generation and suppresses stale tool execution', { timeout: 10000 }, async t => {
   const entered = deferred(), release = deferred(), inputs = [], executed = [];
   const service = new CoordinatorService({ directory: await directory(t), system: 'test', tools: [{ name: 'write' }],

@@ -19,6 +19,43 @@ import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cl
 import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
+test('Home presents names and states without exposing internal identities', () => {
+  const value = { id: 'private-project-id', name: '博客', version: 'a'.repeat(64),
+    map: { id: 'internal-root', title: '博客', children: [{ id: 'internal-login', title: '登录',
+      bugs: [{ id: 'internal-bug', title: '刷新失败', status: 'open' }], children: [] }] },
+    sessions: [{ id: 'internal-session', name: '修复登录', status: 'running' }, { sessionId: 'internal-unnamed-session', status: 'done' }] };
+  const view = homeView({ projects: [value], project: value, cloudOrigin: 'https://map.example.com', userId: 'internal-user' });
+  const visible = view.blocks.flatMap(block => [block.text?.text, ...(block.elements || []).map(element => element.text?.text || element.text)]).filter(x => typeof x === 'string').join('\n');
+  assert.match(visible, /登录/); assert.match(visible, /刷新失败 · open/); assert.match(visible, /修复登录 · running/);
+  assert.match(visible, /未命名会话 · done/);
+  assert.doesNotMatch(visible, /internal-(root|login|bug|session|unnamed-session|user)|a{64}/);
+  const discuss = view.blocks.find(block => block.accessory?.action_id === 'open_item');
+  assert.deepEqual(JSON.parse(discuss.accessory.value), { projectId: value.id, nodeId: 'internal-login', itemId: 'internal-bug', kind: 'bug' });
+  assert.equal(view.blocks.find(block => block.type === 'actions').elements[0].options[0].value, value.id);
+});
+
+test('Explicitly requested technical identities remain intact in Coordinator text and confirmation payloads', () => {
+  const text = 'Bug ID 是 B399679682924，节点 ID 是 BLOG-ENG-SCRIPTS。';
+  assert.equal(messageBlocks({ text }, 'thread')[0].text.text, text);
+  const blocks = approvalBlocks({ id: 'proposal-internal', version: 'main-version', text: '修复刷新失败' }, 'thread');
+  assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'thread', proposalId: 'proposal-internal', version: 'main-version' });
+});
+
+test('Map preview hides the Main hash but retains a version-specific block identity', async t => {
+  const f = await fixture(t), version = 'b'.repeat(64), url = 'https://map.example.com/projects/lab';
+  const original = f.gateway.command;
+  f.gateway.command = async (type, args) => type === 'project.read' ? { ...structuredClone(project), version } : original(type, args);
+  await f.store.update(state => { state.channels[channel] = 'lab'; });
+  await f.plugin.unfurl('preview-event', { user, channel, message_ts: '1.0', links: [{ url }] });
+  const block = f.sent.find(call => call.method === 'chat.unfurl').input.unfurls[url].blocks[0];
+  assert.equal(block.text.text, '*Lab*\n2 个 Map 节点 · Main');
+  assert.doesNotMatch(block.text.text, /b{64}/);
+  assert.equal(block.block_id, `map-preview:${digest(['preview-event', channel, '1.0', url, version])}`);
+  assert.ok(block.block_id.length <= 255);
+  f.gateway.command = async (type, args) => type === 'project.read' ? { ...structuredClone(project), version: 'c'.repeat(64) } : original(type, args);
+  await f.plugin.unfurl('preview-event-next', { user, channel, message_ts: '2.0', links: [{ url }] });
+  assert.notEqual(f.sent.at(-1).input.unfurls[url].blocks[0].block_id, block.block_id);
+});
 
 test('native current mentions exclude inline code, code blocks and quoted history', () => {
   assert.deepEqual(activeMentions('> <@UOTHER> quoted\n`<@UINLINE>`\n```\n<@UFENCE>\n```\n<@UACTIVE>'), ['UACTIVE']);
@@ -1625,7 +1662,8 @@ test('total images over 5MiB and more than 6 files reject before uploading or su
 test('Home renders Map, work items and public session status using free native blocks', async t => {
   const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; }); await f.plugin.publishHome(user, 'E1');
   const view = f.sent.find(call => call.method === 'views.publish').input.view;
-  assert.equal(view.type, 'home'); assert.match(JSON.stringify(view), /登录/); assert.match(JSON.stringify(view), /session-1/); assert.ok(view.blocks.length < 100);
+  assert.equal(view.type, 'home'); assert.match(JSON.stringify(view), /登录/); assert.match(JSON.stringify(view), /未命名会话 · running/); assert.ok(view.blocks.length < 100);
+  assert.doesNotMatch(JSON.stringify(view), /session-1/);
   for (const block of view.blocks) {
     const ids = [...(block.elements || []), ...(block.accessory ? [block.accessory] : [])].map(element => element.action_id).filter(Boolean);
     assert.equal(new Set(ids).size, ids.length, 'Slack rejects duplicate action_id values in a block');
@@ -1953,6 +1991,7 @@ test('approved cards lose approval buttons and tracked Main status updates only 
   await f.store.update(state => { state.threads[key].nextItemPoll = 0; });
   f.gateway.command = async (type, args) => type === 'project.read' ? { ...structuredClone(project), version: 'v2', map: { ...project.map, children: [{ ...project.map.children[0], todos: [{ id: 'TD1', title: 'refresh', status: 'done' }] }] } } : original(type, args);
   await f.plugin.notifyItemChanges(key); const notification = f.sent.find(item => item.text?.includes('pending → done')); assert.equal(notification.threadTs, '123.001'); assert.equal(notification.channel, channel);
+  assert.equal(notification.text, 'refresh：pending → done'); assert.doesNotMatch(notification.text, /TD1/);
 });
 test('only configured-origin and selected-project links are unfolded', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });

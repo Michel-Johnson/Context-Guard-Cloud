@@ -14,6 +14,7 @@ import { createMemoryReadViews } from '../scripts/cloud/memory-read-view.mjs';
 import { commitMainMemoryMap, compactMainHistorySnapshots, completeSessionMemory, memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { atomicWrite, readJSON } from '../scripts/shared/io.mjs';
+import { WorkbenchSync } from '../prototype/workbench-sync.mjs';
 const { reconcileMainBaseline, reconcileSessionMap } = await skillImport('scripts/workbench/memory.mjs');
 
 const execFileAsync = promisify(execFile);
@@ -27,9 +28,9 @@ test('device approval refresh never delays or recovers the Map heartbeat', async
     const schedule=runInNewContext(`({${method}}).scheduleHeartbeat`,{clearTimeout:()=>{},setTimeout:(callback,ms)=>{timers.push({callback,ms});return timers.length;}});
     let release,reads=0,recovered=0,refreshes=0;
     const approval=new Promise((resolve,reject)=>{release=()=>rejection?reject(new Error('approval service failed')):resolve();});
-    const sync={viewId:'main',version:'main-1',dirty:()=>false,status:'synced',
+    const sync=Object.assign(Object.create(WorkbenchSync.prototype),{viewId:'main',version:'main-1',dirty:()=>false,status:'synced',
       call:async()=>{reads++;return {version:'main-1'};},refreshTaskStatuses:async()=>{},
-      recoverConnection:()=>{recovered++;},a:{refreshDeviceApprovals:()=>{refreshes++;return approval;}},scheduleHeartbeat:schedule};
+      recoverConnection:()=>{recovered++;},a:{refreshDeviceApprovals:()=>{refreshes++;return approval;}},scheduleHeartbeat:schedule});
     schedule.call(sync);
     assert.equal(timers[0].ms,10000);
     await timers[0].callback();
