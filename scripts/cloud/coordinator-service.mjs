@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
+import { validateSlackHistory } from './slack-history.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -542,11 +543,12 @@ export class CoordinatorService {
     const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
     return { id, text, answerTo, metadata, hasImages, fingerprint };
   }
-  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor } = {}) {
+  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history } = {}) {
     if (inputs !== undefined) {
       if (text || retry || answerTo !== undefined || attachments.length) throw error('INVALID_INPUT', 'A batch cannot mix single-message controls');
-      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor });
+      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor, ...(history !== undefined ? { history } : {}) });
     }
+    if (history !== undefined) throw error('INVALID_INPUT', 'Reference history is only accepted on verified Slack batches');
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (!['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128) ||
         typeof retry !== 'boolean') throw error('INVALID_INPUT', 'Provide valid follow-up controls');
@@ -686,7 +688,7 @@ export class CoordinatorService {
     this.kick();
     return { accepted: true, id, ...(followup === 'steer' ? { followup } : {}) };
   }
-  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor } = {}) {
+  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history } = {}) {
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (typeof id !== 'string' || !id || id.length > 128 || !Array.isArray(inputs) || !inputs.length || inputs.length > 100 ||
         inputs.some(input => !input || Object.keys(input).some(key => !['id', 'text', 'attachments', 'answerTo'].includes(key))) ||
@@ -696,8 +698,13 @@ export class CoordinatorService {
     }
     actor = trustedActor(actor);
     if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can submit a batch');
+    if (history !== undefined && (source !== 'slack' || actor?.integration !== 'slack' || actor.kind !== 'human' ||
+        !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
+        actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`)) throw error('INVALID_INPUT', 'Reference history requires a gateway-bound Slack operator');
+    history = validateSlackHistory(history);
     const prepared = await Promise.all(inputs.map(input => this.prepareInput(input, { source, actor })));
-    const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor }));
+    const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor,
+      ...(history !== undefined ? { history } : {}) }));
     const mode = hash(JSON.stringify({ followup, expectedTurnId }));
     const receivedAt = Date.now(), nextContext = this.context ? await this.context() : null;
     const contextMs = Date.now() - receivedAt;
@@ -727,7 +734,11 @@ export class CoordinatorService {
         const pending = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0));
         if (steering && pending.length + prepared.length > 100) throw error('BUSY', 'Follow-up capacity reached; retry the original batch ID');
         const answered = new Set(pending.map(item => item.answerTo).filter(Boolean));
-        const messages = prepared.map(input => {
+        const historySeen = state.historyAccepted || journal.historyAccepted ||
+          state.messages.some(message => Object.hasOwn(message.serverContext || {}, 'history')) ||
+          Object.values(journal.requests).some(item => Object.hasOwn(item.message?.serverContext || {}, 'history'));
+        const attachHistory = history !== undefined && !historySeen;
+        const messages = prepared.map((input, index) => {
           let question;
           if (input.answerTo !== undefined) {
             question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === input.answerTo);
@@ -736,7 +747,7 @@ export class CoordinatorService {
             answered.add(input.answerTo);
           }
           return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
-            serverContext: coordinatorInputContext(nextContext, source),
+            serverContext: { ...coordinatorInputContext(nextContext, source), ...(index === 0 && attachHistory ? { history } : {}) },
             content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
             ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
         });
@@ -752,6 +763,7 @@ export class CoordinatorService {
             ...(input.answerTo ? { answerTo: input.answerTo } : {}), message: messages[index], context: nextContext,
           };
           (journal.batches ||= {})[id] = fingerprint;
+          if (attachHistory) journal.historyAccepted = true;
           await atomicWrite(this.inputFile, encode(journal));
           steered = true;
           return;
@@ -776,6 +788,7 @@ export class CoordinatorService {
           if (input.answerTo) (state.answers ||= {})[input.answerTo] = { text: input.text, requestId: input.id };
         }
         (state.batches ||= {})[id] = fingerprint;
+        if (attachHistory) state.historyAccepted = true;
         state.messages.push(...messages);
         // The first original input owns retries; the batch ID is only a receipt.
         state.activeInput = { id: first.id, text: first.text, source, ...(actor ? { actor } : {}),

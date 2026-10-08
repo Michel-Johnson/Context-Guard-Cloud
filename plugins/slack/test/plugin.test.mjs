@@ -7,10 +7,10 @@ import { Store, threadKey, digest } from '../src/store.mjs';
 import { SlackPlugin, envelopeId } from '../src/plugin.mjs';
 import { SlackIO, UncertainDelivery } from '../src/slack-io.mjs';
 import { Gateway } from '../src/gateway.mjs';
-import { homeView, formValues, messageBlocks, approvalBlocks } from '../src/views.mjs';
+import { homeView, formValues, messageBlocks, approvalBlocks, modelChoiceBlocks } from '../src/views.mjs';
 import { plainText, plainChunks } from '../src/plain-text.mjs';
 import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
-import { startIntegrationGateway } from '../../../scripts/cloud/integration-gateway.mjs';
+import { startIntegrationGateway, integrationActor } from '../../../scripts/cloud/integration-gateway.mjs';
 import { CoordinatorService, publicMessages } from '../../../scripts/cloud/coordinator-service.mjs';
 import { IntegrationAttachmentStore } from '../../../scripts/cloud/integration-attachments.mjs';
 import { CoordinatorModelSettings } from '../../../scripts/cloud/coordinator-model-settings.mjs';
@@ -102,6 +102,23 @@ test('Slack post and update disable markdown in fallback text and streamed outpu
   assert.equal(calls.at(-1).args.parse, 'none'); assert.equal(calls.at(-1).args.link_names, false);
 });
 
+test('Slack card fallback preserves separate paragraphs instead of joining header and model text', async t => {
+  const f = await fixture(t), calls = [];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: '1.0' }; } } });
+  const blocks = [
+    { type: 'section', text: { type: 'plain_text', text: 'Coordinator 回复' } },
+    { type: 'section', text: { type: 'plain_text', text: '当前模型：DeepSeek' } },
+    { type: 'actions', elements: [{ type: 'button', action_id: 'open', text: { type: 'plain_text', text: '打开菜单' }, value: 'test' }] },
+    { type: 'context', elements: [{ type: 'plain_text', text: '下一轮生效。' }] },
+  ];
+  await io.post({ id: 'card-spacing', channel, text: 'fallback', blocks });
+  await io.update(channel, '1.0', 'fallback', blocks);
+  for (const call of calls) {
+    assert.equal(call.args.text, 'Coordinator 回复\n\n当前模型：DeepSeek\n\n下一轮生效。');
+    assert.deepEqual(call.args.blocks, blocks);
+  }
+});
+
 test('Completed node presentations render plain Slack links from the trusted project binding', () => {
   const context = { cloudOrigin: 'https://map.example.com', projectId: 'test-project' };
   const blocks = messageBlocks({ text: '首页负责入口，文章页负责正文。', actions: [
@@ -176,7 +193,7 @@ async function fixture(t) {
     if (type === 'prompt.read') return { text: 'execute login', filename: 'prompt.md' };
     return { accepted: true };
   } };
-  const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
+  const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { if (['conversations.history', 'conversations.replies'].includes(method)) return { messages: [] }; sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
     async download() { return { filename: 'screen.png', mimeType: 'image/png', base64: 'aGVsbG8=' }; }, async uploadPrompt(input) { sent.push({ export: input }); } };
   const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} } });
   t.after(async () => { await plugin.stop(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -476,6 +493,11 @@ function modelClick(menu, providerId, actor = user) {
   return { type: 'block_actions', user: { id: actor }, channel: { id: menu.channel }, message: { ts: menu.ts },
     actions: [{ action_id: 'model_select:0', value: JSON.stringify({ menuId: menu.id, providerId }) }] };
 }
+function modelOpenClick(menu, actor = user) {
+  return { type: 'block_actions', user: { id: actor }, channel: { id: menu.channel },
+    message: { ts: menu.ts, ...(menu.threadTs ? { thread_ts: menu.threadTs } : {}) },
+    actions: [{ action_id: 'model_open', value: JSON.stringify({ menuId: menu.id }) }] };
+}
 
 test('Slack models explicit command opens only configured choices with one native confirmation and no model or classification', async t => {
   const f = await modelMenuFixture(t), before = await f.settings.state();
@@ -485,7 +507,7 @@ test('Slack models explicit command opens only configured choices with one nativ
   assert.deepEqual(f.calls.map(call => call.type), ['models.state']);
   const choice = f.sent[0].blocks.find(block => block.type === 'actions').elements[0];
   assert.ok(choice.confirm); assert.equal(JSON.parse(choice.value).providerId, 'second');
-  assert.match(blockText(f.sent[0].blocks), /下一文字轮次/); assert.match(blockText(f.sent[0].blocks), /图片继续/);
+  assert.match(blockText(f.sent[0].blocks), /下一文字轮次/); assert.match(blockText(f.sent[0].blocks), /图片模型不变/);
   assert.deepEqual(await f.settings.state(), before, 'Opening or canceling the native confirmation is not a selection');
   await f.plugin.process('human-confirm', { type: 'interactive', body: modelClick(menu, 'second') });
   assert.equal((await f.settings.state()).selectedId, 'second'); assert.equal(f.store.data.modelMenus[menu.id].status, 'applied');
@@ -532,7 +554,7 @@ test('Slack models lost selection reply freezes the original operation across re
 test('Slack models late acknowledgement replays historical choice without overwriting or claiming the newer default', async t => {
   const f = await modelMenuFixture(t); await f.plugin.process('late-model-receipt', { type: 'slash_commands', body: modelCommand });
   const menu = Object.values(f.store.data.modelMenus)[0], originalPosts = f.sent.length;
-  assert.match(blockText(f.sent.at(-1).blocks), /选择后从下一文字轮次生效/);
+  assert.match(blockText(f.sent.at(-1).blocks), /下一文字轮次生效/);
   f.loseSelection();
   await assert.rejects(f.plugin.process('late-receipt-first-click', { type: 'interactive', body: modelClick(menu, 'second') }), /reply lost/);
   const originalSelection = structuredClone(f.store.data.modelMenus[menu.id].selection), savedA = await f.settings.state();
@@ -550,10 +572,11 @@ test('Slack models late acknowledgement replays historical choice without overwr
   const update = f.sent.at(-1).update; assert.equal(update[0], menu.channel); assert.equal(update[1], menu.ts);
   assert.equal(f.sent.filter(message => !message.update).length, originalPosts, 'The receipt updates the original message, never posts another selection');
   for (const text of [update[2], blockText(update[3])]) {
-    assert.match(text, /历史回执/); assert.match(text, /不代表当前项目默认/); assert.match(text, /\/cg model/);
+    assert.match(text, /历史回执/); assert.match(text, /不代表当前项目默认/); assert.doesNotMatch(text, /\/cg model/);
     assert.doesNotMatch(text, /下一文字轮次生效/);
   }
-  assert.match(blockText(update[3]), /本次已确认的文字模型选择：第二模型/);
+  assert.match(blockText(update[3]), /历史选择：第二模型/);
+  assert.ok(update[3].some(block => block.elements?.some(element => element.action_id === 'model_open')));
 });
 
 test('Slack models fresh current choice is a read-only no-op and stale choices create a new observed version menu', async t => {
@@ -585,8 +608,9 @@ test('Slack models native tool menu binds the actual accepted actor and preserve
     const before = await f.settings.state(); await f.plugin.mirror(key);
     const menu = Object.values(f.store.data.modelMenus)[0]; assert.equal(menu.userId, user); assert.notEqual(menu.userId, 'UOLDOWNER');
     assert.deepEqual(menu.currentRoute, { kind: 'text', model: 'actual-pinned-native-model' });
-    assert.match(blockText(f.sent.at(-1).blocks), /本卡展示轮次的实际模型（文字）：actual-pinned-native-model/);
-    assert.match(blockText(f.sent.at(-1).blocks), /项目默认文字模型：第一模型/);
+    assert.match(blockText(f.sent.at(-1).blocks), /本轮模型未匹配目录（文字）/);
+    assert.match(blockText(f.sent.at(-1).blocks), /默认文字模型：第一模型/);
+    assert.doesNotMatch(blockText(f.sent.at(-1).blocks), /actual-pinned-native-model/);
     assert.deepEqual(await f.settings.state(), before);
     f.plugin.store = await new Store(f.directory).open(); const count = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, count);
     await f.plugin.process('native-human-select', { type: 'interactive', body: modelClick(menu, 'second') });
@@ -615,8 +639,9 @@ test('Slack models real image turn menu reports its pinned vision route separate
     const command = f.gateway.command; f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(state) : command(type, input);
     await f.plugin.mirror(key);
     const menu = Object.values(f.store.data.modelMenus)[0], text = blockText(f.sent.at(-1).blocks);
-    assert.deepEqual(menu.currentRoute, state.modelRoute); assert.match(text, /本卡展示轮次的实际模型（图片）：GLM-5.3-Flash/);
-    assert.match(text, /项目默认文字模型：第一模型/); assert.equal(menu.userId, user);
+    assert.deepEqual(menu.currentRoute, state.modelRoute); assert.match(text, /本轮模型未匹配目录（图片）/);
+    assert.doesNotMatch(text, /GLM-5.3-Flash/);
+    assert.match(text, /默认文字模型：第一模型/); assert.equal(menu.userId, user);
     await f.plugin.process('vision-human-select', { type: 'interactive', body: modelClick(menu, 'second') });
     assert.equal((await f.settings.state()).selectedId, 'second');
     assert.deepEqual((await service.state()).modelRoute, state.modelRoute, 'Changing the text default cannot change the observed image route');
@@ -645,11 +670,113 @@ test('Slack models unknown legacy actors quotes and other Bot messages cannot se
   const command = f.gateway.command; f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(state) : command(type, input);
   await f.plugin.mirror(key);
   const menu = Object.values(f.store.data.modelMenus)[0]; assert.equal(menu.userId, null);
-  assert.equal(f.sent.at(-1).blocks.some(block => block.type === 'actions'), false);
+  assert.equal(f.sent.at(-1).blocks.some(block => block.elements?.some(element => element.action_id.startsWith('model_select:'))), false);
+  assert.ok(f.sent.at(-1).blocks.some(block => block.elements?.some(element => element.action_id === 'model_open')));
   await assert.rejects(f.plugin.process('fake-owner', { type: 'interactive', body: modelClick(menu, 'second') }), { code: 'FORBIDDEN' });
   await f.plugin.process('other-bot-model', { type: 'events_api', body: { event: event({ text: '/cg model', bot_id: 'OTHERBOT' }) } });
   await f.plugin.message('quoted-model-command', event({ ts: '130.001', text: '> <@UOTHER> /cg model，切换模型' }));
   assert.deepEqual(await f.settings.state(), before); assert.equal(f.calls.some(call => call.type === 'models.select'), false);
+});
+
+test('Slack models concise cards show matching names once and distinguish pinned different or unmatched vision routes', () => {
+  const base = { id: 'model-menu-' + 'a'.repeat(64), projectId: 'private-project-slug', userId: user, selectedId: 'private-first', status: 'open',
+    options: [{ id: 'private-first', label: '第一模型', model: 'first-model' }, { id: 'private-second', label: '第二模型', model: 'second-model' }] };
+  const same = modelChoiceBlocks({ ...base, currentRoute: { kind: 'text', model: 'first-model', providerId: 'private-first' } });
+  assert.equal(occurrences(blockText(same), '第一模型'), 1); assert.match(blockText(same), /默认与本轮文字模型：第一模型/);
+  const different = modelChoiceBlocks({ ...base, currentRoute: { kind: 'text', model: 'second-model', providerId: 'private-second' } });
+  assert.match(blockText(different), /默认文字模型：第一模型\n本轮文字模型：第二模型/);
+  for (const route of [{ kind: 'vision', model: 'not-in-catalog' }, { kind: 'text', model: 'changed-in-place', providerId: 'private-first' }]) {
+    const blocks = modelChoiceBlocks({ ...base, currentRoute: route });
+    assert.match(blockText(blocks), /本轮模型未匹配目录/);
+    assert.doesNotMatch(blockText(blocks), /默认与本轮/);
+  }
+  for (const blocks of [same, different, modelChoiceBlocks(base)]) {
+    assert.doesNotMatch(blockText(blocks), /private-project-slug|private-first|private-second|已配置模型|\/cg model/);
+    const choice = blocks.find(block => block.elements?.some(element => element.action_id.startsWith('model_select:'))).elements[0];
+    assert.ok(choice.confirm); assert.match(choice.confirm.text.text, /当前轮次和失败重试不切换，图片模型不变/);
+    assert.equal(JSON.parse(choice.value).providerId, 'private-second', 'Only visible prose is shorter; native routing values remain exact');
+  }
+});
+
+test('Slack models thread opener binds its clicker to fresh catalog without rewriting old unknown owners or selecting', async t => {
+  const f = await modelMenuFixture(t), key = threadKey(teamId, channel, '123.001'), before = await f.settings.state();
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'unknown-menu', userId: user, ownRequests: [] });
+  const original = await f.plugin.saveModelMenu('model-menu-' + 'b'.repeat(64), before, { key, userId: null, projectId: 'lab', channel, threadTs: '123.001' });
+  await f.store.update(state => { state.modelMenus[original.id].ts = '124.001'; });
+  const old = structuredClone(f.store.data.modelMenus[original.id]), clicker = 'UOTHER';
+  await f.settings.select({ id: 'synthetic-human-newer-default', providerId: 'second', baseVersion: before.version });
+  const current = await f.settings.state(); assert.notEqual(current.version, old.version);
+  const wrongChannel = modelOpenClick(old, clicker); wrongChannel.channel.id = 'C000002';
+  const wrongMessage = modelOpenClick(old, clicker); wrongMessage.message.ts = '125.001';
+  const wrongThread = modelOpenClick(old, clicker); wrongThread.message.thread_ts = '999.001';
+  const extra = modelOpenClick(old, clicker); extra.actions[0].value = JSON.stringify({ menuId: old.id, userId: user, projectId: 'other' });
+  for (const body of [wrongChannel, wrongMessage, wrongThread, extra]) await assert.rejects(f.plugin.process('bad-opener', { type: 'interactive', body }), { code: 'CONFLICT' });
+  await f.store.update(state => { state.threads[key].projectId = 'other'; });
+  await assert.rejects(f.plugin.process('changed-opener', { type: 'interactive', body: modelOpenClick(old, clicker) }), { code: 'CONFLICT' });
+  await f.store.update(state => { state.threads[key].projectId = 'lab'; });
+  const command = f.gateway.command;
+  f.gateway.command = async () => { throw Object.assign(new Error('read action not enabled'), { code: 'FORBIDDEN', status: 403 }); };
+  await assert.rejects(f.plugin.process('forbidden-opener', { type: 'interactive', body: modelOpenClick(old, clicker) }), { code: 'FORBIDDEN' });
+  assert.equal(Object.keys(f.store.data.modelMenus).length, 1);
+  f.gateway.command = command;
+  await f.plugin.process('my-model-opener', { type: 'interactive', body: modelOpenClick(old, clicker) });
+  const fresh = Object.values(f.store.data.modelMenus).find(menu => menu.id !== old.id);
+  assert.equal(fresh.userId, clicker); assert.equal(fresh.threadTs, old.threadTs); assert.equal(fresh.version, current.version); assert.equal(fresh.selectedId, 'second');
+  assert.equal(f.calls.filter(call => call.type === 'models.state').length, 1);
+  assert.equal(f.calls.find(call => call.type === 'models.state').userId, clicker);
+  assert.deepEqual(f.store.data.modelMenus[old.id], old); assert.deepEqual(await f.settings.state(), current);
+  assert.equal(f.calls.some(call => call.type === 'models.select'), false);
+  await assert.rejects(f.plugin.process('creator-cannot-borrow', { type: 'interactive', body: modelClick(fresh, 'second', user) }), { code: 'FORBIDDEN' });
+  f.plugin.store = await new Store(f.directory).open();
+  const posts = f.sent.length;
+  await f.plugin.process('my-model-opener', { type: 'interactive', body: modelOpenClick(old, clicker) });
+  assert.equal(Object.keys(f.plugin.store.data.modelMenus).length, 2);
+  assert.equal(f.calls.filter(call => call.type === 'models.state').length, 1);
+  assert.equal(f.sent.length, posts, 'Restart and repeated click reuse the original menu/card operation');
+});
+
+test('Slack models unknown original selection blocks a read-only opener until its original receipt recovers', async t => {
+  const f = await modelMenuFixture(t); await f.plugin.process('pending-menu', { type: 'slash_commands', body: modelCommand });
+  const menu = Object.values(f.store.data.modelMenus)[0]; f.loseSelection();
+  await assert.rejects(f.plugin.process('pending-choice', { type: 'interactive', body: modelClick(menu, 'second') }), /reply lost/);
+  const saved = JSON.parse(JSON.stringify(f.store.data.modelMenus[menu.id])), calls = f.calls.length, posts = f.sent.length;
+  f.plugin.store = await new Store(f.directory).open();
+  await assert.rejects(f.plugin.process('blocked-opener', { type: 'interactive', body: modelOpenClick(saved) }), { code: 'BUSY' });
+  assert.deepEqual(f.plugin.store.data.modelMenus[menu.id], saved); assert.equal(f.calls.length, calls); assert.equal(f.sent.length, posts);
+  await f.plugin.process('pending-choice-recovery', { type: 'interactive', body: modelClick(saved, 'second') });
+  const receipt = structuredClone(f.plugin.store.data.modelMenus[menu.id]);
+  await f.plugin.process('after-receipt-opener', { type: 'interactive', body: modelOpenClick(receipt) });
+  assert.equal(f.calls.filter(call => call.type === 'models.select').length, 2, 'Opening never submits a new selection');
+  assert.deepEqual(f.calls.filter(call => call.type === 'models.select')[0], f.calls.filter(call => call.type === 'models.select')[1]);
+  assert.deepEqual(f.plugin.store.data.modelMenus[menu.id].selection, saved.selection);
+  assert.equal(Object.values(f.plugin.store.data.modelMenus).at(-1).selectedId, 'second');
+});
+
+test('Slack models interleaved inputs bind the original trusted assistant actor rather than the preceding user or creator', async t => {
+  const f = await modelMenuFixture(t), catalog = await f.settings.state(), key = threadKey(teamId, channel, '133.001');
+  const actor = integrationActor({ teamId }, { teamId, userId: user }), secondActor = integrationActor({ teamId }, { teamId, userId: 'UOTHER' });
+  const state = { activeTurnId: 'original-request', activeInput: { id: 'original-request', source: 'slack', actor }, messages: [
+    { role: 'user', requestId: 'original-request', source: 'slack', actor, content: '读取模型菜单' },
+    { role: 'user', requestId: 'later-request', source: 'slack', actor: secondActor, content: '后来的另一位用户输入' },
+  ] };
+  await coordinatorStep({ turnId: state.activeTurnId, state, system: 'Test', tools: coordinatorTools, save: async () => {},
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'interleaved-menu', name: 'show_model_menu', input: {} }] }) },
+    execute: createCoordinatorExecutor({ modelSettings: async () => catalog }) });
+  const projected = { status: 'waiting-for-user', messages: publicMessages(state), activeTurnId: null };
+  assert.equal(projected.messages.at(-1).actor.userId, user, 'Actual server projection preserves the first accepted input metadata');
+  await f.store.bind(key, { channel, threadTs: '133.001', projectId: 'lab', conversationId: 'interleaved', userId: 'UCREATOR', ownRequests: ['original-request', 'later-request'] });
+  const command = f.gateway.command; f.gateway.command = (type, input) => type === 'conversation.state' ? Promise.resolve(projected) : command(type, input);
+  await f.plugin.mirror(key);
+  const menu = Object.values(f.store.data.modelMenus)[0]; assert.equal(menu.userId, user); assert.notEqual(menu.userId, secondActor.userId); assert.notEqual(menu.userId, 'UCREATOR');
+  await assert.rejects(f.plugin.process('interleaved-cross-owner', { type: 'interactive', body: modelClick(menu, 'second', secondActor.userId) }), { code: 'FORBIDDEN' });
+  const trustedMessage = structuredClone(projected.messages.at(-1));
+  for (const [index, changed] of [{ source: 'workflow' }, { actor: { ...actor, teamId: 'TOTHER' } },
+    { actor: { ...actor, integration: 'other' } }, { actor: { ...actor, sessionId: 'forged' } }, { requestId: 'not-owned' }].entries()) {
+    projected.messages[projected.messages.length - 1] = { ...trustedMessage, ...changed, id: `untrusted-assistant-${index}` };
+    await f.plugin.mirror(key);
+    assert.equal(Object.values(f.store.data.modelMenus).at(-1).userId, null);
+  }
+  assert.equal(f.calls.some(call => call.type === 'models.select'), false);
 });
 
 function nativeQuestionProjection(questions, { text = '', answered = [], attachments = [], actions = [] } = {}) {
@@ -971,8 +1098,8 @@ test('unmentioned short DM answer uses the real current conversation and retains
       if (input.type === 'conversation.submit') { submissions.push(input); return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
       return {};
     } });
-  const slackCalls = [];
-  f.io.call = async method => { slackCalls.push(method); throw new Error('Private context must not scan DM Slack history'); };
+  const slackCalls = []; let initialHistoryReads = 0;
+  f.io.call = async method => { if (method === 'conversations.history') { initialHistoryReads++; return { messages: [] }; } slackCalls.push(method); throw new Error('Private relevance context must not scan DM Slack history'); };
   f.io.download = async () => ({ filename: 'reply.txt', mimeType: 'text/plain', base64: Buffer.from('引用资料：<@UOTHER> 不代表当前发送者。').toString('base64') });
   try {
     f.plugin.gateway = new Gateway({ url: server.url, token, teamId });
@@ -982,7 +1109,7 @@ test('unmentioned short DM answer uses the real current conversation and retains
     assert.equal(decisions[1].payload.context.at(-1).speaker, bot); assert.equal(decisions[1].payload.routing.replyToCoordinator, true);
     assert.equal(decisions[1].payload.context[0].speaker, user); assert.equal(decisions[1].payload.inputs[0].text, '答案B');
     assert.deepEqual(decisions[1].payload.routing.mentionedUsers, [], 'Quoted Bot inside a file cannot address the current message');
-    assert.equal(reads.length, 1); assert.equal(reads[0].userId, user); assert.equal(reads[0].projectId, 'lab'); assert.deepEqual(slackCalls, []);
+    assert.equal(reads.length, 1); assert.equal(reads[0].userId, user); assert.equal(reads[0].projectId, 'lab'); assert.deepEqual(slackCalls, []); assert.equal(initialHistoryReads, 1);
     const state = await service.state(), answer = state.messages.find(message => message.role === 'user' && message.text === '答案B');
     assert.equal(answer.actor.userId, user); assert.equal(answer.actor.teamId, teamId); assert.equal(answer.attachments.length, 1);
     assert.equal(answer.attachments[0].id, submissions[1].payload.inputs[0].attachments[0].id);
@@ -1907,6 +2034,61 @@ test('real waiting-for-user state finalizes streamed reply in place after restar
   f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [{ id: 'u1', role: 'user', requestId: 'request-one', text: 'question' }, { id: 'a1', role: 'assistant', text: 'complete answer' }], approvals: [] });
   await f.plugin.mirror(key); assert.equal(f.sent.filter(call => call.channel).length, 1); assert.equal(f.sent.filter(call => call.update).length, 1); assert.equal(f.plugin.store.data.threads[key].liveStream, undefined);
 });
+test('overlapping turn previews finalize in their own slots after restart without reposting old replies', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.overlap');
+  await f.store.bind(key, { channel, threadTs: '123.overlap', projectId: 'lab', conversationId: 'chat-overlap', userId: user, ownRequests: ['request-one', 'request-two'] });
+  const firstUser = { id: 'u1', role: 'user', requestId: 'request-one', text: 'First request' };
+  const secondUser = { id: 'u2', role: 'user', requestId: 'request-two', text: 'Current correction' };
+  const first = { id: 'a1', role: 'assistant', requestId: 'request-one', text: 'First complete reply' };
+  const second = { id: 'a2', role: 'assistant', requestId: 'request-two', text: 'Corrected complete reply' };
+  let state = { status: 'running', activeTurnId: 'request-one', consumedInputRevision: 1, streamingText: 'First preview', messages: [firstUser] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(key);
+  const firstTs = f.store.data.threads[key].mirrored['stream:request-one:1'].ts;
+  state = { status: 'running', activeTurnId: 'request-two', consumedInputRevision: 1, streamingText: 'Corrected preview', messages: [firstUser, secondUser] };
+  await f.plugin.mirror(key);
+  const secondTs = f.store.data.threads[key].mirrored['stream:request-two:1'].ts;
+  assert.notEqual(firstTs, secondTs);
+  f.plugin.store = await new Store(f.directory).open();
+  state = { status: 'waiting-for-user', activeTurnId: null, consumedInputRevision: 1, messages: [firstUser, first, secondUser, second] };
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(call => call.channel).length, 2, 'Both finals reuse the two persisted previews');
+  assert.deepEqual(['a1', 'a2'].map(id => f.plugin.store.data.threads[key].mirrored[id].ts), [firstTs, secondTs]);
+  assert.deepEqual(f.sent.filter(call => call.update).map(call => [call.update[1], call.update[2]]),
+    [[firstTs, 'Coordinator：First complete reply'], [secondTs, 'Coordinator：Corrected complete reply']]);
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.mirror(key);
+  const delivered = f.sent.length;
+  state = { status: 'running', activeTurnId: 'request-one', consumedInputRevision: 1, streamingText: 'First preview', messages: [firstUser, secondUser] };
+  await f.plugin.mirror(key);
+  assert.equal(f.sent.length, delivered, 'A delayed consumed stream snapshot cannot replace a final');
+});
+
+test('legacy stream ledger recovers an older turn without claiming an already finalized newer slot', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.legacy-overlap');
+  await f.store.bind(key, { channel, threadTs: '123.legacy-overlap', projectId: 'lab', conversationId: 'chat-overlap', userId: user, ownRequests: ['request-one', 'request-two'] });
+  const first = { id: 'a1', role: 'assistant', requestId: 'request-one', text: 'First complete reply' };
+  const second = { id: 'a2', role: 'assistant', requestId: 'request-two', text: 'Current complete reply' };
+  await f.store.update(data => {
+    const thread = data.threads[key];
+    thread.mirrored['stream:request-one:1'] = { ts: '5.0', hash: 'old-preview' };
+    thread.mirrored['stream:request-two:1'] = { ts: '6.0', hash: 'current-preview' };
+    thread.mirrored.a2 = { ts: '6.0', hash: digest({ format: 'plain-text-v2', message: second }) };
+  });
+  f.plugin.store = await new Store(f.directory).open();
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages: [first, second] });
+  const update = f.io.update; let attempted = false;
+  f.io.update = async (...args) => { if (!attempted) { attempted = true; throw new Error('Temporary update failure'); } return update(...args); };
+  await assert.rejects(f.plugin.mirror(key), /Temporary update failure/);
+  f.plugin.store = await new Store(f.directory).open(); f.io.update = update;
+  await f.plugin.mirror(key);
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(call => call.channel).length, 0);
+  assert.deepEqual(f.sent.filter(call => call.update).map(call => call.update[1]), ['5.0']);
+  assert.deepEqual(['a1', 'a2'].map(id => f.plugin.store.data.threads[key].mirrored[id].ts), ['5.0', '6.0']);
+});
+
 test('a retained stream finalizes the first pending reply so multiple model steps remain chronological', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.ordered');
   await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: ['request-one'] });
@@ -2224,7 +2406,7 @@ test('other bot routing metadata is semantic input; a silent decision downloads 
 test('own native mention and unknown bot identities still use semantic intent; no permanent hard silence', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   let lookups = 0;
-  f.io.call = async () => { lookups++; throw new Error('lookup unavailable'); };
+  f.io.call = async method => { if (['conversations.history', 'conversations.replies'].includes(method)) return { messages: [] }; lookups++; throw new Error('lookup unavailable'); };
   await f.plugin.message('both', event({ text: `<@UOTHER> <@${bot}> help` }));
   assert.equal(lookups, 1); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
   f.calls.length = 0;
@@ -2339,6 +2521,18 @@ test('Steer partial output retains its slot and the corrected stream uses a new 
   const oldSlotUpdates = f.sent.filter(item => item.update?.[1] === '55.1').length;
   await f.plugin.mirror(key);
   assert.equal(f.sent.filter(item => item.update?.[1] === '55.1').length, oldSlotUpdates);
+  const correctedTs = f.store.data.threads[key].liveStream.ts;
+  f.plugin.store = await new Store(f.directory).open();
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, inputRevision: 2, consumedInputRevision: 2, pendingInputCount: 0,
+    messages: [{ id: 'u', role: 'user', requestId: 'turn', text: 'ask' },
+      { id: 'a', role: 'assistant', requestId: 'turn', text: 'old partial', partial: true },
+      { id: 'corrected', role: 'assistant', requestId: 'turn', text: 'Corrected complete answer' }] });
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.plugin.store.data.threads[key].mirrored.a.ts, '55.1');
+  assert.equal(f.plugin.store.data.threads[key].mirrored.corrected.ts, correctedTs);
+  assert.equal(f.sent.filter(item => item.update?.[1] === '55.1').length, oldSlotUpdates, 'The consumed old revision remains partial');
+  assert.equal(f.sent.filter(item => item.channel).length, 1, 'The corrected final reuses its revision preview');
+  assert.equal(f.plugin.store.data.threads[key].liveStream, undefined);
 });
 
 test('control revision prevents late running snapshot from reviving an interrupted turn', async t => {

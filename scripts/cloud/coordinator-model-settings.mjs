@@ -58,6 +58,13 @@ export class CoordinatorModelSettings {
     const option = this.options.find(item => item.id === state.selectedId);
     return { providerId: option.id, model: overrides ? this.factory({ ...option.config, ...overrides }) : option.model };
   }
+  async selectForTurn(input) {
+    const receipt = await this.select(input), current = await this.state();
+    const historical = receipt.version !== current.version;
+    return { kind: 'model-selected', label: current.options.find(option => option.id === current.selectedId).label,
+      ...(historical ? { receiptLabel: receipt.options.find(option => option.id === receipt.selectedId).label } : {}),
+      status: historical ? 'historical-receipt' : 'applied', effective: historical ? 'historical-only' : 'next-text-turn' };
+  }
   async select(input) {
     if (!input || Object.keys(input).some(key => !['id', 'providerId', 'baseVersion'].includes(key)) ||
         !identifier(input.id) || !identifier(input.providerId) || typeof input.baseVersion !== 'string' || !/^[a-f0-9]{64}$/.test(input.baseVersion)) {
