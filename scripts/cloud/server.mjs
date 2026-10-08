@@ -483,7 +483,7 @@ export async function startCloudServer({
     const principal = await interfaceAuth.authenticate(credential);
     const repository = interfaceConfig.repositories.find(item => item.repositoryId === principal.repositoryId);
     if (principal.role !== 'device' || repository?.projectId !== projectId) return false;
-    if (sessionId) return !!await interfaceStorage(principal).store.registeredBinding(principal, sessionId);
+    if (sessionId) return await interfaceStorage(principal).store.registeredBinding(principal, sessionId) || false;
     return ['GET', 'POST'].includes(method) && ['main', 'preferences'].includes(scope) &&
       (method === 'GET' || scope === 'preferences');
   } }) : null;
@@ -2689,6 +2689,7 @@ export async function startCloudServer({
   server.headersTimeout = 15_000;
   integrationGateway = await startIntegrationGateway({ config: integrations,
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
+    logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
     state: async scope => {
       const project = integrationProject(scope.projectId);
       await requireManualConversation(project, scope.conversationId);

@@ -6,7 +6,7 @@ import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, pr
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 // This narrow boundary repeats the Cloud enum deliberately; contract tests
 // keep it aligned without importing the whole Cloud tool catalogue.
-const slackReactionEmojis = ['thumbsup', 'heart', 'smile'];
+const slackReactionEmojis = ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray'];
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
 const reactionEventHash = event => digest({ ...event, type: 'message' });

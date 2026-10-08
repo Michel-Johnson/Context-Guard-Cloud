@@ -220,16 +220,21 @@ test('native Slack reaction uses real publicMessages projection without inventin
 test('native Slack reaction contract enum stays aligned and necessary emoji text remains intact', async t => {
   const f = await reactionFixture(t); f.plugin.stopped = false;
   const emojis = coordinatorTools.find(tool => tool.name === 'react_to_user').input_schema.properties.emoji.enum;
-  assert.deepEqual(emojis, ['thumbsup', 'heart', 'smile']);
+  assert.deepEqual(emojis, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray']);
   for (const emoji of emojis) {
     const message = structuredClone(f.message); message.actions[0].emoji = emoji; message.actions[0].actionId = emoji;
     await stageReactions(f.plugin, f.key, message, [f.input, message]);
+    await settleReactions(f.plugin);
   }
   await settleReactions(f.plugin);
   assert.deepEqual(f.sent.map(call => call.input.name), emojis);
-  f.message.text = '❤️ 感谢反馈。\n\n仍需人工确认，表情不代表已完成。';
+  assert.equal(f.sent.filter(call => call.text || call.update).length, 0, 'All ten reaction-only choices remain free of placeholder text');
+  f.message.actions[0].emoji = 'clap';
+  f.message.text = '👏 感谢反馈。\n\n仍需人工确认，表情不代表已完成。';
   await f.plugin.mirror(f.key); await settleReactions(f.plugin);
-  const post = f.sent.find(call => call.text); assert.match(post.text, /❤️ 感谢反馈。\n\n仍需人工确认/);
+  const post = f.sent.find(call => call.text); assert.match(post.text, /👏 感谢反馈。\n\n仍需人工确认/);
+  assert.equal(f.sent.filter(call => call.text || call.update).length, 1);
+  assert.equal(f.sent.at(-1).input.name, 'clap', 'Text and a native reaction can coexist without dropping either');
 });
 test('native Slack reaction never borrows untrusted, other-user, synthetic or partial input', async t => {
   const f = await reactionFixture(t); f.plugin.stopped = false;

@@ -150,8 +150,16 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
     return { status: response.status, body: await response.json() };
   };
   const browser = async (conversationId, { suffix = '', body, authorization = browserCredential, project = projectId } = {}) => {
-    const response = await fetch(`${cloud.url}/api/workbench/projects/${project}/api/coordinator${suffix}?conversation=${encodeURIComponent(conversationId || 'main')}`, {
-      method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    let response;
+    try {
+      response = await fetch(`${cloud.url}/api/workbench/projects/${project}/api/coordinator${suffix}?conversation=${encodeURIComponent(conversationId || 'main')}`, {
+        method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    } catch (error) {
+      // Diagnose the actual OS-assigned loopback port without logging credentials
+      // or changing fetch restrictions, allocated ports or the assertion path.
+      error.fixturePort = Number(new URL(cloud.url).port);
+      throw error;
+    }
     return { status: response.status, body: await response.json() };
   };
   const wait = async (conversationId, predicate, label = 'Coordinator final state') => {
@@ -230,6 +238,21 @@ test('unrelated and invalid relevance decisions cannot become submitted turns', 
   const forbiddenTool = await f.gateway('conversation.relevance', { text: 'relevance-tool' }, { id: 'relevance-tool' });
   assert.equal(forbiddenTool.status, 502); assert.equal(forbiddenTool.body.error.code, 'RELEVANCE_INVALID_RESPONSE');
   assert.equal(invalid.body.data, undefined); assert.deepEqual(await f.main(), before);
+});
+
+test('Cloud connects the real integration failure logger using only fixed private diagnostic fields', async t => {
+  const f = await fixture(t), logs = [], warn = console.warn;
+  console.warn = (...args) => logs.push(args);
+  try {
+    const failed = await f.gateway('conversation.relevance', { text: 'invalid-relevance' }, { id: 'private-original-request' });
+    assert.equal(failed.status, 502); assert.deepEqual(Object.keys(failed.body.error).sort(), ['code', 'message']);
+    const entry = logs.find(log => log[0] === 'Context Guard integration failure')?.[1];
+    assert.ok(entry, 'Exercise startCloudServer logger wiring, not a standalone supplied logger');
+    assert.equal(entry.code, 'RELEVANCE_INVALID_RESPONSE'); assert.equal(entry.phase, 'decision-parse'); assert.equal(entry.causeCode, 'MODEL_INVALID_RESPONSE');
+    assert.match(entry.idHash, /^[a-f0-9]{64}$/); assert.ok(Number.isSafeInteger(entry.durationMs) && entry.durationMs >= 0);
+    assert.deepEqual(Object.keys(entry).sort(), ['causeCode', 'code', 'durationMs', 'idHash', 'phase']);
+    assert.doesNotMatch(JSON.stringify(entry), /private-original-request|invalid-relevance|provider|token|model|project|prompt/);
+  } finally { console.warn = warn; }
 });
 
 test('relevance input, workspace, project and conversation boundaries are checked before the model', async t => {
