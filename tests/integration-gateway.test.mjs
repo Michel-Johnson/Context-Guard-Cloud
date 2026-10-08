@@ -179,11 +179,11 @@ test('Both Coordinator profiles reserve internal identifiers for tools and expli
   const document = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
   for (const manual of [false, true]) {
     const prompt = coordinatorRolePrompt(document, { manual });
-    for (const rule of ['不附节点、事项、Session、测试 ID 或版本哈希',
+    for (const rule of ['不附内部 ID、哈希或测试日期前缀', '「E2E/IF11 登录复测」写「登录复测」',
       '明确索要技术编号时再提供', '工具参数、链接/URL、代码、命令、回执和执行提示保留真实值',
       '普通回复约 50–100 字', '通常不超 150 字', '保留必要事实和不确定性',
-      'TODO 概览报总数与可识别短名称', '不附未问 Bug']) assert.ok(prompt.includes(rule), rule);
-    assert.ok(prompt.includes('同名事项用短描述区分'));
+      'TODO 概览报总数与可识别短名称', '同状态只报一次、不漏事项', '不附未问 Bug']) assert.ok(prompt.includes(rule), rule);
+    assert.ok(prompt.includes('同名用短描述'));
   }
 });
 

@@ -149,8 +149,16 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
     return { status: response.status, body: await response.json() };
   };
   const browser = async (conversationId, { suffix = '', body, authorization = browserCredential, project = projectId } = {}) => {
-    const response = await fetch(`${cloud.url}/api/workbench/projects/${project}/api/coordinator${suffix}?conversation=${encodeURIComponent(conversationId || 'main')}`, {
-      method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    let response;
+    try {
+      response = await fetch(`${cloud.url}/api/workbench/projects/${project}/api/coordinator${suffix}?conversation=${encodeURIComponent(conversationId || 'main')}`, {
+        method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
+    } catch (error) {
+      // Diagnose the actual OS-assigned loopback port without logging credentials
+      // or changing fetch restrictions, allocated ports or the assertion path.
+      error.fixturePort = Number(new URL(cloud.url).port);
+      throw error;
+    }
     return { status: response.status, body: await response.json() };
   };
   const wait = async (conversationId, predicate, label = 'Coordinator final state') => {
