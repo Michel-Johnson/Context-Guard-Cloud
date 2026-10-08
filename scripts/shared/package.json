@@ -1,9 +1,0 @@
-{
-  "name": "@michelj/context-guard-core",
-  "version": "2.0.1",
-  "type": "module",
-  "description": "Shared Context Guard protocol, map model and runtime primitives",
-  "repository": "github:Michel-Johnson/Context-Guard-Cloud",
-  "files": ["*.mjs", "vendor/", "roles/", "references/", "LICENSES/"],
-  "engines": { "node": ">=18" }
-}

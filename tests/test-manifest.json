@@ -63,13 +63,9 @@
     "tests/helpers/skill.mjs",
     "tests/integration-gateway.test.mjs",
     "tests/interface-auth.test.mjs",
-    "tests/interface-blobs.test.mjs",
     "tests/interface-device.test.mjs",
     "tests/interface-events.test.mjs",
     "tests/interface-memory-errors.test.mjs",
-    "tests/interface-protocol.test.mjs",
-    "tests/interface-snapshots.test.mjs",
-    "tests/interface-store.test.mjs",
     "tests/interface-workflow.test.mjs",
     "tests/memory-filesystem-migration.test.mjs",
     "tests/multiworktree-cloud.test.mjs",
@@ -78,8 +74,8 @@
     "tests/session-publication-completion.test.mjs",
     "tests/test-manifest.json",
     "tests/workbench-cloud-sync.test.mjs",
-    "tests/workbench-ui-sync.test.mjs",
     "tests/session-sync-cloud.test.mjs",
-    "tests/hook-cloud.test.mjs"
+    "tests/hook-cloud.test.mjs",
+    "tests/build-runtime.test.mjs"
   ]
 }

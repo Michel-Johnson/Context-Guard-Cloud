@@ -10,7 +10,7 @@ const installed = { name: '@michelj/context-guard', version: '0.5.0' };
 
 test('fixed Skill release fixture requires exact URL, version and canonical SHA-512 lock', () => {
   assert.deepEqual(validateSkillFixture(url, locked, installed), { commit, version: '0.5.0', integrity });
-  for (const version of ['0.6.0', '0.6.1', '0.6.3']) {
+  for (const version of ['0.6.0', '0.6.1', '0.6.3', '0.6.5']) {
     const nextUrl = url.replace('0.5.0', version);
     const nextLock = { ...locked, resolved: nextUrl, version };
     assert.deepEqual(validateSkillFixture(nextUrl, nextLock, { ...installed, version }), { commit, version, integrity });

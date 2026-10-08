@@ -29,6 +29,7 @@ Cloud 只能从 [Context-Guard-Cloud](https://github.com/Michel-Johnson/Context-
 sudo git clone https://github.com/Michel-Johnson/Context-Guard-Cloud.git /opt/context-guard-cloud/repository
 cd /opt/context-guard-cloud/repository
 sudo npm ci --omit=dev --ignore-scripts
+sudo npm run build:runtime
 ```
 
 启动服务前选定已审核的发布提交。服务账户需要读取源码和受保护 JSON 文件，但不需要写源码；运行状态和凭据必须放在检出目录之外。
@@ -87,7 +88,7 @@ Cloud 保存哈希，不保存密码。人登录后使用已有的 HttpOnly/Same
 
 模板使用 `ProtectSystem=strict`。省略记忆项目的 `remote` 字段，避免运行中的服务向只读源码或镜像执行拉取。不得为了绕过发布失败而授予源码写权限。
 
-Slack 的可选回环网关与独立凭据配置见 [Slack 接入设计](../scripts/shared/references/design/design-slack-integration-v1.0.0.md)。Slack SDK 依赖留在插件包，Cloud 不加载它们。
+Slack 的可选回环网关与独立凭据配置见 [Slack 接入设计](design/design-slack-integration-v1.0.0.md)。Slack SDK 依赖留在插件包，Cloud 不加载它们。
 
 ### Coordinator 模型选择
 
@@ -138,7 +139,7 @@ context-guard sync status --root <project> --session <actual-session-id>
 ## 4. 升级、淘汰旧源码与回滚
 
 1. 记录当前 Cloud / Slack 源码 SHA 及数据、配置路径。按既有策略备份业务数据和受保护配置，包含私有记忆、附件、Slack 状态与回执，不备份或复制源码检出。停服务前核对必需的备份来源和实际目标文件系统可用容量；缺少可选 drop-in 不等于缺少必需来源。按数据表观大小加上归档开销、依赖和并发占用的明确余量预算，不假定压缩能挽救空间不足。容量不足时，不改变正在运行的版本。
-2. 拉取 Cloud 仓库，选定已批准的准确发布提交。先停 Slack，再停 Cloud；安装根包生产依赖和插件独立依赖，随后先启动 Cloud，再启动 Slack。
+2. 拉取 Cloud 仓库，选定已批准的准确发布提交。先停 Slack，再停 Cloud；安装根包生产依赖，执行 `npm run build:runtime` 生成已锁定的核心与 UI，再安装插件独立依赖，随后先启动 Cloud，再启动 Slack。
 3. 核对入口、进程代次和源码 SHA，验证鉴权读取、编辑、重载、Session 历史保留、重连和 Slack 就绪。编辑必须在已批准的测试项目进行，不任意修改生产 Map。
 4. 将客户端更新到兼容的 Skill 版本，核验安装入口、本地 / Cloud 同步及待处理数据保留。
 5. 只有确认没有进程、服务或业务项目 Git 镜像引用，且独有提交已保存到 Git、运行数据已移出后，才淘汰旧单元、覆盖配置和源码目录。保留单一固定源码入口，不创建 `*-old` 源码副本。
@@ -169,3 +170,5 @@ sudo systemctl enable --now context-guard-cloud-backup-retention.timer
 以 `0600` 权限写入 `.part` 数据归档，核验完整内容后原子改名为可识别的最终名称。保留机制的完整性检查不替代“是否包含所有必需数据与配置”的检查；现有数据、配置目录和归档仍按备份保留策略管理，不属于源码清理。
 
 迁移主机时先停写，复制完整业务数据、状态目录和受保护配置。从 Git 部署相同的已批准 Cloud 版本，核验历史与就绪状态，再通过 `workbench connect` 重连客户端。绝不能只凭最新 Map 重建同步状态。
+
+共享源码来自 Skill 发布包：源码 SHA、core/UI 版本和锁文件完整性摘要必须随 Cloud 修订一起记录。运行数据不参与构建；回退须恢复对应修订的依赖与生成物，不复用新版本目录。
