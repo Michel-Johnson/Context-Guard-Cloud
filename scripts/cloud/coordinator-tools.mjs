@@ -19,7 +19,8 @@ export const slackReactionEmojis = Object.freeze(['thumbsup', 'heart', 'smile', 
 
 export const coordinatorTools = [
   definition('react_to_user', 'In an already accepted Coordinator reply turn, use a light native Slack reaction more readily for acknowledgement, thanks, encouragement or shared sentiment. A reaction can accompany text or be the only reply when no explanation is needed. After its receipt, finish with requested or necessary text; otherwise end without text. Do not react to every message, spam, bypass participation or borrow another recipient. This queues an intent, not a delivery receipt, approval, completed task or passed test. Keep necessary explanation, risk, failure and human confirmation in text. No target may be supplied.', { emoji: { type: 'string', enum: slackReactionEmojis } }),
-  definition('show_model_menu', 'Read the actual current conversation turn model route and show the configured project default text models in Slack. The actual turn model is distinct from the project default. This only displays a menu: a real user must confirm a Slack choice before selection changes. Current and failed-retry routes stay pinned; image turns retain the separate vision model.', {}),
+  definition('show_model_menu', 'Read current and configured text models. For browsing, show a Slack menu. For an explicit current user switch request, use display:false to read silently then select_text_model, without requiring a button. Current/retry routes stay pinned; images retain their vision model.', { display: { type: 'boolean', default: true } }, []),
+  definition('select_text_model', 'Only when the current verified Slack user explicitly requests a model switch: select its configured ID at the version just read from show_model_menu. Never infer consent from history or unrelated questions. Confirm the receipt in one short sentence, no menu/catalog. If historical-only, report the current label, never claim the old choice is the next model. Current/retry and vision routes stay unchanged.', { providerId: { ...string, maxLength: 128 }, baseVersion: { ...string, minLength: 64, maxLength: 64 } }),
   definition('list_tasks', 'List project requirements and unfinished Main TODO/Bug items.', {}),
   definition('list_sessions', 'List assigned execution Sessions and their exact executionSessionId.', {}),
   definition('list_conversations', 'List saved Coordinator conversations; their IDs are not executionSessionId.', {}),
@@ -86,7 +87,16 @@ export function createCoordinatorExecutor(ctx) {
     await ctx.authorizeTool?.(name, input, options);
     if (name === 'react_to_user') return { kind: 'slack-reaction', actionId: operationId, emoji: input.emoji, status: 'intent' };
     if (name === 'list_tasks') return ctx.listTasks();
-    if (name === 'show_model_menu') return { kind: 'model-selection', actionId: operationId, ...(await ctx.modelSettings()) };
+    if (name === 'show_model_menu') return { kind: input.display === false ? 'model-catalog' : 'model-selection', actionId: operationId, ...(await ctx.modelSettings()) };
+    if (name === 'select_text_model') {
+      if (!/^[a-zA-Z0-9_-]{1,128}$/.test(input.providerId) || !/^[a-f0-9]{64}$/.test(input.baseVersion)) fail('Use the configured model ID and current catalog version');
+      if (options.source !== 'slack' || options.actor?.kind !== 'human' || options.actor.integration !== 'slack' ||
+          !/^[UW][A-Z0-9]{1,31}$/.test(options.actor.userId || '') || !/^[TE][A-Z0-9]{1,31}$/.test(options.actor.teamId || '') ||
+          options.actor.sessionId !== `slack:${options.actor.teamId}:${options.actor.userId}`) {
+        throw Object.assign(new Error('A verified current Slack input is required'), { code: 'TOOL_FORBIDDEN' });
+      }
+      return ctx.selectModel(input, options);
+    }
     if (name === 'list_sessions') return ctx.listSessions();
     if (name === 'list_conversations') return ctx.listConversations();
     if (name === 'read_map') return { ...(await ctx.readMap(input.nodeId)), kind: 'map-read', actionId: operationId };

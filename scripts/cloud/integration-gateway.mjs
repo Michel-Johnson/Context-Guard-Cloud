@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { validateSlackHistory } from './slack-history.mjs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
@@ -172,6 +173,10 @@ export function validateIntegrationCommand(config, input) {
   if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
+  if (Object.hasOwn(input.payload || {}, 'history')) {
+    if (input.type !== 'conversation.submit' || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', 'Only a verified Slack input batch may supply reference history');
+    validateSlackHistory(input.payload.history, { projectId: input.projectId });
+  }
   if (input.type === 'models.state' && Object.keys(input.payload || {}).length || input.type === 'models.select' &&
       (Object.keys(input.payload || {}).some(key => !['providerId', 'baseVersion'].includes(key)) ||
         typeof input.payload.providerId !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(input.payload.providerId) ||

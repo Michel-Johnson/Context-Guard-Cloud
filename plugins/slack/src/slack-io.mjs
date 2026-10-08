@@ -14,7 +14,7 @@ function messageParts(text, blocks) {
   // Each message has the content's own fallback for notifications and assistive
   // clients. No 39K slice or 49-block truncation hides the end of an answer.
   return parts.map((group, index) => ({ blocks: group,
-    text: group.map(block => block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '')).join('') || (index ? 'Coordinator · 操作' : plainText(text)), rendered: true }));
+    text: group.map(block => block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '')).filter(Boolean).join('\n\n') || (index ? 'Coordinator · 操作' : plainText(text)), rendered: true }));
 }
 
 export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -65,7 +65,7 @@ export class SlackIO {
   async post({ id, channel, threadTs, text, blocks }) {
     const parts = messageParts(text, blocks);
     const previousCount = this.store.data.outgoing[id]?.partCount || 1;
-    if (parts.length === 1 && previousCount === 1) return this.postOne({ id, channel, threadTs, text, blocks });
+    if (parts.length === 1 && previousCount === 1) return this.postOne({ id, channel, threadTs, ...parts[0] });
     let first;
     for (const [index, part] of parts.entries()) {
       const ts = await this.postOne({ id: index ? `${id}:part:${index}` : id, channel, threadTs, ...part });

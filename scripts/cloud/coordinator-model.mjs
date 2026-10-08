@@ -338,7 +338,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const trustedSlackInput = state.activeInput?.source === 'slack' && !!state.activeInput.id && slackActor?.kind === 'human' &&
     slackActor.integration === 'slack' && /^[UW][A-Z0-9]{1,31}$/.test(slackActor.userId || '') &&
     /^[TE][A-Z0-9]{1,31}$/.test(slackActor.teamId || '') && slackActor.sessionId === `slack:${slackActor.teamId}:${slackActor.userId}`;
-  const executableTools = sourceTools.filter(tool => tool.name !== 'react_to_user' || trustedSlackInput);
+  const executableTools = sourceTools.filter(tool => !['react_to_user', 'select_text_model'].includes(tool.name) || trustedSlackInput);
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
   if (state.activeTurnId && state.performance?.turnId !== state.activeTurnId) state.performance = {
@@ -418,7 +418,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         const started = Date.now();
         let errorCode = null;
         try {
-          const result = await execute(call.name, call.input, { operationId });
+          // Model settings use the integration's identifier alphabet, while
+          // the original native tool receipt keeps its unchanged identity.
+          const result = await execute(call.name, call.input, { operationId: call.name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
+            ...(call.name === 'select_text_model' && trustedSlackInput ? { source: 'slack', actor: slackActor } : {}) });
           receipt = { fingerprint, result: call.name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
             ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result };
         }
@@ -462,7 +465,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (response?.role === 'assistant') response.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' && ['ask_user', 'show_model_menu'].includes(block.name))) ? 'waiting-for-user' : 'running';
+    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' &&
+      (block.name === 'ask_user' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }

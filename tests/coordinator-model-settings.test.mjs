@@ -209,6 +209,74 @@ test('Slack model menu native tool is read-only and only accepted server Slack s
       assert.deepEqual(state.messages[1].actions[0].options, before.options);
     } else assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN');
   }
-  assert.equal(reads, 1); assert.deepEqual(await f.settings.state(), before, 'No native model selector exists and menu display never writes');
+  assert.equal(reads, 1); assert.deepEqual(await f.settings.state(), before, 'Menu display itself never writes');
   await assert.rejects(execute('show_model_menu', { source: 'slack', providerId: 'glm' }, { operationId: 'forged-tool-input' }), { code: 'INVALID_ARGUMENT' });
+});
+
+test('Slack explicit model switch reads silently and changes only future text turns with a short receipt', async t => {
+  const f = await fixture(t), routes = [], toolCalls = [];
+  const actor = { kind: 'human', integration: 'slack', teamId: 'TTESTMODEL', userId: 'UUSERMODEL', sessionId: 'slack:TTESTMODEL:UUSERMODEL' };
+  let rounds = 0, catalog;
+  const execute = createCoordinatorExecutor({ modelSettings: async () => (catalog = await f.settings.state()),
+    selectModel: async (input, options) => {
+      assert.deepEqual(options.actor, actor); assert.equal(options.source, 'slack'); toolCalls.push(options.operationId);
+      return f.settings.selectForTurn({ id: options.operationId, ...input });
+    } });
+  const glm = { model: 'glm-5.3', next: async () => {
+    routes.push('glm');
+    if (++rounds === 1) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'read', name: 'show_model_menu', input: { display: false } }] };
+    if (rounds === 2) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'select_text_model', input: { providerId: 'ds', baseVersion: catalog.version } }] };
+    return answer('已切换到 DeepSeek，下一轮生效。');
+  } };
+  const ds = { model: 'deepseek-flash', next: async () => { routes.push('ds'); return answer('你好。'); } };
+  const models = new Map([['glm', glm], ['ds', ds]]);
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'explicit-chat'), system: 'test', tools: coordinatorTools,
+    execute, model: glm, visionModel: glm, textModels: models, selectTextModel: async () => { const state = await f.settings.state(); return { providerId: state.selectedId, model: models.get(state.selectedId) }; } });
+  await service.submit({ id: 'explicit-switch', text: '切到 DeepSeek' }, { source: 'slack', actor }); await service.running;
+  assert.equal((await f.settings.state()).selectedId, 'ds'); assert.deepEqual(routes, ['glm', 'glm', 'glm']);
+  const state = await service.state();
+  assert.equal(state.modelRoute.providerId, 'glm', 'The switch does not re-route the requesting turn');
+  assert.equal(state.messages.flatMap(message => message.actions || []).length, 0, 'No needless model selection card');
+  assert.equal(toolCalls.length, 1);
+  await service.submit({ id: 'next-input', text: '你好' }, { source: 'slack', actor }); await service.close();
+  assert.equal(routes.at(-1), 'ds');
+});
+
+test('Slack native selector rejects other sources or forged actors and cannot borrow history identity', async t => {
+  const f = await fixture(t), before = await f.settings.state(); let selections = 0;
+  const actor = { kind: 'human', integration: 'slack', teamId: 'TTESTMODEL', userId: 'UUSERMODEL', sessionId: 'slack:TTESTMODEL:UUSERMODEL' };
+  const execute = createCoordinatorExecutor({ selectModel: async () => { selections++; assert.fail('Unverified selection'); } });
+  for (const input of [{ source: 'human', actor }, { source: 'workflow', actor }, { source: 'slack' },
+    { source: 'slack', actor: { ...actor, sessionId: 'forged' } }, { source: 'slack', actor: { ...actor, kind: 'bot' } }]) {
+    const state = { activeInput: { id: 'unverified', ...input }, messages: [{ role: 'user', content: '切换模型', actor }], toolReceipts: {} };
+    await coordinatorStep({ turnId: 'unverified', state, system: 'test', tools: coordinatorTools, execute, save: async () => {},
+      model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'select_text_model', input: { providerId: 'ds', baseVersion: before.version } }] }) } });
+    assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN');
+  }
+  assert.equal(selections, 0); assert.deepEqual(await f.settings.state(), before);
+  await assert.rejects(execute('select_text_model', { providerId: 'ds', baseVersion: before.version }, { operationId: 'forged' }), { code: 'TOOL_FORBIDDEN' });
+});
+
+test('Slack native selection recovers a lost tool acknowledgement with its original settings receipt', async t => {
+  const f = await fixture(t), before = await f.settings.state(), ids = [];
+  const actor = { kind: 'human', integration: 'slack', teamId: 'TTESTMODEL', userId: 'UUSERMODEL', sessionId: 'slack:TTESTMODEL:UUSERMODEL' };
+  let failReply = true;
+  const execute = createCoordinatorExecutor({ selectModel: async (input, { operationId }) => {
+    ids.push(operationId); const result = await f.settings.selectForTurn({ id: operationId, ...input });
+    if (failReply) { failReply = false; throw Object.assign(new Error('Reply lost'), { code: 'UNAVAILABLE' }); }
+    return result;
+  } });
+  let state = { activeInput: { id: 'original-switch', source: 'slack', actor }, messages: [{ role: 'user', content: '切到 DeepSeek' }], toolReceipts: {} };
+  const step = () => coordinatorStep({ turnId: 'original-switch', state, system: 'test', tools: coordinatorTools, execute, save: async () => {},
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'select_text_model', input: { providerId: 'ds', baseVersion: before.version } }] }) } });
+  await assert.rejects(step(), { code: 'UNAVAILABLE' });
+  const changed = await f.settings.state(); assert.equal(changed.selectedId, 'ds');
+  const newer = await f.settings.select({ id: 'other-human-switch', providerId: 'glm', baseVersion: changed.version });
+  state = JSON.parse(JSON.stringify(state)); await step();
+  assert.equal(ids.length, 2); assert.equal(ids[0], ids[1]);
+  assert.deepEqual(await f.settings.state(), newer, 'Recovery does not select a second time or overwrite another newer choice');
+  const receipt = Object.values(state.toolReceipts)[0].result;
+  assert.equal(receipt.status, 'historical-receipt'); assert.equal(receipt.effective, 'historical-only');
+  assert.equal(receipt.label, 'GLM 5.3'); assert.equal(receipt.receiptLabel, 'DeepSeek V4.1 Flash');
+  assert.equal(state.messages.filter(m => m.role === 'assistant').length, 1);
 });

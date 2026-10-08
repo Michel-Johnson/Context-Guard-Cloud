@@ -1,5 +1,56 @@
 # Cloud 验证台账
 
+本轮候选已同步 Main `a35ba54`（PR #29，Map 项目实时选择），实际版本为 Cloud `1.3.1` / Slack `0.2.1`。原 `1.2.4` / `0.1.21` 仅为开发前基线，不再作为发布版本或测试证据。保留实时项目授权、私聊隔离和动态菜单；直接选择与原网关复用同一实时项目检查。
+
+执行者开发后集中批次保留原始结果：40 个目标中 33 通过、7 失败。修复单卡未走段落处理、原生工具操作编号与设置接口不兼容；历史 / 菜单替身补齐新 Main 项目检查与 JSON 持久化语义，模型切换替身提供真实 textModels 路由目录，不放宽产品权限或断言。仅重验失败目标及原遗漏角色规范目标，仍有一项路由替身失败，修正后该目标退出 0。全部原失败和准确哈希日志保留；不能汇总冒称最终源码已有 40/40。独立 Tester 需在当前冻结源码统一验证受影响目标；Required、上线、真实效果仍待完成。
+
+独立 Tester 已完成同一冻结源码的唯一集中验证：41/41 通过，actual exit 0，0 failed/skipped/cancelled，4266.9547 ms；产品、正式测试和文档前后哈希一致，HEAD `243f547` + 准确工作树。静态审查未发现本轮阻断级新增问题，实时 Map 项目授权复用已核对。原失败记录保留；此结果仍是隔离本地模型/Slack 替身，不代替当前提交 Required、上线、付费模型及真实聊天验收。
+
+## SLACK-HISTORY-01 · 首次绑定有限历史资料（2026-10-09）
+
+- [x] Cloud-owned Slack reader 与可信批次接入开发完成：当前频道/线程、严格早于当前输入，最近最多 24 条 × 1000 字符、最多四页；分类仍六条 × 800 字符并复用读取，不扫描工作区。过滤账本可识别的其他项目及当前已记录原生 TS，历史只资料，不赋予任务/授权/actor。
+- [x] 成功快照与原 Inbox/批次指纹冻结；提交确认后绑定标记。服务 state/journal 同事务只首批首输入注入私有 serverContext，公开消息不泄露。未知回复/重启沿原 ID；失败明确不可用、不永久冻结错误/新增 pending 锁，暂时故障沿原有界重试，后来输入可恢复。空成功可省字段，合成命令不读取。
+- [x] 正式 tests/slack-history.test.mjs 登记 productFiles，共九个 `Slack history` 目标，覆盖 reader/验证/状态与 journal/重启失回/跨项目去重/失败恢复/真实本地 HTTP 来源边界；旧插件 fixture 仅按真实 API 返回空 messages 数组，不放宽产品校验。
+- [ ] 由 Coordinator 在所有本轮开发收口后一次集中 Executor 模块验证；目前未运行此新增文件，不能据静态 review 勾通过。
+- [ ] 独立 Tester 同准确源码与测试 hash 验证，再 Required / 合并 / 上线；真实 Slack 首次历史接入仍待验收，不以本地模型替身冒充。
+
+## SLACK-NATIVE-SWITCH-01 · 明确聊天请求直接切换模型（2026-10-09）
+
+- [x] 用户明确确认：当前 Slack 真人说“切到 DeepSeek”时直接选择已配置模型，不强制点菜单；无明确要求不切换。新增窄工具 `select_text_model`，静默读取目录沿用 `show_model_menu(display:false)`；浏览菜单旧调用保持兼容。
+- [x] 工具只接受配置 ID / 观察到的设置版本；执行层核当前 Slack 真人，不借历史身份。Cloud 复用同一集成项目 / 动作白名单、CAS、稳定操作编号和设置回执，不新增供应商或权限。当前轮次 / 原失败重试 / 图片路由不变；新成功回执简短确认，旧回执与当前设置不一致时明确历史结果及当前可读名字，不额外贴菜单。自然语言是否为明确请求仍由模型判断，不能把身份检查说成语义判定已经证明可靠。
+- [ ] 开发完成后集中验证：静默目录→直接选择→简短确认→下一轮使用新模型；其他来源 / 伪造 actor 拒绝；设置已保存但工具回复丢失按原编号恢复，不重复选择。
+- [ ] 独立 Tester / Required / 正常合并 / 上线与真实 Slack 验收待完成。此处不宣称语义判断所有变体均已验收，也不替用户再次切换生产模型。
+
+## SLACK-STREAM-SLOT-01 · 回复槽位与卡片段落（2026-10-09）
+
+- [x] 已核对真实坏例：旧轮预览、新轮答复、旧轮完整答复分别占三个 TS；旧轮已完成但镜像只记最新 liveStream，不能把它归因于纯文本重复执行。
+- [x] 使用既有镜像账本按原轮次领取预览，消费原子保存；保留同轮旋转、steer / partial、停止和重启语义。正式回复不能被晚到流覆盖，不删除既有聊天历史。
+- [x] 卡片运输 fallback 原用空串连接段落，出现“Coordinator 回复项目…”；改为段落分隔，显示卡及通知 / 辅助阅读正文保持同一阅读顺序。
+- [ ] 开发后一次受影响正式目标与独立准确修订验证；覆盖跨轮 / 修订 / 重启 / 失回复 / 重复快照，不冒称修复既有错误发送的旧消息。
+- [ ] Required、上线和真实聊天验收待完成。
+
+## SLACK-MODEL-MENU-02 · 线程入口与连续输入作者关联（2026-10-09）
+
+- [x] 保留真实坏例：旧模型卡作者未知时只有长目录和 `/cg model` 引导，但 Slack 线程拒绝 slash command。只读核验确定该卡 assistant 自身有可信 Slack 真人身份及 ownRequests，连续两个输入使 preceding user 与原请求不同；compaction 为 null，不能归因于摘要。用户已自行选择 DeepSeek，不替用户实际再次选择。
+- [x] 精简固定卡：只显示匹配目录的可读模型名，默认与实际文字路由确实相同时合并一行，不同 / 图片类型保留区别；未匹配不猜 label，不裸 provider ID / 项目 slug 或重复目录。目录由原 native 选择按钮呈现，原确认 / CAS / 幂等接口和下一文字轮次约束保留。
+- [x] 未知作者及旧历史 / 错误卡有「打开我的模型菜单」按钮，核对私有原卡 / 频道 / ts / 线程 / 项目，仅以当前真实点击者 `models.state` 只读新目录并保存新卡。未知原 selection 返回 BUSY，原回执和恢复路径保留；opener 不调用选择，不冒充成功，不借旧创建者或改写旧 null owner。
+- [x] 镜像优先读取 assistant 自身的服务端 source / human actor / integration / team / session 和明确 requestId，并核对本线程 ownRequests；正文或 action 参数不能供身份。旧 visible-user 关联路径保留；新正式例子覆盖双真人输入后原 assistant 绑定原人，后来输入者 / creator / 伪造来源及跨请求不得借用。
+- [ ] 开发后一次受影响正式模型目标及已有 Cloud policy / guide 两目标；等待本轮流式 slot 返工同时完成后，由 Coordinator 通知执行，不开发中反复测试或追加全量。
+- [ ] 独立 Tester 核验最终准确源码和合同；新候选 Cloud 1.2.4 / Slack 0.1.21、提交、Required、上线与真实线程 / 短卡效果待完成。菜单 opener 本身保持只读；用户后续明确批准的直接选择见 SLACK-NATIVE-SWITCH-01，不新增 core 或供应商配置。
+
+## SLACK-PROMPT-ORDER-01 · Slack 重复呈现规则精简（2026-10-08）
+
+- [x] 保留真实验收结果：Cloud 1.2.2 已能发送原生 clap 与文字；默认 TODO 的共同状态已只报一次，但仍复制 E2E / IF11 / SLACK-NL 等测试前缀，短名称效果未过。不能以已发布角色或表情通过代替该失败。
+- [x] 初版 `9aa3652` 在旧 Main 基线上完成两个目标与独立验证、PR #27 Required；未合并上线。并行 PR #28 将缓存前缀迁入 Main `585172866864a077f17413fc20be14978ec794e5`，正常合并因冲突拒绝，原通过证据不冒充新版通过。
+- [x] 合并最新 Main，完整保留稳定 system/tools、按输入冻结的 serverContext、旧格式兼容及执行层来源门禁。仅在现行 `coordinator-prefix` 精简重复长度 / TODO / 泛化标识符规则，保留上下文和来源边界；不搬回旧的逐轮 system 拼接，没有硬截断或短名正则。
+- [x] 候选 Cloud `1.2.4` 避免与新版 Main `1.2.3` 版本重用，固定 core `2.1.2`、UI 与依赖不变，不修改 shared 生成物或新增 core Release。当前设计与验收文档注明 PE 不保证模型合规。
+- [x] 开发后一次两个正式目标（Slack reply policy、按需 role references），真实 terminal exit 0，2/2 passed，0 failed / skipped / cancelled，485.3037 ms；日志 `temp/slack-prompt-order-executor-cd522f8-20261008.log`。校验 Slack 顺序与纯运输尾部、原 Schema 工具、非 Slack 拼接和跨客户端历史；未跑全量 / 旧八目标 / 原端口失败用例。
+- [x] 独立 Tester 核验同一冻结源码与两个目标；不代替本次准确 PR Required、合并与上线。
+  - 最终handoff3d4de8bb…/七文件hash测试期间前后相同，角色1df01bb4未变；HEADcd522f8+准确工作树修订，Node24唯一两个受影响正式目标chunk820f99 actualexit0，2/2、0fail/skip，457.5653ms。原日志 `temp/slack-prompt-order-independent-cd522f8-20261008.log` SHA256 `63ecb678c0a65e264b35b5610195b65e10d276e1567082cb3da6db1e8d4f405a`；同名`.md`保留全hash/静态范围/编号ORDER-01..02。运输常量235→80字符、非空Main整条净减153字符，完整事实/role/native Schema/身份分类与非Slack原样；无旧8/端口case/全量/gates/生产调用，不据Mock或PE顺序称真实短名称通过。
+- [ ] 本次准确 PR Required、合并与上线由 Coordinator 完成。
+- [ ] 最新缓存基线迁移后的准确源码及新增用户菜单 / 乱序 badcase 分别核验，不复用旧两个目标的通过结果。
+- [ ] 默认 TODO 的真实短名称 / 共同状态只报一次及全部事项保留仍待新版本复验；不改原失败为通过，不把受控模型输出当成真实模型遵循证据。
+
 ## COORDINATOR-REPLY-FOLLOWUP-01 · 真实聊天回归返工（2026-10-08）
 
 - [x] 真实 Slack 用户消息确认：Cloud 1.2.1 / Slack 0.1.20 已上线、Required 均通过、保护配置未变；但默认 TODO 仍重复状态和测试前缀，要求表情+文字时只返回了表情，验收未全部通过。
