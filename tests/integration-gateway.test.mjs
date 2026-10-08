@@ -20,6 +20,39 @@ const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
 
+test('Map 自动接入默认关闭，配置必须指定真实用户且缺少实时授权检查时拒绝启动', async () => {
+  assert.equal(validateIntegrationConfig(config).mapProjects, undefined);
+  for (const mapProjects of [null, {}, { coordinatorProjectId: projectId, userIds: [] },
+    { coordinatorProjectId: projectId, userIds: ['*'] }, { coordinatorProjectId: projectId, userIds: [userId, userId] },
+    { coordinatorProjectId: projectId, userIds: [userId], public: true }]) {
+    assert.throws(() => validateIntegrationConfig({ ...config, mapProjects }), { code: 'INVALID_INTEGRATION_CONFIG' });
+  }
+  await assert.rejects(startIntegrationGateway({ config: { ...config, mapProjects: { coordinatorProjectId: projectId, userIds: [userId] } },
+    stateDir: '/unused', command: async () => assert.fail('不应调用业务'), state: async () => ({}) }), { code: 'INVALID_INTEGRATION_CONFIG' });
+});
+
+test('Map 权限撤销后不能重放旧成功回执或建立事件订阅', async t => {
+  const directory = await temporary(t); let allowed = true, calls = 0;
+  const dynamic = 'map-new-project';
+  const server = await startIntegrationGateway({ config: { ...config, mapProjects: { coordinatorProjectId: projectId, userIds: [userId] } },
+    stateDir: directory, authorizeProject: async (id, actual) => {
+      if (id !== dynamic || actual.userId !== userId || !allowed) throw new MapError('FORBIDDEN', '未授权', 403);
+    }, command: async () => { calls++; return { conversationId: 'private-conversation' }; }, state: async () => ({ conversationId: 'private-conversation' }) });
+  t.after(() => server.close());
+  const input = { id: 'dynamic-create', teamId, userId, type: 'conversation.create', projectId: dynamic, payload: {} };
+  const request = async body => {
+    const response = await fetch(server.url + '/v1/command', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    return { status: response.status, body: await response.json() };
+  };
+  assert.equal((await request(input)).status, 200); assert.equal(calls, 1);
+  assert.equal((await request({ ...input, userId: 'UOTHER' })).status, 403);
+  allowed = false;
+  const replay = await request(input); assert.equal(replay.status, 403); assert.equal(replay.body.data, undefined); assert.equal(calls, 1);
+  const response = await fetch(server.url + '/v1/events?' + new URLSearchParams({ teamId, userId, projectId: dynamic, conversationId: 'private-conversation' }),
+    { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(response.status, 403); await response.body.cancel(); assert.equal(server.subscriberCount(), 0);
+});
+
 test('Participation accepts mixed Bot receivers and the entire ordered correction batch without granting authority', async () => {
   const payload = { text: '<@UOTHER> 修一下登录。\nCoordinator，帮我整理验收。',
     inputs: [{ id: 'original', text: '<@UOTHER> 修一下登录。' }, { id: 'correction', text: 'Coordinator，帮我整理验收。' }],

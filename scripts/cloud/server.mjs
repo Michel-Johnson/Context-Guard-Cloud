@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap as commitStoredMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -30,6 +30,7 @@ import { startIntegrationGateway, validateIntegrationConfig, relevanceInput, rel
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
 import { releaseIdentity } from './release.mjs';
+import { MapProjects, isMapProject } from './map-projects.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -453,6 +454,13 @@ export async function startCloudServer({
   const rawIntegrations = integrationConfig || (process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG
     ? await readJson(path.resolve(process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG), null) : null);
   const integrations = rawIntegrations ? validateIntegrationConfig(rawIntegrations) : null;
+  const mapProjects = new MapProjects({ config: integrations?.mapProjects,
+    readOverview: () => workbenchSnapshot('overview', null), registeredProjects: () => registry.projects, memoryConfig: configuredMemory });
+  const mapProjectRefs = new Map();
+  const coordinatorConfigFor = project => isMapProject(project) ? mapProjects.coordinatorConfig() : configuredMemory?.projects?.[project?.id]?.coordinator;
+  const readMemoryProject = (configuration, id) => mapProjectRefs.has(id) ? mapProjects.read(id) : readStoredMemoryProject(configuration, id);
+  const commitMainMemoryMap = (configuration, id, input, actor, options) => mapProjectRefs.has(id)
+    ? commitOverview(input, actor, mapProjectRefs.get(id)) : commitStoredMainMemoryMap(configuration, id, input, actor, options);
   if (integrations && [adminToken, browserToken, configuredMemory?.adminToken].filter(Boolean).includes(integrations.token)) {
     throw new MapError('INVALID_INTEGRATION_CONFIG', 'Use an independent integration credential', 503);
   }
@@ -461,9 +469,16 @@ export async function startCloudServer({
   const modelSettings = new Map();
   const modelSettingsFor = project => {
     if (!modelSettings.has(project.id)) {
-      const config = configuredMemory?.projects?.[project.id]?.coordinator;
+      const config = coordinatorConfigFor(project);
       if (!config?.enabled) protocolFail('COORDINATOR_DISABLED', 'Coordinator is not enabled for this project');
-      const creating = CoordinatorModelSettings.open({ directory: path.join(dataDir, 'coordinators', project.id), config, factory: coordinatorModelFactory });
+      const creating = (async () => {
+        if (isMapProject(project) && config.modelProviders) {
+          const source = projectById(integrations.mapProjects.coordinatorProjectId);
+          if (!source) protocolFail('COORDINATOR_DISABLED', '默认模型项目不可用');
+          config.defaultProviderId = (await (await modelSettingsFor(source)).state()).selectedId;
+        }
+        return CoordinatorModelSettings.open({ directory: path.join(dataDir, 'coordinators', project.id), config, factory: coordinatorModelFactory });
+      })();
       modelSettings.set(project.id, creating);
       creating.catch(() => { if (modelSettings.get(project.id) === creating) modelSettings.delete(project.id); });
     }
@@ -472,6 +487,7 @@ export async function startCloudServer({
   const manualBriefsFor = project => {
     if (!manualBriefStores.has(project.id)) manualBriefStores.set(project.id, new CoordinatorManualBriefs({
       directory: path.join(dataDir, 'manual-briefs', project.id), projectId: project.id,
+      ...(isMapProject(project) ? { mapOnly: true } : {}),
       readMain: async () => { const { main } = await readMemoryProject(configuredMemory, project.id); return { version: main?.version, document: main?.memory?.map }; },
       commitMain: (input, actor) => commitMainMemoryMap(configuredMemory, project.id, input, actor),
     }));
@@ -627,7 +643,7 @@ export async function startCloudServer({
     nodeIds: configuredMemory.projects[project.id].coordinator.nodeIds || null,
   });
   const coordinatorFor = async (project, conversationId = 'legacy') => {
-    const config = configuredMemory?.projects?.[project.id]?.coordinator;
+    const config = coordinatorConfigFor(project);
     if (!config?.enabled) throw new MapError('COORDINATOR_DISABLED', 'Coordinator is not enabled for this project', 404);
     const conversations = conversationsFor(project);
     if (conversationId.startsWith('session:')) {
@@ -639,11 +655,18 @@ export async function startCloudServer({
     }
     const conversation = await conversations.get(conversationId);
     const manual = conversation.executionMode === 'manual';
+    if (isMapProject(project) && !manual) protocolFail('FORBIDDEN', 'Map 项目只支持人工对话，不创建执行 Session');
     const key = `${project.id}:${conversationId}`;
     if (!coordinators.has(key)) {
       const creating = (async () => {
         if (!path.isAbsolute(config.providerFile || '') || !config.bindings || typeof config.bindings !== 'object') throw new MapError('INVALID_COORDINATOR_CONFIG', 'Configure provider and explicit Session bindings', 503);
-        const { repository, store, principal: human } = interfaceProject(project);
+        // A Map-only project has no repository or execution Session. Its
+        // isolated workflow store is empty; manual briefs use Map CAS instead.
+        const { repository, store, principal: human } = isMapProject(project)
+          ? { repository: { repositoryId: project.id },
+            store: new ProtocolStore(path.join(dataDir, 'map-conversation-workflow', project.id)),
+            principal: { repositoryId: project.id, deviceId: 'cloud-browser', agentId: 'cloud-human', role: 'human' } }
+          : interfaceProject(project);
         const bindings = { ...config.bindings };
         const refreshBindings = async () => {
           const next = { ...config.bindings };
@@ -1106,7 +1129,12 @@ export async function startCloudServer({
     const notification = await notifyManualReviews(project, conversationId, await coordinatorFor(project, conversationId));
     return { ...result, notification };
   };
-  const integrationProject = id => {
+  const integrationProject = async id => {
+    if (integrations?.mapProjects) {
+      const project = await mapProjects.get(id);
+      if (isMapProject(project)) { mapProjectRefs.set(id, project); return project; }
+      return project;
+    }
     const project = projectById(id);
     if (!project || !configuredMemory?.projects?.[id]) protocolFail('NOT_FOUND', 'Project is unavailable');
     return project;
@@ -1119,15 +1147,20 @@ export async function startCloudServer({
   };
   const integrationCommand = async (request, { actor, operationId }) => {
     const { type, payload = {}, projectId, conversationId } = request;
-    if (type === 'project.list') return { projects: registry.projects.filter(project => integrations.projectIds.includes(project.id) &&
-      configuredMemory?.projects?.[project.id]?.coordinator?.enabled).map(({ id, name, description }) => ({ id, name, description })) };
-    const project = integrationProject(projectId);
+    if (type === 'project.list') {
+      const projects = mapProjects.allowed(actor) ? await mapProjects.projects() : registry.projects.filter(project => integrations.projectIds.includes(project.id) &&
+        configuredMemory?.projects?.[project.id]?.coordinator?.enabled);
+      return { projects: projects.map(({ id, name, description, mapNodeId }) => ({ id, name, description,
+        ...(mapProjects.allowed(actor) && !integrations.projectIds.includes(id) ? { private: true } : {}),
+        ...(mapNodeId ? { mapNodeId } : {}) })) };
+    }
+    const project = await integrationProject(projectId);
     if (type === 'models.state') return (await modelSettingsFor(project)).state();
     if (type === 'models.select') return (await modelSettingsFor(project)).select({ id: operationId, ...payload });
     if (type === 'conversation.relevance') {
       const input = relevanceInput(payload);
       if (conversationId) await requireManualConversation(project, conversationId);
-      const config = configuredMemory.projects[projectId].coordinator;
+      const config = coordinatorConfigFor(project);
       if (!config?.enabled || !path.isAbsolute(config.providerFile || '')) protocolFail('COORDINATOR_DISABLED', 'Coordinator is unavailable for relevance checks');
       const memory = await readMemoryProject(configuredMemory, projectId);
       const { model } = await (await modelSettingsFor(project)).selection({ timeoutMs: 12000 });
@@ -1137,13 +1170,17 @@ export async function startCloudServer({
       const memory = await readMemoryProject(configuredMemory, project.id);
       const sessions = (await memorySessions(project)).map(({ id, name, state, status, connection, activity, lastSeen }) =>
         ({ id, name, state, status, connection, activity, lastSeen }));
-      return { id: project.id, name: project.name, version: memory.main?.version, map: memory.main?.memory?.map, sessions };
+      return { id: project.id, name: project.name, version: memory.main?.version, map: memory.main?.memory?.map, sessions,
+        ...(mapProjects.allowed(actor) && !integrations.projectIds.includes(project.id) ? { private: true } : {}),
+        ...(isMapProject(project) ? { mapNodeId: project.mapNodeId } : {}) };
     }
     if (type === 'conversation.create') {
       const id = await conversationsFor(project).createChat(payload.operationId || operationId, { executionMode: 'manual' });
-      await coordinatorFor(project, id); return { conversationId: id };
+      await coordinatorFor(project, id); return { conversationId: id,
+        ...(isMapProject(project) ? { mapNodeId: project.mapNodeId } : {}) };
     }
     if (type === 'conversation.bind') {
+      if (isMapProject(project)) protocolFail('FORBIDDEN', 'Map 项目不能关联仓库执行对话');
       const id = payload.conversationId;
       const conversation = await conversationsFor(project).get(id);
       const service = await coordinatorFor(project, id), state = await service.state();
@@ -1506,6 +1543,43 @@ export async function startCloudServer({
     const snapshot = await projectSnapshot(project);
     const document = snapshot.document || emptyProjectDocument(project);
     return { projectId: project.id, version: snapshot.version || versionOf(document), document };
+  };
+  const commitOverview = async (input, actor = { kind: 'human', sessionId: 'cloud-workbench' }, project = null) => {
+    const result = await serial('overview', () => withFileLock(overviewFile + '.lock', async () => {
+      await recoverTransactions('overview');
+      const operationId = validateOperationId(input), receiptPath = operationFile('overview', operationId);
+      const requestDigest = digest(JSON.stringify({ baseVersion: input.baseVersion, operations: input.operations,
+        ...(project ? { projectId: project.id, actor } : {}) }));
+      if (project) await mapProjects.get(project.id);
+      const previous = await readJson(receiptPath, null);
+      if (previous) { if (previous.requestDigest !== requestDigest) throw new MapError('ID_REUSED', 'operationId belongs to another request', 409); return previous.result; }
+      const current = await workbenchSnapshot('overview', null);
+      if (input.baseVersion !== current.version) throw new MapError('VERSION_CONFLICT', 'Map changed; reload before committing', 409, { currentVersion: current.version });
+      if (project) {
+        // Validate against the selected subtree first. The full commit then
+        // preserves existing global validation, relations and delete cleanup.
+        const scoped = (await mapProjects.read(project.id)).main.memory.map;
+        if (!Array.isArray(input.operations) || input.operations.some(operation =>
+          ['document', 'initialize'].includes(operation?.type) || operation?.type === 'attach-bug' && !entries(scoped.root).has(operation.id))) {
+          throw new MapError('FORBIDDEN', '此对话只能修改当前项目的节点和事项', 403);
+        }
+        applyOperations(scoped, input.operations, actor);
+      }
+      const applied = applyOperations(current.document, input.operations, actor); validate(applied.doc);
+      const stored = await readJson(overviewFile, null), version = versionOf(applied.doc);
+      const event = await createEvent('overview', { type: 'map.committed', operationId, actor,
+        baseVersion: current.version, version, operations: input.operations, scope: scopeOfOperations(input.operations) });
+      const next = { projectId: 'overview', version, seq: event.seq, document: applied.doc, updatedAt: event.at };
+      const saved = { committed: true, operationId, version, seq: event.seq, nodeIds: applied.resultIds, persistedAt: event.at,
+        ...(project ? { projectId: project.id } : {}) };
+      await persistTransaction({ v: 1, scope: 'overview', operationId, event,
+        map: { target: 'overview', previousVersion: stored?.version ?? null, next },
+        receipt: { scope: 'overview', value: { requestDigest, result: saved } } });
+      broadcastEvent(event);
+      return saved;
+    }));
+    await broadcastWorkbench('overview', null);
+    return result;
   };
   const sessionSnapshot = async (project, viewId) => {
     if (!configuredMemory?.projects?.[project.id]) throw new MapError('UNKNOWN_VIEW', 'Private Session memory is not configured for this project', 404);
@@ -2470,32 +2544,7 @@ export async function startCloudServer({
             await broadcastWorkbench(scope, project, viewId);
             return send(res, 200, result);
           }
-          const result = await serial('overview', async () => {
-            await recoverTransactions('overview');
-            const operationId = validateOperationId(input), receiptPath = operationFile('overview', operationId);
-            const requestDigest = digest(JSON.stringify({ baseVersion: input.baseVersion, operations: input.operations }));
-            const previous = await readJson(receiptPath, null);
-            if (previous) { if (previous.requestDigest !== requestDigest) throw new MapError('ID_REUSED', 'operationId belongs to another request', 409); return previous.result; }
-            const current = await workbenchSnapshot('overview', null);
-            if (input.baseVersion !== current.version) throw new MapError('VERSION_CONFLICT', 'Map changed; reload before committing', 409, { currentVersion: current.version });
-            const applied = applyOperations(current.document, input.operations, { kind: 'human', sessionId: 'cloud-workbench' }); validate(applied.doc);
-            const stored = await readJson(overviewFile, null), version = versionOf(applied.doc);
-            const event = await createEvent('overview', {
-              type: 'map.committed', operationId, actor: { kind: 'human', sessionId: 'cloud-workbench' },
-              baseVersion: current.version, version, operations: input.operations,
-              scope: scopeOfOperations(input.operations),
-            });
-            const next = { projectId: 'overview', version, seq: event.seq, document: applied.doc, updatedAt: event.at };
-            const saved = { committed: true, operationId, version, seq: event.seq, nodeIds: applied.resultIds, persistedAt: event.at };
-            await persistTransaction({
-              v: 1, scope: 'overview', operationId, event,
-              map: { target: 'overview', previousVersion: stored?.version ?? null, next },
-              receipt: { scope: 'overview', value: { requestDigest, result: saved } },
-            });
-            broadcastEvent(event);
-            return saved;
-          });
-          await broadcastWorkbench('overview', null); return send(res, 200, result);
+          return send(res, 200, await commitOverview(input));
         }
         if (action === '/api/projections' && req.method === 'POST') return send(res, 200, { status: 'ready', sourceVersion: (await scopedWorkbenchState(scope, project, viewId)).version });
         throw new MapError('NOT_FOUND', 'Unsupported cloud workbench route', 404);
@@ -2689,9 +2738,13 @@ export async function startCloudServer({
   server.headersTimeout = 15_000;
   integrationGateway = await startIntegrationGateway({ config: integrations,
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
+    authorizeProject: async (id, actor) => {
+      if (mapProjects.allowed(actor)) { await mapProjects.get(id); return; }
+      if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+    },
     logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
     state: async scope => {
-      const project = integrationProject(scope.projectId);
+      const project = await integrationProject(scope.projectId);
       await requireManualConversation(project, scope.conversationId);
       return coordinatorPublicState(project, scope.conversationId);
     } });

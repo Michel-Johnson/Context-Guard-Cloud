@@ -16,6 +16,7 @@ import { publicMessages, CoordinatorConversations } from '../scripts/cloud/coord
 import { createCoordinatorExecutor } from '../scripts/cloud/coordinator-tools.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store, threadKey } from '../plugins/slack/src/store.mjs';
+import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 
 // These exercise real Cloud and loopback HTTP with isolated persistence. Only
@@ -65,7 +66,7 @@ test('Native Coordinator read_map projection produces no empty Slack reply befor
     'Cloud tool provenance remains complete');
 });
 
-async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap } = {}) {
+async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-slack-cloud-'));
   let cloud;
   const held = new Set();
@@ -93,6 +94,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
     memoryConfig, protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/fixture' },
       { repositoryId: '124', projectId: otherProjectId, slug: 'example/other' }] },
     ...(enabled ? { integrationConfig: { host: '127.0.0.1', port: 0, token: integrationCredential, teamId, projectIds: [projectId, otherProjectId],
+      ...(mapProjects ? { mapProjects: { coordinatorProjectId: projectId, userIds: [userId] } } : {}),
       ...(visionProvider ? { visionProviderFile } : {}) } } : {}),
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push({ system: request.system, messages: request.messages, tools: request.tools, maxTokens: request.maxTokens });
@@ -106,6 +108,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       }
       const message = request.messages.at(-1), text = typeof message?.content === 'string'
         ? message.content.split('[以下为原始输入]\n').at(-1) : '';
+      if (mapProjects && text === '准备测试任务') {
+        const response = await fetch(cloud.url + '/api/workbench/overview/api/state', { headers });
+        const version = (await response.json()).version;
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'map-project-brief', name: 'prepare_task', input: {
+          taskId: 'fixture-manual', text: '验证新增项目的任务', acceptance: '保留原始 Map 分支', nodeIds: ['N-new'], nodeId: 'N-new', mainVersion: version,
+        } }] };
+      }
       if (text === 'show-node-complete') return { stop: 'tool_use', content: [
         { type: 'text', text: 'This is the complete read-only answer.' },
         { type: 'tool_use', id: 'tool-show-complete', name: 'show_nodes', input: { message: 'Project entry', nodeIds: ['T0'], replyComplete: true } },
@@ -190,6 +199,136 @@ test('Cloud integration listener is disabled by default and plugin credentials c
   assert.equal((await enabled.browser('main', { authorization: integrationCredential })).status, 401);
   const projects = await enabled.gateway('project.list');
   assert.equal(projects.status, 200); assert.deepEqual(projects.body.data.projects.map(item => item.id).sort(), [projectId, otherProjectId].sort());
+});
+
+test('Map 新建项目自动可选：沿原分支对话和写入，改名、同名、删除及重启保持身份与隔离', async t => {
+  const f = await fixture(t, { mapProjects: true });
+  const overview = async () => {
+    const response = await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers });
+    assert.equal(response.status, 200); return response.json();
+  };
+  const edit = async (operationId, operations) => {
+    const response = await fetch(f.cloud.url + '/api/workbench/overview/api/commit', { method: 'POST', headers,
+      body: JSON.stringify({ operationId, baseVersion: (await overview()).version, operations }) });
+    const body = await response.json(); assert.equal(response.status, 200, JSON.stringify(body)); return body;
+  };
+  const list = async () => (await f.gateway('project.list')).body.data.projects;
+  await edit('new-projects', [
+    { type: 'create', parentId: 'T0', node: { id: 'N-new', title: '博客', purpose: '新建博客项目', memoryDocument: '仅属于博客的资料' } },
+    { type: 'create', parentId: 'T0', node: { id: 'N-other', title: '博客', purpose: '另一份同名项目', memoryDocument: '不可串入的其他资料' } },
+  ]);
+  const projects = (await list()).filter(project => project.name === '博客');
+  assert.equal(projects.length, 2); assert.notEqual(projects[0].id, projects[1].id);
+  assert.equal(projects[0].private, true);
+  const selected = projects.find(project => project.mapNodeId === 'N-new');
+  const read = await f.gateway('project.read', {}, { project: selected.id });
+  assert.equal(read.status, 200); assert.equal(read.body.data.map.root.id, 'N-new');
+  assert.doesNotMatch(JSON.stringify(read.body.data), /不可串入|N-other/);
+  assert.deepEqual(read.body.data.sessions, []);
+  const denied = await f.gateway('project.read', {}, { project: selected.id, user: 'UOTHER' });
+  assert.equal(denied.status, 403);
+  assert.deepEqual((await f.gateway('project.list', {}, { user: 'UOTHER' })).body.data.projects.map(project => project.id), [projectId, otherProjectId]);
+  const created = await f.gateway('conversation.create', {}, { id: 'new-map-chat', project: selected.id });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  const conversationId = created.body.data.conversationId;
+  const submit = await f.gateway('conversation.submit', { text: '介绍这个项目，不修改' }, { id: 'map-chat-turn', project: selected.id, conversationId });
+  assert.equal(submit.status, 200, JSON.stringify(submit.body));
+  const wait = async predicate => {
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const state = await f.gateway('conversation.state', {}, { project: selected.id, conversationId });
+      assert.equal(state.status, 200, JSON.stringify(state.body));
+      if (predicate(state.body.data)) return state.body.data;
+      await new Promise(resolve => setTimeout(resolve, 15));
+    }
+    assert.fail('Map 项目对话未完成');
+  };
+  const state = await wait(state => state.status === 'waiting-for-user');
+  assert.equal(state.executionMode, 'manual'); assert.deepEqual(state.projectTasks, []);
+  assert.ok(state.messages.some(message => message.role === 'assistant' && message.text.includes('Fixture response')));
+  const call = f.modelCalls.find(call => call.tools.length > 0 && call.messages.some(message => String(message.content).includes('介绍这个项目')));
+  assert.ok(call); assert.doesNotMatch(JSON.stringify(call), /不可串入的其他资料/);
+  assert.equal(call.tools.some(tool => tool.name === 'dispatch_task' || tool.name === 'write_file'), false);
+  const before = await overview();
+  const invalid = await f.gateway('map.write', { baseVersion: before.version, operations: [{ type: 'update', id: 'N-other', fields: { memoryDocument: '越界修改' } }] },
+    { id: 'cross-project', project: selected.id });
+  assert.equal(invalid.status, 404); assert.equal((await overview()).version, before.version);
+  const write = await f.gateway('map.write', { baseVersion: before.version, operations: [{ type: 'update', id: 'N-new', fields: { memoryDocument: '更新后的博客资料' } }] },
+    { id: 'scoped-map-write', project: selected.id });
+  assert.equal(write.status, 200, JSON.stringify(write.body));
+  const afterWrite = await overview();
+  assert.equal(afterWrite.doc.root.children.find(node => node.id === 'N-new').memoryDocument, '更新后的博客资料');
+  assert.equal(afterWrite.doc.root.children.find(node => node.id === 'N-other').memoryDocument, '不可串入的其他资料');
+  assert.equal((await f.gateway('project.read', {}, { project: selected.id })).body.data.version, afterWrite.version);
+  assert.equal((await f.gateway('map.write', { baseVersion: before.version, operations: [{ type: 'update', id: 'N-new', fields: { purpose: '过期修改' } }] },
+    { id: 'stale-map-write', project: selected.id })).status, 409);
+  await edit('rename-project', [{ type: 'update', id: 'N-new', fields: { title: '新的博客名称' } }]);
+  assert.equal((await list()).find(project => project.id === selected.id).name, '新的博客名称');
+  await f.restart();
+  assert.equal((await f.gateway('conversation.state', {}, { project: selected.id, conversationId })).status, 200);
+  const reply = await f.gateway('conversation.submit', { text: '准备测试任务' }, { id: 'map-brief-turn', project: selected.id, conversationId });
+  assert.equal(reply.status, 200, JSON.stringify(reply.body));
+  const prepared = await wait(state => state.approvals?.some(proposal => proposal.manual && !proposal.review));
+  const approval = prepared.approvals.find(proposal => proposal.manual && !proposal.review);
+  const confirmed = await f.gateway('brief.review', { proposalId: approval.id, version: approval.version, decision: 'approved', reason: '隔离测试确认' },
+    { id: 'map-brief-confirm', project: selected.id, conversationId });
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmed.body));
+  const prompt = await f.gateway('prompt.read', { proposalId: approval.id }, { project: selected.id, conversationId });
+  assert.equal(prompt.status, 200);
+  assert.match(prompt.body.data.text, /不代表已经关联代码仓库或执行 Session/);
+  assert.doesNotMatch(prompt.body.data.text, /通过 Context Guard 的按版本单文件读取入口使用/);
+  assert.ok((await overview()).doc.root.children.find(node => node.id === 'N-new').todos.some(item => item.title === '验证新增项目的任务'));
+  const registry = JSON.parse(await fs.readFile(path.join(f.directory, 'projects.json'), 'utf8'));
+  assert.equal(registry.projects.length, 2, '不生成第二份项目或 Map');
+  assert.deepEqual((await f.gateway('project.read', {}, { project: selected.id })).body.data.sessions, []);
+  await edit('delete-project', [{ type: 'delete', id: 'N-new' }]);
+  assert.equal((await list()).some(project => project.id === selected.id), false);
+  assert.equal((await f.gateway('conversation.state', {}, { project: selected.id, conversationId })).status, 404);
+  assert.equal((await f.gateway('conversation.create', {}, { id: 'new-map-chat', project: selected.id })).status, 404,
+    '即使原操作有成功回执，删除后也不再返回私有结果');
+  assert.ok((await list()).some(project => project.id === projects.find(project => project.mapNodeId === 'N-other').id));
+});
+
+test('隔离跨组件：网页新建项目→原 Slack 问题实时选项→同线程 Coordinator 回复', async t => {
+  const f = await fixture(t, { mapProjects: true }), messages = [];
+  const store = await new Store(path.join(f.directory, 'slack-state')).open();
+  const plugin = new SlackPlugin({ store, teamId, cloudOrigin: 'https://map.example.com', botUserId: 'UBOTTEST',
+    gateway: new Gateway({ url: f.cloud.integrationUrl, token: integrationCredential, teamId }),
+    io: { post: async input => { messages.push(input); return `${100 + messages.length}.001`; }, update: async (...input) => messages.push({ update: input }),
+      call: async method => method === 'conversations.info' ? { channel: { user: userId } } : {}, }, logger: { error(){}, warn(){} } });
+  t.after(() => plugin.stop());
+  const event = { type: 'message', user: userId, channel: 'DPRIVATE', channel_type: 'im', ts: '100.000', text: '登录刷新 Bug，请分析。' };
+  await plugin.chooseProject('original-question', event);
+  const original = store.data.inbox['original-question'];
+  const stateResponse = await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers }), state = await stateResponse.json();
+  const added = await fetch(f.cloud.url + '/api/workbench/overview/api/commit', { method: 'POST', headers,
+    body: JSON.stringify({ operationId: 'browser-new-project', baseVersion: state.version,
+      operations: [{ type: 'create', parentId: 'T0', node: { id: 'N-after-question', title: '新项目', purpose: '登录刷新讨论' } }] }) });
+  assert.equal(added.status, 200); await added.body.cancel();
+  const body = { type: 'block_suggestion', user: { id: userId }, channel: { id: event.channel }, message: { ts: original.projectPromptTs },
+    block_id: 'projects:original-question', action_id: 'connect_project_menu', value: '新项目' };
+  const options = await plugin.suggestProjects(body, 'fresh-options');
+  assert.equal(options.length, 1); assert.equal(options[0].text.text, '新项目');
+  assert.equal(original.projectPromptProjects.includes(options[0].value), false, '项目在原问题之后才创建');
+  await plugin.process('select-new-project', { type: 'interactive', body: { ...body, type: 'block_actions',
+    actions: [{ action_id: 'connect_project_menu', block_id: body.block_id, selected_option: options[0] }] } });
+  await plugin.runEntry('original-question', store.data.inbox['original-question']);
+  assert.equal(store.data.inbox['original-question'].status, 'done');
+  const [key, binding] = Object.entries(store.data.threads)[0];
+  assert.equal(binding.threadTs, event.ts); assert.equal(binding.projectId, options[0].value); assert.equal(binding.mapNodeId, 'N-after-question');
+  const deadline = Date.now() + 4000; let final;
+  while (Date.now() < deadline) {
+    const result = await f.gateway('conversation.state', {}, { project: binding.projectId, conversationId: binding.conversationId });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    if (result.body.data.status === 'waiting-for-user') { final = result.body.data; break; }
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  assert.ok(final); await plugin.mirror(key); await plugin.mirror(key);
+  const replies = messages.filter(message => message.text?.startsWith('Coordinator：'));
+  assert.equal(replies.length, 1); assert.equal(replies[0].channel, event.channel); assert.equal(replies[0].threadTs, event.ts);
+  assert.match(replies[0].text, /Fixture response/);
+  assert.equal(final.messages.filter(message => message.role === 'user' && message.text === event.text).length, 1);
+  assert.equal(Object.keys(store.data.threads).length, 1);
 });
 
 test('list_tasks uses the same exact node scope as reads, not inherited access to children', async t => {

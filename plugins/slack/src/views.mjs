@@ -6,6 +6,11 @@ export const section = text => ({ type: 'section', text: { type: 'mrkdwn', text:
 export const textSections = text => { const value = String(text || '—'); return Array.from({ length: Math.ceil(value.length / 2800) }, (_, index) => section(value.slice(index * 2800, (index + 1) * 2800))); };
 export const plainSections = text => plainChunks(text).map(value => ({ type: 'section', text: plain(value, 2800) }));
 export const button = (label, action, value, style) => ({ type: 'button', text: plain(label, 75), action_id: action, value: JSON.stringify(value), ...(style ? { style } : {}) });
+export const projectOptions = (projects, query = '') => projects
+  .filter(project => `${project.name || ''} ${project.description || ''}`.toLocaleLowerCase().includes(String(query).toLocaleLowerCase()))
+  .slice(0, 100).map(project => ({ text: plain(project.name || '未命名项目', 75), value: project.id,
+    ...(project.description ? { description: plain(project.description, 75) } : {}) }));
+export const projectMenu = action => ({ type: 'external_select', action_id: action, placeholder: plain('选择或搜索项目'), min_query_length: 0 });
 export function modelChoiceBlocks(menu) {
   const selected = menu.options.find(option => option.id === menu.selectedId);
   const route = menu.currentRoute;
@@ -29,10 +34,11 @@ export function modelChoiceBlocks(menu) {
 }
 export function projectChoiceBlocks(projects, requestId, direct) {
   const blocks = [section('你好，我可以帮你讨论项目、分析 Bug 和整理任务。先选择这次要聊的项目，选好后我会继续处理刚才的问题。')];
-  if (!projects.length) return [...blocks, section('目前没有开放的项目，请管理员在插件配置中开放项目后再试。')];
+  if (!projects.length) blocks.push(section('目前没有可选项目；新建或授权后可在下方菜单重新查询。'));
   blocks.push(section(direct ? '选择后，这个项目将用于你的私聊。' : '选择后，当前频道将关联这个项目；已有关联的线程保持不变。'));
-  for (let index = 0; index < projects.length; index += 5) blocks.push({ type: 'actions', elements: projects.slice(index, index + 5).map((project, offset) =>
+  for (let index = 0; index < Math.min(projects.length, 10); index += 5) blocks.push({ type: 'actions', elements: projects.slice(index, index + 5).map((project, offset) =>
     button(project.name || project.id, `connect_project:${index + offset}`, { requestId, projectId: project.id })) });
+  blocks.push({ type: 'actions', block_id: `projects:${requestId}`, elements: [projectMenu('connect_project_menu')] });
   return blocks;
 }
 export function nodesOf(map) {
@@ -47,11 +53,11 @@ export function nodesOf(map) {
 }
 export function homeView({ projects, project, cloudOrigin, userId }) {
   const blocks = [{ type: 'header', text: plain('Context Guard · 项目 Coordinator') }, section('选择项目后可私聊，或将当前频道关联到一个项目。Main 是长期记忆，Slack 是协作入口。')];
-  if (projects.length) blocks.push({ type: 'actions', elements: [{ type: 'static_select', action_id: 'select_project', placeholder: plain('选择项目'), options: projects.slice(0, 100).map(item => ({ text: plain(item.name || item.id, 75), value: item.id })),
+  blocks.push({ type: 'actions', elements: [{ ...projectMenu('select_project'),
     ...(project ? { initial_option: { text: plain(project.name || project.id, 75), value: project.id } } : {}) }] });
-  else blocks.push(section('还没有开放的项目。请检查插件网关配置。'));
+  if (!projects.length) blocks.push(section('目前没有可选项目。'));
   if (project) {
-    const url = `${cloudOrigin}/projects/${encodeURIComponent(project.id)}`;
+    const url = project.mapNodeId ? `${cloudOrigin}/?relation=${encodeURIComponent(project.mapNodeId)}` : `${cloudOrigin}/projects/${encodeURIComponent(project.id)}`;
     blocks.push(section(`*${escape(project.name || project.id)}*\n<${url}|打开完整 Map>`));
     blocks.push({ type: 'actions', elements: [button('开始对话', 'start_chat', { projectId: project.id, text: '你好，我想和你讨论项目。' }), button('讨论 TODO', 'open_item:todo', { projectId: project.id, kind: 'todo' }), button('讨论 Bug', 'open_item:bug', { projectId: project.id, kind: 'bug' }), button('修改记忆', 'open_memory', { projectId: project.id })] });
     const nodes = nodesOf(project.map);
@@ -72,7 +78,7 @@ export function modal({ callback, draftId, title, fields, initial = {} }) {
       { type: 'plain_text_input', action_id: 'value', ...(field.multiline ? { multiline: true } : {}), ...(initial[field.id] ? { initial_value: String(initial[field.id]).slice(0, 2900) } : {}), max_length: field.multiline ? 2900 : 500 } })) };
 }
 export function formValues(view) { return Object.fromEntries(Object.entries(view.state?.values || {}).map(([key, actions]) => [key, Object.values(actions)[0]?.value ?? Object.values(actions)[0]?.selected_option?.value ?? ''])); }
-function nodeLinkBlocks(actions, { cloudOrigin, projectId } = {}) {
+function nodeLinkBlocks(actions, { cloudOrigin, projectId, mapNodeId } = {}) {
   let origin;
   try { origin = new URL(cloudOrigin); } catch { return []; }
   if (!['https:', 'http:'].includes(origin.protocol) || origin.username || origin.password ||
@@ -91,14 +97,14 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId } = {}) {
     elements: nodes.slice(group * 5, group * 5 + 5).map((node, offset) => {
       // Use only the authenticated binding and server-resolved ID. Never use
       // a model-supplied URL, project, mrkdwn title or interaction payload.
-      const url = new URL(`/projects/${encodeURIComponent(projectId)}`, origin.origin);
+      const url = new URL(mapNodeId ? '/' : `/projects/${encodeURIComponent(projectId)}`, origin.origin);
       url.searchParams.set('relation', node.id);
       return { type: 'button', text: plain(plainText(node.title) || '打开节点', 75),
         action_id: `map_node:${group * 5 + offset}`, url: url.href };
     }) }));
   if (seen.size > nodes.length) blocks.push({ type: 'context', elements: [plain(`还有 ${seen.size - nodes.length} 个节点入口未展开，请打开完整 Map 查看。`)] },
     { type: 'actions', elements: [{ type: 'button', text: plain('打开完整 Map'), action_id: 'map_all',
-      url: new URL(`/projects/${encodeURIComponent(projectId)}`, origin.origin).href }] });
+      url: new URL(mapNodeId ? `/?relation=${encodeURIComponent(mapNodeId)}` : `/projects/${encodeURIComponent(projectId)}`, origin.origin).href }] });
   return blocks;
 }
 export function messageBlocks(message, key, context) {

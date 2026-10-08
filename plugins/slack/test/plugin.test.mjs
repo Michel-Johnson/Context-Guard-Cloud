@@ -31,7 +31,10 @@ test('Home presents names and states without exposing internal identities', () =
   assert.doesNotMatch(visible, /internal-(root|login|bug|session|unnamed-session|user)|a{64}/);
   const discuss = view.blocks.find(block => block.accessory?.action_id === 'open_item');
   assert.deepEqual(JSON.parse(discuss.accessory.value), { projectId: value.id, nodeId: 'internal-login', itemId: 'internal-bug', kind: 'bug' });
-  assert.equal(view.blocks.find(block => block.type === 'actions').elements[0].options[0].value, value.id);
+  const selector = view.blocks.find(block => block.type === 'actions').elements[0];
+  assert.equal(selector.type, 'external_select');
+  assert.equal(selector.initial_option.value, value.id);
+  assert.equal(selector.min_query_length, 0);
 });
 
 test('Explicitly requested technical identities remain intact in Coordinator text and confirmation payloads', () => {
@@ -180,6 +183,78 @@ async function fixture(t) {
   return { plugin, store, gateway, io, calls, sent, directory };
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
+
+test('项目菜单打开后实时搜索；新建、同名和删除选项不使用旧缓存', async t => {
+  const f = await fixture(t);
+  let projects = [{ id: 'old', name: '旧项目' }];
+  f.gateway.command = async (type, args) => {
+    assert.equal(type, 'project.list'); assert.equal(args.userId, user);
+    assert.equal(args.timeoutMs, 2000); return { projects: structuredClone(projects) };
+  };
+  const query = { team: { id: teamId }, type: 'block_suggestion', action_id: 'select_project', user: { id: user }, view: { type: 'home' }, value: '' };
+  const results = [];
+  const receive = async body => f.plugin.receive({ type: 'interactive', body, envelope_id: 'options-request', ack: async value => results.push(value) });
+  await receive(query);
+  assert.deepEqual(results.at(-1).options.map(option => option.value), ['old']);
+  projects = [{ id: 'new-a', name: '博客', description: '第一份博客' }, { id: 'new-b', name: '博客', description: '另一份博客' }];
+  await receive({ ...query, value: '博客' });
+  assert.deepEqual(results.at(-1).options.map(option => option.value), ['new-a', 'new-b']);
+  assert.notEqual(results.at(-1).options[0].description.text, results.at(-1).options[1].description.text);
+  projects.shift(); await receive(query);
+  assert.deepEqual(results.at(-1).options.map(option => option.value), ['new-b']);
+  assert.equal(Object.keys(f.store.data.inbox).length, 0, '查询不创建消息或对话');
+});
+
+test('原消息的动态菜单可选择后来新建的项目，但不能替其他人选择或覆盖旧关联', async t => {
+  const f = await fixture(t), original = event({ channel: 'D000001', channel_type: 'im' });
+  await f.plugin.chooseProject('original-choice', original);
+  const entry = f.store.data.inbox['original-choice'], base = { type: 'block_suggestion', team: { id: teamId }, user: { id: user },
+    channel: { id: original.channel }, message: { ts: entry.projectPromptTs }, block_id: 'projects:original-choice', action_id: 'connect_project_menu', value: '' };
+  const current = f.gateway.command;
+  f.gateway.command = (type, args) => type === 'project.list' ? Promise.resolve({ projects: [{ id: 'lab', name: 'Lab' }, { id: 'later', name: '后来新建', private: true }] }) : current(type, args);
+  assert.equal((await f.plugin.suggestProjects(base, 'search-new')).length, 2);
+  assert.deepEqual(await f.plugin.suggestProjects({ ...base, user: { id: 'UOTHER' } }, 'other-user'), []);
+  const body = { ...base, type: 'block_actions', actions: [{ action_id: 'connect_project_menu', block_id: base.block_id, selected_option: { value: 'later' } }] };
+  await f.plugin.process('select-later', { type: 'interactive', body });
+  assert.equal(f.store.data.preferences[user], 'later');
+  assert.equal(f.store.data.inbox['original-choice'].projectResume.projectId, 'later');
+  assert.equal(f.store.data.inbox['original-choice'].projectResume.event.ts, original.ts);
+  await assert.rejects(f.plugin.connectProject('overwrite', body, user, { requestId: 'original-choice', projectId: 'lab' }, { dynamic: true }),
+    { code: 'CONFLICT' });
+});
+
+test('私有 Map 项目不在公共频道的按钮或搜索结果中展示，伪造选择也不绑定', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => ({ projects: [{ id: 'lab', name: 'Lab' }, { id: 'private-map', name: '私有项目名称', private: true }] });
+  await f.plugin.chooseProject('private-choices', event());
+  assert.doesNotMatch(JSON.stringify(f.sent), /私有项目名称|private-map/);
+  const query = { type: 'block_suggestion', user: { id: user }, channel: { id: channel }, message: { ts: f.store.data.inbox['private-choices'].projectPromptTs },
+    block_id: 'projects:private-choices', action_id: 'connect_project_menu', value: '' };
+  assert.deepEqual((await f.plugin.suggestProjects(query, 'public-query')).map(option => option.value), ['lab']);
+  await assert.rejects(f.plugin.connectProject('forged-private', query, user, { requestId: 'private-choices', projectId: 'private-map' }, { dynamic: true }), { code: 'CONFLICT' });
+  assert.equal(f.store.data.channels[channel], undefined);
+});
+
+test('Home 点击过期选项重新校验，不保存已经删除的项目偏好', async t => {
+  const f = await fixture(t);
+  await f.plugin.loadProjects(user, 'before-delete');
+  f.gateway.command = async () => ({ projects: [] });
+  await assert.rejects(f.plugin.process('stale-home', { type: 'interactive', body: { user: { id: user },
+    actions: [{ action_id: 'select_project', selected_option: { value: 'lab' } }] } }), { code: 'NOT_FOUND' });
+  assert.equal(f.store.data.preferences[user], undefined);
+});
+
+test('Map-only 项目的 Home 和节点按钮回到原 Map 分支，不生成不存在的仓库页面', () => {
+  const value = { id: 'map-internal', name: '博客', mapNodeId: 'N-blog', map: { root: { id: 'N-blog', title: '博客' } } };
+  const home = homeView({ projects: [value], project: value, cloudOrigin: 'https://map.example.com' });
+  assert.match(JSON.stringify(home), /https:\/\/map.example.com\/\?relation=N-blog/);
+  assert.doesNotMatch(JSON.stringify(home), /\/projects\/map-internal/);
+  const blocks = messageBlocks({ text: '请查看登录模块', actions: [{ kind: 'node-navigation', node: { id: 'N-login', title: '登录模块' } }] }, 'key',
+    { cloudOrigin: 'https://map.example.com', projectId: 'map-internal', mapNodeId: 'N-blog' });
+  const link = blocks.find(block => block.type === 'actions').elements[0];
+  assert.equal(link.url, 'https://map.example.com/?relation=N-login');
+  assert.equal(link.text.text, '登录模块');
+});
 
 async function reactionFixture(t, original = event()) {
   const f = await fixture(t), inboxId = envelopeId('events_api', { team_id: teamId, event: original });
@@ -785,6 +860,7 @@ test('single plugin input crosses real HTTP gateway and Coordinator service with
       if (input.type === 'conversation.create') return { conversationId: 'chat-real-http' };
       if (input.type === 'conversation.submit') { submitted = input; return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
       if (input.type === 'conversation.state') return { ...(await service.state()), conversationId: 'chat-real-http' };
+      if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
       return {};
     } });
   try {
@@ -883,6 +959,7 @@ test('unmentioned short DM answer uses the real current conversation and retains
   const token = 'synthetic-private-context-http-credential-123456';
   const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token, teamId, projectIds: ['lab'] }, stateDir: path.join(f.directory, 'gateway'),
     state: async () => ({ ...(await service.state()), conversationId: 'chat-dm-http' }), command: async (input, context) => {
+      if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
       if (input.type === 'conversation.create') return { conversationId: 'chat-dm-http' };
       if (input.type === 'conversation.state') { reads.push(input); return { ...(await service.state()), conversationId: 'chat-dm-http' }; }
       if (input.type === 'conversation.relevance') {
@@ -1141,11 +1218,12 @@ test('project choice verifies channel membership before changing binding', async
   await assert.rejects(f.plugin.process('nonmember-choice', { type: 'interactive', body: projectChoice(f, 'onboard') }), error => error.code === 'CONFLICT');
   assert.deepEqual(f.store.data.channels, {}); assert.equal(Object.keys(f.store.data.threads).length, 0);
 });
-test('unbound explicit message with no open projects explains unavailable setup without empty actions', async t => {
+test('尚无项目时保留实时菜单，之后新建项目不需要重新发问', async t => {
   const f = await fixture(t); f.gateway.command = async () => ({ projects: [] });
   await f.plugin.message('empty-projects', event());
   assert.ok(f.sent[0].text.includes('没有开放的项目'));
-  assert.equal(f.sent[0].blocks.some(block => block.type === 'actions'), false);
+  assert.equal(f.sent[0].blocks.flatMap(block => block.elements || []).some(element => element.type === 'button'), false);
+  assert.equal(f.sent[0].blocks.flatMap(block => block.elements || []).find(element => element.type === 'external_select').action_id, 'connect_project_menu');
   assert.equal(Object.keys(f.store.data.threads).length, 0);
 });
 test('onboarding continuation uses the normal FIFO lane through held create and BUSY backoff', async t => {
@@ -1214,7 +1292,8 @@ test('project choice menu stays stable on retry and its buttons have distinct Sl
   f.gateway.command = async (type, input) => type === 'project.list' ? { projects: [{ id: 'lab', name: 'Lab' }, { id: 'other', name: 'Other' }] } : gateway(type, input);
   await f.plugin.message('menu', event()); const original = f.sent.find(input => input.blocks);
   const actions = original.blocks.flatMap(block => block.elements || []);
-  assert.equal(new Set(actions.map(action => action.action_id)).size, 2);
+  assert.equal(new Set(actions.map(action => action.action_id)).size, 3);
+  assert.equal(actions.at(-1).type, 'external_select');
   f.gateway.command = async () => ({ projects: [{ id: 'new', name: 'New' }] });
   await f.plugin.message('menu', event());
   const retried = f.sent.filter(input => input.blocks).at(-1);
@@ -1256,7 +1335,7 @@ test('tracked replies reuse conversation, new roots have independent conversatio
 test('related unmentioned message is classified before creating its conversation', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('related-root', event({ text: '登录模块刷新 token 有 Bug，请分析。' }));
-  assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance', 'conversation.create', 'conversation.submit']);
+  assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance', 'project.list', 'conversation.create', 'conversation.submit']);
   const decision = f.store.data.inbox['related-root'].relevance;
   assert.equal(decision.respond, true); assert.equal(decision.mainVersion, 'v1'); assert.equal(decision.projectId, 'lab');
   assert.equal(f.calls[0].conversationId, undefined);
