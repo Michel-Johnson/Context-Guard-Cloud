@@ -619,6 +619,47 @@ try {
   assert.match(await page.locator('.node[data-id="T0"]').textContent(), /Session map/);
   record('Session selector changes the Map scope');
 
+  // Only the first three commit responses are replaced. Recovery then reaches
+  // the real Cloud transaction and is verified against persisted Session data.
+  await page.locator('.node[data-id="N1"]').click();
+  const busyRoute = /\/api\/workbench\/projects\/context-guard\/api\/commit/;
+  const busyBodies = [];
+  let releaseBusy = false;
+  await page.route(busyRoute, async route => {
+    busyBodies.push(route.request().postData());
+    if (!releaseBusy) return route.fulfill({ status: 503, contentType: 'application/json',
+      body: JSON.stringify({ error: { code: 'STATE_BUSY', message: 'Shared state is busy; preserve lock and retry' } }) });
+    await route.continue();
+  });
+  await page.locator('#detail [data-ed="title"]').fill('Busy recovery node');
+  await page.locator('#detail [data-ed="title"]').blur();
+  await page.locator('#cg-sync[data-status="busy"]').waitFor({ state: 'attached' });
+  assert.equal(busyBodies.length, 3);
+  const busyPayload = JSON.parse(busyBodies[0]);
+  assert.ok(busyPayload.operationId);
+  assert.ok(busyBodies.every(body => body === busyBodies[0]), 'Initial retries keep the exact operation');
+  const busyBefore = await request(`${service.url}/v1/projects/context-guard/sessions/session-one`, { headers: headers('project-memory-token') });
+  assert.equal(busyBefore.body.snapshot.memory.map.root.children[0].title, 'Tour one', 'Busy responses did not write a replacement');
+  assert.ok(await page.evaluate(() => JSON.parse(localStorage.getItem(workbenchSync.captureKey))?.pendingRequest?.operationId), 'Recovery draft is persisted before waiting');
+  releaseBusy = true;
+  await page.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced', null, { timeout: 45000 });
+  assert.equal(busyBodies.length, 4);
+  assert.equal(busyBodies[3], busyBodies[0], 'Heartbeat replays the original commit rather than issuing a new one');
+  const busyAfter = await request(`${service.url}/v1/projects/context-guard/sessions/session-one`, { headers: headers('project-memory-token') });
+  assert.equal(busyAfter.body.snapshot.memory.map.root.children[0].title, 'Busy recovery node');
+  assert.equal(busyAfter.body.snapshot.version, await syncVersion());
+  assert.equal(await page.evaluate(() => localStorage.getItem(workbenchSync.captureKey)), null, 'Acknowledged draft is cleared');
+  await page.unroute(busyRoute);
+  // Restore this isolated fixture so later scenarios retain their original inputs.
+  const restoreBusyVersion = await syncVersion();
+  await page.locator('#detail [data-ed="title"]').fill('Tour one');
+  await page.locator('#detail [data-ed="title"]').blur();
+  await synchronizedAfter(restoreBusyVersion);
+  assert.equal((await request(`${service.url}/v1/projects/context-guard/main`, { headers: headers('project-memory-token') })).body.snapshot.version,
+    baselinePublication.body.snapshot.version, 'Recovery never changes Main');
+  record('Busy commit preserves the exact draft and recovers through the real Cloud transaction without approval replay');
+
+  await page.locator('#nav-crumbs a[data-id="T0"]').click();
   await page.locator('.node[data-id="T0"]').click();
   const title = page.locator('#detail [data-ed="title"]');
   const beforeEditVersion = await syncVersion();
