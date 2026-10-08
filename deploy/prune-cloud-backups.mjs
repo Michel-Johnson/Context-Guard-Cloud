@@ -8,11 +8,14 @@ const rootArchive = /^context-guard-cloud-pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\
 const nestedArchive = /^pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\d{9})Z)?\.tar(?:\.zst)?$/i;
 const nestedDirectory = /^pre-[a-z0-9-]+-20\d{6}(?:T(?:\d{4,6}|\d{9})Z)?$/i;
 const keepCount = 5;
-const quietMs = 10 * 60 * 1000;
 
 async function candidatesIn(directory, matches, optional = false) {
   let entries;
-  try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+  try {
+    const info = await fs.lstat(directory);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Backup directory must be a real directory: ${directory}`);
+    entries = await fs.readdir(directory, { withFileTypes: true });
+  }
   catch (error) { if (optional && error.code === 'ENOENT') return []; throw error; }
   const candidates = [];
   for (const entry of entries) {
@@ -67,14 +70,12 @@ async function unchanged(candidate) {
     (candidate.kind === 'directory' ? info.isDirectory() : info.isFile());
 }
 
-export async function pruneCloudBackups({ root = '/var/backups', apply = false, now = Date.now(), minQuietMs = quietMs,
-  verify = verifyCloudBackup } = {}) {
+export async function pruneCloudBackups({ root = '/var/backups', apply = false, verify = verifyCloudBackup } = {}) {
   const candidates = await listCloudBackups(root);
   const retained = candidates.slice(0, keepCount);
   const stale = candidates.slice(keepCount);
   const result = { status: 'ok', retained: retained.map(item => item.path), removed: [], stale: stale.map(item => item.path) };
   if (!stale.length) return result;
-  if (candidates.some(item => now - item.mtimeMs < minQuietMs)) return { ...result, status: 'deferred-recent-backup' };
   for (const item of retained) await verify(item);
   if (!apply) return { ...result, status: 'dry-run' };
   // A new backup or a changed target invalidates the ordered deletion plan.

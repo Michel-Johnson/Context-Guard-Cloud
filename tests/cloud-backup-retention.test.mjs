@@ -69,16 +69,19 @@ test('retention keeps five newest snapshots across both known directories and le
   assert.equal(await fs.readFile(partial, 'utf8'), 'still writing');
 });
 
-test('recent or invalid retained snapshots block every deletion', async t => {
+test('新完成的备份立即清理旧版；保留备份无效时不删除', async t => {
   const root = await fixture(t);
   const backups = [];
   for (let number = 1; number <= 6; number++) backups.push(await createCandidate(root, number));
-  const recent = await pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 23, 0, 7), verify: async () => {} });
-  assert.equal(recent.status, 'deferred-recent-backup');
-  assert.equal((await listCloudBackups(root)).length, 6);
+  const fresh = new Date();
+  await fs.utimes(backups[5], fresh, fresh);
   await assert.rejects(pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 24), minQuietMs: 0,
     verify: async item => { if (item.path === backups[5]) throw new Error('invalid archive'); } }), /invalid archive/);
   assert.equal((await listCloudBackups(root)).length, 6, 'validation fails before removing an old backup');
+  const recent = await pruneCloudBackups({ root, apply: true, verify: async () => {} });
+  assert.equal(recent.status, 'ok');
+  assert.deepEqual(recent.removed, [backups[0]]);
+  assert.equal((await listCloudBackups(root)).length, 5);
 });
 
 test('a changed backup invalidates the deletion plan', async t => {
@@ -89,13 +92,9 @@ test('a changed backup invalidates the deletion plan', async t => {
   assert.equal((await listCloudBackups(root)).length, 6);
 });
 
-test('new-format inventory changes, recent backups and invalid retained archives preserve every snapshot', async t => {
+test('new-format inventory changes and invalid retained archives preserve every snapshot', async t => {
   const root = await fixture(t), backups = [];
   for (let number = 1; number <= 6; number++) backups.push(await createCandidate(root, number, true, millisecondName(number)));
-  const before = await listCloudBackups(root);
-  const recent = await pruneCloudBackups({ root, apply: true, now: before[0].mtimeMs + 9 * 60 * 1000, verify: async () => {} });
-  assert.equal(recent.status, 'deferred-recent-backup');
-  assert.equal((await listCloudBackups(root)).length, 6);
   await assert.rejects(pruneCloudBackups({ root, apply: true, now: Date.UTC(2026, 8, 24), minQuietMs: 0,
     verify: async item => { if (item.path === backups[5]) throw new Error('invalid retained new-format archive'); } }), /invalid retained new-format archive/);
   assert.equal((await listCloudBackups(root)).length, 6);
@@ -103,6 +102,29 @@ test('new-format inventory changes, recent backups and invalid retained archives
     verify: async item => { if (item.path === backups[5]) await createCandidate(root, 7, true, millisecondName(7)); } }), /inventory changed during verification/);
   assert.equal((await listCloudBackups(root)).length, 7);
   for (const [index, file] of backups.entries()) assert.equal(await fs.readFile(file, 'utf8'), `backup ${index + 1}`);
+});
+
+test('备份子目录是符号链接时拒绝清理，不访问外部备份', async t => {
+  const root = await fixture(t), outside = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-backup-protected-'));
+  t.after(() => fs.rm(outside, { recursive: true, force: true }));
+  await fs.rmdir(path.join(root, 'context-guard-cloud'));
+  for (let number = 1; number <= 6; number++) await createCandidate(outside, number, false, millisecondName(number));
+  await fs.symlink(outside, path.join(root, 'context-guard-cloud'), process.platform === 'win32' ? 'junction' : 'dir');
+  await assert.rejects(pruneCloudBackups({ root, apply: true, verify: async () => {} }), /real directory/);
+  assert.equal((await fs.readdir(outside)).length, 6);
+});
+
+test('完成归档的目录变化立即触发清理；定时器只作保底', async () => {
+  const unit = await fs.readFile(new URL('../deploy/context-guard-cloud-backup-retention.path', import.meta.url), 'utf8');
+  assert.match(unit, /^PathChanged=\/var\/backups$/m);
+  assert.match(unit, /^PathChanged=\/var\/backups\/context-guard-cloud$/m);
+  assert.match(unit, /^Unit=context-guard-cloud-backup-retention.service$/m);
+  assert.doesNotMatch(unit, /OnCalendar|OnActiveSec/);
+  const scriptSource = await fs.readFile(script, 'utf8');
+  assert.doesNotMatch(scriptSource, /quietMs|minQuietMs|deferred-recent-backup/);
+  const guide = await fs.readFile(new URL('../references/cloud-deployment.md', import.meta.url), 'utf8');
+  assert.match(guide, /enable --now context-guard-cloud-backup-retention.path/);
+  assert.match(guide, /systemctl start context-guard-cloud-backup-retention.service/);
 });
 
 test('new-format symbolic entries are refused before validation or deletion', async t => {

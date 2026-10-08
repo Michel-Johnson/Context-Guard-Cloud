@@ -1,5 +1,9 @@
 # Cloud 验证台账
 
+## BACKUP-IMMEDIATE-01 · Linux 运行验收
+
+- [ ] 在获准的 Linux 服务器安装 `.path` 单元，用合成备份验证最终归档发布后立即触发清理、只保留五份且不删除 `.part` 或无关文件。清理脚本和单元配置已有正式回归；本机 macOS 未验证 systemd 原生触发。
+
 ## COORDINATOR-REPLY-FOLLOWUP-01 · 真实聊天回归返工（2026-10-08）
 
 - [x] 真实 Slack 用户消息确认：Cloud 1.2.1 / Slack 0.1.20 已上线、Required 均通过、保护配置未变；但默认 TODO 仍重复状态和测试前缀，要求表情+文字时只返回了表情，验收未全部通过。
