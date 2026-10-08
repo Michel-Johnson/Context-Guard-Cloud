@@ -46,7 +46,7 @@ test('Slack reaction tools reject untrusted source and actor even when a model g
     const state = reactionState(source, actor);
     await coordinatorStep({ turnId: 'untrusted', state, system: 'role', tools: coordinatorTools, save: async () => {},
       execute: () => assert.fail('Untrusted tool must never execute'), model: { next: async ({ tools }) => {
-        assert.equal(tools.some(tool => tool.name === 'react_to_user'), false);
+        assert.equal(tools.some(tool => tool.name === 'react_to_user'), true, 'Catalog is stable; server execution remains forbidden');
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'forged', name: 'react_to_user', input: { emoji: 'heart' } }] };
       } } });
     assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN'); assert.equal(state.messages[0].actions, undefined);
@@ -255,9 +255,11 @@ test('Coordinator guide references are callable and loaded only after an explici
   await service.close();
 
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].system, prompt + context.text);
-  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['show_model_menu', 'react_to_user'].includes(tool.name)));
-  assert.deepEqual(calls[0].messages, [{ role: 'user', content: 'Read the memory writing rules.' }]);
+  assert.ok(calls[0].system.startsWith(prompt));
+  assert.ok(calls[0].system.endsWith(context.staticText || context.text));
+  assert.deepEqual(calls[0].tools, coordinatorTools);
+  assert.match(calls[0].messages[0].content, /Read the memory writing rules\.$/);
+  assert.match(calls[0].messages[0].content, /输出来源：human/);
   assert.deepEqual(referenceReads, ['memory-definition.md']);
   const reply = calls[1].messages.at(-1).content.find(block => block.type === 'tool_result');
   assert.equal(reply.tool_use_id, 'read-memory-rules');
@@ -413,7 +415,7 @@ test('Prompt upgrades apply at new turns and recover a pre-model rejection witho
   await service.submit({ id: 'first', text: 'First' }); await service.close();
   service = new CoordinatorService({ ...options, system: 'new' });
   await service.submit({ id: 'second', text: 'Second' }); await service.close();
-  assert.deepEqual(calls, ['old', 'new']);
+  assert.deepEqual(calls.map(value => value.split('\n\n')[0]), ['old', 'new']);
   let saved = JSON.parse(await fs.readFile(service.file, 'utf8'));
   assert.equal(saved.promptChanges.length, 1);
   saved.requests.third = createHash('sha256').update('Third').digest('hex');
@@ -422,7 +424,7 @@ test('Prompt upgrades apply at new turns and recover a pre-model rejection witho
   await fs.writeFile(service.file, JSON.stringify(saved));
   service = new CoordinatorService({ ...options, system: 'latest' });
   await service.submit({ id: 'third', text: 'Third', retry: true }); await service.close();
-  assert.deepEqual(calls, ['old', 'new', 'latest']);
+  assert.deepEqual(calls.map(value => value.split('\n\n')[0]), ['old', 'new', 'latest']);
   saved = JSON.parse(await fs.readFile(service.file, 'utf8'));
   assert.equal(saved.messages.filter(m => m.role === 'user').length, 3);
   assert.equal(saved.promptChanges.length, 2);
@@ -1424,10 +1426,12 @@ test('Coordinator compacts at actual input-token usage without changing the save
   await service.submit({ id: 'turn-6', text: '第 6 轮' });
   await service.close();
   assert.match(sent.at(-1)[0].content, /历史对话摘要/);
-  assert.deepEqual(sent.at(-1).slice(1), saved.messages.slice(2).map(({ role, content }) => ({ role, content })).concat({ role: 'user', content: '第 6 轮' }));
+  const sixth = sent.at(-1).at(-1);
+  assert.match(sixth.content, /第 6 轮$/);
+  assert.deepEqual(sent.at(-1).slice(1, -1), coordinatorModelMessages({ messages: saved.messages.slice(2) }));
   saved = JSON.parse(await fs.readFile(service.file, 'utf8'));
   assert.equal(saved.messages.length, 12);
-  assert.deepEqual(coordinatorModelMessages(saved), sent.at(-1).slice(0, -1).concat({ role: 'user', content: '第 6 轮' }, { role: 'assistant', content: [{ type: 'text', text: '回复 6' }] }));
+  assert.deepEqual(coordinatorModelMessages(saved), sent.at(-1).concat({ role: 'assistant', content: [{ type: 'text', text: '回复 6' }] }));
 });
 
 test('Manual chat compacts early in the background but only after enough human turns', async t => {
@@ -1470,7 +1474,7 @@ test('Manual chat compacts early in the background but only after enough human t
       assert.equal(summaries, 1);
       assert.equal(raw.compaction.through, 8, 'Keep the latest four full human turns verbatim');
       assert.equal(raw.messages.length, 16);
-      assert.deepEqual(coordinatorModelMessages(raw).slice(1), raw.messages.slice(8).map(({ role, content }) => ({ role, content })));
+      assert.deepEqual(coordinatorModelMessages(raw).slice(1), coordinatorModelMessages({ messages: raw.messages.slice(8) }));
     }
     if (turn > 8 && turn < 12) assert.equal(summaries, 1, 'Wait four additional human turns before another compact');
   }
@@ -1871,8 +1875,9 @@ test('Slack reply policy is supplied as system instructions without changing nat
   assert.match(calls[0].system, /只问 TODO 就只列 TODO，不附 Bug/);
   assert.deepEqual(calls[0].tools, tools, 'Delivery format does not replace JSON Schema tool definitions');
   await service.submit({ id: 'browser-query', text: '浏览器接续' }); await service.close();
-  assert.equal(calls[1].system, 'role\nCurrent Main');
-  assert.ok(calls[1].messages.some(m => m.content === '有哪些TODO'), 'Cross-client history remains shared');
+  assert.equal(calls[1].system, calls[0].system);
+  assert.match(calls[1].messages.at(-1).content, /输出来源：human/);
+  assert.ok(calls[1].messages.some(m => typeof m.content === 'string' && m.content.endsWith('有哪些TODO')), 'Cross-client history remains shared');
 });
 
 test('Private timing persists failures and resumes pending tools with their original operation ID', async t => {
@@ -2100,7 +2105,8 @@ test('Mounting a TODO or Bug creates no execution Session before brief approval'
   const scoped = (request = {}) => {
     const system = String(request.system || '');
     if (!system.includes('本对话仅负责下方「当前事项」')) return { itemId: null, unscoped: true };
-    return { itemId: system.match(/^- 事项 ID：([^\n]+)$/m)?.[1] || null, unscoped: false };
+    const latest = request.messages?.filter(message => message.role === 'user' && typeof message.content === 'string').at(-1)?.content || '';
+    return { itemId: latest.match(/^- 事项 ID：([^\n]+)$/m)?.[1] || null, unscoped: false };
   };
   server = await startCloudServer({ dataDir: directory, port: 0, browserToken: 'test-browser', memoryConfig,
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
@@ -2423,7 +2429,7 @@ test('Human feedback can correct a legacy rejected call but cannot discard an un
   let executions = 0;
   const service = new CoordinatorService({ directory, system: 'Coordinator', tools: [{ name: 'review_plan' }],
     execute: async () => { executions++; }, model: { next: async ({ messages }) => {
-      assert.equal(messages.at(-1).content, 'Reject the unsafe Plan and request a corrected version');
+      assert.match(messages.at(-1).content, /\[以下为原始输入\]\nReject the unsafe Plan and request a corrected version$/);
       assert.equal(messages.at(-2).content[0].is_error, true);
       return { stop: 'end_turn', content: [{ type: 'text', text: 'Correction received' }] };
     } } });
