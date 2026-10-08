@@ -11,6 +11,13 @@
 - [ ] Cursor Cloud 私有 API key、真实连接/通讯/小任务、准确修订完整 npm test、Review、Required 与交付验收待完成。
 - 最终只验收连接、通讯、完成任务；复杂恢复、丰富卡片和自动归档后续补。原历史失败及未完成项保留。
 
+## COORDINATOR-SHORT-TEST-LABELS-02 · 固定核心消费（2026-10-09）
+
+- [x] 从公开固定 core2.1.4 制品安装并构建55个运行文件；Cloud1.3.2/UI1.1.6/Slack0.2.1，生成物未手改。原位短名称规则保留业务日期/版本及工具真值，不改Map标题或模型默认。
+- [x] 开发后唯一消费路径目标：`Both Coordinator profiles reserve internal identifiers for tools and explicit technical requests`，实际退出0、1/1、无跳过，197.8461ms；安装包角色与生成角色 SHA256 均为 `f2470f6d8fc70d7e46774acc856c4b1fc3a1ecaac9ad977f7d9cdf57509720c5`。
+- [x] 独立 Tester 对准确四文件前后hash一致：唯一指定目标1/1、actual exit0、0skip/fail/cancel、198.6601ms；公开tar SHA与锁SRI核对，42+13共55生成目标沿tar→安装包→manifest→生成物全部字节一致，role/canonical同f247。报告 `temp/slack-short-labels-cloud-independent-2ab3c71-20261009.md`；没有重建或额外套件。
+- [ ] 单个字面目标不能证明模型语义。真实默认七项TODO短名称及必要业务日期、版本保留仍需上线验收。
+
 本轮候选已同步 Main `a35ba54`（PR #29，Map 项目实时选择），实际版本为 Cloud `1.3.1` / Slack `0.2.1`。原 `1.2.4` / `0.1.21` 仅为开发前基线，不再作为发布版本或测试证据。保留实时项目授权、私聊隔离和动态菜单；直接选择与原网关复用同一实时项目检查。
 
 执行者开发后集中批次保留原始结果：40 个目标中 33 通过、7 失败。修复单卡未走段落处理、原生工具操作编号与设置接口不兼容；历史 / 菜单替身补齐新 Main 项目检查与 JSON 持久化语义，模型切换替身提供真实 textModels 路由目录，不放宽产品权限或断言。仅重验失败目标及原遗漏角色规范目标，仍有一项路由替身失败，修正后该目标退出 0。全部原失败和准确哈希日志保留；不能汇总冒称最终源码已有 40/40。独立 Tester 需在当前冻结源码统一验证受影响目标；Required、上线、真实效果仍待完成。
