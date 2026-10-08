@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## COORDINATOR-OVERVIEW-PURPOSE-01 · 动态用途资料（2026-10-09）
+
+- [x] 补供给而非再改 PE：未完成事项概览新增每条最多160字符的用途摘录，取 desc/description/text 首个非空 string；与原标题正规化空白相同则省略。超长明确「已截短，全文用 read_map」，没有无据测试标签识别或生成展示名，不改 Main 标题/状态或工具/brief/export 原值，不宣称摘录保留全部业务值。
+- [x] 动态资料沿既有当前 Main/作用域及20条上限；staticText/staticVersion/cache 前缀与已有冻结输入/重试不变，没有额外模型轮次或来源权限。正式测试仅合成资料，不复制生产描述/元数据。
+- [x] 最新固定 core2.2.0/UI1.2.0 安装构建后，开发完成唯一六受影响正式 context/prefix 目标，actual terminal `c0138e` exit 0、6/6 passed、0 failed/skipped/cancelled、574.2606ms；日志 `temp/coordinator-overview-purpose-executor-7833da4-20261009.log`。覆盖字段缺失/类型/重复、日期版本/未裁命令空白、160边界/截短标记/多行资料缩进、前20条实际用途读取、范围/数量、静态前缀和接受后重试/新输入资料；未全量/生产模型，不以此证明真实短名合规。
+- [ ] 独立 Tester 同最终准确 hash 验证，Required/正常合并/部署后集中真实七项 TODO 短名称验收；原语义失败保持未过，新增资料及静态测试不保证模型合规，不继续 PE 试绿。本轮无伪 Map task/Main/审批回执。
+- [x] 独立 Tester 同 Main7833da4加六文件准确冻结字节，前后hash一致；唯一同formal pattern actual exit0、6/6 passed、0 failed/skipped/cancelled、533.0997ms。日志 `temp/coordinator-overview-purpose-independent-7833da4-20261009.log` SHA256 `70c139d576099cfb7bcbb0ed12bb39a58a422e59579975d6b2d55dd9f01c3a50`。未改产品/测试、未重复全量、未用受控模型代替真实短名验收；仍待本次 Required / 部署 / 实际聊天。
+
 ## CURSOR-WORKBENCH-01 · Cursor Cloud 首版适配（进行中）
 
 - [x] Cloud `4253814` 准确完整 npm test 实际 467 项、465通过、0失败、2既有跳过、91212.169959ms，独立自有接口8/8通过；PR #33 初次 Required/完整七项 CI `37827680426` 全绿，保留旧固定消费范围，不冒称真实厂商验收。
