@@ -179,9 +179,11 @@ test('Both Coordinator profiles reserve internal identifiers for tools and expli
   const document = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
   for (const manual of [false, true]) {
     const prompt = coordinatorRolePrompt(document, { manual });
-    for (const rule of ['普通回复不附节点 ID、TODO/Bug ID、Session ID、测试编号或版本哈希',
-      '用户明确索要编号或版本时再提供', '工具参数、链接、回执和执行提示保留真实标识']) assert.ok(prompt.includes(rule), rule);
-    assert.ok(prompt.includes('同名事项用模块或简短描述区分'));
+    for (const rule of ['不附节点、事项、Session、测试 ID 或版本哈希',
+      '明确索要技术编号时再提供', '工具参数、链接/URL、代码、命令、回执和执行提示保留真实值',
+      '普通回复约 50–100 字', '通常不超 150 字', '保留必要事实和不确定性',
+      'TODO 概览报总数与可识别短名称', '不附未问 Bug']) assert.ok(prompt.includes(rule), rule);
+    assert.ok(prompt.includes('同名事项用短描述区分'));
   }
 });
 
@@ -552,6 +554,36 @@ test('Participation provider failure is recoverable, not a saved silent decision
   }
 });
 
+test('Participation diagnostics preserve safe native causes and distinguish decision parsing from model failures', async () => {
+  const options = { overview: { version: 'main-v1' }, input: { text: 'private-current-input' }, actor };
+  for (const code of ['MODEL_TIMEOUT', 'MODEL_HTTP_502', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_private-secret', 'arbitrary-private-secret']) {
+    await assert.rejects(classifyIntegrationMessage({ next: async () => {
+      const failure = Object.assign(new Error('private-upstream-text'), { code });
+      Object.defineProperty(failure, 'modelDiagnostic', { value: { phase: 'response-stream', token: 'private-credential' } }); throw failure;
+    } }, options), error => {
+      assert.equal(error.code, 'RELEVANCE_UNAVAILABLE'); assert.equal(error.status, 503);
+      const diagnostic = error.participationDiagnostic;
+      assert.equal(diagnostic.causeCode, code.includes('private') ? 'UNKNOWN_MODEL_ERROR' : code);
+      assert.equal(diagnostic.phase, 'response-stream'); assert.ok(Number.isSafeInteger(diagnostic.durationMs) && diagnostic.durationMs >= 0);
+      assert.equal(Object.prototype.propertyIsEnumerable.call(error, 'participationDiagnostic'), false);
+      assert.doesNotMatch(JSON.stringify(diagnostic), /private|upstream|token|credential/); return true;
+    });
+  }
+  await assert.rejects(classifyIntegrationMessage({ next: async () => ({ stop: 'end_turn', content: [{ type: 'text', text: 'private-invalid-decision' }] }) }, options), error => {
+    assert.equal(error.code, 'RELEVANCE_INVALID_RESPONSE'); assert.equal(error.participationDiagnostic.phase, 'decision-parse');
+    assert.equal(error.participationDiagnostic.causeCode, 'MODEL_INVALID_RESPONSE'); return true;
+  });
+});
+
+test('Participation malicious diagnostic access cannot replace the original recoverable public failure', async () => {
+  const cause = Object.assign(new Error('private-original'), { code: 'MODEL_TIMEOUT' });
+  Object.defineProperty(cause, 'modelDiagnostic', { value: { get phase() { throw new Error('private-diagnostic-getter'); } } });
+  await assert.rejects(classifyIntegrationMessage({ next: async () => { throw cause; } }, { overview: { version: 'main-v1' }, input: { text: 'private-input' } }), error => {
+    assert.equal(error.code, 'RELEVANCE_UNAVAILABLE'); assert.equal(error.status, 503);
+    assert.doesNotMatch(error.message, /private/); return true;
+  });
+});
+
 test('Participation deadline cancels a stalled provider and returns a recoverable error', async () => {
   const started = Date.now();
   // Keep the event loop alive while AbortSignal.timeout uses its unref timer.
@@ -561,7 +593,7 @@ test('Participation deadline cancels a stalled provider and returns a recoverabl
     await assert.rejects(classifyIntegrationMessage({ next: ({ signal }) => new Promise((_, reject) => {
       signal.addEventListener('abort', () => { cancelled = true; reject(signal.reason); }, { once: true });
     }) }, { overview: { version: 'main-v1' }, input: { text: '请解释当前情况。' }, actor }), error =>
-      error.code === 'RELEVANCE_UNAVAILABLE' && error.status === 503);
+      error.code === 'RELEVANCE_UNAVAILABLE' && error.status === 503 && error.participationDiagnostic.causeCode === 'MODEL_TIMEOUT');
     assert.equal(cancelled, true);
     assert.ok(Date.now() - started < 15000, 'Stalled classification must not hold a slot beyond its deadline');
   } finally { clearTimeout(guard); }
@@ -650,18 +682,23 @@ test('Gateway BUSY failure preserves the same operation for a later successful r
 
 test('Participation failure saves no silent receipt; same-ID recovery survives restart and replays once', async t => {
   const stateDir = await temporary(t);
-  let calls = 0;
+  let calls = 0; const logs = [];
   const options = { config, stateDir, state: async () => ({}), command: async (command, { actor }) =>
     classifyIntegrationMessage({ next: async () => {
       if (++calls === 1) throw Object.assign(new Error('private upstream error'), { code: 'MODEL_HTTP_503' });
       return { stop: 'end_turn', content: [{ type: 'text', text: '{"target":"coordinator","intent":"reply","reason":"需要解释"}' }] };
-    } }, { overview: { version: 'main-v1' }, input: relevanceInput(command.payload), actor }) };
+    } }, { overview: { version: 'main-v1' }, input: relevanceInput(command.payload), actor }), logger: entry => logs.push(entry) };
   let gateway = await startIntegrationGateway(options);
   t.after(() => gateway.close());
   const body = input('participation-recovery', 'conversation.relevance', { text: '请解释当前问题。' });
   const failed = await call(gateway, body);
   assert.equal(failed.status, 503); assert.equal(failed.body.error.code, 'RELEVANCE_UNAVAILABLE');
   assert.equal(JSON.stringify(failed.body).includes('private upstream error'), false);
+  assert.deepEqual(Object.keys(failed.body.error).sort(), ['code', 'message']);
+  assert.equal(logs.length, 1); assert.equal(logs[0].code, 'RELEVANCE_UNAVAILABLE'); assert.equal(logs[0].causeCode, 'MODEL_HTTP_503');
+  assert.equal(logs[0].phase, 'model'); assert.equal(logs[0].idHash, hash(body.id));
+  assert.ok(Number.isSafeInteger(logs[0].durationMs) && logs[0].durationMs >= 0);
+  assert.doesNotMatch(JSON.stringify(logs), /participation-recovery|private upstream|fixture-project|UTESTUSER|TTESTWORKSPACE/);
   assert.deepEqual((await fs.readdir(path.join(stateDir, 'receipts'))).filter(name => name.endsWith('.json')), []);
   await gateway.close(); gateway = await startIntegrationGateway(options);
   const recovered = await call(gateway, body);
@@ -673,6 +710,55 @@ test('Participation failure saves no silent receipt; same-ID recovery survives r
   const receipt = await readJSON(path.join(stateDir, 'receipts', names[0]));
   assert.deepEqual(receipt.actor, actor); assert.ok(receipt.durationMs >= 0);
   assert.deepEqual(Object.keys(receipt.data).sort(), ['mainVersion', 'reason', 'respond']);
+});
+
+test('Gateway participation diagnostics sanitize malformed metadata and never expose raw operation or secret codes', async t => {
+  const stateDir = await temporary(t), logs = [];
+  const gateway = await startIntegrationGateway({ config, stateDir, state: async () => ({}), logger: entry => logs.push(entry), command: async () => {
+    const error = new MapError('RELEVANCE_UNAVAILABLE', 'Decision temporarily unavailable', 503);
+    Object.defineProperty(error, 'participationDiagnostic', { value: { causeCode: 'MODEL_private-secret', phase: 'private-phase', durationMs: Infinity,
+      message: 'private-error-message', prompt: 'private-prompt', token: 'private-token' } }); throw error;
+  } });
+  t.after(() => gateway.close());
+  const body = input('private-original-operation', 'conversation.relevance', { text: 'private-original-text' });
+  const failed = await call(gateway, body);
+  assert.equal(failed.status, 503); assert.deepEqual(Object.keys(failed.body.error).sort(), ['code', 'message']);
+  assert.deepEqual(logs, [{ code: 'RELEVANCE_UNAVAILABLE', idHash: hash(body.id), phase: 'model', causeCode: 'UNKNOWN_MODEL_ERROR' }]);
+  assert.doesNotMatch(JSON.stringify(logs), /private|prompt|token|Infinity/);
+});
+
+test('Gateway unknown non-participation failures cannot use forged diagnostic fields or secret codes in logs', async t => {
+  const stateDir = await temporary(t), logs = [];
+  const gateway = await startIntegrationGateway({ config, stateDir, state: async () => ({}), logger: entry => logs.push(entry), command: async () => {
+    const error = Object.assign(new Error('private-internal-message'), { code: 'arbitrary-private-secret' });
+    Object.defineProperty(error, 'participationDiagnostic', { value: { causeCode: 'MODEL_TIMEOUT', phase: 'response-stream', durationMs: 7 } }); throw error;
+  } });
+  t.after(() => gateway.close());
+  const body = input('private-non-participation-id', 'map.write', { baseVersion: 'v1', operations: [] });
+  const failed = await call(gateway, body);
+  assert.equal(failed.status, 500); assert.equal(failed.body.error.message, 'Integration command failed');
+  assert.deepEqual(logs, [{ code: 'INTEGRATION_ERROR', idHash: hash(body.id) }]); assert.doesNotMatch(JSON.stringify(logs), /private/);
+});
+
+test('Gateway diagnostic getter or logger throw and rejection cannot change the original failure response', async t => {
+  for (const logger of [() => { throw new Error('private-logger'); }, () => Promise.reject(new Error('private-logger'))]) {
+    const stateDir = await temporary(t);
+    const gateway = await startIntegrationGateway({ config, stateDir, state: async () => ({}), logger, command: async () =>
+      classifyIntegrationMessage({ next: async () => { throw Object.assign(new Error('private-model'), { code: 'MODEL_TIMEOUT' }); } },
+        { overview: { version: 'main-v1' }, input: { text: 'private-text' } }) });
+    t.after(() => gateway.close());
+    const failed = await call(gateway, input('logger-isolated', 'conversation.relevance', { text: 'private-text' }));
+    assert.equal(failed.status, 503); assert.equal(failed.body.error.code, 'RELEVANCE_UNAVAILABLE'); assert.doesNotMatch(JSON.stringify(failed.body), /private/);
+  }
+  let getterLoggerCalls = 0;
+  const gateway = await startIntegrationGateway({ config, stateDir: await temporary(t), state: async () => ({}), command: async () => {
+    const error = new MapError('RELEVANCE_UNAVAILABLE', 'Original recoverable outcome', 503);
+    Object.defineProperty(error, 'participationDiagnostic', { value: { get phase() { throw new Error('private-getter'); } } }); throw error;
+  }, logger: () => { getterLoggerCalls++; } });
+  t.after(() => gateway.close());
+  const failed = await call(gateway, input('metadata-getter', 'conversation.relevance', { text: 'x' }));
+  assert.equal(failed.status, 503); assert.equal(failed.body.error.code, 'RELEVANCE_UNAVAILABLE');
+  assert.equal(getterLoggerCalls, 0, 'Assert outside the isolated logger so a forbidden invocation cannot be hidden');
 });
 
 test('SSE subscription sends public snapshot and stops polling when disconnected', async t => {
