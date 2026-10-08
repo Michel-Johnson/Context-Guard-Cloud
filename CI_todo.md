@@ -1,5 +1,16 @@
 # Cloud 验证台账
 
+## COORDINATOR-REPLY-FOLLOWUP-01 · 真实聊天回归返工（2026-10-08）
+
+- [x] 真实 Slack 用户消息确认：Cloud 1.2.1 / Slack 0.1.20 已上线、Required 均通过、保护配置未变；但默认 TODO 仍重复状态和测试前缀，要求表情+文字时只返回了表情，验收未全部通过。
+- [x] 修复 reaction-only 工具调用无条件结束轮次：保留原可信输入和幂等回执，沿正常工具结果继续，让模型以 end_turn 决定带文字或只用表情；不新增接口参数、队列、权限或模型配置。
+- [x] Skill PR #461 Required 后正常合入 Main `1fa3859faaeed634ea3bfade208ed82c111f1442`，core 2.1.2 / Skill 0.7.3；角色原位替换且静态更短，公开 core SHA `e4f229b0b3a686b16af2b93a2cb11ac870b228df50dc5526e9575c5dc992e5bd`。Cloud 1.2.2 消费固定 URL，UI 与 Slack 插件版本不变。
+- [x] 开发后一次隔离定向 8/8，实际 child exit 0，1148.5326ms；包含表情后文字和无正文结束、来源权限、幂等重启、混合业务与两 profile / 真实 manual HTTP。日志 `temp/coordinator-reply-followup-executor-cloud-20261008.log`；未重跑本地全量。
+- [ ] 独立 Tester 验证同一最终源码、固定包、八目标。
+  - 首次独立八目标failed：HEAD41819778+冻结pkg/lock/model/tools/formal/rolehash前后相同，Node24原批准launcher唯一chunk7b32d0 actualexit1，8总项/7pass/1fail/0skip，1128.4208ms。唯一Public manual完整HTTP目标在restart后wait(:356)由browser(:152)fetch抛cause bad port，日志未捕获实际端口，不能猜值或随机重跑求绿。原log `temp/coordinator-reply-followup-independent-cloud-41819778-20261008.log` SHA256 `709490044f795e858dabb2fce96820e60dae3a9a6da10842910aac5b177d2404`保留；同名`.md`记录准确hash/原cause/静态端口0路径。另一次只读54文件/固定URL/SRI/tar/8900bytes角色parity chunk702537 actualexit0，消费log SHA `e3bcc32293a5fb11d5aad20994ebde387cdce5e98c55d13d2461c78080eadaf8`。产品reaction七项局部通过不合称八目标passed；未全量/生产/Git/追加测试，独立项保持未勾待审核返工。
+- [ ] 同一提交 Required / Main CI、上线与两个真实聊天场景复验；保留首次失败证据，不重复跑本地全量。
+  - [x] 独立原失败目标一次复验（不是新八项全套）：仅fixture.browser捕获原fetch error后附fixturePort并原样throw，正式test SHA88f4f8eca7ae34d5ee4c9b30d7faa58a01d739feb49f476e832b0b4737fe9601、产品/锁/role前后原冻结未变；Node24隔离唯一原Public manual目标，chunk3b45a5 actualexit0，1/1、0fail/skip，1710.3163ms。日志 `temp/coordinator-reply-followup-independent-onecase-portdiag-41819778-20261008.log` SHA256 `0932e0de4e82df6d6fccffdbc0a81ce5c048deb15afa89d1898898e5def4f33f`，同名`.md`保留静态与版本边界。本次badport未重现，原端口未知，不宣称修复、不改原8/7pass/1fail，不改变port0/fetch禁止表/重试/listener或断言，未追加任何其他测试。
+
 ## COORDINATOR-REFINEMENT-01 · 固定短回复核心与表情上线（2026-10-08）
 
 - [x] 保留最新 Main 的只读上下文适配，同步本轮参与故障诊断和十种表情；Cloud 1.2.1 / Slack 0.1.20 固定消费已发布 Skill core 2.1.1，UI 1.1.6 与模型、权限不变。短回复只改唯一 Skill 根角色，不编辑消费生成物。

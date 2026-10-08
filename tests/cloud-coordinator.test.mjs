@@ -19,15 +19,26 @@ const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKS
 function reactionState(source = 'slack', actor = reactionActor) {
   return { activeInput: { id: 'original-human-input', source, actor }, messages: [], toolReceipts: {} };
 }
-test('Slack reaction intent binds server actor and input and completes without a second model round', async () => {
-  const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
-  await coordinatorStep({ turnId: 'reaction-turn', state, system: 'role', tools: coordinatorTools, save: async () => {}, execute,
-    model: { next: async ({ tools }) => { calls++; assert.ok(tools.some(tool => tool.name === 'react_to_user'));
-      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'social', name: 'react_to_user', input: { emoji: 'heart' } }] }; } } });
-  assert.equal(calls, 1); assert.equal(state.status, 'waiting-for-user');
-  assert.deepEqual(state.messages[0].actions[0], { kind: 'slack-reaction', actionId: Object.keys(state.toolReceipts)[0], emoji: 'heart', status: 'intent', requestId: 'original-human-input', actor: reactionActor });
-  assert.equal(state.messages[1].content[0].type, 'tool_result');
-  assert.doesNotMatch(JSON.stringify(state.toolReceipts), /delivered|approved|passed/);
+test('Slack reaction intent binds server actor and input and preserves the following text or emoji-only completion', async () => {
+  for (const text of ['已收到。', '']) {
+    const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
+    const options = { turnId: 'reaction-turn', system: 'role', tools: coordinatorTools, save: async () => {}, execute };
+    await coordinatorStep({ ...options, state,
+      model: { next: async ({ tools }) => { calls++; assert.ok(tools.some(tool => tool.name === 'react_to_user'));
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'social', name: 'react_to_user', input: { emoji: 'heart' } }] }; } } });
+    assert.equal(calls, 1); assert.equal(state.status, 'running');
+    assert.deepEqual(state.messages[0].actions[0], { kind: 'slack-reaction', actionId: Object.keys(state.toolReceipts)[0], emoji: 'heart', status: 'intent', requestId: 'original-human-input', actor: reactionActor });
+    assert.equal(state.messages[1].content[0].type, 'tool_result');
+    assert.doesNotMatch(JSON.stringify(state.toolReceipts), /delivered|approved|passed/);
+    await coordinatorStep({ ...options, state, execute: () => assert.fail('Reaction must not execute twice'),
+      model: { next: async ({ messages }) => {
+        calls++; assert.equal(messages.at(-1).content[0].type, 'tool_result');
+        return { stop: 'end_turn', content: text ? [{ type: 'text', text }] : [] };
+      } } });
+    assert.equal(calls, 2); assert.equal(state.status, 'waiting-for-user');
+    assert.equal(Object.keys(state.toolReceipts).length, 1);
+    assert.deepEqual(state.messages.at(-1).content, text ? [{ type: 'text', text }] : []);
+  }
 });
 test('Slack reaction tools reject untrusted source and actor even when a model guesses the tool', async () => {
   for (const [source, actor] of [['human', reactionActor], ['workflow', reactionActor], ['slack', null],

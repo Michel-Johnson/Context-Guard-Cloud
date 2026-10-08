@@ -444,14 +444,15 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
       ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
-  const reactionOnly = !failed && responses.length > 0 && next.content.filter(block => block.type === 'tool_use').every(call => call.name === 'react_to_user');
+  // A reaction intent does not complete the requested textual answer. Let the
+  // model consume its receipt and end the turn normally, with or without text.
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
     const response = state.messages.at(-2);
     if (response?.role === 'assistant') response.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' && ['ask_user', 'show_model_menu'].includes(block.name))) ? 'waiting-for-user' : 'running';
+    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' && ['ask_user', 'show_model_menu'].includes(block.name))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }
