@@ -1,5 +1,20 @@
 # Cloud 验证台账
 
+## CURSOR-WORKBENCH-01 · Cursor Cloud 首版适配（进行中）
+
+- [x] Cloud `4253814` 准确完整 npm test 实际 467 项、465通过、0失败、2既有跳过、91212.169959ms，独立自有接口8/8通过；PR #33 初次 Required/完整七项 CI `37827680426` 全绿，保留旧固定消费范围，不冒称真实厂商验收。
+- [x] 从已合 Skill main `2ccae20` 的公开不可变共享 Release，经包管理器固定 core2.2.0/UI1.2.0并更新锁完整性；构建57文件，未编辑生成物。Cloud候选1.4.0，新功能次版本；旧测试客户端fixture0.7.1不变。新增公共配对HTTP用例：实际设备认证/绑定/心跳→真人POST入队→设备sync.read→原生result HTTP回显→同Session追问/重放/未绑定拒绝，Cursor公共工作台两项实际2/2 exit0，原生模型边界为合成接收器。
+- [ ] 当前固定新包准确修订的全量、独立Review/Required、Cloud真实配对Cursor、Cursor Cloud API key与真实任务仍待完成；不部署或宣称交付。
+
+- [x] 独立 `codex/cursor-workbench` 工作树已同步至 main `2ab3c71`；未修改共享生成物、生产配置、既有目录或第三方 Hook。
+- [x] 官方 REST v1 提供方实现连接检查、固定仓库/SHA 建 Agent、同 Agent 追问、Run 状态/结果读取及取消。默认新分支，禁用自动 PR；保留未知结果，不盲目重投写请求。
+- [x] 正式 `tests/cursor-provider.test.mjs` 4/4、实际退出 0；真实 loopback HTTP 提供方为合成 Cursor，不是厂商服务。覆盖线协议、分支边界、错误/冲突、未知接收及跨 Agent/Run 拒绝；同步 main 后原四项再次通过。
+- [x] Cloud 自有工作台 API 与原生 Agent/Run/CG Session 持久关联实现；公共真人入口、创建、结果回显和同 Agent 追问正式测试通过。配置只读私有 key 文件和固定仓库/SHA，浏览器不能覆盖供应商地址/凭据/仓库；非授权、跨 Origin/项目和变更操作编号拒绝。提供方/持久调用账本/HTTP 三文件 8/8、实际退出 0，供应商边界为合成 HTTP，不是厂商验收。
+- [x] 准确 Cloud 源码完整 `npm test` 实际退出 0：467 项、465 通过、0 失败、2 个既有跳过、88091.636958 ms；边界/治理检查通过。日志 `temp/cursor-workbench-cloud-npm-test-20261009.log`。当前生成物仍为旧固定 core 2.1.2 / UI 1.1.6；新配对协议返回 UPGRADE_REQUIRED，未复制 Skill 源码绕过消费边界。
+- [ ] 待发布新 core/UI 后固定消费，完成 Cloud→配对本地 Cursor 的正式公共接口联调和真实任务；线上未部署，不能宣称可用。复杂队列/自动中断恢复与自动归档保持后续范围。
+- [ ] Cursor Cloud 私有 API key、真实连接/通讯/小任务、准确修订完整 npm test、Review、Required 与交付验收待完成。
+- 最终只验收连接、通讯、完成任务；复杂恢复、丰富卡片和自动归档后续补。原历史失败及未完成项保留。
+
 ## SLACK-CARD-PLAIN-FALLBACK-01 · 程序卡片备用正文（2026-10-09）
 
 - [x] 已确认实际关联卡把项目名包在星号中，mrkdwn block 的文本未经转换就以 mrkdwn:false 发作 fallback；这是程序格式错误，不用追加角色 PE。关联确认改 plain_text，项目名按真实字面保持。
