@@ -1,6 +1,6 @@
 {
   "name": "@michelj/context-guard-cloud",
-  "version": "1.10.2",
+  "version": "1.10.3",
   "private": true,
   "type": "module",
   "description": "Context Guard Cloud workbench and Coordinator service",
@@ -34,7 +34,7 @@
     "playwright": "1.62.1"
   },
   "dependencies": {
-    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.3.0/michelj-context-guard-core-2.3.0.tgz",
+    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.3.1/michelj-context-guard-core-2.3.1.tgz",
     "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.4.1/michelj-context-guard-workbench-1.4.1.tgz"
   }
 }
