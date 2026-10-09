@@ -518,14 +518,16 @@ export class CoordinatorService {
     return { interrupted: Object.values(journal.interrupts).some(item => item.turnId === state.activeTurnId && !state.resumedInterrupts?.includes(item.id)),
       steered: Object.values(journal.requests).some(item => item.revision > (state.consumedInputRevision || 0)) };
   }
+  async saveInterrupted(state, controlRevision) {
+    state.controlRevision = controlRevision; captureInterruptedText(state);
+    state.status = 'interrupted'; state.streaming = null; state.activity = null;
+    await this.saveState(state);
+  }
   async consumeInputs(state) {
     return withFileLock(this.file + '.submit.lock', async () => {
       const signals = await this.inputSignals(state);
       if (signals.interrupted) {
-        state.controlRevision = (await this.inputJournal()).controlRevision || 0;
-        captureInterruptedText(state);
-        state.status = 'interrupted'; state.streaming = null; state.activity = null;
-        await this.saveState(state);
+        await this.saveInterrupted(state, (await this.inputJournal()).controlRevision || 0);
         return false;
       }
       const journal = await this.inputJournal();
@@ -1079,7 +1081,15 @@ export class CoordinatorService {
   }
   async run() {
     return withFileLock(this.file + '.run.lock', async () => {
-      let state = await this.readConversation(null);
+      let state = await withFileLock(this.file + '.submit.lock', async () => {
+        const current = await this.readConversation(null);
+        // A durable human stop precedes error recovery, even when the old
+        // runner already failed or reached its step limit before it saw it.
+        if (current?.activeTurnId && current.status !== 'interrupted' && (await this.inputSignals(current)).interrupted) {
+          await this.saveInterrupted(current, (await this.inputJournal()).controlRevision || 0);
+        }
+        return current;
+      });
       if (!state?.activeTurnId) return false;
       if (state.status === 'interrupted') return false;
       this.turnAbort = new AbortController();
