@@ -133,6 +133,13 @@ export function messageBlocks(message, key, context) {
     blocks.push(...plainSections(question.text));
     if (!question.answer) questionControls(question);
   }
+  for (const action of message.actions || []) {
+    if (action.kind !== 'node-references') continue;
+    for (const node of (action.nodes || []).slice(0, 3)) if (Array.isArray(node.path) && node.path.length) {
+      const path = node.path.map((item, index) => `${index ? '  '.repeat(index - 1) + '└─ ' : ''}${item.title}：${item.purpose || '尚未填写描述'}`).join('\n');
+      blocks.push(...plainSections(path));
+    }
+  }
   blocks.push(...nodeLinkBlocks(message.actions, context));
   for (const menu of context?.modelMenus || []) blocks.push(...modelChoiceBlocks(menu));
   for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
@@ -144,6 +151,12 @@ export function messageBlocks(message, key, context) {
 }
 export function approvalBlocks(approval, key) {
   const version = approval.version || approval.brief?.version;
-  return [...plainSections(`待确认 brief\n${approval.title || approval.text || approval.brief?.text || approval.brief?.summary || '请查看工作台中的 brief'}\n${Array.isArray(approval.acceptance) ? approval.acceptance.join('\n') : approval.acceptance || ''}`),
+  return [...plainSections(`待确认 brief\n${approval.title || approval.text || approval.brief?.text || approval.brief?.summary || '请查看工作台中的 brief'}\n${approval.pathText ? `主节点路径：\n${approval.pathText}\n` : ''}${Array.isArray(approval.acceptance) ? approval.acceptance.join('\n') : approval.acceptance || ''}`),
     { type: 'actions', elements: [button('确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
+}
+
+export function bindingBlocks(proposal, key) {
+  return [...plainSections('建议绑定到：\n' + proposal.pathText + '\n回复“同意绑定”或“暂不绑定”，也可点下方按钮。'),
+    { type: 'actions', elements: [button('确认绑定', 'approve_binding', { key, proposalId: proposal.id, version: proposal.version }, 'primary'),
+      button('暂不绑定', 'reject_binding', { key, proposalId: proposal.id, version: proposal.version })] }];
 }

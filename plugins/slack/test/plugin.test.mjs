@@ -7,7 +7,7 @@ import { Store, threadKey, digest } from '../src/store.mjs';
 import { SlackPlugin, envelopeId } from '../src/plugin.mjs';
 import { SlackIO, UncertainDelivery } from '../src/slack-io.mjs';
 import { Gateway } from '../src/gateway.mjs';
-import { homeView, formValues, messageBlocks, approvalBlocks, modelChoiceBlocks } from '../src/views.mjs';
+import { homeView, formValues, messageBlocks, approvalBlocks, bindingBlocks, modelChoiceBlocks } from '../src/views.mjs';
 import { plainText, plainChunks } from '../src/plain-text.mjs';
 import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
 import { startIntegrationGateway, integrationActor } from '../../../scripts/cloud/integration-gateway.mjs';
@@ -19,6 +19,54 @@ import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cl
 import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
+test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
+  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归' };
+  const blocks = bindingBlocks(proposal, 'internal-thread');
+  const text = blocks.filter(block => block.type === 'section').map(block => block.text.text).join('\n');
+  assert.ok(text.includes(proposal.pathText)); assert.match(text, /同意绑定|暂不绑定/);
+  assert.doesNotMatch(text, /internal-/); assert.ok(blocks.filter(block => block.type === 'section').every(block => block.text.type === 'plain_text'));
+  assert.deepEqual(blocks.at(-1).elements.map(button => button.action_id), ['approve_binding', 'reject_binding']);
+  assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'internal-thread', proposalId: proposal.id, version: proposal.version });
+});
+
+test('Slack 绑定建议只发一次，确认回读后在原线程更新卡片而不改其他线程', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'proposal-one', kind: 'binding-proposal', version: 'v1', pending: true,
+    node: { id: 'login', title: '登录' }, pathText: '项目：目标\n└─ 登录：会话' };
+  const command = f.gateway.command;
+  f.gateway.command = async (type, args) => {
+    if (type === 'conversation.state') return { status: 'waiting-for-user', activeTurnId: null, messages: [], approvals: [proposal] };
+    if (type === 'binding.review') { f.calls.push({ type, ...args }); return { decision: 'approved', message: '已确认绑定到登录' }; }
+    return command(type, args);
+  };
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.channel).length, 1);
+  assert.equal(f.sent[0].threadTs, '123.001'); assert.match(JSON.stringify(f.sent[0].blocks), /approve_binding/);
+  await f.plugin.reviewBinding('human-action', user, { key, proposalId: proposal.id, version: proposal.version }, 'approved');
+  const review = f.calls.find(call => call.type === 'binding.review');
+  assert.equal(review.userId, user); assert.equal(review.projectId, 'lab'); assert.equal(review.conversationId, 'chat-one');
+  assert.deepEqual(review.payload, { proposalId: proposal.id, version: proposal.version, decision: 'approved' });
+  assert.equal(f.sent.at(-1).threadTs, '123.001');
+  proposal.pending = false; proposal.decision = 'approved';
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.update).length, 1);
+  assert.doesNotMatch(JSON.stringify(f.sent.at(-1)), /approve_binding|reject_binding/);
+});
+test('改绑使旧需求卡失效，不误报人类退回且移除审批与导出按钮', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'old-brief', manual: true, pending: true, version: 'v1', text: '旧需求', acceptance: '旧条件' };
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages: [], approvals: [proposal] });
+  await f.plugin.mirror(key);
+  assert.match(JSON.stringify(f.sent.at(-1)), /approve_brief/);
+  proposal.pending = false; proposal.stale = true;
+  await f.plugin.mirror(key); const updated = f.sent.at(-1);
+  assert.match(JSON.stringify(updated), /主节点已改绑/);
+  assert.doesNotMatch(JSON.stringify(updated), /退回|approve_brief|reject_brief|export_prompt/);
+  const count = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+});
+
 test('Home presents names and states without exposing internal identities', () => {
   const value = { id: 'private-project-id', name: '博客', version: 'a'.repeat(64),
     map: { id: 'internal-root', title: '博客', children: [{ id: 'internal-login', title: '登录',
@@ -544,7 +592,8 @@ test('native Slack reaction uses real publicMessages projection without inventin
 test('native Slack reaction contract enum stays aligned and necessary emoji text remains intact', async t => {
   const f = await reactionFixture(t); f.plugin.stopped = false;
   const emojis = coordinatorTools.find(tool => tool.name === 'react_to_user').input_schema.properties.emoji.enum;
-  assert.deepEqual(emojis, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray']);
+  assert.deepEqual(emojis, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
+    'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
   for (const emoji of emojis) {
     const message = structuredClone(f.message); message.actions[0].emoji = emoji; message.actions[0].actionId = emoji;
     await stageReactions(f.plugin, f.key, message, [f.input, message]);
@@ -2162,43 +2211,52 @@ test('read reactions are bounded and stop waits for in-flight reactions without 
   await Promise.resolve(); assert.equal(stopped, false); assert.equal(calls, 8);
   release(); await stop; assert.equal(f.plugin.reactions.size, 0);
 });
-test('合并👀只绑定当前已接话原消息，静默、未决定、他人和改写原文均拒绝', async t => {
+test('状态决定只绑定当前已接受原消息，未决定、他人和改写原文均拒绝', async t => {
   const f = await projectSwitchFixture(t);
   const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
     acceptedRequestIds: [f.input.requestId], messages: [f.input] };
   f.plugin.stopped = false;
-  for (const decision of ['pending', 'silent']) assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationDecision: decision }), []);
+  await f.plugin.feedback.receive('switch-inbox'); f.plugin.feedback.drain(); await settleReactions(f.plugin);
+  assert.equal(f.store.data.feedback['switch-inbox'].desired, 'received');
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationDecision: 'pending' }), []);
   assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationRequestIds: ['new-pending-input'] }), []);
   assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, acceptedRequestIds: [] }), []);
   assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot,
     messages: [{ ...f.input, actor: { ...f.actor, userId: 'UOTHER', sessionId: `slack:${teamId}:UOTHER` } }] }), []);
   await f.store.update(state => { state.inbox['switch-inbox'].envelope.body.event.text = '改写原文'; });
   assert.deepEqual(await f.plugin.queueReadReactions(f.key, snapshot), []);
+  assert.equal(f.store.data.feedback['switch-inbox'].desired, 'received');
   assert.deepEqual(f.store.data.reactionOutbox || {}, {});
 });
 test('合并👀的失回、重启和重复镜像沿原消息恢复，already_reacted确认后不再发送', async t => {
   const f = await projectSwitchFixture(t), calls = [];
+  // 本用例手动驱动状态恢复，不启动夹具中无关的项目切换镜像。
+  f.plugin.kick = () => {};
   const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
     acceptedRequestIds: [f.input.requestId], messages: [f.input] };
   f.io.call = async (method, input) => {
-    assert.equal(method, 'reactions.add'); calls.push(input);
+    calls.push({ method, ...input });
+    if (method === 'reactions.remove') return {};
     if (calls.length === 1) throw new TypeError('Synthetic lost ACK');
     throw Object.assign(new Error('Already reacted'), { code: 'slack_webapi_platform_error', data: { error: 'already_reacted' } });
   };
   f.plugin.stopped = false;
-  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await f.plugin.feedback.receive('switch-inbox'); f.plugin.feedback.drain();
   await Promise.all([...f.plugin.reactions]);
-  const [id, record] = Object.entries(f.store.data.reactionOutbox)[0];
-  assert.equal(record.status, 'unknown');
+  const id = 'switch-inbox', record = f.store.data.feedback[id];
+  assert.equal(record.pending.status, 'unknown');
+  await f.plugin.stop();
   f.plugin.store = await new Store(f.directory).open();
-  await f.plugin.store.update(state => { state.reactionOutbox[id].next = 0; });
-  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  f.plugin.stopped = false;
+  await f.plugin.store.update(state => { state.feedback[id].pending.next = 0; });
+  await f.plugin.queueReadReactions(f.key, snapshot);
   await Promise.all([...f.plugin.reactions]);
-  assert.equal(f.plugin.store.data.reactionOutbox[id].status, 'sent');
-  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  assert.equal(f.plugin.store.data.feedback[id].pending, null);
+  assert.equal(f.plugin.store.data.feedback[id].applied.speech_balloon, true);
+  await f.plugin.queueReadReactions(f.key, snapshot);
   await Promise.all([...f.plugin.reactions]);
-  assert.equal(calls.length, 2); assert.deepEqual(calls[0], calls[1]);
-  assert.deepEqual(calls[0], { channel: f.dm, timestamp: '123.001', name: 'eyes' });
+  assert.equal(calls.length, 4); assert.deepEqual(calls[0], calls[1]);
+  assert.deepEqual(calls[0], { method: 'reactions.add', channel: f.dm, timestamp: '123.001', name: 'eyes' });
 });
 test('a submit ACK racing an older mirror snapshot resets its next poll atomically', async t => {
   for (const mode of ['message', 'answer']) {
@@ -3087,7 +3145,7 @@ test('resume freezes the original turn and uses a new transport receipt without 
     if (type === 'conversation.submit') {
       f.calls.push({ type, ...input }); attempts++;
       assert.notEqual(input.id, 'original-turn');
-      assert.deepEqual(input.payload, { retry: true, expectedTurnId: 'original-turn' });
+      assert.deepEqual(input.payload, { retry: true, expectedTurnId: 'original-turn', slackChannelId: channel });
       const disk = JSON.parse(await fs.readFile(f.store.file, 'utf8'));
       assert.equal(disk.inbox.resume.resumeTarget.expectedTurnId, 'original-turn');
       if (attempts === 1) throw Object.assign(new Error('Unavailable'), { code: 'GATEWAY_ERROR' });

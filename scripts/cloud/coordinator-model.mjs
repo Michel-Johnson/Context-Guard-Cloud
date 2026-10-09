@@ -34,7 +34,7 @@ function safeModelDiagnostic(value) {
       ...safeTermination(ownValue(value, 'termination')) };
   } catch { return null; }
 }
-export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
+export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'APPROVAL_REQUIRED', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
 export function coordinatorInputTokens(usage) {
   const input = usage?.input_tokens;
   if (Number.isSafeInteger(input) && input >= 0) {
@@ -403,6 +403,21 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
+    // 只接受本轮纯交流表情的完整原生工具回执后的空结束。
+    // 读写工具、失败回执、首轮空答复或仅输出标识都不能借此结束。
+    const previousAssistant = state.messages.at(-2), previousResults = state.messages.at(-1);
+    const reactionCalls = previousAssistant?.role === 'assistant' && previousAssistant.requestId === gateKey
+      ? previousAssistant.content?.filter(block => block.type === 'tool_use') || [] : [];
+    const reactionOnlyCompletion = !!alreadyAllowed && reactionCalls.length > 0 &&
+      !previousAssistant.content.some(block => block.type === 'text' && block.text.trim()) &&
+      !state.messages.some(message => message.role === 'assistant' && message.requestId === gateKey &&
+        message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user')) &&
+      previousResults?.role === 'user' && reactionCalls.every(call => {
+        const receipt = state.toolReceipts[`coordinator:${hash(`${turnId}:${call.id}`)}`];
+        return call.name === 'react_to_user' && receipt && !receipt.isError && receipt.result?.kind === 'slack-reaction' &&
+          receipt.result.requestId === gateKey && previousResults.content?.some(block =>
+            block.type === 'tool_result' && block.tool_use_id === call.id && !block.is_error);
+      });
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
     // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
     const generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
@@ -415,9 +430,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
     const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
+      // 同一增量含控制头与正文时，也先持久发布决定，再发布正文。
+      await publishDecision();
       if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
       await onText?.(text);
-    }, { continuation: !!alreadyAllowed }) : null;
+    }, { continuation: !!alreadyAllowed, reactionOnlyCompletion }) : null;
     const publishDecision = async () => {
       if (gate?.decision && (state.slackParticipation?.requestId !== gateKey || state.slackParticipation.decision !== gate.decision)) {
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
@@ -504,6 +521,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
       else if (!executableTools.some(tool => tool.name === call.name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
+      else if (call.name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
+        item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id).length >= 2) {
+        receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
+      }
       else {
         const started = Date.now();
         let errorCode = null;
@@ -511,6 +532,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           // Model settings use the integration's identifier alphabet, while
           // the original native tool receipt keeps its unchanged identity.
           const result = await execute(call.name, call.input, { operationId: call.name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
+            ...(call.name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
+              ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(['select_text_model', ...projectTools].includes(call.name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
               ...(projectTools.includes(call.name) ? { requestId: state.activeInput.id } : {}) } : {}) });
           receipt = { fingerprint, result: call.name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
@@ -533,7 +556,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       kind: 'node-read', actionId: receipt.result.actionId, node: { id: receipt.result.node.id, title: receipt.result.node.title || '' },
     });
     else if (!receipt.isError && call.name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
-    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
+    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'binding-proposal', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
     if (!receipt.isError && ['conversation-mounted', 'project-switch'].includes(receipt.result?.kind)) transferred = true;
     responses.push(toolReply(call, receipt));
   }
@@ -548,16 +571,21 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
       ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
-  // A reaction intent does not complete the requested textual answer. Let the
-  // model consume its receipt and end the turn normally, with or without text.
+  // 纯社交回应必须由模型明确标记，无正文、无本轮业务工具且所有意图回执成功。
+  // 默认表情意图仍不能结束应有的文字答复；平台送达继续由私有队列核验。
+  const reactionOnly = trustedSlackInput && !failed && responses.length > 0 && visible.length === responses.length &&
+    !next.content.some(block => block.type === 'text' && block.text?.trim()) &&
+    next.content.filter(block => block.type === 'tool_use').every(call => call.name === 'react_to_user' && call.input?.replyComplete === true) &&
+    !state.messages.some(message => message.role === 'assistant' && message.requestId === state.activeInput.id &&
+      message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
     const response = state.messages.at(-2);
     if (response?.role === 'assistant') response.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' &&
-      (block.name === 'ask_user' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
+    transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
+      (block.name === 'ask_user' || block.name === 'mount_conversation' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }

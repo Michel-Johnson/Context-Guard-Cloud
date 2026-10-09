@@ -1,6 +1,6 @@
 {
   "name": "@michelj/context-guard-cloud",
-  "version": "1.8.0",
+  "version": "1.10.0",
   "private": true,
   "type": "module",
   "description": "Context Guard Cloud workbench and Coordinator service",
@@ -22,6 +22,7 @@
     "start": "node scripts/build-runtime.mjs && node scripts/cloud/server.mjs",
     "test": "node .github/scripts/verify-boundaries.mjs && node .github/scripts/verify-workflows.mjs && node .github/scripts/verify-test-governance.mjs && node .github/scripts/run-node-tests.mjs",
     "test:slack": "npm test --prefix plugins/slack",
+    "test:dialogue:live": "node tests/coordinator-dialogue-live-browser.mjs",
     "test:browser": "node tests/browser-device-login-runner.mjs && node tests/cloud-workbench-browser.mjs && node tests/cloud-sync-browser.mjs",
     "security:setup": "node .github/scripts/security-tool.mjs",
     "security:test": "node .github/scripts/security-checks.test.mjs",
@@ -33,7 +34,7 @@
     "playwright": "1.62.1"
   },
   "dependencies": {
-    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.2.0/michelj-context-guard-core-2.2.0.tgz",
-    "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.3.2/michelj-context-guard-workbench-1.3.2.tgz"
+    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.3.0/michelj-context-guard-core-2.3.0.tgz",
+    "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.4.0/michelj-context-guard-workbench-1.4.0.tgz"
   }
 }

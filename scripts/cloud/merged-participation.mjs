@@ -39,7 +39,7 @@ export function mergedParticipationInput(state) {
 }
 
 // onText 接收累计文本；半个控制头永远不进入用户可见流。
-export function createParticipationGate(onText, { continuation = false } = {}) {
+export function createParticipationGate(onText, { continuation = false, reactionOnlyCompletion = false } = {}) {
   let decision = continuation ? 'reply' : null, visible = '', lastText = '';
   const consume = async (text, final = false, toolBoundary = false) => {
     if (typeof text !== 'string') throw invalid();
@@ -91,7 +91,7 @@ export function createParticipationGate(onText, { continuation = false } = {}) {
         const body = block.text.slice(removed);
         return body ? [{ ...block, text: body }] : [];
       });
-      if (next.stop === 'end_turn' && !visible.trim()) throw invalid();
+      if (next.stop === 'end_turn' && !visible.trim() && !(continuation && reactionOnlyCompletion)) throw invalid();
       return { ...next, content };
     },
   };

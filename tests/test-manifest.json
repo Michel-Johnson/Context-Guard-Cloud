@@ -12,6 +12,11 @@
   },
   "standaloneSuites": [
     {
+      "path": "tests/coordinator-dialogue-live-browser.mjs",
+      "command": "npm run test:dialogue:live",
+      "purpose": "显式运行真实模型与浏览器的需求、归属确认、改绑和审批闭环；隔离项目数据。"
+    },
+    {
       "path": ".github/scripts/security-checks.test.mjs",
       "command": "npm run security:test",
       "purpose": "Fail-closed source, history and final artifact secret scanning."
@@ -54,6 +59,8 @@
     "tests/cursor-role-http.test.mjs",
     "tests/cursor-role-factory.test.mjs",
     "tests/cursor-role-channel.test.mjs",
+    "tests/coordinator-dialogue-live-browser.mjs",
+    "tests/coordinator-binding.test.mjs",
     "tests/merged-participation-independent.test.mjs",
     "tests/slack-merged-participation.test.mjs",
     "tests/map-translations.test.mjs",

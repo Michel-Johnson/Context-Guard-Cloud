@@ -200,7 +200,7 @@ export class CoordinatorConversations {
     });
     return this.get(id);
   }
-  async setFocus(id, { nodeId, kind, itemId, title }) {
+  async setFocus(id, { nodeId, kind, itemId, title, expectedFocus, bindingApproval }) {
     if (typeof nodeId !== 'string' || !nodeId || !['todo', 'bug', 'idea'].includes(kind)) {
       throw error('INVALID_ARGUMENT', 'Provide a valid conversation focus');
     }
@@ -216,7 +216,16 @@ export class CoordinatorConversations {
       } else if (/^chat-[a-f0-9]{64}$/.test(id)) item = state.chats?.[id];
       else if (/^session:[a-zA-Z0-9_-]{1,128}$/.test(id)) item = state.sessions?.[id];
       if (!item) throw error('FORBIDDEN', 'Only a registered independent conversation can change its focus');
+      if (bindingApproval && item.bindingApproval === bindingApproval) {
+        if (item.nodeId !== nodeId || item.kind !== kind) throw error('CONFLICT', '绑定回执与当前归属不符');
+        return;
+      }
+      if (expectedFocus && JSON.stringify({ nodeId: item.nodeId || null, kind: item.kind || null, itemId: item.itemId || null }) !== JSON.stringify(expectedFocus)) {
+        throw error('CONFLICT', '讨论归属已变化，请重新确认');
+      }
       Object.assign(item, { nodeId, kind, ...(title ? { title: String(title).slice(0, 200) } : {}) });
+      if (bindingApproval) item.bindingApproval = bindingApproval;
+      else delete item.bindingApproval;
       if (itemId) item.itemId = itemId;
       else delete item.itemId;
       await atomicWrite(this.file, encode(state));
@@ -343,9 +352,10 @@ export class CoordinatorMapIntake {
 export class CoordinatorService {
   constructor({ directory, model, system, tools, execute, context = null, maxSteps = 12, maxModelRetries = 2, retryDelayMs = 250,
     compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, onStateChange = null,
-    textModels = null, selectTextModel = null, steerSettleMs = 80 }) {
+    textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null }) {
     if (!Number.isSafeInteger(compactMinTurns) || compactMinTurns < 1) throw error('INVALID_ARGUMENT', 'Compaction requires a positive completed-turn interval');
     if (onStateChange !== null && typeof onStateChange !== 'function') throw error('INVALID_ARGUMENT', 'State observer must be a function');
+    if (beforeAcceptHumanInput !== null && typeof beforeAcceptHumanInput !== 'function') throw error('INVALID_ARGUMENT', 'Human input handler must be a function');
     if (textModels !== null && !(textModels instanceof Map) || selectTextModel !== null && typeof selectTextModel !== 'function') throw error('INVALID_ARGUMENT', 'Configured text models require a model selector');
     if (!Number.isSafeInteger(steerSettleMs) || steerSettleMs < 0 || steerSettleMs > 2000) throw error('INVALID_ARGUMENT', 'Steer settling must be bounded');
     this.file = path.join(directory, 'conversation.json');
@@ -360,6 +370,7 @@ export class CoordinatorService {
     this.completePresentations = completePresentations;
     this.visionModel = visionModel; this.resolveAttachment = resolveAttachment;
     this.onStateChange = onStateChange;
+    this.beforeAcceptHumanInput = beforeAcceptHumanInput;
     this.textModels = textModels; this.selectTextModel = selectTextModel;
     this.steerSettleMs = steerSettleMs;
     // Serialize only this instance's short conversation-file operations. Model,
@@ -574,7 +585,7 @@ export class CoordinatorService {
     actor = trustedActor(actor);
     const { metadata, hasImages, fingerprint } = await this.prepareInput({ id, text, answerTo, attachments }, { source, actor });
     const receivedAt = Date.now(), contextStartedAt = Date.now();
-    const nextContext = this.context ? await this.context() : null;
+    let nextContext = this.context ? await this.context() : null;
     const contextCompletedAt = Date.now();
     // A published terminal state can precede the runner's final durable write.
     // Drain that runner outside the submission lock before accepting a new turn.
@@ -623,6 +634,10 @@ export class CoordinatorService {
               throw error('ATTACHMENT_TOO_LARGE', 'Follow-ups share the active turn attachment limits');
             }
           }
+          if (this.beforeAcceptHumanInput) {
+            nextContext = await this.beforeAcceptHumanInput({ inputs: [{ id, text }], context: nextContext, source, actor });
+            message.serverContext = coordinatorInputContext(nextContext, source);
+          }
           journal.requests[id] = { id, fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
             revision: ++journal.revision, turnId: state.activeTurnId, text, ...(answerTo ? { answerTo } : {}), message, context: nextContext };
           await atomicWrite(this.inputFile, encode(journal));
@@ -649,6 +664,9 @@ export class CoordinatorService {
             state.partialText = '';
             delete state.partialOutputId;
             delete state.partialResponseIndex;
+          }
+          if (state.status === 'interrupted' || state.status === 'error' && source === 'slack') {
+            // 显式恢复是新的控制代次，旧失败快照不能覆盖恢复后的状态。
             journal.controlRevision = (journal.controlRevision || 0) + 1;
             await atomicWrite(this.inputFile, encode(journal));
             state.controlRevision = journal.controlRevision;
@@ -685,6 +703,10 @@ export class CoordinatorService {
               messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
             if (selected.prepareRequest) selected.prepareRequest(input);
             else if (Buffer.byteLength(JSON.stringify(input)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Attachments and conversation exceed the provider request limit');
+          }
+          if (this.beforeAcceptHumanInput) {
+            nextContext = await this.beforeAcceptHumanInput({ inputs: [{ id, text }], context: nextContext, source, actor });
+            message.serverContext = coordinatorInputContext(nextContext, source);
           }
           state.messages.push(message);
           state.activeInput = { id, text, source, ...(actor ? { actor } : {}), ...(metadata.length ? { attachments: metadata.map(({ id }) => ({ id })) } : {}), ...(question ? { answerTo } : {}) };
@@ -726,7 +748,7 @@ export class CoordinatorService {
     const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor,
       ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) }));
     const mode = hash(JSON.stringify({ followup, expectedTurnId }));
-    const receivedAt = Date.now(), nextContext = this.context ? await this.context() : null;
+    const receivedAt = Date.now(); let nextContext = this.context ? await this.context() : null;
     const contextMs = Date.now() - receivedAt;
     let steered = false;
     for (;;) {
@@ -778,6 +800,10 @@ export class CoordinatorService {
           throw error('ATTACHMENT_TOO_LARGE', 'Batch inputs share the active turn attachment limits');
         }
         if (steering) {
+          if (this.beforeAcceptHumanInput) {
+            nextContext = await this.beforeAcceptHumanInput({ inputs: prepared, context: nextContext, source, actor });
+            for (const message of messages) message.serverContext = { ...message.serverContext, ...coordinatorInputContext(nextContext, source) };
+          }
           for (const [index, input] of prepared.entries()) journal.requests[input.id] = {
             id: input.id, fingerprint: input.fingerprint, followup, ...(expectedTurnId ? { expectedTurnId } : {}),
             revision: ++journal.revision, turnId: state.activeTurnId, text: input.text,
@@ -799,6 +825,10 @@ export class CoordinatorService {
             messages: await this.materializeMessages(candidate, { currentImages: hasImages }) };
           if (selected.prepareRequest) selected.prepareRequest(request);
           else if (Buffer.byteLength(JSON.stringify(request)) > 8 * 1024 * 1024) throw error('CONTEXT_TOO_LARGE', 'Batch exceeds the provider request limit');
+        }
+        if (this.beforeAcceptHumanInput) {
+          nextContext = await this.beforeAcceptHumanInput({ inputs: prepared, context: nextContext, source, actor });
+          for (const message of messages) message.serverContext = { ...message.serverContext, ...coordinatorInputContext(nextContext, source) };
         }
         const version = hash(this.system);
         if (state.promptVersion && state.promptVersion !== version) (state.promptChanges ||= []).push({ from: state.promptVersion, to: version, requestId: first.id, at: new Date().toISOString() });
