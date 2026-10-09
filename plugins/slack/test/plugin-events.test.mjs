@@ -57,6 +57,36 @@ async function fixture(t, { automatic = false } = {}) {
   return { store, gateway, io, plugin, calls, posts, warnings, subscriptions: streamProvider.subscriptions, directory };
 }
 
+test('空闲镜像不重复写整份账本，新状态仍耐久保存且轮询截止时间有效', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null, acceptedRequestIds: ['request-1'], inputRevision: 1, consumedInputRevision: 1 });
+  await f.plugin.mirror(key);
+  const before = await fs.readFile(f.store.file), rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  for (let index = 0; index < 5; index++) await f.plugin.mirror(key);
+  assert.equal(writes, 0); assert.deepEqual(await fs.readFile(f.store.file), before);
+  assert.ok(f.store.data.threads[key].nextPoll > Date.now()); assert.equal(f.posts.length, 0);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null, inputRevision: 2, consumedInputRevision: 2 });
+  await f.plugin.mirror(key);
+  assert.equal(writes, 1); assert.equal((await new Store(f.directory).open()).data.threads[key].inputRevision, 2);
+});
+
+test('相同事件仅唤醒原线程不写盘，新最终状态仍镜像一次并保留回执', async t => {
+  const f = await fixture(t); await f.plugin.tick();
+  const rename = fs.rename.bind(fs); let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  f.subscriptions[0].send(snapshot()); await until(() => f.plugin.eventStreams.get(key)?.latest); await f.store.tail;
+  assert.equal(writes, 0); assert.equal(f.store.data.threads[key].nextPoll, 0);
+  const completed = snapshot('chat-1', { status: 'idle', activeTurnId: null, acceptedRequestIds: ['request-1'],
+    messages: [{ id: 'idle-write-final', role: 'assistant', requestId: 'request-1', text: '合成最终回复' }] });
+  f.subscriptions[0].send(completed); await until(() => f.plugin.eventStreams.get(key)?.latest === completed); await f.store.tail;
+  await f.plugin.tick(); assert.equal(f.posts.length, 1); assert.ok(writes > 0);
+  f.gateway.command = async () => completed;
+  await f.plugin.mirror(key); assert.equal(f.posts.length, 1);
+  assert.ok((await new Store(f.directory).open()).data.threads[key].mirrored['idle-write-final']);
+});
+
 test('scoped event snapshot mirrors real prose once without an extra state command and survives restart', async t => {
   const f = await fixture(t); await f.plugin.tick(); assert.equal(f.calls.length, 1);
   const subscription = f.subscriptions[0];

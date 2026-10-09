@@ -89,3 +89,66 @@ test('Unix directory fsync failure rejects acknowledgement and closes its handle
   failDirectory = false;
   assert.equal(await restarted.receive('event-1', {}), false);
 });
+
+test('只刷新线程轮询时间不写盘，业务字段变化仍耐久保存', async t => {
+  const store = await fixture(t), key = 'thread';
+  await store.bind(key, { projectId: 'project', conversationId: 'conversation', status: 'idle', nextPoll: 0 });
+  const before = await fs.readFile(store.file), rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  assert.equal(await store.updateThread(key, thread => { thread.nextPoll = 1234; thread.nextItemPoll = 5678; return 'clock'; }), 'clock');
+  assert.equal(writes, 0); assert.deepEqual(await fs.readFile(store.file), before);
+  assert.equal(store.data.threads[key].nextPoll, 1234);
+  assert.equal((await new Store(store.directory).open()).data.threads[key].nextPoll, 0, '重启只提前只读核对，不丢业务状态');
+  await store.updateThread(key, thread => { thread.pendingQuestionId = 'question'; thread.nextPoll = 9999; });
+  assert.equal(writes, 1);
+  const restarted = await new Store(store.directory).open();
+  assert.equal(restarted.data.threads[key].pendingQuestionId, 'question'); assert.equal(restarted.data.threads[key].nextPoll, 9999);
+});
+
+test('线程时钟更新与全局回执共用串行队列，不丢新输入或复活删除的线程', async t => {
+  const store = await fixture(t), key = 'thread';
+  await store.bind(key, { projectId: 'project', conversationId: 'conversation' });
+  let release, entered;
+  const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const clock = store.updateThread(key, async thread => { entered(); await gate; thread.nextPoll = 1234; });
+  await ready;
+  const receipt = store.receive('new-input', { text: 'synthetic' });
+  release(); await Promise.all([clock, receipt]);
+  assert.equal(store.data.inbox['new-input'].status, 'pending'); assert.equal(store.data.threads[key].nextPoll, 1234);
+  assert.deepEqual((await new Store(store.directory).open()).data, store.data);
+  await store.update(data => { delete data.threads[key]; });
+  await store.updateThread(key, () => assert.fail('已删除线程不能重新建立'));
+  assert.equal((await new Store(store.directory).open()).data.threads[key], undefined);
+});
+
+test('线程业务字段必须 fsync，失败不发布内存状态且原队列可继续', async t => {
+  const store = await fixture(t), key = 'thread';
+  await store.bind(key, { projectId: 'project', conversationId: 'conversation', live: false });
+  const original = await fs.readFile(store.file), open = fs.open.bind(fs);
+  let rejectSync = true;
+  t.mock.method(fs, 'open', async (...args) => {
+    const handle = await open(...args), sync = handle.sync.bind(handle);
+    t.mock.method(handle, 'sync', async () => { if (rejectSync) throw Object.assign(new Error('synthetic flush failure'), { code: 'EIO' }); return sync(); });
+    return handle;
+  });
+  await assert.rejects(store.updateThread(key, thread => { thread.live = true; thread.inputRevision = 2; }), { code: 'EIO' });
+  assert.equal(store.data.threads[key].live, false); assert.deepEqual(await fs.readFile(store.file), original);
+  rejectSync = false;
+  await store.updateThread(key, thread => { thread.live = true; thread.inputRevision = 2; });
+  assert.equal((await new Store(store.directory).open()).data.threads[key].inputRevision, 2);
+});
+
+test('空闲更新只复制目标线程，保留其余记录和业务身份的耐久校验', async t => {
+  const store = await fixture(t);
+  await store.bind('one', { projectId: 'one', conversationId: 'conversation-one' });
+  await store.bind('two', { projectId: 'two', conversationId: 'conversation-two' });
+  await store.update(data => { data.threads.one.mirrored.reply = { ts: '1.1' }; });
+  const inbox = store.data.inbox, other = store.data.threads.two;
+  await store.updateThread('one', thread => { thread.nextPoll = 1000; });
+  assert.equal(store.data.inbox, inbox); assert.equal(store.data.threads.two, other);
+  await assert.rejects(store.updateThread('one', thread => { thread.projectId = 'changed'; throw new Error('synthetic callback failure'); }), /synthetic callback failure/);
+  assert.equal(store.data.threads.one.projectId, 'one');
+  await store.updateThread('one', thread => { thread.mirrored.reply.hash = 'delivered'; });
+  assert.equal((await new Store(store.directory).open()).data.threads.one.mirrored.reply.hash, 'delivered');
+});
