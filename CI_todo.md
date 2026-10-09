@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## SLACK-EVENT-RECONCILE-01 · 事件停滞与独立核对（2026-10-10）
+
+- [x] 代码 Review 确认：消费事件也重置 lastFallbackAt，会使持续旧快照无限推迟 HTTP 补读；响应头和正文缺少独立空闲期限。属于代码确定缺陷，不倒推为所有历史掉线根因。
+- [x] Root 直接开发：活动订阅十秒独立核对，实际 HTTP 读取才重置；二十五秒无数据有界退出，服务端沿原轮询十秒轻量注释心跳，不增加状态读取或重发正文。返回后核用户/项目/会话/频道/线程，错身份拒绝、旧缺省兼容。保持四槽、退避、原发送 ID、修订去重和未知回执，不扩大权限或替换模型。
+- [x] 开发完成后一次受影响模块批次：Node22.18.0，插件 gateway-events / plugin-events 41/41、真实集成网关 SSE 五目标5/5，零失败/跳过/取消，source/test六文件前后hash一致。actual `9af5c4` / `137517` exit0；日志 `temp/slack-event-reconcile-development-20261010.log` SHA256 `a5eb9660f0ca34388f225cddd17d7b82ea8892b32bd181441406cdcbe1ba2971`。含响应头/正文停滞、真实心跳、取消卡住、持续旧事件补漏、迟到绑定隔离及原有乱序/重启/停用/背压/握手容量；不跑付费模型，不以替身证明真实 Slack 或长期稳定，不冒充独立 Tester。
+- [ ] 独立 Tester：核准确修订的多线程及 HTTP 故障合同与生产长时观察。当前人类要求不调用 subagent，Root 自检/Required CI 不冒充独立角色；全目标保持未完成。
+- [ ] Required CI、正常 Main 合并和精确版本上线，数据/配置保留；当前账号完整 Map 的真实模型查询仍须单独验收。
+
 ## REFERENCE-DOCS-01 · 合并指南的兼容入口
 
 - [ ] Skill 新 core 发布后固定消费准确版本，从该构建验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并指南，角色相对链接与章节定位正确。源码的目录迁移与工具读取已有正式回归；旧固定包及合成迁移测试不代替新版共享包消费验收，不修改生成物绕过固定包。本次不部署。

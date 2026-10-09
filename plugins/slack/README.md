@@ -23,7 +23,7 @@ sudo systemctl show context-guard-slack.service -p WorkingDirectory -p ExecStart
 
 ## 使用
 
-Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员首次关联 Map 与已核实的本人 Slack 账号后，该用户可在频道/thread 或私聊查询完整授权目录及按需读取其他项目，无须换对话；回复对频道成员可见，不使其他用户获得后端权限。私有项目菜单和持久切换仍限原私聊/Home 路由。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.7.0.md)。
+Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员首次关联 Map 与已核实的本人 Slack 账号后，该用户可在频道/thread 或私聊查询完整授权目录及按需读取其他项目，无须换对话；回复对频道成员可见，不使其他用户获得后端权限。私有项目菜单和持久切换仍限原私聊/Home 路由。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.7.1.md)。
 
 私聊中可以直接问“有哪些项目”或说“切换到某项目”，不用进入 Home。Coordinator 查询当前授权目录，只显示项目名称；同名时先澄清。插件成功保存后才确认切换，目标使用独立对话，原项目记录保留；在原线程继续回复也会进入目标项目。公共频道不开放此切换工具，也不因此新增权限。
 

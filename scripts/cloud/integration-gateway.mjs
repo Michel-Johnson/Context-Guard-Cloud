@@ -342,15 +342,16 @@ export async function startIntegrationGateway({ config, command, state, authoriz
         if (closed) fail('STOPPING', 'Integration listener is stopping', 503);
         if (req.destroyed || res.destroyed || res.writableEnded) return;
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-        const client = { res, scope, timer: null, fingerprint: null, polling: true, dirty: handshake.dirty, poll: null }; clients.add(client);
+        const client = { res, scope, timer: null, fingerprint: null, lastWriteAt: 0, polling: true, dirty: handshake.dirty, poll: null }; clients.add(client);
         const finish = () => { clearTimeout(client.timer); clients.delete(client); };
         res.once('close', finish); res.once('error', finish);
         const write = async value => {
           const serialized = JSON.stringify(value), fingerprint = hash(serialized);
-          if (client.fingerprint === fingerprint) return true;
+          const changed = client.fingerprint !== fingerprint;
+          if (!changed && Date.now() - client.lastWriteAt < 10000) return true;
           if (res.writableLength > 256 * 1024) { res.end(); finish(); return false; }
-          const ready = res.write(`event: state\ndata: ${serialized}\n\n`);
-          client.fingerprint = fingerprint;
+          const ready = res.write(changed ? `event: state\ndata: ${serialized}\n\n` : ': heartbeat\n\n');
+          client.fingerprint = fingerprint; client.lastWriteAt = Date.now();
           if (ready) return true;
           // write(false) is normal backpressure for a long conversation. Wait
           // within this subscription only; never hold a model/Agent operation.

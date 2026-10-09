@@ -80,7 +80,7 @@ test('no pending snapshot means an active stream suppresses duplicate polls but 
   const f = await fixture(t); await f.plugin.tick();
   f.subscriptions[0].send(snapshot()); await until(() => f.plugin.eventStreams.get(key)?.latest); await f.store.tail; await f.plugin.tick();
   await f.store.update(data => { data.threads[key].nextPoll = 0; }); await f.plugin.tick(); assert.equal(f.calls.length, 1);
-  f.plugin.eventStreams.get(key).lastFallbackAt = Date.now() - 15001;
+  f.plugin.eventStreams.get(key).lastFallbackAt = Date.now() - 10001;
   await f.plugin.tick(); assert.equal(f.calls.length, 2, 'Stalled subscription cannot disable periodic state reads');
 });
 
@@ -94,6 +94,50 @@ test('failed and foreign event subscriptions fall back to polling without displa
     await f.store.update(data => { data.threads[key].nextPoll = 0; }); await f.plugin.tick();
     assert.equal(f.calls.length, 2); assert.equal(f.subscriptions.length, 1, 'Reconnect backoff avoids request storms');
   }
+});
+
+test('不断到来的旧事件不重置独立补读，丢失的最终状态由十秒核对恢复', async t => {
+  const f = await fixture(t); await f.plugin.tick();
+  const stream = f.plugin.eventStreams.get(key), checkedAt = Date.now() - 9000;
+  stream.lastFallbackAt = checkedAt;
+  for (let index = 0; index < 3; index++) {
+    f.subscriptions[0].send(snapshot());
+    await until(() => stream.latest); await f.store.tail; await f.plugin.tick();
+    assert.equal(stream.lastFallbackAt, checkedAt, 'Consuming snapshots never postpones a server reconciliation');
+  }
+  assert.equal(f.calls.length, 1);
+  f.gateway.command = async (type, args) => {
+    f.calls.push({ type, ...args });
+    return snapshot('chat-1', { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: ['request-1'],
+      messages: [{ id: 'lost-final', requestId: 'request-1', role: 'assistant', text: '补读恢复最终回答' }] });
+  };
+  stream.lastFallbackAt = Date.now() - 10001;
+  f.subscriptions[0].send(snapshot());
+  await until(() => stream.latest); await f.store.tail; await f.plugin.tick();
+  assert.equal(f.calls.length, 2, 'A due reconciliation wins even while a cached event is ready');
+  assert.equal(f.posts.length, 1); assert.match(f.posts[0].text, /补读恢复最终回答/);
+  assert.equal(f.store.data.threads[key].live, false);
+  await f.plugin.tick(); await until(() => f.subscriptions[0].closed);
+  assert.equal(f.posts.length, 1, 'Recovery neither duplicates the final reply nor leaves the old subscription active');
+});
+
+test('补读等待期间绑定变化或被删除，不向原频道投递迟到内容', async t => {
+  for (const field of ['projectId', 'conversationId', 'userId', 'channel', 'threadTs', 'removed']) {
+    const f = await fixture(t), entered = deferred(), result = deferred();
+    f.gateway.command = async () => { entered.resolve(); return result.promise; };
+    const pending = f.plugin.mirror(key); await entered.promise;
+    await f.store.update(data => { if (field === 'removed') delete data.threads[key]; else data.threads[key][field] = `changed-${field}`; });
+    result.resolve(snapshot('chat-1', { messages: [{ id: 'old-scope', role: 'assistant', text: 'PRIVATE OLD SCOPE' }] }));
+    await pending; assert.equal(f.posts.length, 0, field);
+  }
+});
+
+test('显式错会话的补读结果拒绝，旧无身份快照继续兼容', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => snapshot('other-chat', { messages: [{ id: 'foreign-poll', role: 'assistant', text: 'PRIVATE FOREIGN POLL' }] });
+  await assert.rejects(f.plugin.mirror(key), { code: 'GATEWAY_BAD_RESPONSE' }); assert.equal(f.posts.length, 0);
+  f.gateway.command = async () => ({ status: 'idle', messages: [], approvals: [] });
+  await f.plugin.mirror(key); assert.equal(f.posts.length, 0);
 });
 
 test('removing the last binding releases its active event subscription', async t => {

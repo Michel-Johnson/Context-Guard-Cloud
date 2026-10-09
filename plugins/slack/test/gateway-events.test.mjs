@@ -13,7 +13,7 @@ const state = (data = {}) => ({ type: 'state', data: { conversationId: scope.con
 const frame = (value, newline = '\n') => `event: state${newline}data: ${JSON.stringify(value)}${newline}${newline}`;
 const collect = async iterator => { const values = []; for await (const value of iterator) values.push(value); return values; };
 
-async function fixture(t, respond, fetchImpl = fetch) {
+async function fixture(t, respond, fetchImpl = fetch, gatewayOptions = {}) {
   const requests = [], failures = [];
   let closed;
   const disconnected = new Promise(resolve => { closed = resolve; });
@@ -29,7 +29,7 @@ async function fixture(t, respond, fetchImpl = fetch) {
     assert.deepEqual(failures, [], 'Synthetic HTTP responder completed without an unobserved error');
   });
   const url = `http://127.0.0.1:${server.address().port}`;
-  const gateway = new Gateway({ url, token, teamId, fetchImpl });
+  const gateway = new Gateway({ url, token, teamId, fetchImpl, ...gatewayOptions });
   const events = (signal = AbortSignal.timeout(5000)) => gateway.events({ ...scope, signal });
   return { gateway, events, requests, disconnected, url };
 }
@@ -183,4 +183,41 @@ test('读取和取消不响应时仍及时中断，释放锁但不重连或丢�
   await assert.rejects(waiting, { name: 'AbortError' });
   assert.equal(cancelCalls, 1);
   assert.equal(body.locked, false);
+});
+
+for (const headers of [false, true]) test(`事件${headers ? '正文' : '响应头'}停滞自动超时并释放真实连接`, { timeout: 5000 }, async t => {
+  const f = await fixture(t, (_req, res) => { if (headers) { sse(res); res.flushHeaders(); } }, fetch, { streamIdleMs: 200 });
+  await assert.rejects(() => collect(f.gateway.events(scope)), error => error instanceof GatewayError && error.code === 'GATEWAY_STREAM_IDLE');
+  await f.disconnected;
+  assert.equal(f.requests.length, 1, 'Timeout releases the old stream; it does not create a new subscription itself');
+});
+
+test('真实心跳刷新空闲期限，但心跳停止后仍自动恢复入口', { timeout: 5000 }, async t => {
+  let heartbeats = 0, interval;
+  const f = await fixture(t, (_req, res) => {
+    sse(res); res.flushHeaders();
+    interval = setInterval(() => {
+      res.write(': ping\n\n'); heartbeats++;
+      if (heartbeats === 6) { res.write(frame(state({ sequence: 2 }))); clearInterval(interval); }
+    }, 50);
+    res.once('close', () => clearInterval(interval));
+  }, fetch, { streamIdleMs: 200 });
+  t.after(() => clearInterval(interval));
+  const iterator = f.gateway.events(scope);
+  assert.equal((await iterator.next()).value.sequence, 2);
+  assert.equal(heartbeats, 6, 'Heartbeats keep a subscription alive beyond its initial deadline');
+  await assert.rejects(iterator.next(), error => error.code === 'GATEWAY_STREAM_IDLE');
+  await f.disconnected;
+});
+
+test('无外部取消信号且正文取消卡住时，空闲期限仍结束读取并释放锁', { timeout: 3000 }, async () => {
+  let cancelCalls = 0;
+  const body = new ReadableStream({ cancel() { cancelCalls++; return new Promise(() => {}); } });
+  const gateway = new Gateway({ url: 'http://127.0.0.1:1234', token, teamId, streamIdleMs: 100,
+    fetchImpl: async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }) });
+  // Keep the test process alive without making the product timer a process owner.
+  const hold = setTimeout(() => {}, 2000);
+  try { await assert.rejects(() => collect(gateway.events(scope)), error => error.code === 'GATEWAY_STREAM_IDLE'); }
+  finally { clearTimeout(hold); }
+  assert.equal(cancelCalls, 1); assert.equal(body.locked, false);
 });
