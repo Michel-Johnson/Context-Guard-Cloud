@@ -8,7 +8,7 @@ import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
-import { validateMergedParticipation, mergedParticipationMessages } from '../scripts/cloud/merged-participation.mjs';
+import { validateMergedParticipation, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store } from '../plugins/slack/src/store.mjs';
@@ -103,6 +103,12 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
   assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
   assert.equal(f.modelCalls[0].tools.length > 0, true);
   assert.match(f.modelCalls[0].system, /Slack 合并接话协议/);
+  assert.ok(f.modelCalls[0].system.includes(MERGED_PARTICIPATION_POLICY), 'The actual request carries the current policy, not a second classifier');
+  assert.match(f.modelCalls[0].system, /明确或隐式请Coordinator参与/);
+  assert.match(f.modelCalls[0].system, /可信历史 speaker 匹配 routing\.coordinatorUserId/);
+  assert.match(f.modelCalls[0].system, /更正、补充是接续/);
+  assert.match(f.modelCalls[0].system, /没有外层邀请只是资料/);
+  assert.match(f.modelCalls[0].system, /当前概览名称按本轮用途概括/);
   const submitted = f.commands.find(command => command.type === 'conversation.submit');
   assert.deepEqual(submitted.payload.participation.inputs, submitted.payload.inputs.map(({ id, text }) => ({ id, text })));
   assert.equal(state.messages.find(message => message.role === 'user').actor.sessionId, `slack:${teamId}:${userId}`);
@@ -118,11 +124,14 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
 
 test('合并接话格式提醒只改本次请求副本，原文、附件和历史保持不变', () => {
   for (const content of ['请确认。', [{ type: 'text', text: '查看附件' }, { type: 'image', source: { type: 'base64', data: 'synthetic' } }]]) {
-    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content }];
+    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content,
+      serverContext: { participation: { context: [{ speaker: botUserId, text: '合成 Coordinator 产物' },
+        { speaker: 'UOTHER', text: '合成他人产物' }], routing: { coordinatorUserId: botUserId } } } }];
     const original = structuredClone(messages), request = mergedParticipationMessages(messages);
     assert.deepEqual(messages, original);
     assert.match(JSON.stringify(request.at(-1).content), /服务器本轮输出格式/);
     assert.deepEqual(request[0], original[0]);
+    assert.deepEqual(request[1].serverContext, original[1].serverContext, 'Trusted speaker/routing data is not rewritten into a decision');
     if (Array.isArray(content)) assert.deepEqual(request[1].content.slice(0, -1), content);
   }
 });

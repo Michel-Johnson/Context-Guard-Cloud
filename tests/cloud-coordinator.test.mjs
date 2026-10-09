@@ -1240,6 +1240,59 @@ test('Coordinator failure diagnostics distinguish transport phases without seria
   }
 });
 
+test('Stream callback failures retain the original boundary in private performance without becoming parser errors', async () => {
+  const secret = 'callback-private-body-and-arguments';
+  for (const fixture of [
+    { boundary: 'onText' }, { boundary: 'onText', delta: true }, { boundary: 'onToolStart' },
+    { boundary: 'onText', gate: true }, { boundary: 'onText', plainError: true, code: 'MODEL_UNAVAILABLE' },
+    { boundary: 'onText', cancel: 'MODEL_STEERED', code: 'MODEL_STEERED' },
+    { boundary: 'onText', cancel: 'MODEL_TIMEOUT', code: 'MODEL_TIMEOUT' },
+    { boundary: 'onText', cancel: 'human', code: 'MODEL_INTERRUPTED' },
+  ]) {
+    const tool = fixture.boundary === 'onToolStart', controller = new AbortController();
+    const block = tool ? { type: 'tool_use', id: 'callback-tool', name: 'read', input: { privateArgument: secret } }
+      : { type: 'text', text: fixture.delta ? '' : secret };
+    const events = [
+      { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12 } } },
+      { type: 'content_block_start', index: 0, content_block: block },
+      ...(fixture.delta ? [{ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: secret } }] : []),
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' } }, { type: 'message_stop' },
+    ];
+    let requests = 0, executions = 0;
+    const model = new CoordinatorModel({ ...config, maxTokens: 256, timeoutMs: 12000, fetch: async (_url, options) => {
+      requests++; assert.equal(JSON.parse(options.body).max_tokens, 256);
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const input = { role: 'user', content: secret, requestId: 'callback-turn', source: 'slack', actor: reactionActor,
+      ...(fixture.gate ? { serverContext: { participation: { text: secret, inputs: [{ id: 'callback-turn', text: secret }] } } } : {}) };
+    const state = { activeTurnId: 'callback-turn', messages: [input],
+      ...(fixture.gate ? { activeInput: { id: 'callback-turn', source: 'slack', actor: reactionActor } } : {}) };
+    const callback = async () => {
+      if (fixture.cancel) controller.abort(Object.assign(new Error(secret), fixture.cancel === 'human' ? {} : { code: fixture.cancel }));
+      throw fixture.plainError ? new Error(secret) : Object.assign(new Error(secret), { code: 'MODEL_INVALID_RESPONSE', privateBody: secret });
+    };
+    await assert.rejects(coordinatorStep({ turnId: 'callback-turn', state, model, system: secret, tools: [], save: async () => {},
+      signal: controller.signal, [fixture.boundary]: callback, execute: async () => { executions++; } }), error => {
+      assert.equal(error.code, fixture.code || 'MODEL_INVALID_RESPONSE');
+      assert.equal(error.modelDiagnostic.phase, 'response-stream');
+      assert.equal(error.modelDiagnostic.termination.failureOrigin, 'callback');
+      assert.equal(error.modelDiagnostic.termination.callbackBoundary, fixture.boundary);
+      assert.equal(error.modelDiagnostic.termination.validationCode, undefined);
+      return true;
+    });
+    const diagnostic = state.performance.models[0].diagnostic;
+    assert.equal(diagnostic.code, fixture.code || 'MODEL_INVALID_RESPONSE');
+    assert.equal(diagnostic.failureOrigin, 'callback'); assert.equal(diagnostic.callbackBoundary, fixture.boundary);
+    assert.equal(diagnostic.validationCode, undefined); assert.equal(diagnostic.openBlockCount, 1);
+    assert.equal(diagnostic.messageStopSeen, false); assert.equal(diagnostic.usage.input_tokens, 12);
+    assert.doesNotMatch(JSON.stringify(state.performance), /callback-private|privateBody|privateArgument|synthetic-private/);
+    assert.equal(requests, 1); assert.equal(executions, 0); assert.equal(state.pending, undefined);
+    assert.equal(state.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.deepEqual(state.toolReceipts, {});
+  }
+});
+
 test('Failed stream termination diagnostics preserve only known reasons and numeric usage without accepting incomplete output', async () => {
   const start = { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12, privateBody: 'diagnostic-secret' } } };
   const block = { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'visible incomplete explanation' } };
@@ -1259,6 +1312,8 @@ test('Failed stream termination diagnostics preserve only known reasons and nume
       const diagnostic = error.modelDiagnostic;
       assert.equal(error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(diagnostic.phase, 'response-stream');
       assert.equal(diagnostic.termination.validationCode, fixture.code);
+      assert.equal(diagnostic.termination.failureOrigin, undefined);
+      assert.equal(diagnostic.termination.callbackBoundary, undefined);
       assert.equal(diagnostic.termination.stopReason, fixture.reason);
       assert.equal(diagnostic.termination.openBlockCount, fixture.open);
       assert.equal(diagnostic.termination.messageStopSeen, fixture.terminal);
@@ -1308,11 +1363,16 @@ test('Failed stream metrics reject forged diagnostic values and never invoke dia
   let reads = 0;
   const forged = { phase: 'response-stream', code: 'diagnostic-secret', durationMs: -1, termination: {
     validationCode: 'diagnostic-secret', stopReason: 'diagnostic-secret', openBlockCount: -1, messageStopSeen: 'yes',
+    failureOrigin: 'diagnostic-secret', callbackBoundary: 'diagnostic-secret',
     usage: { output_tokens: 5, privateBody: 'diagnostic-secret' } } };
   Object.defineProperty(forged.termination.usage, 'input_tokens', { get() { reads++; throw new Error('diagnostic-secret'); } });
-  for (const getter of [false, true]) {
+  const guardedOrigin = { ...forged, termination: { ...forged.termination, callbackBoundary: 'onText' } };
+  Object.defineProperty(guardedOrigin.termination, 'failureOrigin', { get() { reads++; throw new Error('diagnostic-secret'); } });
+  const guardedBoundary = { ...forged, termination: { ...forged.termination, failureOrigin: 'callback' } };
+  Object.defineProperty(guardedBoundary.termination, 'callbackBoundary', { get() { reads++; throw new Error('diagnostic-secret'); } });
+  for (const value of [forged, guardedOrigin, guardedBoundary]) for (const getter of [false, true]) {
     const failure = Object.assign(new Error('diagnostic-secret'), { code: 'MODEL_INVALID_RESPONSE' });
-    Object.defineProperty(failure, 'modelDiagnostic', getter ? { get() { reads++; throw new Error('diagnostic-secret'); } } : { value: forged });
+    Object.defineProperty(failure, 'modelDiagnostic', getter ? { get() { reads++; throw new Error('diagnostic-secret'); } } : { value });
     const state = { activeTurnId: 'failure-turn', messages: [] };
     await assert.rejects(coordinatorStep({ turnId: 'failure-turn', state, model: { next: async () => { throw failure; } }, system: '', tools: [], save: async () => {}, execute: () => assert.fail('No incomplete tool') }), { code: 'MODEL_INVALID_RESPONSE' });
     assert.equal(state.performance.models.length, 1);
