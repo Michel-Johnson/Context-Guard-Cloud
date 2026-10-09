@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import http from 'node:http';
 import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, authorizeCiTransaction } from '../scripts/cloud/server.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { canonical } from '../scripts/shared/protocol.mjs';
@@ -62,24 +63,144 @@ async function fixture(t) {
   const tuple = { taskId: 'task', planRef: plan.ref, planVersion: plan.version, planSourceSha,
     approvalReceiptId: approval.receiptId, sourceSha, ciTodoRef: todo.ref, ciTodoVersion: todo.version };
   const credential = JSON.parse(await fs.readFile(device.file, 'utf8')).credential;
-  const request = async (type, payload, { id = 'http-' + ++sequence, expectation = tuple, ci = 'ci', auth = credential, target = session, browser = false } = {}) => {
+  const request = async (type, payload, { id = 'http-' + ++sequence, expectation = tuple, proof, ci = 'ci', auth = credential, target = session, browser = false } = {}) => {
     const response = await fetch(cloud.url + '/api/v2/messages?project=fixture', { method: 'POST', headers: {
       'Content-Type': 'application/json', ...(browser ? { Cookie: 'cg_workbench=synthetic-browser' } : { Authorization: `Bearer ${auth}` }),
       ...(ci ? { 'X-Context-Guard-CI-Session': ci } : {}),
       ...(expectation === null ? {} : { 'X-Context-Guard-CI-Task': typeof expectation === 'string' ? expectation : header(expectation) }),
+      ...(proof === undefined ? {} : { 'X-Context-Guard-CI-Evidence': typeof proof === 'string' ? proof : header(proof) }),
     }, body: JSON.stringify({ v: 2, id, type, session: target, payload }) });
-    return { status: response.status, body: await response.json(), authorized: response.headers.get('x-context-guard-ci-task-authorized') };
+    return { status: response.status, body: await response.json(), authorized: response.headers.get('x-context-guard-ci-task-authorized'),
+      evidenceAuthorized: response.headers.get('x-context-guard-ci-evidence-authorized') };
   };
   const unchangedRejection = async (type, payload, options, code = 'FORBIDDEN') => {
     const before = await fs.readFile(store.file, 'utf8'), result = await request(type, payload, options);
     assert.equal(result.body.ok, false, JSON.stringify(result)); assert.equal(result.body.error.code, code, JSON.stringify(result));
     assert.equal(result.authorized, null, 'an error or rejected scope must never acknowledge task authorization');
+    assert.equal(result.evidenceAuthorized, null, 'an error must not acknowledge host evidence');
     assert.equal(await fs.readFile(store.file, 'utf8'), before, 'rejection must not mutate Task, objects, scope or receipts');
   };
   const evidence = { kind: 'evidence', ref: 'ci:ci:observation', baseVersion: '', content: { observed: 'synthetic-only' } };
   const result = { taskId: 'task', sourceSha, verdict: 'passed', checks: [{ testId: 'test-1', todoId: 'CI-1', status: 'passed', evidenceRef: evidence.ref }] };
-  return { store, session, tuple, todo, unit, plan, evidence, result, request, unchangedRejection, put, send, executor, coordinator, receivers };
+  return { store, session, tuple, todo, unit, plan, evidence, result, request, unchangedRejection, put, send, executor, coordinator, receivers, url: cloud.url, credential };
 }
+
+async function hostEvidence(f) {
+  const evidence = { ...f.evidence, ref: 'ci:ci:host:observation', content: { taskId: f.tuple.taskId, sourceSha: f.tuple.sourceSha, observation: 'synthetic-host-output' } };
+  const accepted = await f.request('object.put', evidence); assert.equal(accepted.status, 200, JSON.stringify(accepted));
+  return { evidence, proof: [{ ref: evidence.ref, version: accepted.body.data.version, contentHash: digest(canonical(evidence.content)) }],
+    result: { ...f.result, checks: [{ ...f.result.checks[0], evidenceRef: evidence.ref }] } };
+}
+
+test('host evidence CI result pins exact consumed versions and both ACKs in the original Core transaction', async t => {
+  for (const verdict of ['passed', 'failed']) {
+  const f = await fixture(t), host = await hostEvidence(f), options = { id: 'proved-result', proof: host.proof };
+  if (verdict === 'failed') host.result = { ...host.result, verdict, checks: [{ ...host.result.checks[0], status: 'failed', reproductionRef: host.evidence.ref }] };
+  const accepted = await f.request('ci.result', host.result, options); assert.equal(accepted.status, 200, JSON.stringify(accepted));
+  assert.equal(accepted.authorized, digest(canonical(f.tuple))); assert.equal(accepted.evidenceAuthorized, digest(canonical(host.proof)));
+  const task = await f.store.taskRecord(f.coordinator, f.session, 'task'); assert.equal(task.stage, verdict === 'passed' ? 'awaiting-merge' : 'ci-failed');
+  const state = JSON.parse(await fs.readFile(f.store.file, 'utf8'));
+  const result = state.objects[scopedObjectKey(f.coordinator, f.session, task.ci.ref)].versions[task.ci.version];
+  assert.equal(result.content.references[host.evidence.ref], host.proof[0].version);
+  assert.ok(Object.values(state.cursorCiTaskScopes).some(scope => scope.evidenceHash === digest(canonical(host.proof))));
+  const snapshot = await fs.readFile(f.store.file, 'utf8');
+  assert.deepEqual(await f.request('ci.result', host.result, options), accepted);
+  assert.equal(await fs.readFile(f.store.file, 'utf8'), snapshot, 'terminal same-ID replay does not change the accepted task');
+  await f.unchangedRejection('ci.result', host.result, { id: options.id });
+  await f.unchangedRejection('ci.result', host.result, { ...options, proof: [{ ...host.proof[0], contentHash: 'd'.repeat(64) }] });
+  await f.unchangedRejection('ci.result', host.result, { ...options, id: 'replacement-result' });
+  }
+});
+
+test('host evidence drift and same-version corruption reject both new results and unknown terminal ACK replay', async t => {
+  for (const terminal of [false, true]) for (const drift of ['latest', 'content', 'task', 'source']) {
+    const f = await fixture(t), host = await hostEvidence(f), options = { id: 'proved-result', proof: host.proof };
+    if (terminal) assert.equal((await f.request('ci.result', host.result, options)).status, 200);
+    await f.store.transaction(state => {
+      const object = state.objects[scopedObjectKey(f.coordinator, f.session, host.evidence.ref)];
+      if (drift === 'latest') { object.versions.later = structuredClone(object.versions[object.latest]); object.latest = 'later'; }
+      else if (drift === 'content') object.versions[object.latest].content.observation = 'changed';
+      else object.versions[object.latest].content[drift === 'task' ? 'taskId' : 'sourceSha'] = 'foreign';
+      return null;
+    });
+    await f.unchangedRejection('ci.result', host.result, options);
+  }
+});
+
+test('host evidence cannot upgrade legacy receipts or consume unchecked reproduction references', async t => {
+  const f = await fixture(t), host = await hostEvidence(f);
+  for (const check of [{ ...host.result.checks[0], reproductionRef: host.evidence.ref },
+    { ...host.result.checks[0], status: 'failed', reproductionRef: 'ci:ci:other' }]) {
+    await f.unchangedRejection('ci.result', { ...host.result, verdict: check.status === 'failed' ? 'failed' : 'passed', checks: [check] }, { proof: host.proof });
+  }
+  const legacy = await f.request('ci.result', host.result, { id: 'legacy-result' }); assert.equal(legacy.status, 200);
+  assert.equal(legacy.evidenceAuthorized, null);
+  await f.unchangedRejection('ci.result', host.result, { id: 'legacy-result', proof: host.proof });
+  assert.deepEqual(await f.request('ci.result', host.result, { id: 'legacy-result' }), legacy, 'ordinary scoped legacy replay remains compatible');
+});
+
+test('host evidence HTTP rejects malformed and unscoped expectations without effects', async t => {
+  const f = await fixture(t), host = await hostEvidence(f);
+  for (const proof of ['not-base64!', header([{ ...host.proof[0], verified: true }]), header([]), header([host.proof[0], host.proof[0]]),
+    Buffer.from(JSON.stringify(host.proof, null, 2)).toString('base64url'), header([{ ...host.proof[0], contentHash: [host.proof[0].contentHash] }])]) {
+    await f.unchangedRejection('ci.result', host.result, { proof }, 'INVALID_ARGUMENT');
+  }
+  await f.unchangedRejection('ci.result', host.result, { proof: host.proof, expectation: null });
+  await f.unchangedRejection('object.read', { ref: f.todo.ref, version: f.todo.version }, { proof: host.proof });
+  await f.unchangedRejection('ci.result', host.result, { proof: [{ ...host.proof[0], ref: 'ci:foreign:host:observation' }] });
+  await f.unchangedRejection('ci.result', host.result, { proof: host.proof, browser: true });
+  const duplicateKey = '[{"ref":"ci:ci:host:observation","ref":"ci:ci:host:observation","version":' + JSON.stringify(host.proof[0].version) + ',"contentHash":' + JSON.stringify(host.proof[0].contentHash) + '}]';
+  await f.unchangedRejection('ci.result', host.result, { proof: Buffer.from(duplicateKey).toString('base64url') }, 'INVALID_ARGUMENT');
+  const message = { v: 2, id: 'duplicate-header', type: 'ci.result', session: f.session, payload: host.result };
+  const snapshot = await fs.readFile(f.store.file, 'utf8');
+  const duplicate = await new Promise((resolve, reject) => {
+    const request = http.request(new URL('/api/v2/messages', f.url), { method: 'POST', headers: {
+      'Content-Type': 'application/json', Authorization: `Bearer ${f.credential}`, 'X-Context-Guard-CI-Session': 'ci',
+      'X-Context-Guard-CI-Task': header(f.tuple), 'X-Context-Guard-CI-Evidence': [header(host.proof), header(host.proof)],
+    } }, response => { const chunks = []; response.on('data', chunk => chunks.push(chunk)); response.on('error', reject);
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') })); });
+    request.on('error', reject); request.end(JSON.stringify(message));
+  });
+  assert.equal(duplicate.status, 400); assert.equal(JSON.parse(duplicate.body).error.code, 'INVALID_ARGUMENT');
+  assert.equal(duplicate.headers['x-context-guard-ci-evidence-authorized'], undefined);
+  assert.equal(await fs.readFile(f.store.file, 'utf8'), snapshot);
+});
+
+test('host evidence scope and result roll back together on original persistence failure and revoked binding', async t => {
+  const f = await fixture(t), host = await hostEvidence(f), message = { v: 2, id: 'proved-result', type: 'ci.result', session: f.session, payload: host.result };
+  const receiver = await authorizeCiReceiver({ principal: f.executor, ciSessionId: 'ci', message, receivers: f.receivers, store: f.store });
+  const principal = { ...receiver, ciTaskExpectation: f.tuple, ciHostEvidence: host.proof };
+  const snapshot = await fs.readFile(f.store.file, 'utf8');
+  const failing = new ProtocolStore(path.dirname(f.store.file), { beforeCommit: () => { throw new Error('synthetic proof persistence failure'); } });
+  await assert.rejects(failing.handle(principal, message, { authorize: authorizeCiTransaction }), /synthetic proof persistence failure/);
+  assert.equal(await fs.readFile(f.store.file, 'utf8'), snapshot, 'no proof sidecar, Task or receipt survives a failed atomic commit');
+  const accepted = await f.request('ci.result', host.result, { id: message.id, proof: host.proof }); assert.equal(accepted.status, 200);
+  const binding = await f.store.registeredBinding(f.executor, 'ci');
+  await f.store.handle(f.executor, { v: 2, id: 'move-ci', type: 'session.bind', payload: {
+    sessionId: 'ci', agentId: 'ci', worktreeId: 'foreign-ci-tree', expectedBindingVersion: binding.version } }, { verifyBinding: () => true, allowMigration: true });
+  await f.unchangedRejection('ci.result', host.result, { id: message.id, proof: host.proof });
+});
+
+test('host evidence is checked after acquiring the original Core lock, not against pre-submit reads', async t => {
+  const f = await fixture(t), host = await hostEvidence(f);
+  const message = { v: 2, id: 'waiting-result', type: 'ci.result', session: f.session, payload: host.result };
+  const receiver = await authorizeCiReceiver({ principal: f.executor, ciSessionId: 'ci', message, receivers: f.receivers, store: f.store });
+  const principal = { ...receiver, ciTaskExpectation: f.tuple, ciHostEvidence: host.proof };
+  let entered, release;
+  const acquired = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const writing = f.store.transaction(async state => {
+    entered(); await gate;
+    state.objects[scopedObjectKey(f.coordinator, f.session, host.evidence.ref)].versions[host.proof[0].version].content.observation = 'changed while result waits';
+    return null;
+  });
+  await acquired;
+  const waitingStore = new ProtocolStore(path.dirname(f.store.file));
+  const rejected = assert.rejects(waitingStore.handle(principal, message, { authorize: authorizeCiTransaction }), { code: 'FORBIDDEN' });
+  release(); await writing;
+  const snapshot = await fs.readFile(f.store.file, 'utf8'); await rejected;
+  assert.equal(await fs.readFile(f.store.file, 'utf8'), snapshot, 'only the first writer changed evidence; rejected result has no Task, scope or receipt effect');
+  assert.equal((await f.store.taskRecord(f.coordinator, f.session, 'task')).stage, 'testing');
+});
 
 test('scoped CI HTTP validates the exact current Task, approved Plan baseline and final handoff before frozen reads', async t => {
   const f = await fixture(t), payload = { ref: f.todo.ref, version: f.todo.version };

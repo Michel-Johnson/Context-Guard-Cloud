@@ -41,7 +41,7 @@ import { CursorCloudSessions } from './cursor-sessions.mjs';
 import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
 import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
 import { CursorGitProof } from './cursor-git-proof.mjs';
-import { authorizeCursorCiTask, parseCursorCiTaskHeader } from './cursor-ci-task-authority.mjs';
+import { authorizeCursorCiTask, parseCursorCiTaskHeader, authorizeCursorCiHostEvidence, parseCursorCiEvidenceHeader } from './cursor-ci-task-authority.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -416,6 +416,7 @@ export async function authorizeCiReceiver({ principal, ciSessionId, message, rec
 
 export function authorizeCiTransaction(state, principal, message) {
   authorizeCursorCiTask(state, principal, message);
+  authorizeCursorCiHostEvidence(state, principal, message);
   if (principal.role !== 'ci') return;
   // Recheck the delegated identity on the same authoritative snapshot as the
   // object read, before ProtocolStore can reuse any accepted receipt.
@@ -2488,8 +2489,11 @@ export async function startCloudServer({
           if (typeof input?.id === 'string' && input.id.length <= 128) id = input.id;
           validateMessage(input);
           const ciTaskHeader = req.headers['x-context-guard-ci-task'];
+          const ciEvidenceHeader = req.headers['x-context-guard-ci-evidence'];
           if (ciTaskHeader !== undefined && (!req.headers['x-context-guard-ci-session'] ||
               !['object.read', 'object.put', 'ci.result'].includes(input.type))) protocolFail('FORBIDDEN', 'CI task expectation requires delegated CI');
+          if (ciEvidenceHeader !== undefined && (ciTaskHeader === undefined || !req.headers['x-context-guard-ci-session'] ||
+              input.type !== 'ci.result')) protocolFail('FORBIDDEN', 'Host evidence requires a scoped CI result');
           if (input.type === 'auth.open') {
             const opened = loginResult(await interfaceAuth.open(input, String(req.socket.remoteAddress)));
             return send(res, 200, { id, ok: true, data: opened.data }, { 'X-Context-Guard-Credential': opened.credential });
@@ -2511,6 +2515,12 @@ export async function startCloudServer({
               const count = req.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'x-context-guard-ci-task').length;
               if (count !== 1) protocolFail('INVALID_ARGUMENT', 'Ambiguous CI task expectation');
               principal = { ...principal, ciTaskExpectation: parseCursorCiTaskHeader(ciTaskHeader) };
+            }
+            if (ciEvidenceHeader !== undefined) {
+              const count = req.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'x-context-guard-ci-evidence').length;
+              if (count !== 1 || typeof ciTaskHeader !== 'string' || typeof ciEvidenceHeader !== 'string' ||
+                  ciEvidenceHeader.length + ciTaskHeader.length > 12288) protocolFail('INVALID_ARGUMENT', 'Ambiguous or oversized CI host evidence expectation');
+              principal = { ...principal, ciHostEvidence: parseCursorCiEvidenceHeader(ciEvidenceHeader) };
             }
           }
           if (input.type === 'sync.heartbeat') return send(res, 200, await receiveHeartbeat(principal, input));
@@ -2578,8 +2588,10 @@ export async function startCloudServer({
             verifyBinding: (identity, payload) => identity.role === 'device' || identity.bindings?.[payload.sessionId] === payload.worktreeId,
             workflow: interfaceWorkflow,
           });
-          return send(res, 200, reply, principal.ciTaskExpectation
-            ? { 'X-Context-Guard-CI-Task-Authorized': digest(canonical(principal.ciTaskExpectation)) } : {});
+          return send(res, 200, reply, {
+            ...(principal.ciTaskExpectation ? { 'X-Context-Guard-CI-Task-Authorized': digest(canonical(principal.ciTaskExpectation)) } : {}),
+            ...(principal.ciHostEvidence ? { 'X-Context-Guard-CI-Evidence-Authorized': digest(canonical(principal.ciHostEvidence)) } : {}),
+          });
         } catch (error) { return send(res, error.status || 503, errorReply(id, error)); }
       }
       const passwordLoginRequest = route === '/auth/login' && req.method === 'POST';

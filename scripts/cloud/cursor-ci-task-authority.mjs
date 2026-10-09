@@ -29,6 +29,49 @@ function validateTuple(tuple) {
   }
 }
 
+function validateEvidence(expectations) {
+  const fields = ['ref', 'version', 'contentHash'];
+  if (!Array.isArray(expectations) || !expectations.length || expectations.length > 20 ||
+      new Set(expectations.map(entry => entry?.ref)).size !== expectations.length ||
+      expectations.some(entry => !record(entry) || Object.keys(entry).length !== fields.length ||
+        fields.some(field => !Object.hasOwn(entry, field)) || typeof entry.ref !== 'string' || !entry.ref || entry.ref.length > 128 ||
+        typeof entry.version !== 'string' || !entry.version || entry.version.length > 4096 ||
+        /[\x00-\x1f\x7f]/.test(entry.ref + entry.version) || typeof entry.contentHash !== 'string' || !/^[a-f0-9]{64}$/.test(entry.contentHash))) {
+    fail('INVALID_ARGUMENT', 'Invalid CI host evidence expectation');
+  }
+}
+
+export function parseCursorCiEvidenceHeader(value) {
+  if (typeof value !== 'string' || value.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(value)) fail('INVALID_ARGUMENT', 'Invalid CI host evidence expectation');
+  const bytes = Buffer.from(value, 'base64url');
+  if (bytes.toString('base64url') !== value) fail('INVALID_ARGUMENT', 'Invalid CI host evidence expectation');
+  let expectations;
+  try { expectations = JSON.parse(bytes.toString('utf8')); } catch { fail('INVALID_ARGUMENT', 'Invalid CI host evidence expectation'); }
+  validateEvidence(expectations);
+  if (bytes.toString('utf8') !== canonical(expectations)) fail('INVALID_ARGUMENT', 'Invalid CI host evidence expectation');
+  return expectations;
+}
+
+// Receiver-owned check on Core's locked snapshot, including cached result
+// replay. This narrows device delegation; it does not attest native execution.
+export function authorizeCursorCiHostEvidence(state, principal, message) {
+  const expectations = principal.ciHostEvidence;
+  if (expectations === undefined) return;
+  validateEvidence(expectations);
+  if (principal.role !== 'ci' || !principal.ciTaskExpectation || message.type !== 'ci.result') forbidden();
+  const checks = message.payload.checks;
+  if (expectations.length !== checks.length || new Set(checks.map(check => check.evidenceRef)).size !== checks.length ||
+      checks.some(check => !expectations.some(entry => entry.ref === check.evidenceRef) ||
+        (check.status === 'failed' ? check.reproductionRef !== check.evidenceRef : check.reproductionRef !== undefined))) forbidden();
+  for (const expected of expectations) {
+    const object = state.objects[scopedObjectKey(principal, message.session, expected.ref)];
+    const saved = object?.versions?.[expected.version];
+    if (!expected.ref.startsWith(`ci:${principal.agentId}:host:`) || object?.latest !== expected.version ||
+        saved?.kind !== 'evidence' || saved.content?.taskId !== message.payload.taskId ||
+        saved.content.sourceSha !== message.payload.sourceSha || hash(canonical(saved.content)) !== expected.contentHash) forbidden();
+  }
+}
+
 export function authorizeCursorCiTask(state, principal, message) {
   const receiptKey = hash(canonical([principal.repositoryId, principal.deviceId, principal.agentId, message.id]));
   const pinned = state.cursorCiTaskScopes?.[receiptKey], tuple = principal.ciTaskExpectation;
@@ -46,6 +89,11 @@ export function authorizeCursorCiTask(state, principal, message) {
       ci.worktreeId === executor.worktreeId || principal.bindings?.[message.session.id] !== executor.worktreeId) forbidden();
   const scope = { expectationHash: hash(canonical(tuple)), sessionHash: hash(canonical(message.session)),
     ciBindingVersion: ci.version, executorBindingVersion: executor.version };
+  if (principal.ciHostEvidence !== undefined) {
+    validateEvidence(principal.ciHostEvidence);
+    if (message.type !== 'ci.result') forbidden();
+    scope.evidenceHash = hash(canonical(principal.ciHostEvidence));
+  }
   if (pinned && canonical(pinned) !== canonical(scope)) forbidden();
   const task = state.tasks[scopedObjectKey(principal, message.session, `task:${tuple.taskId}`)];
   if (!task || task.repositoryId !== principal.repositoryId || canonical(task.session) !== canonical(message.session) ||
