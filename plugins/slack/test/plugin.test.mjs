@@ -91,6 +91,38 @@ test('Coordinator prose is plain text while links code and identifiers remain re
   assert.equal(blocks.map(block => block.text?.text || '').join(''), value);
 });
 
+test('Partial emphasis projection removes only a terminal prose opener and leaves complete projection unchanged', () => {
+  for (const [source, expected] of [['**Status', 'Status'], ['*Status', 'Status'], ['说明：**状态正在检查', '说明：状态正在检查'],
+    ['上一段。\n\n**Status is pending', '上一段。\n\nStatus is pending'], ['- **Status', '• Status']]) {
+    assert.equal(plainText(source, { partial: true }), expected);
+    assert.equal(plainText(source), plainText(source, { partial: false }), 'Complete projection is not silently repaired');
+    assert.ok(plainText(source).includes('*'), 'Original incomplete complete text remains literal');
+    assert.equal(messageBlocks({ text: source, partial: true }, 'thread').map(block => block.text?.text || '').join(''), expected);
+  }
+  for (const source of ['**Status**', '*Status*', '**Status** is ready']) {
+    assert.equal(plainText(source, { partial: true }), plainText(source));
+  }
+});
+
+test('Partial emphasis projection preserves escaped code arithmetic identifiers and ambiguous delimiters', () => {
+  for (const [source, expected] of [['`**Status`', '**Status'], ['```js\n**Status\n```', '**Status'],
+    ['```js\n**Status', '**Status'], ['\\*\\*Status', '**Status'], ['\\**Status', '**Status'],
+    ['`**Status', '`**Status'], ['2 ** 3', '2 ** 3'], ['**2', '**2'], ['foo**Status', 'foo**Status'],
+    ['2 *count', '2 *count'], ['x *value', 'x *value'], ['x **power', 'x **power'], ['说明 (**Status', '说明 (**Status'],
+    ['__API_name', '__API_name'], ['**Status\\path', '**Status\\path']]) {
+    assert.equal(plainText(source, { partial: true }), expected);
+  }
+  assert.equal(plainText('**Status*', { partial: true }), plainText('**Status*'), 'Ambiguous delimiters retain the original complete-parser behavior');
+  assert.equal(plainText('[**Status](https://example.com)', { partial: true }), plainText('[**Status](https://example.com)'), 'A closed link label is not repaired as unfinished prose');
+  const source = '**Earlier paragraph\n\n**Status';
+  assert.equal(plainText(source, { partial: true }), '**Earlier paragraph\n\nStatus', 'Only the terminal prose fragment is projected');
+  const long = '🙂正文。'.repeat(900) + '\n\n```js\nconst x = "**Status";\n```\n\n**Status';
+  const chunks = plainChunks(long, 2800, { partial: true });
+  assert.equal(chunks.join(''), plainText(long, { partial: true }));
+  assert.ok(chunks.every(chunk => chunk.length <= 2800 && !/^[\uDC00-\uDFFF]/.test(chunk) && !/[\uD800-\uDBFF]$/.test(chunk)));
+  assert.ok(chunks.join('').includes('const x = "**Status";'), 'Protected code is not parsed a second time');
+});
+
 test('Slack post and update disable markdown in fallback text and streamed output', async t => {
   const f = await fixture(t), calls = [];
   const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: '1.0' }; } } });
@@ -231,7 +263,7 @@ async function fixture(t) {
     if (type === 'conversation.create') return { conversationId: `chat-${args.payload.operationId}` };
     if (type === 'conversation.bind') return { conversationId: args.payload.conversationId };
     if (type === 'conversation.state') return { status: 'idle', messages: [], approvals: [] };
-    if (type === 'conversation.relevance') return { respond: true, reason: 'Controlled relevant message', mainVersion: 'v1' };
+    if (type === 'conversation.relevance') assert.fail('Native Slack must not call a separate classifier');
     if (type === 'attachment.upload') return { id: 'attachment-1' };
     if (type === 'prompt.read') return { text: 'execute login', filename: 'prompt.md' };
     return { accepted: true };
@@ -297,8 +329,8 @@ test('切换后旧线程的新回复按新项目处理，不携带旧 Slack 历�
   const submits = f.calls.filter(call => call.type === 'conversation.submit');
   assert.equal(submits.length, 1); assert.equal(submits[0].projectId, 'blog'); assert.equal(submits[0].conversationId, 'new-chat');
   assert.equal(submits[0].payload.history, undefined); assert.equal(submits[0].payload.slackChannelId, f.dm);
-  const relevance = f.calls.find(call => call.type === 'conversation.relevance');
-  assert.deepEqual(relevance.payload.context, []);
+  assert.deepEqual(submits[0].payload.participation.context, []);
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
 });
 
 test('项目新线程发送失回后重启复用原编号，确认失败不再次切换', async t => {
@@ -347,7 +379,8 @@ test('切换请求已完成但确认尚未发送时，先交接再处理紧接�
   const submits = f.calls.filter(call => call.type === 'conversation.submit');
   assert.equal(submits.length, 1); assert.equal(submits[0].projectId, 'blog'); assert.equal(submits[0].conversationId, 'new-chat');
   assert.equal(submits[0].payload.history, undefined);
-  assert.deepEqual(f.calls.find(call => call.type === 'conversation.relevance').payload.context, []);
+  assert.deepEqual(submits[0].payload.participation.context, []);
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
 });
 
 test('切换应用前重新校验目标权限，撤销授权不创建 Slack 线程', async t => {
@@ -1131,13 +1164,14 @@ test('durable collection merges other-bot request and unmentioned correction onc
   const ids = Object.keys(f.store.data.inbox), batch = f.store.data.messageBatches[ids[0]];
   assert.deepEqual(batch.ids, ids); assert.ok(batch.readyAt <= batch.deadline); assert.equal(batch.deadline - batch.firstAt, 2000);
   f.plugin.stopped = false; f.plugin.kick = () => {};
-  await f.plugin.tick(); assert.equal(f.calls.length, 0, 'Do not classify the first message before the correction window closes');
+  await f.plugin.tick(); assert.equal(f.calls.length, 0, 'Do not submit the first message before the correction window closes');
   const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
   await reopened.update(state => { state.messageBatches[ids[0]].readyAt = Date.now() - 1; });
   await f.plugin.tick();
   await Promise.all([...f.plugin.processing.values()]);
-  const judgments = f.calls.filter(call => call.type === 'conversation.relevance'), submits = f.calls.filter(call => call.type === 'conversation.submit');
-  assert.equal(judgments.length, 1); assert.deepEqual(judgments[0].payload.inputs.map(item => item.text), messages.map(item => item.text));
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
+  assert.deepEqual(submits[0].payload.participation.inputs.map(item => item.text), messages.map(item => item.text));
   assert.equal(submits.length, 1); assert.deepEqual(submits[0].payload.inputs.map(item => item.text), messages.map(item => item.text));
   assert.equal(submits[0].payload.inputs[0].attachments.length, 1); assert.equal(submits[0].payload.inputs[1].attachments, undefined);
   assert.ok(ids.every(id => reopened.data.inbox[id].status === 'done'));
@@ -1177,14 +1211,15 @@ test('receive queued before freeze is included in the atomic snapshot and cannot
 test('single plugin input crosses real HTTP gateway and Coordinator service with independent batch receipt', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const service = new CoordinatorService({ directory: path.join(f.directory, 'coordinator'), system: 'Test Coordinator', tools: [], execute: async () => {},
-    model: { next: async () => ({ stop: 'end_turn', content: [{ type: 'text', text: '收到单条原文' }] }) } });
+    model: { next: async () => ({ stop: 'end_turn', content: [{ type: 'text', text: '[CG_REPLY]\n收到单条原文' }] }) } });
   const token = 'synthetic-plugin-http-test-credential-123456'; let submitted;
   const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token, teamId, projectIds: ['lab'] }, stateDir: path.join(f.directory, 'gateway'),
     state: async () => ({ ...(await service.state()), conversationId: 'chat-real-http' }),
     command: async (input, context) => {
-      if (input.type === 'conversation.relevance') return { respond: true, mainVersion: 'v1' };
+      if (input.type === 'conversation.relevance') assert.fail('Native Slack must not call a separate classifier');
       if (input.type === 'conversation.create') return { conversationId: 'chat-real-http' };
-      if (input.type === 'conversation.submit') { submitted = input; return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      if (input.type === 'conversation.submit') { submitted = input; const { participation, ...payload } = input.payload;
+        return service.submit({ ...payload, id: input.id }, { source: 'slack', actor: context.actor, participation }); }
       if (input.type === 'conversation.state') return { ...(await service.state()), conversationId: 'chat-real-http' };
       if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
       return {};
@@ -1229,7 +1264,8 @@ test('frozen batch replays the same original IDs and retains every member on los
   await f.plugin.runEntry('late', reopened.data.inbox.late);
   assert.deepEqual(submissions[0], submissions[1]);
   assert.deepEqual(submissions[1].payload.inputs.map(input => input.text), ['original request', 'new correction']);
-  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 1);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 0);
+  assert.deepEqual(submissions[1].payload.participation.inputs, submissions[1].payload.inputs);
   assert.equal(reopened.data.inbox.early.status, 'done'); assert.equal(reopened.data.inbox.late.status, 'done');
 });
 
@@ -1276,11 +1312,11 @@ test('private top-level inputs reuse a durable current conversation and start-ch
 test('unmentioned short DM answer uses the real current conversation and retains protected attachment identity through HTTP', async t => {
   const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
   const attachments = new IntegrationAttachmentStore({ directory: path.join(f.directory, 'attachments') });
-  let turns = 0; const decisions = [], submissions = [], reads = [];
+  let turns = 0; const submissions = [], reads = [];
   const service = new CoordinatorService({ directory: path.join(f.directory, 'coordinator'), system: 'Test Coordinator', tools: [], execute: async () => {},
     resolveAttachment: id => attachments.resolve({ teamId, projectId: 'lab', id }), model: { next: async ({ system }) => {
       if (system.includes('附件阅读轮次')) return { stop: 'end_turn', content: [{ type: 'text', text: '附件内有引用他人Bot的资料。' }] };
-      return { stop: 'end_turn', content: [{ type: 'text', text: ++turns === 1 ? '你选择答案A还是答案B？' : '已记录答案B。' }] };
+      return { stop: 'end_turn', content: [{ type: 'text', text: '[CG_REPLY]\n' + (++turns === 1 ? '你选择答案A还是答案B？' : '已记录答案B。') }] };
     } } });
   const token = 'synthetic-private-context-http-credential-123456';
   const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token, teamId, projectIds: ['lab'] }, stateDir: path.join(f.directory, 'gateway'),
@@ -1288,13 +1324,10 @@ test('unmentioned short DM answer uses the real current conversation and retains
       if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
       if (input.type === 'conversation.create') return { conversationId: 'chat-dm-http' };
       if (input.type === 'conversation.state') { reads.push(input); return { ...(await service.state()), conversationId: 'chat-dm-http' }; }
-      if (input.type === 'conversation.relevance') {
-        decisions.push(input);
-        const previous = input.payload.context.at(-1);
-        return { respond: input.payload.text === '开始讨论' || input.payload.text === '答案B' && previous?.speaker === bot && previous.text.includes('答案A还是答案B'), mainVersion: 'v1' };
-      }
+      if (input.type === 'conversation.relevance') assert.fail('Native Slack must not call a separate classifier');
       if (input.type === 'attachment.upload') return attachments.upload({ teamId, projectId: input.projectId, actor: context.actor, ...input.payload });
-      if (input.type === 'conversation.submit') { submissions.push(input); return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      if (input.type === 'conversation.submit') { submissions.push(input); const { participation, ...payload } = input.payload;
+        return service.submit({ ...payload, id: input.id }, { source: 'slack', actor: context.actor, participation }); }
       return {};
     } });
   const slackCalls = []; let initialHistoryReads = 0;
@@ -1305,9 +1338,10 @@ test('unmentioned short DM answer uses the real current conversation and retains
     await f.plugin.message('dm-http-first', event({ channel: 'D000001', ts: '900.001', text: '开始讨论' })); await service.close();
     await f.plugin.message('dm-http-answer', event({ channel: 'D000001', ts: '900.002', text: '答案B', files: [{ id: 'FDOC', name: 'reply.txt', mimetype: 'text/plain' }] })); await service.close();
     assert.equal(turns, 2); assert.equal(submissions.length, 2); assert.equal(submissions[0].conversationId, submissions[1].conversationId);
-    assert.equal(decisions[1].payload.context.at(-1).speaker, bot); assert.equal(decisions[1].payload.routing.replyToCoordinator, true);
-    assert.equal(decisions[1].payload.context[0].speaker, user); assert.equal(decisions[1].payload.inputs[0].text, '答案B');
-    assert.deepEqual(decisions[1].payload.routing.mentionedUsers, [], 'Quoted Bot inside a file cannot address the current message');
+    const decision = submissions[1].payload.participation;
+    assert.equal(decision.context.at(-1).speaker, bot); assert.equal(decision.routing.replyToCoordinator, true);
+    assert.equal(decision.context[0].speaker, user); assert.equal(decision.inputs[0].text, '答案B');
+    assert.deepEqual(decision.routing.mentionedUsers, [], 'Quoted Bot inside a file cannot address the current message');
     assert.equal(reads.length, 1); assert.equal(reads[0].userId, user); assert.equal(reads[0].projectId, 'lab'); assert.deepEqual(slackCalls, []); assert.equal(initialHistoryReads, 1);
     const state = await service.state(), answer = state.messages.find(message => message.role === 'user' && message.text === '答案B');
     assert.equal(answer.actor.userId, user); assert.equal(answer.actor.teamId, teamId); assert.equal(answer.attachments.length, 1);
@@ -1319,7 +1353,7 @@ test('private participation context is bounded and preserves trusted speakers ra
   const f = await fixture(t); await f.store.update(state => { state.preferences[user] = 'lab'; });
   await f.plugin.message('dm-seed', event({ channel: 'D000001', ts: '910.001', text: 'seed' }));
   f.calls.length = 0;
-  const original = f.gateway.command; let contexts = 0, judgments = 0;
+  const original = f.gateway.command; let contexts = 0, submissions = 0;
   f.gateway.command = async (type, input) => {
     if (type === 'conversation.state') {
       contexts++;
@@ -1333,22 +1367,23 @@ test('private participation context is bounded and preserves trusted speakers ra
         { role: 'assistant', text: '请告诉我你的选择。' },
       ] };
     }
-    if (type === 'conversation.relevance') {
-      judgments++; f.calls.push({ type, ...input });
-      if (judgments === 1) throw new TypeError('relevance reply lost');
-      return { respond: true, mainVersion: 'v1' };
+    if (type === 'conversation.submit') {
+      submissions++; f.calls.push({ type, ...input });
+      if (submissions === 1) throw new TypeError('submission reply lost');
+      return { accepted: true };
     }
     return original(type, input);
   };
   const current = event({ channel: 'D000001', ts: '910.002', text: '好的' });
-  await assert.rejects(f.plugin.message('dm-context-replay', current), /relevance reply lost/);
-  const request = f.store.data.inbox['dm-context-replay'].relevanceRequest;
+  await assert.rejects(f.plugin.message('dm-context-replay', current), /submission reply lost/);
+  const request = f.store.data.inbox['dm-context-replay'].participation;
   assert.equal(request.payload.context.length, 6); assert.equal(request.payload.context[0].speaker, 'U000002');
   assert.equal(request.payload.context.at(-2).speaker, user); assert.equal(request.payload.context.at(-2).text.length, 800);
   assert.equal(request.payload.context.at(-1).speaker, bot); assert.equal(request.payload.routing.replyToCoordinator, true);
   assert.ok(request.payload.context.every(item => !/workflow|Legacy/.test(item.text)));
   await f.plugin.message('dm-context-replay', current);
-  assert.equal(contexts, 1); assert.deepEqual(f.calls.filter(call => call.type === 'conversation.relevance').map(call => call.payload), [request.payload, request.payload]);
+  assert.equal(contexts, 1); assert.deepEqual(f.calls.filter(call => call.type === 'conversation.submit').map(call => call.payload.participation), [request.payload, request.payload]);
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
 });
 
 test('native DM thread context has priority over current-conversation state', async t => {
@@ -1356,7 +1391,7 @@ test('native DM thread context has priority over current-conversation state', as
   await f.plugin.message('dm-native-seed', event({ channel: 'D000001', ts: '920.001', text: 'seed' }));
   f.calls.length = 0; f.io.call = async method => { assert.equal(method, 'conversations.replies'); return { messages: [{ ts: '920.001', user: bot, text: '真实Slack线程问题' }] }; };
   await f.plugin.message('dm-native-answer', event({ channel: 'D000001', ts: '920.002', thread_ts: '920.001', text: '继续' }));
-  const request = f.calls.find(call => call.type === 'conversation.relevance'); assert.deepEqual(request.payload.context, [{ speaker: bot, text: '真实Slack线程问题' }]);
+  const request = f.calls.find(call => call.type === 'conversation.submit'); assert.deepEqual(request.payload.participation.context, [{ speaker: bot, text: '真实Slack线程问题' }]);
   assert.equal(f.calls.some(call => call.type === 'conversation.state'), false);
 });
 
@@ -1685,77 +1720,99 @@ test('tracked replies reuse conversation, new roots have independent conversatio
   assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 2);
   const submits = f.calls.filter(call => call.type === 'conversation.submit'); assert.equal(submits[0].conversationId, submits[1].conversationId); assert.notEqual(submits[1].conversationId, submits[2].conversationId);
 });
-test('related unmentioned message is classified before creating its conversation', async t => {
+test('related unmentioned message carries a frozen participation frame in its single business submit', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('related-root', event({ text: '登录模块刷新 token 有 Bug，请分析。' }));
-  assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance', 'project.list', 'conversation.create', 'conversation.submit']);
-  const decision = f.store.data.inbox['related-root'].relevance;
-  assert.equal(decision.respond, true); assert.equal(decision.mainVersion, 'v1'); assert.equal(decision.projectId, 'lab');
-  assert.equal(f.calls[0].conversationId, undefined);
+  assert.deepEqual(f.calls.map(call => call.type), ['project.list', 'conversation.create', 'conversation.submit']);
+  const frame = f.store.data.inbox['related-root'].participation;
+  assert.equal(frame.projectId, 'lab'); assert.equal(frame.payload.text, '登录模块刷新 token 有 Bug，请分析。');
+  assert.deepEqual(f.calls.at(-1).payload.participation, frame.payload);
 });
-test('unrelated roots and replies to other people are silent, with no attachment upload or business writes', async t => {
+test('unrelated roots and replies retain inputs but terminal silent projection sends no Slack content or business writes', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('seed', event()); f.calls.length = 0; f.sent.length = 0;
   const original = f.gateway.command;
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance') { f.calls.push({ type, ...input }); return { respond: false, reason: 'Addressed to another person', mainVersion: 'v1' }; }
+    if (type === 'conversation.state') { f.calls.push({ type, ...input }); return { status: 'waiting-for-user', activeTurnId: null,
+      messages: [], approvals: [], acceptedRequestIds: Object.values(f.store.data.threads).flatMap(binding => binding.ownRequests) }; }
     return original(type, input);
   };
-  f.io.download = async () => { assert.fail('An unrelated attachment must not be downloaded'); };
   await f.plugin.message('unrelated-root', event({ ts: '999.001', text: '午饭去哪吃？', files: [{ name: 'food.png', mimetype: 'image/png' }] }));
   await f.plugin.message('unrelated-reply', event({ ts: '123.002', thread_ts: '123.001', text: '<@UOTHER> 中午去哪吃饭？' }));
-  assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance', 'conversation.relevance']);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit'); assert.equal(submits.length, 2);
+  assert.equal(submits[0].payload.inputs[0].attachments.length, 1);
+  assert.equal(submits[1].payload.participation.routing.mentionedUsers[0].id, 'UOTHER');
+  for (const key of Object.keys(f.store.data.threads)) await f.plugin.mirror(key);
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance' || call.type === 'map.write'), false);
   assert.equal(f.sent.some(call => !call.method || !['conversations.replies', 'users.info'].includes(call.method)), false);
-  assert.equal(Object.keys(f.store.data.threads).length, 1);
+  assert.equal(Object.keys(f.store.data.threads).length, 2);
 });
-test('relevance timeouts retry with a durable bounded budget then require private attention without channel spam', async t => {
+test('pending or silent merged decisions never mirror private model errors or pending-input notices', async t => {
+  for (const participationDecision of ['pending', 'silent']) {
+    const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
+    await f.plugin.message(`seed-${participationDecision}`, event()); f.sent.length = 0;
+    f.gateway.command = async () => ({ status: 'error', activeTurnId: 'failed-native-turn', participationDecision,
+      error: { code: 'MODEL_INVALID_RESPONSE', message: 'private diagnostic' }, messages: [], approvals: [], pendingInputCount: 1 });
+    for (const key of Object.keys(f.store.data.threads)) await f.plugin.mirror(key);
+    assert.deepEqual(f.sent, [], `${participationDecision} must not publish errors, notices or reactions`);
+  }
+});
+test('merged submit timeouts retry with a durable eight-attempt budget then require private attention without channel spam', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
-  f.gateway.command = async () => { throw Object.assign(new Error('Controlled classification failure'), { code: 'MODEL_TIMEOUT' }); };
+  const original = f.gateway.command, submissions = [];
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.submit') { submissions.push(structuredClone(input)); throw Object.assign(new Error('Controlled submission failure'), { code: 'MODEL_TIMEOUT' }); }
+    return original(type, input);
+  };
   const envelope = { type: 'events_api', body: { event: event({ text: '相关吗？' }) } };
   await f.store.receive('failed-relevance', envelope);
   await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
   assert.equal(f.store.data.inbox['failed-relevance'].status, 'pending');
-  assert.equal(f.store.data.inbox['failed-relevance'].relevanceAttempts, 1);
+  assert.equal(f.store.data.inbox['failed-relevance'].attempts, 1);
   assert.equal(f.store.data.inbox['failed-relevance'].relevance, undefined);
-  const frozen = structuredClone(f.store.data.inbox['failed-relevance'].relevanceRequest);
-  await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
-  assert.equal(f.store.data.inbox['failed-relevance'].status, 'pending');
-  await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
+  const frozen = structuredClone(f.store.data.inbox['failed-relevance'].participation);
+  for (let attempt = 1; attempt < 8; attempt++) {
+    await f.plugin.runEntry('failed-relevance', f.store.data.inbox['failed-relevance']);
+    assert.equal(f.store.data.inbox['failed-relevance'].status, attempt < 7 ? 'pending' : 'attention');
+  }
   assert.equal(f.store.data.inbox['failed-relevance'].status, 'attention');
-  assert.equal(f.store.data.inbox['failed-relevance'].relevanceAttempts, 3);
-  assert.deepEqual(f.store.data.inbox['failed-relevance'].relevanceRequest, frozen);
+  assert.equal(f.store.data.inbox['failed-relevance'].attempts, 8);
+  assert.deepEqual(f.store.data.inbox['failed-relevance'].participation, frozen);
+  assert.ok(submissions.every(input => JSON.stringify(input) === JSON.stringify(submissions[0])));
   assert.equal(f.store.data.inbox['failed-relevance'].error, 'MODEL_TIMEOUT');
-  assert.equal(f.sent.length, 0); assert.equal(Object.keys(f.store.data.threads).length, 0);
+  assert.equal(f.sent.length, 0); assert.equal(Object.keys(f.store.data.threads).length, 1);
 });
 
-test('participation transient HTTP parse network and provider failures recover with the same frozen operation and actual decision', async t => {
+test('merged submit transient HTTP parse network and provider failures recover with the same frozen operation', async t => {
   const failures = [
     () => { throw new DOMException('Timeout', 'TimeoutError'); },
     () => { throw new TypeError('Network unavailable'); },
     () => new Response('<private upstream body>', { status: 502 }),
     () => new Response(JSON.stringify({ ok: false, error: { code: 'MODEL_UNAVAILABLE' } }), { status: 503 }),
     () => new Response('{broken JSON', { status: 200 }),
-    () => new Response(JSON.stringify({ ok: true, data: { mainVersion: 'v1' } }), { status: 200 }),
+    () => new Response(JSON.stringify({ ok: 'invalid', data: {} }), { status: 200 }),
+    ...['BUSY', 'COORDINATOR_BUSY'].map(code => () => new Response(JSON.stringify({ ok: false, error: { code } }), { status: 409 })),
   ];
   for (const [index, failure] of failures.entries()) {
     const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
     const commands = [], original = f.gateway.command; let requests = 0;
     const client = new Gateway({ url: 'http://127.0.0.1:8790', token: 'synthetic-transient-token', teamId, fetchImpl: async (_url, options) => {
       commands.push(JSON.parse(options.body)); if (++requests === 1) return failure();
-      return new Response(JSON.stringify({ ok: true, data: { respond: index % 2 === 0, mainVersion: 'v1' } }), { status: 200 });
+      return new Response(JSON.stringify({ ok: true, data: { accepted: true } }), { status: 200 });
     } });
-    f.gateway.command = (type, input) => type === 'conversation.relevance' ? client.command(type, input) : original(type, input);
+    f.gateway.command = (type, input) => type === 'conversation.submit' ? client.command(type, input) : original(type, input);
     const id = `transient-${index}`, message = event({ text: '请继续分析登录问题' });
     await f.store.receive(id, { type: 'events_api', body: { event: message } });
     await f.plugin.runEntry(id, f.store.data.inbox[id]);
     assert.equal(f.store.data.inbox[id].status, 'pending'); assert.equal(f.store.data.inbox[id].relevance, undefined);
     assert.ok(f.store.data.inbox[id].next > Date.now(), 'Recovery retains bounded backoff instead of spinning');
-    const frozen = structuredClone(f.store.data.inbox[id].relevanceRequest);
+    const frozen = structuredClone(f.store.data.inbox[id].participation);
     const reopened = await new Store(f.directory).open(); f.plugin.store = reopened;
     await f.plugin.runEntry(id, reopened.data.inbox[id]);
-    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].relevance.respond, index % 2 === 0);
-    assert.deepEqual(commands[0], commands[1]); assert.deepEqual(reopened.data.inbox[id].relevanceRequest, frozen);
-    assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, index % 2 === 0 ? 1 : 0);
+    assert.equal(reopened.data.inbox[id].status, 'done');
+    assert.deepEqual(commands[0], commands[1]); assert.deepEqual(reopened.data.inbox[id].participation, frozen);
+    assert.equal(commands.length, 2); assert.equal(commands[0].type, 'conversation.submit');
+    assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
     assert.equal(f.sent.some(item => item.method === 'chat.postEphemeral'), false);
   }
 });
@@ -1765,20 +1822,23 @@ test('participation authorization contract version and identity failures never r
     () => new Response('<sign in required>', { status: 401 }),
     () => new Response('{broken', { status: 403 }),
     ...['INVALID_ARGUMENT', 'VERSION_MISMATCH', 'IDENTITY_MISMATCH', 'MODEL_ROUTE_CHANGED'].map(code => () => new Response(JSON.stringify({ ok: false, error: { code } }), { status: 503 })),
+    () => new Response(JSON.stringify({ ok: false, error: { code: 'CONFLICT' } }), { status: 409 }),
+    () => new Response(JSON.stringify({ ok: false, error: { code: 'COORDINATOR_BUSY' } }), { status: 401 }),
   ];
   for (const [index, failure] of failures.entries()) {
     const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
     const client = new Gateway({ url: 'http://127.0.0.1:8790', token: 'synthetic-negative-token', teamId, fetchImpl: async () => failure() });
-    f.gateway.command = (type, input) => client.command(type, input);
+    const original = f.gateway.command;
+    f.gateway.command = (type, input) => type === 'conversation.submit' ? client.command(type, input) : original(type, input);
     const id = `negative-${index}`;
     await f.store.receive(id, { type: 'events_api', body: { event: event({ text: '是否应该参与？' }) } });
     await f.plugin.runEntry(id, f.store.data.inbox[id]);
-    assert.equal(f.store.data.inbox[id].status, 'attention'); assert.equal(f.store.data.inbox[id].relevanceAttempts, 1);
+    assert.equal(f.store.data.inbox[id].status, 'attention'); assert.equal(f.store.data.inbox[id].attempts, 1);
     assert.equal(f.store.data.inbox[id].relevance, undefined); assert.equal(f.sent.length, 0);
   }
 });
 
-test('classification retry limits do not reduce or expand the existing business submit retry policy', async t => {
+test('merged participation does not prematurely exhaust the existing business submit retry policy', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const original = f.gateway.command;
   f.gateway.command = (type, input) => type === 'conversation.submit'
@@ -1786,17 +1846,17 @@ test('classification retry limits do not reduce or expand the existing business 
   await f.store.receive('business-retry', { type: 'events_api', body: { event: event() } });
   for (let attempt = 0; attempt < 3; attempt++) await f.plugin.runEntry('business-retry', f.store.data.inbox['business-retry']);
   assert.equal(f.store.data.inbox['business-retry'].status, 'pending'); assert.equal(f.store.data.inbox['business-retry'].relevanceAttempts, undefined);
-  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 1);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 0);
 });
-test('relevance request is durable before calling the gateway and replays unchanged after thread edits', async t => {
+test('participation frame is durable before business submit and replays unchanged after thread edits', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const original = f.gateway.command; let unavailable = true, contextReads = 0;
   f.io.call = async method => method === 'conversations.replies' ? { messages: [{ ts: '122.001', user, text: `Original context ${++contextReads}` }] } : {};
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance' && unavailable) {
+    if (type === 'conversation.submit' && unavailable) {
       unavailable = false;
       const disk = JSON.parse(await fs.readFile(f.store.file, 'utf8'));
-      assert.deepEqual(disk.inbox.replay.relevanceRequest, input);
+      assert.deepEqual(disk.inbox.replay.participation.payload, input.payload.participation);
       f.calls.push({ type, ...input }); throw Object.assign(new Error('Unavailable'), { code: 'BUSY' });
     }
     return original(type, input);
@@ -1807,11 +1867,11 @@ test('relevance request is durable before calling the gateway and replays unchan
   assert.equal(f.store.data.inbox.replay.status, 'pending');
   await f.plugin.runEntry('replay', f.store.data.inbox.replay);
   assert.equal(contextReads, 1);
-  const judgments = f.calls.filter(call => call.type === 'conversation.relevance');
-  assert.deepEqual(judgments[0], judgments[1]);
-  assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.deepEqual(submits[0], submits[1]); assert.equal(submits.length, 2);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 0);
 });
-test('restart after relevant decision reuses it and does not classify or create twice', async t => {
+test('restart after frozen participation capture reuses it and does not classify or create twice', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const original = f.gateway.command; let busy = true;
   f.gateway.command = async (type, input) => {
@@ -1825,10 +1885,102 @@ test('restart after relevant decision reuses it and does not classify or create 
     cloudOrigin: 'https://map.example.com', logger: { warn() {}, error() {} } });
   await restarted.runEntry('restart', reopened.data.inbox.restart);
   assert.equal(reopened.data.inbox.restart.status, 'done');
-  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 1);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 0);
+  assert.deepEqual(reopened.data.inbox.restart.participation, f.store.data.inbox.restart.participation);
   assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
 });
-test('channel rebind cannot redirect a saved relevance request to another project', async t => {
+
+async function seedLegacyParticipation(f, id, original, { respond = true, binding = false } = {}) {
+  const op = suffix => `slack-${digest(`${id}:${suffix}`)}`;
+  await f.store.update(state => { state.channels[original.channel] = 'lab'; });
+  await f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: original } });
+  const key = threadKey(teamId, original.channel, original.thread_ts || original.ts), inputs = [{ id: op('submit'), text: original.text }];
+  if (binding) await f.store.bind(key, { channel: original.channel, threadTs: original.thread_ts || original.ts,
+    projectId: 'lab', conversationId: 'chat-legacy-http', userId: user, ownRequests: [inputs[0].id] });
+  await f.store.update(state => {
+    const item = state.inbox[id];
+    item.relevance = { respond, reason: 'Persisted old classification', mainVersion: 'legacy-v1', projectId: 'lab' };
+    item.relevanceRequest = { id: op('relevance'), userId: user, projectId: 'lab',
+      ...(binding ? { conversationId: 'chat-legacy-http' } : {}), payload: { text: original.text, inputs, context: [],
+        routing: { coordinatorUserId: bot, mentionedUsers: [{ id: bot, isBot: true }], replyToCoordinator: false },
+        files: (original.files || []).map(file => ({ name: String(file.name || file.title || '').slice(0, 200), mimeType: String(file.mimetype || '').slice(0, 100) })) } };
+    item.replyContext = { answerTo: null };
+    if (item.batchId) state.messageBatches[item.batchId].frozen = true;
+  });
+  return { key, inputs, request: { id: op('batch-submit'), userId: user, projectId: 'lab', conversationId: 'chat-legacy-http',
+    payload: { inputs, followup: 'steer', slackChannelId: original.channel } } };
+}
+
+test('legacy accepted submit with lost ACK replays identical old payload after upgrade without another model or write', async t => {
+  const f = await fixture(t), id = 'legacy-lost-ack', original = event({ text: `<@${bot}> 请确认旧请求。` });
+  const legacy = await seedLegacyParticipation(f, id, original, { binding: true });
+  let models = 0, accepted = 0;
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'legacy-coordinator'), system: 'Old accepted Coordinator',
+    tools: [], execute: async () => assert.fail('This old request needs no business write'),
+    model: { next: async () => { models++; return { stop: 'end_turn', content: [{ type: 'text', text: '旧请求已确认。' }] }; } } });
+  const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token: 'synthetic-upgrade-lost-ack-credential-123456', teamId, projectIds: ['lab'] },
+    stateDir: path.join(f.directory, 'legacy-gateway'), state: async () => ({ ...(await service.state()), conversationId: 'chat-legacy-http' }),
+    command: async (input, context) => {
+      if (input.type === 'conversation.relevance') assert.fail('Upgrade recovery cannot invoke a classifier');
+      if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
+      if (input.type === 'conversation.state') return { ...(await service.state()), conversationId: 'chat-legacy-http' };
+      if (input.type === 'conversation.submit') { accepted++; return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      assert.fail(`Unexpected upgrade operation ${input.type}`);
+    } });
+  const gateway = new Gateway({ url: server.url, token: 'synthetic-upgrade-lost-ack-credential-123456', teamId });
+  let upgraded;
+  try {
+    // The old service committed and Gateway persisted its receipt. Its caller
+    // lost the reply before changing the durable old inbox from pending.
+    await gateway.command('conversation.submit', legacy.request); await service.close();
+    assert.equal(f.store.data.inbox[id].status, 'pending'); assert.equal(models, 1); assert.equal(accepted, 1);
+    const reopened = await new Store(f.directory).open(), submissions = [];
+    const command = gateway.command.bind(gateway);
+    gateway.command = async (type, input) => { if (type === 'conversation.submit') submissions.push(structuredClone(input)); return command(type, input); };
+    upgraded = new SlackPlugin({ store: reopened, gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot,
+      logger: { warn() {}, error() {} } });
+    await upgraded.runEntry(id, reopened.data.inbox[id]);
+    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].error, undefined);
+    assert.deepEqual(submissions, [legacy.request]); assert.equal(submissions[0].payload.participation, undefined);
+    assert.equal(models, 1); assert.equal(accepted, 1, 'The saved old Gateway receipt must replay before the business callback');
+    await upgraded.mirror(legacy.key);
+    assert.ok(f.sent.some(item => item.text?.includes('旧请求已确认。')));
+  } finally { await upgraded?.stop(); await server.close(); await service.close({ stop: true }); }
+});
+
+test('legacy cached silent pending input completes after upgrade without classification submission download or external message', async t => {
+  const f = await fixture(t), id = 'legacy-silent', original = event({ text: `<@${bot}> 仅存档，不用回复。`, files: [{ id: 'FOLD', name: 'old.png', mimetype: 'image/png' }] });
+  await seedLegacyParticipation(f, id, original, { respond: false });
+  f.io.download = async () => assert.fail('A cached old silent decision cannot download attachments');
+  f.gateway.command = async () => assert.fail('A cached old silent decision cannot call Gateway');
+  const reopened = await new Store(f.directory).open();
+  const upgraded = new SlackPlugin({ store: reopened, gateway: f.gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot,
+    logger: { warn() {}, error() {} } });
+  try {
+    await upgraded.runEntry(id, reopened.data.inbox[id]);
+    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].participation, undefined);
+    assert.equal(Object.keys(reopened.data.threads).length, 0); assert.deepEqual(f.sent, []);
+  } finally { await upgraded.stop(); }
+});
+
+test('legacy decision recovery rejects mismatched project user or original batch instead of borrowing an old decision', async t => {
+  for (const mismatch of ['project', 'user', 'batch']) {
+    const f = await fixture(t), id = `legacy-mismatch-${mismatch}`, original = event({ text: `<@${bot}> 原始旧需求。` });
+    await seedLegacyParticipation(f, id, original);
+    await f.store.update(state => {
+      const item = state.inbox[id];
+      if (mismatch === 'project') item.relevanceRequest.projectId = 'other';
+      else if (mismatch === 'user') item.relevanceRequest.userId = 'UOTHER';
+      else item.relevanceRequest.payload.inputs[0].text = 'different request';
+    });
+    f.gateway.command = async () => assert.fail('Mismatched cached decision cannot reach business Gateway');
+    await f.plugin.runEntry(id, f.store.data.inbox[id]);
+    assert.equal(f.store.data.inbox[id].status, 'attention'); assert.equal(f.store.data.inbox[id].error, 'ID_REUSED');
+    assert.equal(Object.keys(f.store.data.threads).length, 0); assert.deepEqual(f.sent, []);
+  }
+});
+
+test('channel rebind cannot redirect a saved participation frame to another project', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   f.gateway.command = async () => { throw Object.assign(new Error('Busy'), { code: 'BUSY' }); };
   await f.store.receive('rebind', { type: 'events_api', body: { event: event({ text: '登录刷新失败' }) } });
@@ -1838,24 +1990,24 @@ test('channel rebind cannot redirect a saved relevance request to another projec
   assert.equal(f.store.data.inbox.rebind.error, 'CONFLICT'); assert.equal(f.sent.length, 0);
   assert.equal(Object.keys(f.store.data.threads).length, 0);
 });
-test('channel rebind during the relevance model call cannot create or submit in the new project', async t => {
+test('channel rebind during participation context capture cannot create or submit in the new project', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
-  const original = f.gateway.command; let release, entered;
+  const original = f.io.call; let release, entered;
   const began = new Promise(resolve => { entered = resolve; });
   const held = new Promise(resolve => { release = resolve; });
-  f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance') { entered(); await held; }
-    return original(type, input);
+  f.io.call = async (method, input) => {
+    if (method === 'conversations.replies') { entered(); await held; }
+    return original(method, input);
   };
-  const pending = f.plugin.message('inflight-rebind', event({ text: '登录 Bug 需要分析。' }));
+  const pending = f.plugin.message('inflight-rebind', event({ thread_ts: '122.001', text: '登录 Bug 需要分析。' }));
   await began;
   await f.store.update(state => { state.channels[channel] = 'other'; });
   release();
   await assert.rejects(pending, error => error.code === 'CONFLICT' && error.silent === true);
-  assert.deepEqual(f.calls.map(call => call.type), ['conversation.relevance']);
+  assert.deepEqual(f.calls.map(call => call.type), []);
   assert.equal(Object.keys(f.store.data.threads).length, 0); assert.equal(f.sent.length, 0);
 });
-test('long thread relevance reads the latest six preceding messages, not the earliest page', async t => {
+test('long thread participation reads the latest six preceding messages, not the earliest page', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const reads = [];
   f.io.call = async (method, input) => {
@@ -1868,7 +2020,7 @@ test('long thread relevance reads the latest six preceding messages, not the ear
   };
   await f.plugin.message('long-thread', event({ ts: '300.001', thread_ts: '100.001', text: '接着讨论登录 Bug。' }));
   assert.equal(reads.length, 2); assert.equal(reads[1].cursor, 'page-2');
-  assert.deepEqual(f.calls.find(call => call.type === 'conversation.relevance').payload.context.map(item => item.text),
+  assert.deepEqual(f.calls.find(call => call.type === 'conversation.submit').payload.participation.context.map(item => item.text),
     Array.from({ length: 6 }, (_, index) => `Recent ${index}`));
 });
 test('incomplete or looping thread pagination cannot feed stale context to the model', async t => {
@@ -1880,12 +2032,12 @@ test('incomplete or looping thread pagination cannot feed stale context to the m
   assert.equal(count, 2); assert.equal(f.store.data.inbox['incomplete-context'].error, 'RELEVANCE_CONTEXT_INCOMPLETE');
   assert.equal(f.calls.length, 0); assert.equal(f.sent.length, 0); assert.equal(Object.keys(f.store.data.threads).length, 0);
 });
-test('slow overheard classifiers cannot block explicit messages or conversation mirroring', async t => {
+test('slow overheard submissions cannot block explicit messages or conversation mirroring', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const original = f.gateway.command; let release, classifications = 0;
   const held = new Promise(resolve => { release = resolve; });
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance' && !input.payload.routing.mentionedUsers.some(item => item.id === bot)) { classifications++; await held; }
+    if (type === 'conversation.submit' && !input.payload.participation.routing.mentionedUsers.some(item => item.id === bot)) { classifications++; await held; }
     return original(type, input);
   };
   for (let index = 0; index < 3; index++) await f.store.receive(`indirect-${index}`, { type: 'events_api', body: {
@@ -1945,6 +2097,9 @@ test('an unrelated slow read-reaction cannot block a ready Coordinator answer', 
   };
   await f.store.receive('slow-reaction', { type: 'events_api', body: { event: event({ text: `<@${bot}> 当前问题` }) } });
   f.plugin.stopped = false;
+  // A prior independent read reaction is already in flight; native merged
+  // inputs themselves no longer add an acknowledgement before deciding.
+  f.plugin.readReaction(event({ ts: '122.001' }));
   const tick = f.plugin.tick();
   let timer;
   try {
@@ -2007,6 +2162,44 @@ test('read reactions are bounded and stop waits for in-flight reactions without 
   await Promise.resolve(); assert.equal(stopped, false); assert.equal(calls, 8);
   release(); await stop; assert.equal(f.plugin.reactions.size, 0);
 });
+test('合并👀只绑定当前已接话原消息，静默、未决定、他人和改写原文均拒绝', async t => {
+  const f = await projectSwitchFixture(t);
+  const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
+    acceptedRequestIds: [f.input.requestId], messages: [f.input] };
+  f.plugin.stopped = false;
+  for (const decision of ['pending', 'silent']) assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationDecision: decision }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationRequestIds: ['new-pending-input'] }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, acceptedRequestIds: [] }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot,
+    messages: [{ ...f.input, actor: { ...f.actor, userId: 'UOTHER', sessionId: `slack:${teamId}:UOTHER` } }] }), []);
+  await f.store.update(state => { state.inbox['switch-inbox'].envelope.body.event.text = '改写原文'; });
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, snapshot), []);
+  assert.deepEqual(f.store.data.reactionOutbox || {}, {});
+});
+test('合并👀的失回、重启和重复镜像沿原消息恢复，already_reacted确认后不再发送', async t => {
+  const f = await projectSwitchFixture(t), calls = [];
+  const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
+    acceptedRequestIds: [f.input.requestId], messages: [f.input] };
+  f.io.call = async (method, input) => {
+    assert.equal(method, 'reactions.add'); calls.push(input);
+    if (calls.length === 1) throw new TypeError('Synthetic lost ACK');
+    throw Object.assign(new Error('Already reacted'), { code: 'slack_webapi_platform_error', data: { error: 'already_reacted' } });
+  };
+  f.plugin.stopped = false;
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  const [id, record] = Object.entries(f.store.data.reactionOutbox)[0];
+  assert.equal(record.status, 'unknown');
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.store.update(state => { state.reactionOutbox[id].next = 0; });
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  assert.equal(f.plugin.store.data.reactionOutbox[id].status, 'sent');
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  assert.equal(calls.length, 2); assert.deepEqual(calls[0], calls[1]);
+  assert.deepEqual(calls[0], { channel: f.dm, timestamp: '123.001', name: 'eyes' });
+});
 test('a submit ACK racing an older mirror snapshot resets its next poll atomically', async t => {
   for (const mode of ['message', 'answer']) {
     const f = await fixture(t), key = threadKey(teamId, channel, '120.001');
@@ -2035,15 +2228,15 @@ test('a submit ACK racing an older mirror snapshot resets its next poll atomical
     } finally { release(); await submitting; await f.plugin.stop(); }
   }
 });
-test('same-thread corrections and explicit replies cannot overtake an earlier classification or BUSY retry', async t => {
+test('same-thread corrections and explicit replies cannot overtake an earlier merged submit or BUSY retry', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('seed', event());
   const original = f.gateway.command; let release, entered, busy = true, judgments = 0;
   const classified = new Promise(resolve => { entered = resolve; });
   const held = new Promise(resolve => { release = resolve; }), submitted = [];
   f.gateway.command = async (type, input) => {
-    if (type === 'conversation.relevance') { judgments++; entered(); if (input.payload.text === '原需求') await held; }
     if (type === 'conversation.submit') {
+      judgments++; entered(); if (input.payload.inputs[0].text === '原需求') await held;
       if (input.payload.inputs[0].text === '原需求' && busy) { busy = false; throw Object.assign(new Error('Busy'), { code: 'BUSY' }); }
       submitted.push(input.payload.inputs[0].text);
     }
@@ -2260,6 +2453,175 @@ test('real waiting-for-user state finalizes streamed reply in place after restar
   f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [{ id: 'u1', role: 'user', requestId: 'request-one', text: 'question' }, { id: 'a1', role: 'assistant', text: 'complete answer' }], approvals: [] });
   await f.plugin.mirror(key); assert.equal(f.sent.filter(call => call.channel).length, 1); assert.equal(f.sent.filter(call => call.update).length, 1); assert.equal(f.plugin.store.data.threads[key].liveStream, undefined);
 });
+test('Partial emphasis stream updates its own revision slot and finalizes without refreshing complete history', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.emphasis');
+  const old = { id: 'old-answer', role: 'assistant', requestId: 'old-turn', text: '**Old complete answer**' };
+  const question = { id: 'u', role: 'user', requestId: 'emphasis-turn', text: 'Report status' };
+  await f.store.bind(key, { channel, threadTs: '123.emphasis', projectId: 'lab', conversationId: 'emphasis-chat', userId: user, ownRequests: ['emphasis-turn'] });
+  const oldHash = digest({ format: 'plain-text-v2', message: old });
+  await f.store.update(data => { data.threads[key].mirrored[old.id] = { ts: '5.0', hash: oldHash }; });
+  let state = { status: 'running', activeTurnId: 'emphasis-turn', inputRevision: 1, consumedInputRevision: 1,
+    streamingText: '**Status', messages: [old, question] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(key);
+  const ts = f.plugin.store.data.threads[key].liveStream.ts;
+  assert.equal(blockText(f.sent.find(item => item.channel).blocks), 'Status');
+  assert.equal(f.plugin.store.data.threads[key].liveStream.text, '**Status', 'Persist original preview, not the rendered projection');
+  for (const text of ['**Status is pending', '**Status is pending**']) {
+    state = { ...state, streamingText: text }; await f.plugin.mirror(key);
+    assert.equal(f.sent.at(-1).update[1], ts); assert.equal(blockText(f.sent.at(-1).update[3]), 'Status is pending');
+  }
+  f.plugin.store = await new Store(f.directory).open();
+  const unchanged = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, unchanged);
+  const final = { id: 'emphasis-final', role: 'assistant', requestId: 'emphasis-turn', text: '**Status is ready**' };
+  state = { ...state, status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [old, question, final] };
+  await f.plugin.mirror(key); assert.equal(f.sent.at(-1).update[1], ts); assert.equal(blockText(f.sent.at(-1).update[3]), 'Status is ready');
+  assert.equal(f.plugin.store.data.threads[key].mirrored[final.id].ts, ts);
+  assert.equal(f.plugin.store.data.threads[key].mirrored[old.id].hash, oldHash);
+  assert.equal(f.sent.some(item => item.update?.[1] === '5.0'), false, 'Complete history fingerprint stays unchanged');
+  const settled = f.sent.length;
+  state = { ...state, status: 'running', activeTurnId: 'emphasis-turn', streamingText: '**Late old preview' };
+  await f.plugin.mirror(key); assert.equal(f.sent.length, settled, 'Late partial cannot replace the consumed final');
+  assert.equal(f.sent.filter(item => item.channel).length, 1);
+});
+
+test('Partial emphasis failure stop and steer preserve source and original slot across restart', async t => {
+  for (const phase of ['error', 'interrupted', 'steer']) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.emphasis-' + phase);
+    const nativeWrites = [];
+    const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+      assert.ok(['chat.postMessage', 'chat.update'].includes(method));
+      nativeWrites.push({ method, args: structuredClone(args) });
+      return { ts: method === 'chat.update' ? args.ts : `${100 + nativeWrites.filter(write => write.method === 'chat.postMessage').length}.001` };
+    } } });
+    f.plugin.io = io;
+    const question = { id: 'u', role: 'user', requestId: 'turn', text: 'Report' };
+    await f.store.bind(key, { channel, threadTs: '123.emphasis-' + phase, projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: ['turn'] });
+    let state = { status: 'running', activeTurnId: 'turn', inputRevision: 1, consumedInputRevision: 1,
+      streamingText: '**Status', messages: [question] };
+    f.gateway.command = async () => state; await f.plugin.mirror(key);
+    const ts = f.plugin.store.data.threads[key].liveStream.ts;
+    state = phase === 'steer' ? { ...state, consumedInputRevision: 2, inputRevision: 2, streamingText: '**Current status',
+      messages: [question, { id: 'partial', role: 'assistant', requestId: 'turn', partial: true, text: '**Status' }] }
+      : { ...state, status: phase, ...(phase === 'error' ? { error: { code: 'MODEL_INVALID_RESPONSE' } } : {}) };
+    await f.plugin.mirror(key);
+    const updates = nativeWrites.filter(write => write.method === 'chat.update' && write.args.ts === ts);
+    assert.equal(updates.length, 1); assert.match(blockText(updates[0].args.blocks), /非最终答案/);
+    assert.match(blockText(updates[0].args.blocks), /Status/); assert.doesNotMatch(blockText(updates[0].args.blocks), /\*\*Status/);
+    assert.equal(state.messages[0].text, 'Report'); assert.equal(state.streamingText, phase === 'steer' ? '**Current status' : '**Status');
+    f.plugin.store = await new Store(f.directory).open(); io.store = f.plugin.store; const count = nativeWrites.length;
+    await f.plugin.mirror(key); await f.plugin.mirror(key); assert.equal(nativeWrites.length, count, 'Repeated partial snapshots perform no additional platform writes');
+    if (phase === 'steer') assert.notEqual(f.plugin.store.data.threads[key].liveStream.ts, ts, 'New revision owns another slot');
+    else assert.equal(f.plugin.store.data.threads[key].mirrored['stream:turn:1'].consumedBy, undefined);
+  }
+});
+
+test('Partial emphasis legacy receipt upgrades its own timestamp once and cannot overwrite a reassigned final slot', async t => {
+  for (const reassigned of [false, true]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.legacy-emphasis-' + reassigned);
+    const partial = { id: 'old-partial', role: 'assistant', requestId: 'turn', text: '**Status', partial: true };
+    const final = { id: 'new-final', role: 'assistant', requestId: 'later', text: '**Complete answer**' };
+    const oldHash = digest({ format: 'plain-text-v2', message: partial });
+    await f.store.bind(key, { channel, threadTs: '123.legacy-emphasis-' + reassigned, projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: ['turn'] });
+    await f.store.update(data => {
+      const thread = data.threads[key];
+      thread.mirrored[partial.id] = { ts: '5.0', hash: oldHash };
+      thread.mirrored['stream:turn:1'] = { ts: '5.0', turnId: 'turn', consumedBy: partial.id };
+      if (reassigned) thread.mirrored[final.id] = { ts: '5.0', hash: digest({ format: 'plain-text-v2', message: final }) };
+    });
+    const messages = [{ id: 'u', role: 'user', requestId: 'turn', text: 'Question' }, partial, ...(reassigned ? [final] : [])];
+    f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages });
+    await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(item => item.update).length, reassigned ? 0 : 1);
+    if (!reassigned) {
+      assert.equal(f.sent[0].update[1], '5.0');
+      assert.equal(blockText(f.sent[0].update[3]), '部分回复（已被补充调整，非最终答案）：\nStatus');
+      assert.notEqual(f.plugin.store.data.threads[key].mirrored[partial.id].hash, oldHash);
+    } else assert.equal(f.plugin.store.data.threads[key].mirrored[partial.id].hash, oldHash, 'The old receipt stays intact when its slot is occupied');
+    const count = f.sent.length; f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key); await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+    assert.equal(f.sent.some(item => item.channel), false, 'No migration post or new timestamp');
+  }
+});
+
+test('Partial emphasis plain blocks reach Slack fallback once without reparsing literal code', async t => {
+  const f = await fixture(t), calls = [];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: '1.0' }; } } });
+  const source = '`**Status`\n\n**Status', blocks = messageBlocks({ text: source, partial: true }, 'thread');
+  await io.post({ id: 'partial-emphasis', channel, text: source, blocks }); await io.update(channel, '1.0', source, blocks);
+  for (const call of calls) {
+    assert.equal(call.args.text, '**Status\n\nStatus');
+    assert.equal(call.args.mrkdwn, false); assert.equal(call.args.parse, 'none'); assert.equal(call.args.link_names, false);
+    assert.deepEqual(call.args.blocks, blocks);
+  }
+});
+
+test('Failed stream preview stays in its original slot and failure marking survives lost ACK restart and repeated snapshots', async t => {
+  for (const lostAck of [false, true]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-${lostAck}`), posts = new Map();
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    const post = f.io.post;
+    f.io.post = async input => { if (!posts.has(input.id)) posts.set(input.id, await post(input)); return posts.get(input.id); };
+    let state = { status: 'running', activeTurnId: 'failed-turn', consumedInputRevision: 0, streamingText: 'const value =',
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Explain a read-only example' }] };
+    f.gateway.command = async () => state;
+    await f.plugin.mirror(key);
+    const ts = f.plugin.store.data.threads[key].liveStream.ts;
+    state = { ...state, status: 'error', streamingText: 'const value = 3;\nconst pending =', error: { code: 'MODEL_INVALID_RESPONSE' } };
+    const update = f.io.update; let failed = false;
+    f.io.update = async (...args) => { await update(...args); if (lostAck && !failed) { failed = true; throw new Error('Lost preview ACK'); } };
+    if (lostAck) await assert.rejects(f.plugin.mirror(key), /Lost preview ACK/);
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key);
+    const count = f.sent.filter(call => call.update).length;
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, count);
+    assert.equal(count, lostAck ? 2 : 1, 'Lost ACK retries the same slot, not a new partial or final');
+    for (const call of f.sent.filter(call => call.update)) {
+      assert.equal(call.update[1], ts); assert.equal(call.update[2], 'Coordinator 部分回复（生成失败，非最终答案）：\nconst value = 3;\nconst pending =');
+      assert.ok(call.update[3].some(block => block.text?.text.includes('非最终答案')));
+    }
+    const thread = f.plugin.store.data.threads[key], stream = thread.mirrored['stream:failed-turn:0'];
+    assert.equal(stream.ts, ts); assert.ok(stream.failedHash); assert.equal(stream.consumedBy, undefined);
+    assert.equal(thread.liveStream.failedHash, stream.failedHash);
+    assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
+    assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
+  }
+});
+
+test('Failed stream marking never borrows another revision or turn when the exact failed slot is missing', async t => {
+  for (const [priorTurn, revision, consumed] of [['failed-turn', 1, false], ['another-turn', 1, false], ['failed-turn', 2, true]]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-scope-${priorTurn}-${revision}`);
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    await f.store.update(data => {
+      data.threads[key].mirrored[`stream:${priorTurn}:${revision}`] = { ts: '5.0', turnId: priorTurn, revision, text: 'Prior preview', ...(consumed ? { consumedBy: 'saved-final' } : {}) };
+      if (consumed) data.threads[key].mirrored['saved-final'] = { ts: '5.0', hash: 'completed-reply' };
+      data.threads[key].liveStream = { ts: '5.0', turnId: priorTurn, slotId: `stream:${priorTurn}:${revision}`, text: 'Prior preview' };
+    });
+    f.gateway.command = async () => ({ status: 'error', activeTurnId: 'failed-turn', consumedInputRevision: 2,
+      streamingText: 'Different revision failed', error: { code: 'MODEL_INVALID_RESPONSE' },
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Ask' }] });
+    await f.plugin.mirror(key);
+    f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, 0);
+    const slot = f.plugin.store.data.threads[key].mirrored[`stream:${priorTurn}:${revision}`];
+    assert.equal(slot.text, 'Prior preview'); assert.equal(slot.failedHash, undefined); assert.equal(slot.consumedBy, consumed ? 'saved-final' : undefined);
+  }
+});
+
+test('Failed legacy stream with no revision is marked only through its persisted same-turn pointer', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.failed-legacy');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'legacy-chat', userId: user, ownRequests: ['legacy-turn'] });
+  await f.store.update(data => { data.threads[key].liveStream = { ts: '7.0', turnId: 'legacy-turn', text: 'Legacy preview' }; });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'legacy-turn', streamingText: 'Legacy visible partial',
+    error: { code: 'MODEL_INVALID_RESPONSE' }, messages: [{ id: 'u', role: 'user', requestId: 'legacy-turn', text: 'Ask' }] });
+  await f.plugin.mirror(key); f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+  assert.deepEqual(f.sent.filter(call => call.update).map(call => call.update[1]), ['7.0']);
+  assert.ok(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].failedHash);
+  assert.equal(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].consumedBy, undefined);
+});
+
 test('overlapping turn previews finalize in their own slots after restart without reposting old replies', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.overlap');
   await f.store.bind(key, { channel, threadTs: '123.overlap', projectId: 'lab', conversationId: 'chat-overlap', userId: user, ownRequests: ['request-one', 'request-two'] });
@@ -2615,18 +2977,22 @@ test('Block Kit shows literal user text without mentions and emits versioned bri
   assert.deepEqual(formValues({ state: { values: { p: { v: { selected_option: { value: 'lab' } } } } } }), { p: 'lab' });
 });
 
-test('other bot routing metadata is semantic input; a silent decision downloads no attachments', async t => {
+test('other bot routing remains trusted semantic input while silent terminal mirroring posts nothing', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   await f.plugin.message('seed', event()); f.calls.length = 0; f.sent.length = 0;
   let identityCalls = 0;
   f.io.call = async method => { if (method === 'conversations.replies') return { messages: [] }; assert.equal(method, 'users.info'); identityCalls++; return { user: { id: 'UOTHER', is_bot: true } }; };
   const command = f.gateway.command;
-  f.gateway.command = async (type, input) => type === 'conversation.relevance' ? (f.calls.push({ type, ...input }), { respond: false, mainVersion: 'v1' }) : command(type, input);
-  f.io.download = async () => assert.fail('misaddressed message cannot download files');
+  f.gateway.command = async (type, input) => type === 'conversation.state' ? { status: 'waiting-for-user', activeTurnId: null,
+    participationDecision: 'silent', messages: [], approvals: [] } : command(type, input);
   for (let i = 0; i < 2; i++) await f.plugin.message(`other-${i}`, event({ thread_ts: '123.001', ts: `124.00${i}`, text: '<@UOTHER> fix it', files: [{ id: 'F1' }] }));
-  assert.equal(identityCalls, 1); assert.equal(f.calls.length, 2); assert.deepEqual(f.sent, []);
-  assert.deepEqual(f.calls[0].payload.routing.mentionedUsers, [{ id: 'UOTHER', isBot: true }]);
-  const reopened = await new Store(f.directory).open(); assert.equal(reopened.data.inbox['other-1'].relevance.respond, false);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(identityCalls, 1); assert.equal(submits.length, 2);
+  assert.equal(f.calls.filter(call => call.type === 'attachment.upload').length, 2);
+  assert.deepEqual(submits[0].payload.participation.routing.mentionedUsers, [{ id: 'UOTHER', isBot: true }]);
+  for (const key of Object.keys(f.store.data.threads)) await f.plugin.mirror(key);
+  assert.deepEqual(f.sent, []);
+  const reopened = await new Store(f.directory).open(); assert.deepEqual(reopened.data.inbox['other-1'].participation.payload, submits[1].payload.participation);
 });
 
 test('own native mention and unknown bot identities still use semantic intent; no permanent hard silence', async t => {
@@ -2638,18 +3004,20 @@ test('own native mention and unknown bot identities still use semantic intent; n
   f.calls.length = 0;
   await f.plugin.message('unknown', event({ text: '<@UUNKNOWN> help', ts: '200.001' }));
   await f.plugin.message('unknown-again', event({ text: '<@UUNKNOWN> help', ts: '201.001' }));
-  assert.equal(lookups, 2); assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 2);
+  assert.equal(lookups, 2); assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 2);
+  assert.equal(f.calls.filter(call => call.type === 'conversation.relevance').length, 0);
   assert.deepEqual(f.store.data.inbox.unknown.routingMetadata.mentionedUsers, [{ id: 'UUNKNOWN', isBot: null }]);
 });
 
-test('identity cache is bounded and quoted own mention still uses relevance', async t => {
+test('identity cache is bounded and quoted own mention still carries merged participation evidence', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   for (let i = 0; i < 257; i++) await f.plugin.mentionRoute(`identity-${i}`, event({ text: `<@U${i}>` }));
   assert.equal(f.plugin.userIdentities.size, 256);
   await f.plugin.message('quoted', event({ type: 'app_mention', text: `> <@${bot}> historical request\nnow discuss login` }));
-  assert.equal(f.calls[0].type, 'conversation.relevance');
+  assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
   const submitted = f.calls.find(call => call.type === 'conversation.submit');
   assert.equal(submitted.payload.followup, 'steer'); assert.equal(submitted.payload.expectedTurnId, undefined);
+  assert.deepEqual(submitted.payload.participation.routing.mentionedUsers, []);
 });
 
 test('stop freezes the target turn before delivery and never retargets on retry', async t => {

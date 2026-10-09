@@ -63,6 +63,15 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run build:runtime
       - run: npm test
+        env:
+          CONTEXT_GUARD_CI_TEST_DIAGNOSTICS: '1'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ failure() && !cancelled() }}
+        with:
+          name: cloud-node18-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cloud-node18-diagnostics/*.jsonl
+          if-no-files-found: ignore
+          retention-days: 1
   slack:
     needs: security
     runs-on: ubuntu-latest
