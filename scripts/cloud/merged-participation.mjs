@@ -91,7 +91,8 @@ export function createParticipationGate(onText, { continuation = false, reaction
         const body = block.text.slice(removed);
         return body ? [{ ...block, text: body }] : [];
       });
-      if (next.stop === 'end_turn' && !visible.trim() && !(continuation && reactionOnlyCompletion)) throw invalid();
+      if (next.stop === 'end_turn' && !visible.trim() && !(continuation && reactionOnlyCompletion &&
+          !content.some(block => block.type === 'tool_use'))) throw invalid();
       return { ...next, content };
     },
   };

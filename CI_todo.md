@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## SLACK-MERGED-EMOJI-03 · 纯表情完成的批次与耐久边界（2026-10-09）
+
+- [x] Coordinator 审核最小代码 Plan 与 Main 整合：保留 Main `16790590b838a7ca416713df7d184b9d7549f0a3` 的即时反馈、17种交流表情/单原消息两次限额、决定先持久发布和恢复 controlRevision；不重复开发纯表情功能。只补 current batch 与原 activeInput 目标分离、原生配对/持久回执完整性、零内容不新增空 assistant、确切 checkpoint 对象；无产品节点或 Main 绑定冒名。
+- [x] 历史 Executor 证据独立保留：基于 `03d99c4` 的 Cloud1.7.2/Slack0.4.1 候选唯一组合 actual `7e980d` exit0，63/63、0失败/跳过/取消，23158.9513ms；18文件前后一致。日志 `temp/slack-merged-emoji03-executor-20261009.log` SHA256 `7fe8c0baff0e753f543cba1bfa23071af83cef4ae8b3ed8c6f73e4972addb99a`。这63项未覆盖多输入纯完成，不能套到新 Main；其旧资格对多输入批次的静态缺口在整合时修正，原记录不覆盖。
+- [x] Executor 新 Main 开发收口后唯一组合：候选 Cloud1.8.1/Slack0.5.0，Node24.19.0 actual `1db9c1` exit0，91/91、0失败/跳过/取消，27508.2107ms，21文件前后一致。新增9云目标（含真实原双input与steer双input批次）及2 HTTP耐久目标，原无工具空答失败/业务/限额/feedback/签名/停止补充断言保留。日志 `temp/slack-merged-emoji03-main167-executor-20261009.log` SHA256 `acab86ba6b22d65d71ffb376470ca5fb6f498831fd250914c235d07fc3035586`，交接 `temp/slack-merged-emoji03-main167-handoff-20261009.md`。首轮零失败、无重跑；未全量/供应商/生产/Git/CI，不把 intent 当 NativeAck，不改旧记录或空历史。
+- [ ] 独立 Tester：按最终准确提交独立验证最小受影响组合，重点 current batch 原始有序输入、原首消息表情目标、严格配对/指纹/actor/状态、未知原生结果、stop/steer与零内容历史；不重复未改整组，不引用旧63或 incoming旧提交结果替代新修订。
+- [ ] Delivery：Root正常 PR/Required/Main CI/精确部署；新真人pure-only验证原生表情与零占位正文，并与接收/接话反馈区分。Cloud1.8.1/Slack0.5.0、固定core/UI保留；旧失败不重放，未确认投递不称成功。
+
 ## SLACK-FEEDBACK-01 · 即时状态与自然交流（2026-10-09）
 
 - [x] 正式模块测试：接收原消息和 👀 意图同事务保存；无项目绑定、慢模型、迟到、失回、重启、限流、身份/目标拒绝和八槽预算均有断言。状态切换只移除本机器人旧状态，不影响交流表情或正文。

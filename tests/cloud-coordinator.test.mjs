@@ -88,6 +88,249 @@ test('Slack reaction alongside business or a failed tool never finishes outstand
   }
 });
 
+function mergedReactionState() {
+  const state = reactionState(), id = state.activeInput.id;
+  state.activeTurnId = id; state.activeRequestIds = [id];
+  state.messages.push({ role: 'user', requestId: id, source: 'slack', actor: reactionActor, content: '只需表情回应。',
+    serverContext: { participation: { text: '只需表情回应。', inputs: [{ id, text: '只需表情回应。' }] } } });
+  return state;
+}
+async function acceptedReaction(state, options = {}) {
+  const step = { turnId: 'merged-reaction-turn', system: 'role', tools: coordinatorTools, save: async () => {},
+    execute: createCoordinatorExecutor({}), ...options };
+  await coordinatorStep({ ...step, state, model: { next: async ({ onText, onToolStart }) => {
+    await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+    return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+      { type: 'tool_use', id: 'social', name: 'react_to_user', input: { emoji: 'heart' } }] };
+  } } });
+  return step;
+}
+test('Merged reaction completes only after its native receipt and a valid empty end_turn without empty assistant history', async () => {
+  const state = mergedReactionState(), step = await acceptedReaction(state);
+  assert.equal(state.status, 'running'); assert.equal(state.messages.length, 3);
+  const pair = structuredClone(state.messages.slice(1)), receipts = structuredClone(state.toolReceipts);
+  await coordinatorStep({ ...step, state, execute: () => assert.fail('Receipt must not execute again'),
+    model: { next: async ({ messages, system }) => {
+      assert.doesNotMatch(system, /Slack 合并接话协议/);
+      assert.deepEqual(messages.at(-1).content, pair[1].content);
+      return { stop: 'end_turn', content: [] };
+    } } });
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(state.pending, null);
+  assert.deepEqual(state.messages.slice(1), pair); assert.deepEqual(state.toolReceipts, receipts);
+  assert.equal(state.messages.filter(message => message.role === 'assistant').length, 1);
+  assert.equal(Object.values(receipts)[0].result.status, 'intent');
+  assert.doesNotMatch(JSON.stringify(receipts), /delivered|approved|passed/);
+  const model = new CoordinatorModel({ baseUrl: 'https://fixture.invalid', model: 'fixture', token: 'synthetic' });
+  const body = JSON.parse(model.prepareRequest({ system: 'role', messages: [...coordinatorModelMessages(state), { role: 'user', content: '新的请求' }] }));
+  assert.equal(body.messages.some(message => message.role === 'assistant' && message.content.length === 0), false);
+});
+test('Merged reaction retains accompanying necessary text and complete private metadata on continuation', async () => {
+  for (const content of [[{ type: 'text', text: '仍需人工确认。' }],
+    [{ type: 'thinking', thinking: 'synthetic private', signature: 'opaque-complete-signature', extra: { preserved: true } }]]) {
+    const state = mergedReactionState(), step = await acceptedReaction(state);
+    await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'end_turn', content }) } });
+    assert.equal(state.status, 'waiting-for-user'); assert.deepEqual(state.messages.at(-1).content, content);
+    assert.deepEqual(coordinatorModelMessages(state).at(-1).content, content);
+  }
+});
+test('Merged reaction multiple native receipts survive pending restart and authorize only the following empty completion', async () => {
+  let recovered; const state = mergedReactionState();
+  const options = { turnId: 'multi-reaction', system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}),
+    save: async value => { if (value.pending && Object.keys(value.toolReceipts).length === 2) recovered = structuredClone(value); } };
+  await coordinatorStep({ ...options, state, model: { next: async ({ onText, onToolStart }) => {
+    await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+    return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' }, ...['heart', 'wave'].map(emoji => ({
+      type: 'tool_use', id: emoji, name: 'react_to_user', input: { emoji },
+    }))] };
+  } } });
+  assert.ok(recovered); const receipts = structuredClone(recovered.toolReceipts);
+  await coordinatorStep({ ...options, state: recovered, execute: () => assert.fail('Restart must reuse original native receipts'),
+    model: { next: () => assert.fail('Pending result recovery must not request the model') } });
+  assert.equal(recovered.status, 'running'); assert.equal(recovered.messages.at(-1).content.length, 2);
+  await coordinatorStep({ ...options, state: recovered, model: { next: async ({ messages }) => {
+    assert.equal(messages.at(-1).content.length, 2); return { stop: 'end_turn', content: [] };
+  } } });
+  assert.equal(recovered.status, 'waiting-for-user'); assert.equal(recovered.messages.length, 3);
+  assert.deepEqual(recovered.toolReceipts, receipts);
+});
+test('Merged reaction empty completion cannot borrow a stale altered failed or incomplete pair', async () => {
+  const cases = [
+    ['other turn', (state, step) => { step.turnId = 'another-turn'; }],
+    ['other input', state => { state.activeInput.id = 'different-request'; }],
+    ['other actor', state => { state.activeInput.actor = { ...reactionActor, userId: 'UOTHER', sessionId: 'slack:TTESTWORKSPACE:UOTHER' }; }],
+    ['superseded', state => { state.messages[1].superseded = true; }],
+    ['failed receipt', state => { Object.values(state.toolReceipts)[0].isError = true; }],
+    ['missing receipt', state => { state.toolReceipts = {}; }],
+    ['invented delivery status', state => { Object.values(state.toolReceipts)[0].result.status = 'delivered'; }],
+    ['wrong receipt actor', state => { Object.values(state.toolReceipts)[0].result.actor = { ...reactionActor, userId: 'UOTHER' }; }],
+    ['extra native result', state => { state.messages[2].content.push({ type: 'tool_result', tool_use_id: 'unknown', content: '{}' }); }],
+    ['unrelated batch member', state => {
+      state.activeRequestIds.push('unrelated');
+      state.messages.splice(1, 0, { ...state.messages[0], requestId: 'unrelated', serverContext: {}, content: '另一条输入' });
+    }],
+    ['altered fingerprint', state => { Object.values(state.toolReceipts)[0].fingerprint = 'different'; }],
+    ['changed result', state => { state.messages[2].content[0].content = '{}'; }],
+    ['unmatched result', state => { state.messages[2].content[0].tool_use_id = 'other'; }],
+    ['business call', state => { state.messages[1].content.push({ type: 'tool_use', id: 'business', name: 'read_map', input: {} }); }],
+    ['necessary text', state => { state.messages[1].content.unshift({ type: 'text', text: '我还需要继续解释。' }); }],
+    ['new accepted correction', state => {
+      state.activeRequestIds.push('correction'); state.consumedInputRevision = 1;
+      state.messages.push({ ...state.messages[0], requestId: 'correction', content: '补充：请解释。' });
+      state.slackParticipation = { requestId: 'correction', decision: 'reply' };
+    }],
+  ];
+  for (const [name, alter] of cases) {
+    const state = mergedReactionState(), step = await acceptedReaction(state);
+    alter(state, step); const original = structuredClone(state.messages);
+    await assert.rejects(coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'end_turn', content: [] }) } }),
+      { code: 'MODEL_INVALID_RESPONSE' }, name);
+    assert.deepEqual(state.messages, original, name);
+  }
+});
+test('Merged reaction terminal checkpoint preserves new input and explicit stop priority', async () => {
+  for (const interrupted of [false, true]) {
+    const state = mergedReactionState(), step = await acceptedReaction(state);
+    state.consumedInputRevision = 7;
+    await coordinatorStep({ ...step, state, checkpoint: async () => {
+      if (!interrupted) state.messages.push({ ...state.messages[0], requestId: 'new-current-input', content: '新补充' });
+      return { steered: !interrupted, interrupted };
+    },
+      model: { next: async () => ({ stop: 'end_turn', content: [] }) } });
+    assert.equal(state.status, interrupted ? 'interrupted' : 'running');
+    assert.equal(state.consumedInputRevision, 7); assert.equal(state.messages.length, interrupted ? 3 : 4);
+    assert.equal(state.messages[1].superseded, true); assert.equal(Object.keys(state.toolReceipts).length, 1);
+    assert.equal(state.messages.at(-1).superseded, undefined);
+  }
+});
+test('Merged reaction real business and rejected tools still require a textual continuation', async () => {
+  for (const mode of ['read-only', 'mixed', 'forbidden-reaction']) {
+    const state = mergedReactionState(), step = { turnId: 'mixed-merged', state, system: 'role', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ readMap: async () => ({ node: { id: 'T0' } }),
+        authorizeTool: async name => { if (mode === 'forbidden-reaction' && name === 'react_to_user') throw Object.assign(new Error('synthetic refusal'), { code: 'FORBIDDEN' }); } }) };
+    const names = mode === 'read-only' ? ['read_map'] : mode === 'mixed' ? ['react_to_user', 'read_map'] : ['react_to_user'];
+    await coordinatorStep({ ...step, model: { next: async ({ onText, onToolStart }) => {
+      await onText?.('[CG_REPLY]'); await onToolStart?.(names[0]);
+      return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' }, ...names.map((name, index) => ({
+        type: 'tool_use', id: `call-${index}`, name, input: name === 'react_to_user' ? { emoji: 'heart' } : {},
+      }))] };
+    } } });
+    assert.equal(state.status, 'running', mode);
+    const receipts = structuredClone(state.toolReceipts);
+    await assert.rejects(coordinatorStep({ ...step, model: { next: async () => ({ stop: 'end_turn', content: [] }) } }),
+      { code: 'MODEL_INVALID_RESPONSE' }, mode);
+    assert.deepEqual(state.toolReceipts, receipts, mode);
+  }
+});
+test('Merged reaction durable continuation obeys real steer and stop without reexecuting the intent', { timeout: 10000 }, async t => {
+  for (const stop of [false, true]) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-merged-reaction-control-'));
+    let enter, release; const entered = new Promise(resolve => { enter = resolve; });
+    const released = new Promise(resolve => { release = resolve; }); let calls = 0, executions = 0;
+    const native = createCoordinatorExecutor({});
+    const service = new CoordinatorService({ directory, system: 'role', tools: coordinatorTools, steerSettleMs: 0,
+      execute: async (...args) => { executions++; return native(...args); }, model: { next: async ({ onText, onToolStart, signal }) => {
+        if (++calls === 1) {
+          await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+          return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+            { type: 'tool_use', id: 'heart-control', name: 'react_to_user', input: { emoji: 'heart' } }] };
+        }
+        if (calls === 2) {
+          enter(); await Promise.race([released, new Promise(resolve => signal.aborted ? resolve() : signal.addEventListener('abort', resolve, { once: true }))]);
+          return { stop: 'end_turn', content: [] }; // A late adapter result cannot settle the newer input.
+        }
+        return { stop: 'end_turn', content: [{ type: 'text', text: '[CG_REPLY]\n补充已收到，继续说明。' }] };
+      } } });
+    t.after(async () => { release(); await service.close({ stop: true }); await fs.rm(directory, { recursive: true, force: true }); });
+    const submit = (id, text, controls = {}) => service.submit({ id: `batch-${id}`, inputs: [{ id, text }], ...controls },
+      { source: 'slack', actor: reactionActor, participation: { text, inputs: [{ id, text }], files: [], context: [],
+        routing: { coordinatorUserId: 'UCOORD', mentionedUsers: [], replyToCoordinator: false } } });
+    await submit('original', '仅表情回应。'); await entered;
+    const before = await service.readConversation(null); assert.equal(Object.keys(before.toolReceipts).length, 1);
+    if (stop) await service.interrupt({ id: 'stop-original', expectedTurnId: 'original' });
+    else await submit('correction', '补充：请继续说明。', { followup: 'steer', expectedTurnId: 'original' });
+    await service.close();
+    const raw = await service.readConversation(null), state = await service.state();
+    assert.equal(executions, 1); assert.deepEqual(raw.toolReceipts, before.toolReceipts);
+    assert.equal(state.status, stop ? 'interrupted' : 'waiting-for-user'); assert.equal(calls, stop ? 2 : 3);
+    assert.equal(raw.messages.some(message => message.role === 'assistant' && message.content.length === 0), false);
+    if (!stop) {
+      assert.equal(raw.consumedInputRevision, 1);
+      assert.deepEqual(raw.messages.filter(message => message.requestId && message.role === 'user').map(message => message.requestId), ['original', 'correction']);
+      assert.equal(state.messages.at(-1).text, '补充已收到，继续说明。');
+    }
+  }
+});
+test('Merged reaction empty provider result remains bound to validated stream and JSON termination', async () => {
+  const events = [
+    { type: 'message_start', message: { model: 'fixture' } },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' } }, { type: 'message_stop' },
+  ];
+  for (const protocol of ['stream', 'json', 'openai']) {
+    const state = mergedReactionState(), step = await acceptedReaction(state);
+    const model = new CoordinatorModel({ baseUrl: 'https://fixture.invalid', model: 'fixture', token: 'synthetic',
+      protocol: protocol === 'openai' ? 'openai' : 'anthropic', fetch: async () => protocol === 'stream'
+        ? new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } })
+        : new Response(JSON.stringify(protocol === 'json' ? { model: 'fixture', stop_reason: 'end_turn', content: [] }
+          : { model: 'fixture', choices: [{ finish_reason: 'stop', message: { content: null } }] })) });
+    await coordinatorStep({ ...step, state, model });
+    assert.equal(state.status, 'waiting-for-user', protocol); assert.equal(state.messages.length, 3, protocol);
+  }
+  for (const source of [events.slice(0, -1), [events[0], { type: 'message_delta', delta: { stop_reason: 'max_tokens' } }, events[2]],
+    [events[0], { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'unfinished', name: 'read_map', input: {} } }, events[1], events[2]],
+    [events[0], { type: 'message_delta', delta: { stop_reason: 'tool_use' } }, events[2]]]) {
+    const state = mergedReactionState(), step = await acceptedReaction(state);
+    const model = new CoordinatorModel({ baseUrl: 'https://fixture.invalid', model: 'fixture', token: 'synthetic',
+      fetch: async () => new Response(source.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }) });
+    await assert.rejects(coordinatorStep({ ...step, state, model }), { code: 'MODEL_INVALID_RESPONSE' });
+    assert.equal(state.messages.length, 3);
+  }
+});
+
+test('Merged reaction real ordered input and steer batches preserve the original native target and current batch anchor', { timeout: 10000 }, async t => {
+  for (const steering of [false, true]) {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-merged-reaction-batch-'));
+    let enter, release; const entered = new Promise(resolve => { enter = resolve; });
+    const released = new Promise(resolve => { release = resolve; }); let calls = 0;
+    const service = new CoordinatorService({ directory, system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}), steerSettleMs: 0,
+      model: { next: async ({ onText, onToolStart, signal, messages }) => {
+        calls++;
+        if (steering && calls === 1) {
+          enter(); await Promise.race([released, new Promise(resolve => signal.aborted ? resolve() : signal.addEventListener('abort', resolve, { once: true }))]);
+          return { stop: 'end_turn', content: [] };
+        }
+        if (calls === (steering ? 2 : 1)) {
+          await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+          return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+            { type: 'tool_use', id: 'batch-reaction', name: 'react_to_user', input: { emoji: 'heart' } }] };
+        }
+        assert.equal(JSON.parse(messages.at(-1).content[0].content).requestId, 'original-first');
+        return { stop: 'end_turn', content: [] };
+      } } });
+    t.after(async () => { release(); await service.close({ stop: true }); await fs.rm(directory, { recursive: true, force: true }); });
+    const submit = (id, inputs, controls = {}) => service.submit({ id, inputs, ...controls }, { source: 'slack', actor: reactionActor,
+      participation: { text: inputs.map(input => input.text).join('\n\n'), inputs, files: [], context: [],
+        routing: { coordinatorUserId: 'UCOORD', mentionedUsers: [], replyToCoordinator: false } } });
+    const original = [{ id: 'original-first', text: '请回应。' }, { id: 'original-last', text: '仅表情即可。' }];
+    await submit('original-batch', original);
+    const corrected = [{ id: 'correction-first', text: '补充更正。' }, { id: 'correction-last', text: '现在仅表情确认即可。' }];
+    if (steering) {
+      await entered; await submit('correction-batch', corrected, { followup: 'steer', expectedTurnId: 'original-first' });
+    }
+    await service.close(); const raw = await service.readConversation(null), state = await service.state();
+    assert.equal(state.status, 'waiting-for-user'); assert.equal(state.activeTurnId, null); assert.equal(calls, steering ? 3 : 2);
+    assert.equal(raw.activeInput.id, 'original-first');
+    const users = raw.messages.filter(message => message.role === 'user' && message.requestId);
+    assert.deepEqual(users.map(message => message.requestId), [...original, ...(steering ? corrected : [])].map(input => input.id));
+    assert.equal(users.every(message => JSON.stringify(message.actor) === JSON.stringify(reactionActor)), true);
+    assert.deepEqual(raw.slackParticipation, { requestId: steering ? 'correction-first' : 'original-first', decision: 'reply' });
+    const [receipt] = Object.values(raw.toolReceipts); assert.equal(receipt.result.requestId, 'original-first');
+    assert.equal(receipt.result.actor.userId, reactionActor.userId); assert.equal(receipt.result.status, 'intent');
+    assert.equal(raw.messages.filter(message => message.role === 'assistant').length, 1);
+    assert.equal(raw.messages.at(-1).content[0].tool_use_id, 'batch-reaction');
+    if (steering) assert.equal(raw.consumedInputRevision, 2);
+  }
+});
+
 test('Project requirements survive restart, reserve capacity atomically and dispatch only the approved fresh Session', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-project-task-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

@@ -375,6 +375,41 @@ export class CoordinatorModel {
   }
 }
 
+// Empty completion belongs to the current accepted participation batch and
+// native reaction pairs, never to a historical intent or a model-supplied flag.
+function reactionOnlyContinuation(state, turnId, input) {
+  const anchor = state.messages.lastIndexOf(input);
+  const start = state.messages.findLastIndex(message => message.role === 'user' && message.requestId);
+  const inputs = input?.serverContext?.participation?.inputs;
+  const active = state.activeInput, actorHash = hash(JSON.stringify(active.actor));
+  const users = state.messages.slice(anchor, start + 1), pairs = state.messages.slice(start + 1);
+  if (anchor < 0 || start < anchor || !Array.isArray(inputs) || !inputs.length || users.length !== inputs.length ||
+      users.some((message, index) => message.role !== 'user' || message.requestId !== inputs[index].id ||
+        !state.activeRequestIds?.includes(message.requestId) || message.source !== 'slack' || !message.actor ||
+        hash(JSON.stringify(message.actor)) !== actorHash) || !pairs.length || pairs.length % 2) return false;
+  for (let index = 0; index < pairs.length; index += 2) {
+    const assistant = pairs[index], results = pairs[index + 1];
+    if (assistant.role !== 'assistant' || assistant.superseded || assistant.requestId !== active.id ||
+        assistant.source !== 'slack' || !assistant.actor || hash(JSON.stringify(assistant.actor)) !== actorHash ||
+        !Array.isArray(assistant.content) || assistant.content.some(block => block.type === 'text' && block.text?.trim()) ||
+        results.role !== 'user' || results.requestId || !Array.isArray(results.content)) return false;
+    const calls = assistant.content.filter(block => block.type === 'tool_use');
+    if (!calls.length || calls.length !== results.content.length || new Set(calls.map(call => call.id)).size !== calls.length) return false;
+    for (let offset = 0; offset < calls.length; offset++) {
+      const call = calls[offset], reply = results.content[offset];
+      const operationId = `coordinator:${hash(`${turnId}:${call.id}`)}`, receipt = state.toolReceipts[operationId];
+      if (call.name !== 'react_to_user' || !receipt || receipt.isError ||
+          receipt.fingerprint !== hash(JSON.stringify({ name: call.name, input: call.input })) ||
+          receipt.result?.kind !== 'slack-reaction' || receipt.result.status !== 'intent' ||
+          receipt.result.actionId !== operationId || receipt.result.emoji !== call.input?.emoji ||
+          receipt.result.requestId !== active.id || !receipt.result.actor || hash(JSON.stringify(receipt.result.actor)) !== actorHash ||
+          reply.type !== 'tool_result' || reply.tool_use_id !== call.id || reply.is_error ||
+          reply.content !== JSON.stringify(receipt.result)) return false;
+    }
+  }
+  return true;
+}
+
 // Persist every assistant response and tool receipt through the caller. Stable
 // operation IDs let protocol-backed tools replay a lost response idempotently.
 export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, completePresentations = false, checkpoint = null, signal = null }) {
@@ -403,21 +438,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
-    // 只接受本轮纯交流表情的完整原生工具回执后的空结束。
-    // 读写工具、失败回执、首轮空答复或仅输出标识都不能借此结束。
-    const previousAssistant = state.messages.at(-2), previousResults = state.messages.at(-1);
-    const reactionCalls = previousAssistant?.role === 'assistant' && previousAssistant.requestId === gateKey
-      ? previousAssistant.content?.filter(block => block.type === 'tool_use') || [] : [];
-    const reactionOnlyCompletion = !!alreadyAllowed && reactionCalls.length > 0 &&
-      !previousAssistant.content.some(block => block.type === 'text' && block.text.trim()) &&
-      !state.messages.some(message => message.role === 'assistant' && message.requestId === gateKey &&
-        message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user')) &&
-      previousResults?.role === 'user' && reactionCalls.every(call => {
-        const receipt = state.toolReceipts[`coordinator:${hash(`${turnId}:${call.id}`)}`];
-        return call.name === 'react_to_user' && receipt && !receipt.isError && receipt.result?.kind === 'slack-reaction' &&
-          receipt.result.requestId === gateKey && previousResults.content?.some(block =>
-            block.type === 'tool_result' && block.tool_use_id === call.id && !block.is_error);
-      });
+    const reactionOnlyCompletion = !!alreadyAllowed && reactionOnlyContinuation(state, turnId, participationInput);
+    const reactionAssistant = reactionOnlyCompletion ? state.messages.at(-2) : null;
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
     // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
     const generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
@@ -487,6 +509,15 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) await onToolStart?.('ask_user');
     if (gate?.decision === 'silent') {
       const changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
+      state.pending = null;
+      state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user';
+      await save(state); return state;
+    }
+    if (reactionOnlyCompletion && next.stop === 'end_turn' && next.content.length === 0) {
+      // Preserve the native pair without adding an empty assistant to future
+      // provider requests. Nonempty private blocks keep their original history.
+      const changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
+      if ((changed.steered || changed.interrupted) && state.messages.includes(reactionAssistant)) reactionAssistant.superseded = true;
       state.pending = null;
       state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user';
       await save(state); return state;
