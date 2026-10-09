@@ -39,7 +39,10 @@ export async function start(config = configuration()) {
   let socket, plugin;
   const logger = { debug() {}, info() {}, warn() { console.warn('Slack SDK warning'); }, error() { console.error('Slack SDK failure'); }, getLevel: () => 'error', setLevel() {}, setName() {} };
   try {
-    const store = await new Store(config.directory).open();
+    let commitSamples = 0;
+    const store = await new Store(config.directory, { onCommit: info => {
+      if (commitSamples++ < 20) console.info(JSON.stringify({ event: 'slack-state-commit', ...info }));
+    } }).open();
     const client = new WebClient(config.botToken, { retryConfig: { retries: 0 }, rejectRateLimitedCalls: true, timeout: 15000, logger });
     const authentication = await client.auth.test();
     if (authentication.team_id !== config.teamId || !authentication.user_id) throw new Error('Slack token is not installed in Jerry Family');
