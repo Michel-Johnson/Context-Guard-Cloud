@@ -11,9 +11,9 @@ const hash = data => createHash('sha256').update(data).digest('hex');
 const manifestFile = path.join(root, '.runtime-generated.json');
 const generatedPath = file => /^(?:scripts\/shared\/|prototype\/|references\/)[^\\]+$/.test(file) || file === 'docs/interface-contract-v2.json';
 const mappings = [
-  ['@michelj/context-guard-core', 'scripts/shared', file => !file.startsWith('roles/') && !file.startsWith('references/') && file !== 'interface-contract-v2.json'],
+  ['@michelj/context-guard-core', 'scripts/shared', file => !file.startsWith('roles/') && !file.startsWith('references/') && !file.startsWith('skill-reference/') && file !== 'interface-contract-v2.json'],
   ['@michelj/context-guard-core', 'scripts/shared/roles', file => file.startsWith('roles/'), file => file.slice('roles/'.length)],
-  ['@michelj/context-guard-core', 'scripts/shared', file => file.startsWith('references/')],
+  ['@michelj/context-guard-core', 'scripts/shared', file => file.startsWith('references/') || file.startsWith('skill-reference/')],
   ['@michelj/context-guard-core', 'docs', file => file === 'interface-contract-v2.json'],
   ['@michelj/context-guard-workbench', 'prototype', () => true],
 ];

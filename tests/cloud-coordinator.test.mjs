@@ -5,10 +5,11 @@ import { CoordinatorModel, coordinatorInputTokens, coordinatorModelMessages, coo
 import { buildCoordinatorContext } from '../scripts/cloud/coordinator-context.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   coordinatorCompactBoundary, COORDINATOR_COMPACT_AT_TOKENS, COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from '../scripts/cloud/coordinator-service.mjs';
-import { createCoordinatorExecutor, coordinatorReferences, coordinatorReferenceFiles, coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
+import { createCoordinatorExecutor, coordinatorReferences, coordinatorReferenceFiles, coordinatorTools, readCoordinatorReferenceFile } from '../scripts/cloud/coordinator-tools.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, coordinatorStructureOperations, coordinatorTaskOwnerRequired } from '../scripts/cloud/server.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
@@ -472,17 +473,44 @@ test('Cloud project approval dispatches once as soon as the fresh Session is reg
   assert.equal(queue.data.messages.filter(item => item.message.type === 'task.assign').length, 1);
 });
 
+test('Coordinator reference migration keeps legacy identifiers and never masks a broken new package', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-reference-layout-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'scripts/shared/references');
+  const current = path.join(root, 'scripts/shared/skill-reference');
+  await fs.mkdir(legacy, { recursive: true });
+  await fs.writeFile(path.join(legacy, 'map-mount.md'), 'legacy mount');
+  await fs.writeFile(path.join(legacy, 'map-read.md'), 'legacy map');
+  await fs.writeFile(path.join(legacy, 'agent-handoff.md'), 'legacy handoff');
+  assert.equal(await readCoordinatorReferenceFile(root, 'map-mount.md'), 'legacy mount');
+  assert.equal(await readCoordinatorReferenceFile(root, 'plan-review.md'), 'legacy handoff');
+  await fs.mkdir(current);
+  await fs.writeFile(path.join(current, 'map-read.md'), 'current map and mount');
+  await fs.writeFile(path.join(current, 'agent-handoff.md'), 'current handoff');
+  assert.equal(await readCoordinatorReferenceFile(root, 'map-mount.md'), 'current map and mount');
+  for (const name of ['plan-review.md', 'test-check.md']) assert.equal(await readCoordinatorReferenceFile(root, name), 'current handoff');
+  await fs.unlink(path.join(current, 'map-read.md'));
+  await assert.rejects(readCoordinatorReferenceFile(root, 'map-mount.md'), { code: 'ENOENT' });
+  for (const name of ['../map-read.md', '/etc/passwd', 'unknown.md']) await assert.rejects(readCoordinatorReferenceFile(root, name), { code: 'INVALID_ARGUMENT' });
+});
+
 test('Coordinator guide references are callable and loaded only after an explicit tool call', async t => {
   const prompt = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
-  const linkedReferences = [...new Set([...prompt.matchAll(/\]\(references\/([^)]*)\)/g)]
-    .map(match => match[1])
-    .map(file => Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file)))];
+  const linkedReferences = [...new Set([...prompt.matchAll(/\[([^\]]+)\]\((?:\.\.\/)?(?:references|skill-reference)\/([^)]*)\)/g)]
+    .map(([, label, target]) => {
+      const file = target.split('#')[0];
+      if (coordinatorReferences.includes(label)) {
+        assert.ok(file === coordinatorReferenceFiles[label] || file === label, label);
+        return label;
+      }
+      return Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file);
+    }))];
   assert.ok(linkedReferences.every(Boolean), '角色提示里的每个资料链接都必须可调用，不能漏掉文件格式规范');
   assert.deepEqual([...linkedReferences].sort(), [...coordinatorReferences].sort());
   const referenceReads = [];
   const execute = createCoordinatorExecutor({ readReference: async name => {
     referenceReads.push(name);
-    return { text: await fs.readFile(new URL(`../scripts/shared/references/${coordinatorReferenceFiles[name]}`, import.meta.url), 'utf8') };
+    return { text: await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), name) };
   } });
   for (const name of linkedReferences) {
     const result = await execute('read_reference', { name }, { operationId: `prompt-ref:${name}` });
@@ -521,7 +549,7 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(reply.tool_use_id, 'read-memory-rules');
   assert.equal(reply.is_error, undefined);
   assert.equal(JSON.parse(reply.content).text,
-    await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8'));
+    await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), 'memory-definition.md'));
 });
 
 test('Cloud reads the moved memory design through the unchanged reference identifier', async t => {
@@ -540,7 +568,7 @@ test('Cloud reads the moved memory design through the unchanged reference identi
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'main-1', memory: { records: {}, map: {
     v: 1, root: { id: 'T0', title: 'Synthetic project', kind: 'module', owns: [], children: [] },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
-  const expectedText = await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8');
+  const expectedText = await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), 'memory-definition.md');
   let modelCalls = 0, observed;
   server = await startCloudServer({ dataDir: directory, port: 0, memoryConfig, browserToken: 'synthetic-browser',
     protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },

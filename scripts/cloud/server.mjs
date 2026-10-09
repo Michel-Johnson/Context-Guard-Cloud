@@ -21,7 +21,7 @@ import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
 import { MapTranslations, translationInput } from './map-translations.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from './coordinator-service.mjs';
-import { coordinatorTools, coordinatorReferences, coordinatorReferenceFiles, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
+import { coordinatorTools, coordinatorReferences, readCoordinatorReferenceFile, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
@@ -1018,7 +1018,7 @@ export async function startCloudServer({
           },
           readReference: async name => {
             if (!references.has(name)) protocolFail('FORBIDDEN', 'Reference is not available to the Coordinator');
-            const text = await fs.readFile(path.join(root, 'scripts/shared/references', coordinatorReferenceFiles[name]), 'utf8');
+            const text = await readCoordinatorReferenceFile(root, name);
             return { name, version: digest(text), text };
           },
           editMap: async (input, operationId) => {
