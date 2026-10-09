@@ -4,6 +4,13 @@ import { hash } from '../shared/io.mjs';
 const compact = (value, limit = 240) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
 const treeText = value => String(value || '').replace(/[\\`*_\[\]]/g, character => `\\${character}`).replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const itemKinds = { todo: 'TODO', bug: 'Bug', idea: 'Idea' };
+function overviewPurpose(item) {
+  const source = [item.desc, item.description, item.text].find(value => typeof value === 'string' && value.trim());
+  if (!source || compact(source, Infinity) === compact(item.title || item.text || item.desc || item.id, Infinity)) return null;
+  const value = source.trim(); let excerpt = value.slice(0, 160);
+  if (/[\uD800-\uDBFF]$/.test(excerpt) && /^[\uDC00-\uDFFF]/.test(value.slice(160))) excerpt = excerpt.slice(0, -1);
+  return { text: excerpt, truncated: excerpt.length < value.length };
+}
 
 function visit(node, parentId, depth, rows, index) {
   if (!node) return;
@@ -75,13 +82,17 @@ export function buildCoordinatorContext(snapshot, { conversation = null, nodeIds
       return ['todo', 'bug'].flatMap(kind => (node[`${kind}s`] || [])
         .filter(item => item.id && !(kind === 'todo' ? item.status === 'done' : isClosedBugStatus(item.status)))
         .map(item => ({ kind, nodeId: id, nodeTitle: title,
-          title: compact(item.title || item.text || item.desc || item.id, 120), status: compact(item.status || '未标记', 40) })));
+          title: compact(item.title || item.text || item.desc || item.id, 120), status: compact(item.status || '未标记', 40),
+          record: item })));
     });
     details.push('## 当前 Main 未完成事项概览',
       `TODO ${unfinished.filter(item => item.kind === 'todo').length} 条，Bug ${unfinished.filter(item => item.kind === 'bug').length} 条。`,
       '这是本轮 Main 快照的记录状态，不是执行阶段或完成证据；询问概览可直接使用，核验执行阶段或证据时再读取任务。');
-    for (const item of unfinished.slice(0, 20)) details.push(
-      `- ${itemKinds[item.kind]}｜${treeText(item.nodeTitle)} [${item.nodeId}]｜${treeText(item.title)}（${treeText(item.status)}）`);
+    for (const item of unfinished.slice(0, 20)) {
+      details.push(`- ${itemKinds[item.kind]}｜${treeText(item.nodeTitle)} [${item.nodeId}]｜${treeText(item.title)}（${treeText(item.status)}）`);
+      const purpose = overviewPurpose(item.record);
+      if (purpose) details.push(`  用途摘录${purpose.truncated ? '（已截短，全文用 read_map）' : ''}：${treeText(purpose.text).replace(/\r?\n/g, '\n    ')}`);
+    }
     if (unfinished.length > 20) details.push(`另有 ${unfinished.length - 20} 条未展开；需要完整清单时调用 list_tasks。`);
   }
   if (currentTask) {

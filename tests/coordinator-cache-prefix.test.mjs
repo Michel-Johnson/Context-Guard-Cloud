@@ -41,6 +41,13 @@ test('Main version and task changes update only the trailing context, not the st
   assert.match(b.dynamicText, /状态：done/);
   assert.match(b.dynamicText, /模块记忆/);
   assert.equal(coordinatorPrefix('role', a, tools), coordinatorPrefix('role', b, tools));
+  const overview = snapshot(); overview.memory.map.root.children[0].todos[0].desc = '旧用途资料';
+  const first = buildCoordinatorContext(overview);
+  overview.memory.map.root.children[0].todos[0].desc = '新用途资料';
+  const second = buildCoordinatorContext(overview);
+  assert.match(first.dynamicText, /用途摘录：旧用途资料/); assert.match(second.dynamicText, /用途摘录：新用途资料/);
+  assert.equal(first.staticText, second.staticText); assert.equal(first.staticVersion, second.staticVersion);
+  assert.equal(coordinatorPrefix('role', first, tools), coordinatorPrefix('role', second, tools));
 });
 
 test('Memory, navigation, roles and permitted tool profiles invalidate their own content versions', () => {
@@ -98,6 +105,32 @@ test('Retry after a provider failure reuses the accepted snapshot despite later 
   await service.submit({ id: 'retry', text: '检查', retry: true }); await service.running;
   assert.deepEqual(calls[1], calls[0]);
   assert.equal(JSON.parse(await fs.readFile(service.file, 'utf8')).messages.filter(m => m.role === 'user').length, 1);
+});
+
+test('Main overview purpose enters fresh inputs but cannot rewrite accepted retry snapshots or cached envelopes', async t => {
+  let current = snapshot(), attempts = 0; const calls = [];
+  current.memory.map.root.children[0].todos[0].desc = '旧用途资料 v1.2，期限 2027-02-03';
+  const { service } = await setup(t, { maxModelRetries: 0, context: async () => buildCoordinatorContext(current),
+    model: { next: async request => {
+      calls.push(structuredClone({ system: request.system, tools: request.tools, messages: request.messages }));
+      if (++attempts === 1) throw Object.assign(new Error('synthetic'), { code: 'MODEL_UNAVAILABLE' });
+      return structuredClone(answer);
+    } } });
+  await service.submit({ id: 'overview-first', text: '有哪些待办' }); await service.running;
+  const accepted = JSON.parse(await fs.readFile(service.file, 'utf8')).messages[0];
+  assert.equal(accepted.content, '有哪些待办');
+  assert.match(calls[0].messages[0].content, /用途摘录：旧用途资料 v1.2，期限 2027-02-03/);
+  current = snapshot('v2'); current.memory.map.root.children[0].todos[0].description = '新用途资料 v2.3，期限 2027-06-07';
+  await service.submit({ id: 'overview-first', text: '有哪些待办', retry: true }); await service.running;
+  assert.deepEqual(calls[1], calls[0], 'Retry uses the original accepted data, not latest item purposes');
+  const before = JSON.parse(await fs.readFile(service.file, 'utf8')).messages;
+  await service.submit({ id: 'overview-second', text: '现在呢' }); await service.running;
+  assert.equal(calls.length, 3, 'No new model rewriting or formatting round is introduced');
+  assert.equal(calls[2].system, calls[0].system); assert.deepEqual(calls[2].tools, calls[0].tools);
+  assert.match(calls[2].messages.at(-1).content, /用途摘录：新用途资料 v2.3，期限 2027-06-07/);
+  const after = JSON.parse(await fs.readFile(service.file, 'utf8')).messages;
+  assert.deepEqual(after.slice(0, before.length), before); assert.deepEqual(after[0], accepted);
+  assert.equal(after.filter(message => message.role === 'user').length, 2);
 });
 
 test('Legacy persisted contexts remain readable without guessing or rearranging their content', () => {

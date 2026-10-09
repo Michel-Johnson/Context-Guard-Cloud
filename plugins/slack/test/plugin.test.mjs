@@ -119,6 +119,49 @@ test('Slack card fallback preserves separate paragraphs instead of joining heade
   }
 });
 
+test('Slack card fallback renders typed block text once through single and multipart post and update', async t => {
+  const literal = '*literal* _API_name_ `value` [path](./api) 2 * 3';
+  const formatted = '*标题*：`2 ** 3; _code_`\n<https://example.com/api?v=2|接口>';
+  const rendered = '标题：2 ** 3; _code_\n接口（https://example.com/api?v=2）';
+  for (const multipart of [false, true]) {
+    const f = await fixture(t), calls = [];
+    const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+      calls.push({ method, args }); return { ts: `${calls.length}.0` };
+    } } });
+    const sections = [
+      { type: 'section', text: { type: 'plain_text', text: literal } },
+      { type: 'section', text: { type: 'mrkdwn', text: formatted } },
+      ...(multipart ? Array.from({ length: 47 }, (_, index) => ({ type: 'section', text: { type: 'plain_text', text: `段落 ${index}` } })) : []),
+    ];
+    const context = { type: 'context', elements: [
+      { type: 'plain_text', text: '*literal context* `API`' },
+      { type: 'mrkdwn', text: '*提示*：`*code*`' }, { type: 'mrkdwn', text: '' },
+      { type: 'image', image_url: 'https://example.com/image.png', alt_text: 'not message text' },
+    ] };
+    const blocks = [...sections, { type: 'actions', elements: [{ type: 'button', action_id: 'open', text: { type: 'plain_text', text: '打开' }, value: 'fixture' }] }, context];
+    const expected = [literal, rendered, ...sections.slice(2).map(block => block.text.text)];
+    const contextText = '*literal context* `API`\n提示：*code*';
+    const ts = await io.post({ id: 'typed-fallback', channel, threadTs: '1.0', text: 'unused', blocks });
+    const posts = calls.filter(call => call.method === 'chat.postMessage');
+    assert.equal(posts.length, multipart ? 2 : 1);
+    assert.deepEqual(posts.map(call => call.args.text), multipart ? [expected.join('\n\n'), contextText] : [[...expected, contextText].join('\n\n')]);
+    assert.deepEqual(posts.flatMap(call => call.args.blocks), blocks, 'Native blocks and code are not rewritten');
+    assert.deepEqual(posts.map(call => call.args.metadata.event_payload.id), multipart ? ['typed-fallback', 'typed-fallback:part:1'] : ['typed-fallback']);
+    await io.post({ id: 'typed-fallback', channel, threadTs: '1.0', text: 'unused', blocks });
+    assert.equal(calls.length, posts.length, 'Identical contents reuse the acknowledged original receipts');
+    const changed = structuredClone(blocks); changed[0].text.text += ' 新值'; changed.at(-1).elements[0].text += ' 新值';
+    await io.update(channel, ts, 'unused update', changed);
+    const updates = calls.filter(call => call.method === 'chat.update');
+    assert.equal(updates.length, multipart ? 2 : 1);
+    const next = [literal + ' 新值', rendered, ...expected.slice(2)], nextContext = contextText.replace('*literal context* `API`', '*literal context* `API` 新值');
+    assert.deepEqual(updates.map(call => call.args.text), multipart ? [next.join('\n\n'), nextContext] : [[...next, nextContext].join('\n\n')]);
+    assert.deepEqual(updates.flatMap(call => call.args.blocks), changed);
+    for (const call of calls) { assert.equal(call.args.mrkdwn, false); assert.equal(call.args.parse, 'none'); assert.equal(call.args.link_names, false); }
+    assert.equal(f.store.data.outgoing['typed-fallback'].status, 'sent');
+    if (multipart) assert.equal(f.store.data.outgoing['typed-fallback:part:1'].status, 'sent');
+  }
+});
+
 test('Completed node presentations render plain Slack links from the trusted project binding', () => {
   const context = { cloudOrigin: 'https://map.example.com', projectId: 'test-project' };
   const blocks = messageBlocks({ text: '首页负责入口，文章页负责正文。', actions: [
@@ -1429,6 +1472,33 @@ function projectChoice(f, requestId, projectId = 'lab') {
   return { type: 'block_actions', user: { id: user }, channel: { id: original.projectPromptEvent.channel },
     message: { ts: original.projectPromptTs }, actions: [{ action_id: 'connect_project:0', value: JSON.stringify({ requestId, projectId }) }] };
 }
+
+test('Slack project association delivers a literal plain card through SlackIO and never resubmits the original request', async t => {
+  for (const name of ['Claude Agent Lab', '*literal project* _API_name_']) {
+    const f = await fixture(t), gateway = f.gateway.command, call = f.io.call, writes = [];
+    f.gateway.command = async (type, args) => type === 'project.list' ? { projects: [{ id: 'lab', name }] } : gateway(type, args);
+    f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+      if (['chat.postMessage', 'chat.update'].includes(method)) { writes.push({ method, args }); return { ts: args.ts || `${writes.length + 100}.001` }; }
+      return call(method, args);
+    } } });
+    await f.plugin.message('plain-association', event());
+    const body = projectChoice(f, 'plain-association');
+    await f.plugin.process('plain-choice', { type: 'interactive', body });
+    await runPluginCycle(f.plugin);
+    await f.plugin.process('plain-choice-repeat', { type: 'interactive', body });
+    await runPluginCycle(f.plugin);
+    const confirmations = writes.filter(write => write.method === 'chat.update' && write.args.blocks[0]?.text?.text.startsWith('已关联'));
+    assert.ok(confirmations.length > 0);
+    for (const { args } of confirmations) {
+      const expected = `已关联 ${name}。刚才的问题已排入当前线程，回复会出现在这里。`;
+      assert.equal(args.blocks[0].text.type, 'plain_text'); assert.equal(args.blocks[0].text.text, expected);
+      assert.equal(args.text, expected); assert.equal(args.mrkdwn, false);
+    }
+    assert.equal(f.calls.filter(input => input.type === 'conversation.create').length, 1);
+    const submits = f.calls.filter(input => input.type === 'conversation.submit');
+    assert.equal(submits.length, 1); assert.equal(submits[0].payload.inputs[0].text, event().text);
+  }
+});
 async function runPluginCycle(plugin) {
   plugin.stopped = false;
   try { await plugin.tick(); await Promise.all([...plugin.processing.values()]); }
