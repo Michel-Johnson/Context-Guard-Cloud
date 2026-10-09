@@ -192,6 +192,15 @@ for (const headers of [false, true]) test(`事件${headers ? '正文' : '响应�
   assert.equal(f.requests.length, 1, 'Timeout releases the old stream; it does not create a new subscription itself');
 });
 
+test('响应头等待不占用后续正文的空闲窗口', { timeout: 5000 }, async t => {
+  const f = await fixture(t, async (_req, res) => {
+    await new Promise(resolve => setTimeout(resolve, 600)); sse(res); res.flushHeaders();
+    await new Promise(resolve => setTimeout(resolve, 600)); res.end(frame(state({ sequence: 3 })));
+  }, fetch, { streamIdleMs: 1000 });
+  assert.deepEqual(await collect(f.gateway.events(scope)), [state({ sequence: 3 }).data]);
+  assert.equal(f.requests.length, 1, 'Each phase fits its idle window even when total connection lifetime exceeds it');
+});
+
 test('真实心跳刷新空闲期限，但心跳停止后仍自动恢复入口', { timeout: 5000 }, async t => {
   let heartbeats = 0, interval;
   const f = await fixture(t, (_req, res) => {

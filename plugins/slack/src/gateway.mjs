@@ -44,6 +44,7 @@ export class Gateway {
       const response = await this.fetch(`${this.url}/v1/events?${query}`, {
         headers: { authorization: `Bearer ${this.token}`, accept: 'text/event-stream' }, redirect: 'error', signal: controller.signal,
       });
+      refresh();
       const mediaType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
       if (!response.ok || mediaType !== 'text/event-stream' || !response.body) {
         void response.body?.cancel().catch(() => {});
