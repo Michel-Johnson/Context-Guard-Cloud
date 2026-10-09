@@ -403,6 +403,21 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
+    // 只接受本轮纯交流表情的完整原生工具回执后的空结束。
+    // 读写工具、失败回执、首轮空答复或仅输出标识都不能借此结束。
+    const previousAssistant = state.messages.at(-2), previousResults = state.messages.at(-1);
+    const reactionCalls = previousAssistant?.role === 'assistant' && previousAssistant.requestId === gateKey
+      ? previousAssistant.content?.filter(block => block.type === 'tool_use') || [] : [];
+    const reactionOnlyCompletion = !!alreadyAllowed && reactionCalls.length > 0 &&
+      !previousAssistant.content.some(block => block.type === 'text' && block.text.trim()) &&
+      !state.messages.some(message => message.role === 'assistant' && message.requestId === gateKey &&
+        message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user')) &&
+      previousResults?.role === 'user' && reactionCalls.every(call => {
+        const receipt = state.toolReceipts[`coordinator:${hash(`${turnId}:${call.id}`)}`];
+        return call.name === 'react_to_user' && receipt && !receipt.isError && receipt.result?.kind === 'slack-reaction' &&
+          receipt.result.requestId === gateKey && previousResults.content?.some(block =>
+            block.type === 'tool_result' && block.tool_use_id === call.id && !block.is_error);
+      });
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
     // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
     const generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
@@ -415,9 +430,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
     const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
+      // 同一增量含控制头与正文时，也先持久发布决定，再发布正文。
+      await publishDecision();
       if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
       await onText?.(text);
-    }, { continuation: !!alreadyAllowed }) : null;
+    }, { continuation: !!alreadyAllowed, reactionOnlyCompletion }) : null;
     const publishDecision = async () => {
       if (gate?.decision && (state.slackParticipation?.requestId !== gateKey || state.slackParticipation.decision !== gate.decision)) {
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
@@ -504,6 +521,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
       else if (!executableTools.some(tool => tool.name === call.name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
+      else if (call.name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
+        item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id).length >= 2) {
+        receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
+      }
       else {
         const started = Date.now();
         let errorCode = null;
