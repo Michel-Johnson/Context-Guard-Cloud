@@ -326,7 +326,7 @@ export class SlackPlugin {
     for (const [key] of selected) {
       if (this.stopped) return;
       try { await this.mirror(key); }
-      catch (error) { this.logger.warn('Slack mirror failed', { code: error.code || 'MIRROR_ERROR' }); await this.store.update(state => { state.threads[key].nextPoll = Date.now() + 30000; state.threads[key].error = error.code || 'MIRROR_ERROR'; }); }
+      catch (error) { this.logger.warn('Slack mirror failed', { code: error.code || 'MIRROR_ERROR' }); await this.store.updateThread(key, thread => { thread.nextPoll = Date.now() + 30000; thread.error = error.code || 'MIRROR_ERROR'; }); }
     }
   }
   watchEvents(key, binding) {
@@ -340,8 +340,7 @@ export class SlackPlugin {
           if (this.stopped || stream.controller.signal.aborted || current?.projectId !== stream.projectId || current?.conversationId !== stream.conversationId || current?.userId !== stream.userId) break;
           if (state?.conversationId !== stream.conversationId) throw Object.assign(new Error('Event scope mismatch'), { code: 'GATEWAY_EVENT_INVALID' });
           stream.latest = state; stream.lastEventAt = Date.now();
-          await this.store.update(data => {
-            const thread = data.threads[key];
+          await this.store.updateThread(key, thread => {
             if (thread?.projectId === stream.projectId && thread?.conversationId === stream.conversationId && thread?.userId === stream.userId) thread.nextPoll = 0;
           });
           this.kick();
@@ -1556,8 +1555,7 @@ export class SlackPlugin {
       catch (error) { this.logger.warn('Slack 完成状态保留', { code: error.code || 'FEEDBACK_JOURNAL_ERROR' }); }
     }
     const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer);
-    await this.store.update(data => {
-      const thread = data.threads[key];
+    await this.store.updateThread(key, (thread, data) => {
       thread.status = state.status;
       if (lastRequestId) thread.lastStateRequestId = lastRequestId;
       thread.live = state.status === 'running' || !!state.activeTurnId && !['error', 'interrupted'].includes(state.status);
@@ -1583,9 +1581,9 @@ export class SlackPlugin {
       const status = item ? item.status || (watch.kind === 'bug' ? 'open' : 'pending') : 'removed';
       if (watch.status && watch.status !== status) await this.io.post({ id: operationId(`${key}:${itemId}:${project.version}:${status}`, 'item-status'), channel: thread.channel, threadTs: thread.threadTs,
         text: `${item?.title || (watch.kind === 'bug' ? '已关联 Bug' : '已关联 TODO')}：${watch.status} → ${status}` });
-      await this.store.update(data => { data.threads[key].watchedItems[itemId].status = status; });
+      await this.store.updateThread(key, next => { if (next.watchedItems?.[itemId]) next.watchedItems[itemId].status = status; });
     }
-    await this.store.update(data => { data.threads[key].nextItemPoll = Date.now() + 30000; });
+    await this.store.updateThread(key, next => { next.nextItemPoll = Date.now() + 30000; });
   }
   async unfurl(id, event) {
     const binding = this.store.data.threads[threadKey(this.teamId, event.channel, event.thread_ts || event.message_ts)];

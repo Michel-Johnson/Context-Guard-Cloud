@@ -1,11 +1,13 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { activeMentions } from './mentions.mjs';
 
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export const threadKey = (team, channel, ts) => `${team}:${channel}:${ts}`;
 const empty = () => ({ version: 1, inbox: {}, threads: {}, channels: {}, preferences: {}, drafts: {}, outgoing: {} });
+const durableThread = ({ nextPoll, nextItemPoll, ...thread }) => thread;
 
 // A single process owns this file. Every acknowledgement follows a file fsync
 // and atomic rename; Unix also flushes the directory before acknowledging.
@@ -21,20 +23,39 @@ export class Store {
   async update(operation) {
     const run = this.tail.then(async () => {
       const next = structuredClone(this.data), result = await operation(next);
-      const temporary = path.join(this.directory, `.state-${randomUUID()}`);
-      const handle = await fs.open(temporary, 'wx', 0o600);
-      try { await handle.writeFile(JSON.stringify(next)); await handle.sync(); } finally { await handle.close(); }
-      await fs.rename(temporary, this.file);
-      // Windows does not support directory fsync. File fsync remains mandatory.
-      if (process.platform !== 'win32') {
-        const directory = await fs.open(this.directory, 'r');
-        try { await directory.sync(); } finally { await directory.close(); }
-      }
-      this.data = next;
+      // A replay may inspect an existing durable receipt without changing it.
+      if (!isDeepStrictEqual(this.data, next)) await this.#publish(next);
       return result;
     });
     this.tail = run.catch(() => {});
     return run;
+  }
+  async updateThread(key, operation) {
+    const run = this.tail.then(async () => {
+      const previous = this.data.threads[key];
+      if (!previous) return;
+      const thread = structuredClone(previous), result = await operation(thread, this.data);
+      const next = { ...this.data, threads: { ...this.data.threads, [key]: thread } };
+      // Poll deadlines alone are volatile; restart can only advance a read.
+      // Every identity, status, input, mirror or receipt change remains durable.
+      if (isDeepStrictEqual(durableThread(previous), durableThread(thread))) this.data = next;
+      else await this.#publish(next);
+      return result;
+    });
+    this.tail = run.catch(() => {});
+    return run;
+  }
+  async #publish(next) {
+    const temporary = path.join(this.directory, `.state-${randomUUID()}`);
+    const handle = await fs.open(temporary, 'wx', 0o600);
+    try { await handle.writeFile(JSON.stringify(next)); await handle.sync(); } finally { await handle.close(); }
+    await fs.rename(temporary, this.file);
+    // Windows does not support directory fsync. File fsync remains mandatory.
+    if (process.platform !== 'win32') {
+      const directory = await fs.open(this.directory, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
+    this.data = next;
   }
   async receive(id, envelope, { collectMs = 800, maxCollectMs = 2000, feedback = null } = {}) {
     return this.update(state => {
