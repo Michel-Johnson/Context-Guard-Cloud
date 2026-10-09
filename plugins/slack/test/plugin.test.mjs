@@ -589,6 +589,38 @@ test('native Slack reaction uses real publicMessages projection without inventin
   f.plugin.stopped = false; await f.plugin.mirror(f.key); await settleReactions(f.plugin);
   assert.deepEqual(f.sent, [{ method: 'reactions.add', input: { channel, timestamp: '123.001', name: 'smile' } }]);
 });
+test('native Slack explicit reaction completion checkpoint preserves its exact assistant and never first mirrors a superseded intent', async t => {
+  for (const stopped of [false, true]) {
+    const f = await reactionFixture(t);
+    const state = { activeTurnId: f.requestId, activeRequestIds: [f.requestId], activeInput: { id: f.requestId, source: 'slack', actor: f.input.actor },
+      messages: [{ ...f.input, content: f.input.text, serverContext: { participation: { inputs: [{ id: f.requestId, text: f.input.text }] } } }], toolReceipts: {} };
+    await coordinatorStep({ turnId: 'explicit-terminal', state, system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}),
+      save: async () => {}, checkpoint: async () => {
+        if (!state.pending && state.messages.at(-1).content?.[0]?.type === 'tool_result') {
+          state.messages.push({ ...f.input, requestId: 'new-current-input', content: '当前新输入', serverContext: {} });
+          return { interrupted: stopped, steered: !stopped };
+        }
+        return { interrupted: false, steered: false };
+      }, model: { next: async ({ onText, onToolStart }) => {
+        await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+        return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+          { type: 'tool_use', id: 'explicit-react', name: 'react_to_user', input: { emoji: 'heart', replyComplete: true } }] };
+      } } });
+    assert.equal(state.status, stopped ? 'interrupted' : 'running');
+    assert.equal(state.messages.length, 4); assert.equal(state.messages[1].superseded, true);
+    assert.equal(state.messages[2].content[0].tool_use_id, 'explicit-react');
+    assert.equal(state.messages[2].superseded, undefined); assert.equal(state.messages[3].superseded, undefined);
+    const [receipt] = Object.values(state.toolReceipts);
+    assert.equal(receipt.result.status, 'intent'); assert.equal(receipt.result.requestId, f.requestId);
+    assert.equal(state.messages[1].actions[0].actionId, receipt.result.actionId);
+    const projected = publicMessages(state);
+    assert.equal(projected.find(message => message.requestId === f.requestId && message.role === 'assistant').partial, true);
+    f.gateway.command = async () => ({ status: state.status, activeTurnId: f.requestId, acceptedRequestIds: [f.requestId], messages: projected, approvals: [] });
+    f.plugin.stopped = false; await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+    assert.equal(f.sent.filter(call => call.method === 'reactions.add').length, 0);
+    assert.equal(Object.keys(f.plugin.store.data.reactionOutbox || {}).length, 0);
+  }
+});
 test('native Slack reaction contract enum stays aligned and necessary emoji text remains intact', async t => {
   const f = await reactionFixture(t); f.plugin.stopped = false;
   const emojis = coordinatorTools.find(tool => tool.name === 'react_to_user').input_schema.properties.emoji.enum;
