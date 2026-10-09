@@ -1,5 +1,9 @@
 # Cloud 验证台账
 
+## CURSOR-CI-TASK-SCOPE-01 · 原任务范围与回执
+
+- [ ] 已在真实设备委托后的原 Core authorize 接入固定 Task/Plan 基线/批准回执/交接 SHA/TODO 版本校验；原读保持只读，写入范围与业务回执同事务提交，旧回执不得升级、降级省略范围或跨重绑/返工重放。正式隔离 HTTP 与 Core 故障测试已覆盖；正常发布后的本机 owning 后端、固定传输、实际 Cloud 服务完整组合及原生角色验收仍未完成，不将 header 当成隔离或通过证明。
+
 ## CURSOR-SLACK-ENTRY-01 · 原对话执行入口（2026-10-10）
 
 - [x] 原 Slack/manual 对话增加默认关闭的 `conversation.cursor`：显式仓库/模板/真人授权、空闲模式 CAS、原 ProjectTask/准确 brief 人审/既有 Plan 与独立 CI 回传；不另开聊天、转换旧批准或恢复通用派发。固定 core 2.3.0/UI 1.4.1 不变。
