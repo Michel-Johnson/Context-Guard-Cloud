@@ -123,6 +123,41 @@ test('合并接话格式提醒只改本次请求副本，原文、附件和历�
   }
 });
 
+test('合并接话的纯交流表情可正常结束，保留原生工具对和💬但不发送占位正文', async t => {
+  const f = await fixture(t, async ({ onText, onToolStart, messages }, count) => {
+    if (count === 1) {
+      await onText('[CG_REPLY]'); await onToolStart('react_to_user');
+      return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+        { type: 'tool_use', id: 'social-only', name: 'react_to_user', input: { emoji: 'heart' } }] };
+    }
+    assert.match(JSON.stringify(messages.at(-1)), /slack-reaction/);
+    return { stop: 'end_turn', content: [] };
+  });
+  await f.send('谢谢，仅用一个表情回应即可。');
+  const state = await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId &&
+    f.reactions.some(reaction => reaction.name === 'heart'));
+  assert.equal(f.modelCalls.length, 2); assert.equal(state.participationDecision, 'reply');
+  assert.deepEqual(f.posts, []);
+  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'heart']);
+});
+
+test('读业务工具之后的空结束仍失败，不能用交流表情冒充完整答复', async t => {
+  const f = await fixture(t, async ({ onText, onToolStart }, count) => {
+    if (count === 1) {
+      await onText('[CG_REPLY]'); await onToolStart('read_map');
+      return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+        { type: 'tool_use', id: 'required-read', name: 'read_map', input: { nodeId: 'T0' } }] };
+    }
+    if (count === 2) return { stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'not-complete', name: 'react_to_user', input: { emoji: 'bulb' } }] };
+    return { stop: 'end_turn', content: [] };
+  });
+  await f.send('读取测试模块并说明它是什么。');
+  const state = await f.wait(state => state.status === 'error' &&
+    f.reactions.some(reaction => reaction.name === 'warning'));
+  assert.equal(state.error.code, 'MODEL_INVALID_RESPONSE');
+});
+
 test('慢模型尚未给出任何标识时已出现👀，确认后才切换状态并发送正文', async t => {
   let release; const held = new Promise(resolve => { release = resolve; }); t.after(() => release());
   const f = await fixture(t, async ({ onText }) => {
