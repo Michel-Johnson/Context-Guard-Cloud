@@ -3,6 +3,37 @@ import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
+const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
+const diagnosticPhases = new Set(['fetch', 'http', 'response-stream', 'response-json', 'response-validation']);
+const terminationCodes = new Set(['STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'STOP_REASON_INVALID', 'MODEL_MISMATCH', 'CONTENT_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH']);
+const stopReasons = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'pause_turn', 'refusal', 'model_context_window_exceeded', 'stop', 'tool_calls', 'length', 'content_filter']);
+const ownValue = (value, field) => value && Object.getOwnPropertyDescriptor(value, field)?.value;
+function safeTermination(value) {
+  try {
+    const result = {}, code = ownValue(value, 'validationCode'), stop = ownValue(value, 'stopReason');
+    if (terminationCodes.has(code)) result.validationCode = code;
+    if (stopReasons.has(stop)) result.stopReason = stop;
+    const open = ownValue(value, 'openBlockCount'), terminal = ownValue(value, 'messageStopSeen');
+    if (Number.isSafeInteger(open) && open >= 0) result.openBlockCount = open;
+    if (typeof terminal === 'boolean') result.messageStopSeen = terminal;
+    const usage = ownValue(value, 'usage'), tokens = {};
+    for (const name of ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'prompt_tokens', 'completion_tokens']) {
+      const count = ownValue(usage, name);
+      if (Number.isSafeInteger(count) && count >= 0) tokens[name] = count;
+    }
+    if (Object.keys(tokens).length) result.usage = tokens;
+    return result;
+  } catch { return {}; }
+}
+function safeModelDiagnostic(value) {
+  try {
+    const code = ownValue(value, 'code'), phase = ownValue(value, 'phase'), durationMs = ownValue(value, 'durationMs');
+    if (!diagnosticPhases.has(phase)) return null;
+    return { code: diagnosticCodes.has(code) || typeof code === 'string' && /^MODEL_HTTP_[45]\d\d$/.test(code) ? code : 'UNKNOWN_MODEL_ERROR', phase,
+      ...(Number.isSafeInteger(durationMs) && durationMs >= 0 ? { durationMs } : {}),
+      ...safeTermination(ownValue(value, 'termination')) };
+  } catch { return null; }
+}
 export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
 export function coordinatorInputTokens(usage) {
   const input = usage?.input_tokens;
@@ -124,8 +155,11 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
   const reader = response.body.getReader(), decoder = new TextDecoder();
   let buffer = '', size = 0, model = '', stopReason = '', usage = {}, visibleText = '';
   const blocks = [], openBlocks = new Set();
-  let started = false, terminal = false;
-  const invalidStream = () => problem('MODEL_INVALID_RESPONSE', 'Coordinator returned an incomplete or invalid event stream');
+  let started = false, terminal = false, messageStopSeen = false, validationCode = 'STREAM_INVALID';
+  const invalidStream = (code = 'STREAM_INVALID') => {
+    validationCode = code;
+    return problem('MODEL_INVALID_RESPONSE', 'Coordinator returned an incomplete or invalid event stream');
+  };
   const checkActive = () => {
     if (abort.signal.aborted) throw abort.signal.reason;
     if (Date.now() >= deadlineAt) { abort.abort(timeoutProblem()); throw abort.signal.reason; }
@@ -181,7 +215,10 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
       stopReason = value.delta?.stop_reason || stopReason; usage = { ...usage, ...(value.usage || {}) };
     }
     if (value.type === 'message_stop') {
-      if (!started || openBlocks.size || !['end_turn', 'tool_use'].includes(stopReason)) throw invalidStream();
+      messageStopSeen = true;
+      if (!started) throw invalidStream();
+      if (openBlocks.size) throw invalidStream('OPEN_BLOCKS');
+      if (!['end_turn', 'tool_use'].includes(stopReason)) throw invalidStream('STOP_REASON_INVALID');
       terminal = true;
     }
   };
@@ -201,8 +238,14 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
     if (!terminal) {
       buffer += decoder.decode(); if (buffer.trim()) await event(buffer);
     }
-    if (!terminal) throw invalidStream();
+    if (!terminal) throw invalidStream('MISSING_TERMINAL');
     checkActive();
+  } catch (error) {
+    // Never retain raw events, blocks, thoughts or arbitrary usage properties.
+    try { Object.defineProperty(error, 'modelTermination', { value: safeTermination({
+      ...(ownValue(error, 'code') === 'MODEL_INVALID_RESPONSE' ? { validationCode } : {}), stopReason,
+      openBlockCount: openBlocks.size, messageStopSeen, usage }), configurable: true }); } catch {}
+    throw error;
   } finally { cancelReader(reader); try { reader.releaseLock(); } catch {} }
   return { model, stop_reason: stopReason, content: blocks.filter(Boolean), usage };
 }
@@ -274,7 +317,7 @@ export class CoordinatorModel {
     if (signal?.aborted) cancel();
     const deadlineAt = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => abort.abort(timeoutProblem()), this.timeoutMs);
-    let phase = 'fetch';
+    let phase = 'fetch', termination = null;
     try {
       const response = await this.fetch(this.endpoint, {
         method: 'POST', redirect: 'error', signal: abort.signal,
@@ -297,15 +340,21 @@ export class CoordinatorModel {
         for (const call of result.content.filter(block => block.type === 'tool_use')) await onToolStart?.(call.name);
       }
       phase = 'response-validation';
+      termination = { stopReason: result.stop_reason, usage: result.usage };
       if (result.model !== this.model || !Array.isArray(result.content) || !['end_turn', 'tool_use'].includes(result.stop_reason)) {
+        termination.validationCode = result.model !== this.model ? 'MODEL_MISMATCH' : !Array.isArray(result.content) ? 'CONTENT_INVALID' : 'STOP_REASON_INVALID';
         throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned a different model or an incomplete turn');
       }
       for (const block of result.content) validatePrivateBlock(block);
       const calls = result.content.filter(block => block.type === 'tool_use');
       if (new Set(calls.map(call => call.id)).size !== calls.length || calls.some(call => typeof call.id !== 'string' || !call.id || typeof call.name !== 'string' || !call.input || typeof call.input !== 'object' || Array.isArray(call.input))) {
+        termination.validationCode = 'TOOL_INVALID';
         throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned malformed tool calls');
       }
-      if ((result.stop_reason === 'tool_use') !== Boolean(calls.length)) throw problem('MODEL_INVALID_RESPONSE', 'Coordinator stop reason does not match its tool calls');
+      if ((result.stop_reason === 'tool_use') !== Boolean(calls.length)) {
+        termination.validationCode = 'STOP_TOOL_MISMATCH';
+        throw problem('MODEL_INVALID_RESPONSE', 'Coordinator stop reason does not match its tool calls');
+      }
       return { content: result.content, stop: result.stop_reason, usage: result.usage || {}, model: result.model, requestId: response.headers.get('request-id') || '' };
     } catch (error) {
       const wasAborted = abort.signal.aborted;
@@ -315,10 +364,10 @@ export class CoordinatorModel {
       // Private metadata only: provider exception text and arbitrary codes are
       // never diagnostic data. Preserve the original outcome if metadata fails.
       try {
-        const safeCodes = ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE'];
-        const code = safeCodes.includes(failure.code) || /^MODEL_HTTP_[45]\d\d$/.test(failure.code || '') ? failure.code : 'UNKNOWN_MODEL_ERROR';
+        const code = diagnosticCodes.has(failure.code) || /^MODEL_HTTP_[45]\d\d$/.test(failure.code || '') ? failure.code : 'UNKNOWN_MODEL_ERROR';
         const elapsed = Date.now() - (deadlineAt - this.timeoutMs);
         Object.defineProperty(failure, 'modelDiagnostic', { value: { code, phase,
+          termination: safeTermination(ownValue(error, 'modelTermination') || termination),
           ...(Number.isSafeInteger(elapsed) && elapsed >= 0 ? { durationMs: elapsed } : {}) }, configurable: true });
       } catch {}
       throw failure;
@@ -404,6 +453,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     } catch (cause) {
       if (gate && cause.partialText !== undefined) cause.partialText = gate.visible;
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started, errorCode: cause.code || 'MODEL_UNAVAILABLE' });
+      if (measurement) {
+        // Only the closed diagnostic projection enters private performance.
+        try { const diagnostic = safeModelDiagnostic(ownValue(cause, 'modelDiagnostic'));
+          if (diagnostic) measurement.diagnostic = diagnostic; } catch {}
+      }
       throw cause;
     } finally {
       if (measurement) state.performance.models = [...state.performance.models, measurement].slice(-60);

@@ -984,6 +984,89 @@ test('Coordinator failure diagnostics distinguish transport phases without seria
   }
 });
 
+test('Failed stream termination diagnostics preserve only known reasons and numeric usage without accepting incomplete output', async () => {
+  const start = { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12, privateBody: 'diagnostic-secret' } } };
+  const block = { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'visible incomplete explanation' } };
+  const close = { type: 'content_block_stop', index: 0 }, end = { type: 'message_stop' };
+  for (const fixture of [
+    { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 256, cache_read_input_tokens: -1 } }, end], code: 'STOP_REASON_INVALID', reason: 'max_tokens', open: 0, terminal: true, output: 256 },
+    { events: [start, block, { type: 'message_delta', delta: { stop_reason: 'end_turn' } }, end], code: 'OPEN_BLOCKS', reason: 'end_turn', open: 1, terminal: true },
+    { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'end_turn' } }], code: 'MISSING_TERMINAL', reason: 'end_turn', open: 0, terminal: false },
+    { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'diagnostic-secret' }, usage: { output_tokens: 'diagnostic-secret' } }, end], code: 'STOP_REASON_INVALID', open: 0, terminal: true },
+  ]) {
+    let requests = 0;
+    const model = new CoordinatorModel({ ...config, maxTokens: 256, fetch: async (_url, options) => {
+      requests++; assert.equal(JSON.parse(options.body).max_tokens, 256);
+      return new Response(fixture.events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    await assert.rejects(model.next({ system: 'diagnostic-secret', messages: [] }), error => {
+      const diagnostic = error.modelDiagnostic;
+      assert.equal(error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(diagnostic.phase, 'response-stream');
+      assert.equal(diagnostic.termination.validationCode, fixture.code);
+      assert.equal(diagnostic.termination.stopReason, fixture.reason);
+      assert.equal(diagnostic.termination.openBlockCount, fixture.open);
+      assert.equal(diagnostic.termination.messageStopSeen, fixture.terminal);
+      assert.equal(diagnostic.termination.usage.input_tokens, 12);
+      assert.equal(diagnostic.termination.usage.output_tokens, fixture.output);
+      assert.equal(diagnostic.termination.usage.cache_read_input_tokens, undefined);
+      assert.doesNotMatch(JSON.stringify(diagnostic), /diagnostic-secret|visible incomplete|privateBody|synthetic/);
+      return true;
+    });
+    assert.equal(requests, 1, 'Diagnostics do not retry or increase the token budget');
+  }
+});
+
+test('Failed stream private performance survives restart without becoming completed history or public diagnostics', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-failed-stream-metrics-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const events = [
+    { type: 'message_start', message: { model: config.model, usage: { input_tokens: 21 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'diagnostic-visible-partial' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 100, privatePrompt: 'diagnostic-hidden-body' } },
+    { type: 'message_stop' },
+  ];
+  let calls = 0, tools = 0;
+  const options = { directory, system: 'diagnostic-hidden-body', tools: [], execute: async () => { tools++; },
+    model: new CoordinatorModel({ ...config, fetch: async () => { calls++; return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }); } }) };
+  const service = new CoordinatorService(options);
+  await service.submit({ id: 'failure-turn', text: 'diagnostic-hidden-body' }); await service.close();
+  const raw = JSON.parse(await fs.readFile(path.join(directory, 'conversation.json'), 'utf8'));
+  assert.equal(raw.status, 'error'); assert.equal(raw.error.code, 'MODEL_INVALID_RESPONSE');
+  assert.equal(raw.performance.models.length, 1); assert.equal(raw.performance.models[0].diagnostic.phase, 'response-stream');
+  assert.equal(raw.performance.models[0].diagnostic.validationCode, 'STOP_REASON_INVALID');
+  assert.equal(raw.performance.models[0].diagnostic.stopReason, 'max_tokens');
+  assert.deepEqual(raw.performance.models[0].diagnostic.usage, { input_tokens: 21, output_tokens: 100 });
+  assert.doesNotMatch(JSON.stringify(raw.performance), /diagnostic-hidden-body|diagnostic-visible-partial|privatePrompt|synthetic/);
+  assert.equal(raw.pending, undefined); assert.equal(raw.messages.filter(message => message.role === 'assistant').length, 0);
+  assert.equal(raw.toolReceipts && Object.keys(raw.toolReceipts).length || 0, 0); assert.equal(calls, 1); assert.equal(tools, 0);
+  const restarted = new CoordinatorService(options), publicState = await restarted.state();
+  assert.equal(publicState.status, 'error'); assert.equal(publicState.performance, undefined);
+  assert.equal(publicState.consumedInputRevision, 0, 'Public initial revision normalizes the absent private field');
+  assert.equal(Object.hasOwn(raw, 'consumedInputRevision'), false);
+  assert.doesNotMatch(JSON.stringify(publicState), /STOP_REASON_INVALID|messageStopSeen|output_tokens|diagnostic\.phase/);
+  assert.equal(calls, 1); await restarted.close();
+});
+
+test('Failed stream metrics reject forged diagnostic values and never invoke diagnostic getters', async () => {
+  let reads = 0;
+  const forged = { phase: 'response-stream', code: 'diagnostic-secret', durationMs: -1, termination: {
+    validationCode: 'diagnostic-secret', stopReason: 'diagnostic-secret', openBlockCount: -1, messageStopSeen: 'yes',
+    usage: { output_tokens: 5, privateBody: 'diagnostic-secret' } } };
+  Object.defineProperty(forged.termination.usage, 'input_tokens', { get() { reads++; throw new Error('diagnostic-secret'); } });
+  for (const getter of [false, true]) {
+    const failure = Object.assign(new Error('diagnostic-secret'), { code: 'MODEL_INVALID_RESPONSE' });
+    Object.defineProperty(failure, 'modelDiagnostic', getter ? { get() { reads++; throw new Error('diagnostic-secret'); } } : { value: forged });
+    const state = { activeTurnId: 'failure-turn', messages: [] };
+    await assert.rejects(coordinatorStep({ turnId: 'failure-turn', state, model: { next: async () => { throw failure; } }, system: '', tools: [], save: async () => {}, execute: () => assert.fail('No incomplete tool') }), { code: 'MODEL_INVALID_RESPONSE' });
+    assert.equal(state.performance.models.length, 1);
+    if (getter) assert.equal(state.performance.models[0].diagnostic, undefined);
+    else assert.deepEqual(state.performance.models[0].diagnostic, { code: 'UNKNOWN_MODEL_ERROR', phase: 'response-stream', usage: { output_tokens: 5 } });
+    assert.doesNotMatch(JSON.stringify(state.performance), /diagnostic-secret|privateBody/);
+  }
+  assert.equal(reads, 0);
+});
+
 test('Coordinator failure diagnostics retain the real response-stream timeout without changing stream budgets', async () => {
   const model = new CoordinatorModel({ ...config, timeoutMs: 20, fetch: async () => new Response(new ReadableStream({ start() {}, cancel() {} }), {
     headers: { 'content-type': 'text/event-stream' },

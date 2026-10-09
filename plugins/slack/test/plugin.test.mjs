@@ -91,6 +91,38 @@ test('Coordinator prose is plain text while links code and identifiers remain re
   assert.equal(blocks.map(block => block.text?.text || '').join(''), value);
 });
 
+test('Partial emphasis projection removes only a terminal prose opener and leaves complete projection unchanged', () => {
+  for (const [source, expected] of [['**Status', 'Status'], ['*Status', 'Status'], ['说明：**状态正在检查', '说明：状态正在检查'],
+    ['上一段。\n\n**Status is pending', '上一段。\n\nStatus is pending'], ['- **Status', '• Status']]) {
+    assert.equal(plainText(source, { partial: true }), expected);
+    assert.equal(plainText(source), plainText(source, { partial: false }), 'Complete projection is not silently repaired');
+    assert.ok(plainText(source).includes('*'), 'Original incomplete complete text remains literal');
+    assert.equal(messageBlocks({ text: source, partial: true }, 'thread').map(block => block.text?.text || '').join(''), expected);
+  }
+  for (const source of ['**Status**', '*Status*', '**Status** is ready']) {
+    assert.equal(plainText(source, { partial: true }), plainText(source));
+  }
+});
+
+test('Partial emphasis projection preserves escaped code arithmetic identifiers and ambiguous delimiters', () => {
+  for (const [source, expected] of [['`**Status`', '**Status'], ['```js\n**Status\n```', '**Status'],
+    ['```js\n**Status', '**Status'], ['\\*\\*Status', '**Status'], ['\\**Status', '**Status'],
+    ['`**Status', '`**Status'], ['2 ** 3', '2 ** 3'], ['**2', '**2'], ['foo**Status', 'foo**Status'],
+    ['2 *count', '2 *count'], ['x *value', 'x *value'], ['x **power', 'x **power'], ['说明 (**Status', '说明 (**Status'],
+    ['__API_name', '__API_name'], ['**Status\\path', '**Status\\path']]) {
+    assert.equal(plainText(source, { partial: true }), expected);
+  }
+  assert.equal(plainText('**Status*', { partial: true }), plainText('**Status*'), 'Ambiguous delimiters retain the original complete-parser behavior');
+  assert.equal(plainText('[**Status](https://example.com)', { partial: true }), plainText('[**Status](https://example.com)'), 'A closed link label is not repaired as unfinished prose');
+  const source = '**Earlier paragraph\n\n**Status';
+  assert.equal(plainText(source, { partial: true }), '**Earlier paragraph\n\nStatus', 'Only the terminal prose fragment is projected');
+  const long = '🙂正文。'.repeat(900) + '\n\n```js\nconst x = "**Status";\n```\n\n**Status';
+  const chunks = plainChunks(long, 2800, { partial: true });
+  assert.equal(chunks.join(''), plainText(long, { partial: true }));
+  assert.ok(chunks.every(chunk => chunk.length <= 2800 && !/^[\uDC00-\uDFFF]/.test(chunk) && !/[\uD800-\uDBFF]$/.test(chunk)));
+  assert.ok(chunks.join('').includes('const x = "**Status";'), 'Protected code is not parsed a second time');
+});
+
 test('Slack post and update disable markdown in fallback text and streamed output', async t => {
   const f = await fixture(t), calls = [];
   const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: '1.0' }; } } });
@@ -2421,6 +2453,175 @@ test('real waiting-for-user state finalizes streamed reply in place after restar
   f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [{ id: 'u1', role: 'user', requestId: 'request-one', text: 'question' }, { id: 'a1', role: 'assistant', text: 'complete answer' }], approvals: [] });
   await f.plugin.mirror(key); assert.equal(f.sent.filter(call => call.channel).length, 1); assert.equal(f.sent.filter(call => call.update).length, 1); assert.equal(f.plugin.store.data.threads[key].liveStream, undefined);
 });
+test('Partial emphasis stream updates its own revision slot and finalizes without refreshing complete history', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.emphasis');
+  const old = { id: 'old-answer', role: 'assistant', requestId: 'old-turn', text: '**Old complete answer**' };
+  const question = { id: 'u', role: 'user', requestId: 'emphasis-turn', text: 'Report status' };
+  await f.store.bind(key, { channel, threadTs: '123.emphasis', projectId: 'lab', conversationId: 'emphasis-chat', userId: user, ownRequests: ['emphasis-turn'] });
+  const oldHash = digest({ format: 'plain-text-v2', message: old });
+  await f.store.update(data => { data.threads[key].mirrored[old.id] = { ts: '5.0', hash: oldHash }; });
+  let state = { status: 'running', activeTurnId: 'emphasis-turn', inputRevision: 1, consumedInputRevision: 1,
+    streamingText: '**Status', messages: [old, question] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(key);
+  const ts = f.plugin.store.data.threads[key].liveStream.ts;
+  assert.equal(blockText(f.sent.find(item => item.channel).blocks), 'Status');
+  assert.equal(f.plugin.store.data.threads[key].liveStream.text, '**Status', 'Persist original preview, not the rendered projection');
+  for (const text of ['**Status is pending', '**Status is pending**']) {
+    state = { ...state, streamingText: text }; await f.plugin.mirror(key);
+    assert.equal(f.sent.at(-1).update[1], ts); assert.equal(blockText(f.sent.at(-1).update[3]), 'Status is pending');
+  }
+  f.plugin.store = await new Store(f.directory).open();
+  const unchanged = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, unchanged);
+  const final = { id: 'emphasis-final', role: 'assistant', requestId: 'emphasis-turn', text: '**Status is ready**' };
+  state = { ...state, status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [old, question, final] };
+  await f.plugin.mirror(key); assert.equal(f.sent.at(-1).update[1], ts); assert.equal(blockText(f.sent.at(-1).update[3]), 'Status is ready');
+  assert.equal(f.plugin.store.data.threads[key].mirrored[final.id].ts, ts);
+  assert.equal(f.plugin.store.data.threads[key].mirrored[old.id].hash, oldHash);
+  assert.equal(f.sent.some(item => item.update?.[1] === '5.0'), false, 'Complete history fingerprint stays unchanged');
+  const settled = f.sent.length;
+  state = { ...state, status: 'running', activeTurnId: 'emphasis-turn', streamingText: '**Late old preview' };
+  await f.plugin.mirror(key); assert.equal(f.sent.length, settled, 'Late partial cannot replace the consumed final');
+  assert.equal(f.sent.filter(item => item.channel).length, 1);
+});
+
+test('Partial emphasis failure stop and steer preserve source and original slot across restart', async t => {
+  for (const phase of ['error', 'interrupted', 'steer']) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.emphasis-' + phase);
+    const nativeWrites = [];
+    const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+      assert.ok(['chat.postMessage', 'chat.update'].includes(method));
+      nativeWrites.push({ method, args: structuredClone(args) });
+      return { ts: method === 'chat.update' ? args.ts : `${100 + nativeWrites.filter(write => write.method === 'chat.postMessage').length}.001` };
+    } } });
+    f.plugin.io = io;
+    const question = { id: 'u', role: 'user', requestId: 'turn', text: 'Report' };
+    await f.store.bind(key, { channel, threadTs: '123.emphasis-' + phase, projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: ['turn'] });
+    let state = { status: 'running', activeTurnId: 'turn', inputRevision: 1, consumedInputRevision: 1,
+      streamingText: '**Status', messages: [question] };
+    f.gateway.command = async () => state; await f.plugin.mirror(key);
+    const ts = f.plugin.store.data.threads[key].liveStream.ts;
+    state = phase === 'steer' ? { ...state, consumedInputRevision: 2, inputRevision: 2, streamingText: '**Current status',
+      messages: [question, { id: 'partial', role: 'assistant', requestId: 'turn', partial: true, text: '**Status' }] }
+      : { ...state, status: phase, ...(phase === 'error' ? { error: { code: 'MODEL_INVALID_RESPONSE' } } : {}) };
+    await f.plugin.mirror(key);
+    const updates = nativeWrites.filter(write => write.method === 'chat.update' && write.args.ts === ts);
+    assert.equal(updates.length, 1); assert.match(blockText(updates[0].args.blocks), /非最终答案/);
+    assert.match(blockText(updates[0].args.blocks), /Status/); assert.doesNotMatch(blockText(updates[0].args.blocks), /\*\*Status/);
+    assert.equal(state.messages[0].text, 'Report'); assert.equal(state.streamingText, phase === 'steer' ? '**Current status' : '**Status');
+    f.plugin.store = await new Store(f.directory).open(); io.store = f.plugin.store; const count = nativeWrites.length;
+    await f.plugin.mirror(key); await f.plugin.mirror(key); assert.equal(nativeWrites.length, count, 'Repeated partial snapshots perform no additional platform writes');
+    if (phase === 'steer') assert.notEqual(f.plugin.store.data.threads[key].liveStream.ts, ts, 'New revision owns another slot');
+    else assert.equal(f.plugin.store.data.threads[key].mirrored['stream:turn:1'].consumedBy, undefined);
+  }
+});
+
+test('Partial emphasis legacy receipt upgrades its own timestamp once and cannot overwrite a reassigned final slot', async t => {
+  for (const reassigned of [false, true]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.legacy-emphasis-' + reassigned);
+    const partial = { id: 'old-partial', role: 'assistant', requestId: 'turn', text: '**Status', partial: true };
+    const final = { id: 'new-final', role: 'assistant', requestId: 'later', text: '**Complete answer**' };
+    const oldHash = digest({ format: 'plain-text-v2', message: partial });
+    await f.store.bind(key, { channel, threadTs: '123.legacy-emphasis-' + reassigned, projectId: 'lab', conversationId: 'chat', userId: user, ownRequests: ['turn'] });
+    await f.store.update(data => {
+      const thread = data.threads[key];
+      thread.mirrored[partial.id] = { ts: '5.0', hash: oldHash };
+      thread.mirrored['stream:turn:1'] = { ts: '5.0', turnId: 'turn', consumedBy: partial.id };
+      if (reassigned) thread.mirrored[final.id] = { ts: '5.0', hash: digest({ format: 'plain-text-v2', message: final }) };
+    });
+    const messages = [{ id: 'u', role: 'user', requestId: 'turn', text: 'Question' }, partial, ...(reassigned ? [final] : [])];
+    f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages });
+    await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(item => item.update).length, reassigned ? 0 : 1);
+    if (!reassigned) {
+      assert.equal(f.sent[0].update[1], '5.0');
+      assert.equal(blockText(f.sent[0].update[3]), '部分回复（已被补充调整，非最终答案）：\nStatus');
+      assert.notEqual(f.plugin.store.data.threads[key].mirrored[partial.id].hash, oldHash);
+    } else assert.equal(f.plugin.store.data.threads[key].mirrored[partial.id].hash, oldHash, 'The old receipt stays intact when its slot is occupied');
+    const count = f.sent.length; f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key); await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+    assert.equal(f.sent.some(item => item.channel), false, 'No migration post or new timestamp');
+  }
+});
+
+test('Partial emphasis plain blocks reach Slack fallback once without reparsing literal code', async t => {
+  const f = await fixture(t), calls = [];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) { calls.push({ method, args }); return { ts: '1.0' }; } } });
+  const source = '`**Status`\n\n**Status', blocks = messageBlocks({ text: source, partial: true }, 'thread');
+  await io.post({ id: 'partial-emphasis', channel, text: source, blocks }); await io.update(channel, '1.0', source, blocks);
+  for (const call of calls) {
+    assert.equal(call.args.text, '**Status\n\nStatus');
+    assert.equal(call.args.mrkdwn, false); assert.equal(call.args.parse, 'none'); assert.equal(call.args.link_names, false);
+    assert.deepEqual(call.args.blocks, blocks);
+  }
+});
+
+test('Failed stream preview stays in its original slot and failure marking survives lost ACK restart and repeated snapshots', async t => {
+  for (const lostAck of [false, true]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-${lostAck}`), posts = new Map();
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    const post = f.io.post;
+    f.io.post = async input => { if (!posts.has(input.id)) posts.set(input.id, await post(input)); return posts.get(input.id); };
+    let state = { status: 'running', activeTurnId: 'failed-turn', consumedInputRevision: 0, streamingText: 'const value =',
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Explain a read-only example' }] };
+    f.gateway.command = async () => state;
+    await f.plugin.mirror(key);
+    const ts = f.plugin.store.data.threads[key].liveStream.ts;
+    state = { ...state, status: 'error', streamingText: 'const value = 3;\nconst pending =', error: { code: 'MODEL_INVALID_RESPONSE' } };
+    const update = f.io.update; let failed = false;
+    f.io.update = async (...args) => { await update(...args); if (lostAck && !failed) { failed = true; throw new Error('Lost preview ACK'); } };
+    if (lostAck) await assert.rejects(f.plugin.mirror(key), /Lost preview ACK/);
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key);
+    const count = f.sent.filter(call => call.update).length;
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, count);
+    assert.equal(count, lostAck ? 2 : 1, 'Lost ACK retries the same slot, not a new partial or final');
+    for (const call of f.sent.filter(call => call.update)) {
+      assert.equal(call.update[1], ts); assert.equal(call.update[2], 'Coordinator 部分回复（生成失败，非最终答案）：\nconst value = 3;\nconst pending =');
+      assert.ok(call.update[3].some(block => block.text?.text.includes('非最终答案')));
+    }
+    const thread = f.plugin.store.data.threads[key], stream = thread.mirrored['stream:failed-turn:0'];
+    assert.equal(stream.ts, ts); assert.ok(stream.failedHash); assert.equal(stream.consumedBy, undefined);
+    assert.equal(thread.liveStream.failedHash, stream.failedHash);
+    assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
+    assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
+  }
+});
+
+test('Failed stream marking never borrows another revision or turn when the exact failed slot is missing', async t => {
+  for (const [priorTurn, revision, consumed] of [['failed-turn', 1, false], ['another-turn', 1, false], ['failed-turn', 2, true]]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-scope-${priorTurn}-${revision}`);
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    await f.store.update(data => {
+      data.threads[key].mirrored[`stream:${priorTurn}:${revision}`] = { ts: '5.0', turnId: priorTurn, revision, text: 'Prior preview', ...(consumed ? { consumedBy: 'saved-final' } : {}) };
+      if (consumed) data.threads[key].mirrored['saved-final'] = { ts: '5.0', hash: 'completed-reply' };
+      data.threads[key].liveStream = { ts: '5.0', turnId: priorTurn, slotId: `stream:${priorTurn}:${revision}`, text: 'Prior preview' };
+    });
+    f.gateway.command = async () => ({ status: 'error', activeTurnId: 'failed-turn', consumedInputRevision: 2,
+      streamingText: 'Different revision failed', error: { code: 'MODEL_INVALID_RESPONSE' },
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Ask' }] });
+    await f.plugin.mirror(key);
+    f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, 0);
+    const slot = f.plugin.store.data.threads[key].mirrored[`stream:${priorTurn}:${revision}`];
+    assert.equal(slot.text, 'Prior preview'); assert.equal(slot.failedHash, undefined); assert.equal(slot.consumedBy, consumed ? 'saved-final' : undefined);
+  }
+});
+
+test('Failed legacy stream with no revision is marked only through its persisted same-turn pointer', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.failed-legacy');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'legacy-chat', userId: user, ownRequests: ['legacy-turn'] });
+  await f.store.update(data => { data.threads[key].liveStream = { ts: '7.0', turnId: 'legacy-turn', text: 'Legacy preview' }; });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'legacy-turn', streamingText: 'Legacy visible partial',
+    error: { code: 'MODEL_INVALID_RESPONSE' }, messages: [{ id: 'u', role: 'user', requestId: 'legacy-turn', text: 'Ask' }] });
+  await f.plugin.mirror(key); f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+  assert.deepEqual(f.sent.filter(call => call.update).map(call => call.update[1]), ['7.0']);
+  assert.ok(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].failedHash);
+  assert.equal(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].consumedBy, undefined);
+});
+
 test('overlapping turn previews finalize in their own slots after restart without reposting old replies', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.overlap');
   await f.store.bind(key, { channel, threadTs: '123.overlap', projectId: 'lab', conversationId: 'chat-overlap', userId: user, ownRequests: ['request-one', 'request-two'] });

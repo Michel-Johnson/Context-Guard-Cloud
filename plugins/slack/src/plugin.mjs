@@ -1296,9 +1296,14 @@ export class SlackPlugin {
       const modelMenus = await this.naturalModelMenus(key, message, userId);
       const blocks = messageBlocks(display, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId, mapNodeId: binding.mapNodeId, modelMenus });
       const content = digest({ format: 'plain-text-v2', message,
+        ...(partial ? { partialProjection: 1 } : {}),
         ...(blocks.some(block => block.type === 'actions') ? { nodeLinks: blocks.filter(block => block.type === 'actions') } : {}),
         ...(message.questions?.length ? { questionRender: blocks } : {}), ...(modelMenus.length ? { modelMenuRender: blocks } : {}) }),
         prior = this.store.data.threads[key].mirrored[id];
+      // A legacy partial can refresh its own display once, but never a slot
+      // since assigned to another formal message by chronological rotation.
+      if (partial && prior && Object.entries(this.store.data.threads[key].mirrored).some(([otherId, entry]) =>
+        otherId !== id && !otherId.startsWith('stream:') && entry.ts === prior.ts)) continue;
       // Older versions could append an earlier model step after the stream.
       // Rotate those occupied slots forward until a pending reply consumes the
       // final slot, without deleting Slack history or duplicating the content.
@@ -1330,13 +1335,13 @@ export class SlackPlugin {
     this.drainReactions(readyReactions);
     if (state.streamingText && state.status === 'running') {
       const streamId = streamIdFor(state.activeTurnId, state.consumedInputRevision), thread = this.store.data.threads[key],
-        prior = thread.mirrored[streamId], content = digest({ format: 'plain-text-v2', text: state.streamingText });
+        prior = thread.mirrored[streamId], content = digest({ format: 'plain-text-v2', partialProjection: 1, text: state.streamingText });
       // A delayed stream never writes over a slot already assigned to a reply.
       if (!prior?.consumedBy && (!prior || !occupiedSlot(thread, prior.ts))) {
         let ts = prior?.ts;
         if (prior?.hash !== content) {
           const text = `Coordinator：${state.streamingText}`;
-          const blocks = messageBlocks({ text: state.streamingText }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
+          const blocks = messageBlocks({ text: state.streamingText, partial: true }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId });
           ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${streamId}`, 'stream'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
         }
         if (prior?.hash !== content || thread.liveStream?.slotId !== streamId) await this.store.update(data => {
@@ -1345,12 +1350,33 @@ export class SlackPlugin {
         });
       }
     }
+    if (state.status === 'error' && state.activeTurnId) {
+      const slotId = streamIdFor(state.activeTurnId, state.consumedInputRevision);
+      const thread = this.store.data.threads[key];
+      const stream = Number.isSafeInteger(state.consumedInputRevision) || thread.liveStream?.slotId === slotId && thread.liveStream.turnId === state.activeTurnId
+        ? streamFor(state.activeTurnId, false, slotId) : null;
+      const partial = state.streamingText || state.partialText || stream?.text;
+      if (stream && partial) {
+        const failedHash = digest({ partialProjection: 1, text: partial, code: state.error?.code || 'UNKNOWN' });
+        if (stream.failedHash !== failedHash) {
+          const text = `Coordinator 部分回复（生成失败，非最终答案）：\n${partial}`;
+          await this.io.update(binding.channel, stream.ts, text, messageBlocks({ text, partial: true }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId }));
+          await this.store.update(data => {
+            data.threads[key].mirrored[stream.slotId].failedHash = failedHash;
+            if (data.threads[key].liveStream?.slotId === stream.slotId) data.threads[key].liveStream.failedHash = failedHash;
+          });
+        }
+      }
+    }
     if (state.status === 'interrupted') {
       const turnId = state.activeTurnId || binding.lastStateRequestId;
       const stream = streamFor(turnId, false, streamIdFor(turnId, state.consumedInputRevision)) || streamFor(turnId);
       if (stream && !stream.interrupted) {
         const partial = stream.text || state.partialText || state.streamingText;
-        if (partial) await this.io.update(binding.channel, stream.ts, `Coordinator 已停止（部分回复，非最终答案）：\n${partial}`);
+        if (partial) {
+          const text = `Coordinator 已停止（部分回复，非最终答案）：\n${partial}`;
+          await this.io.update(binding.channel, stream.ts, text, messageBlocks({ text, partial: true }, key));
+        }
         await this.store.update(data => {
           data.threads[key].mirrored[stream.slotId].interrupted = true;
           if (data.threads[key].liveStream?.slotId === stream.slotId) data.threads[key].liveStream.interrupted = true;
