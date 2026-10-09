@@ -106,6 +106,22 @@ test('只刷新线程轮询时间不写盘，业务字段变化仍耐久保存',
   assert.equal(restarted.data.threads[key].pendingQuestionId, 'question'); assert.equal(restarted.data.threads[key].nextPoll, 9999);
 });
 
+test('无变化事务和重复已保存输入不写盘，新输入仍在耐久发布后返回', async t => {
+  const store = await fixture(t);
+  await store.receive('original-input', { text: 'original synthetic text' });
+  const before = await fs.readFile(store.file), originalState = store.data, rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  assert.equal(await store.update(state => { state.inbox['original-input'].status = 'pending'; return 'existing'; }), 'existing');
+  assert.equal(await store.receive('original-input', { text: 'different replay body' }), false);
+  assert.equal(writes, 0); assert.equal(store.data, originalState); assert.deepEqual(await fs.readFile(store.file), before);
+  assert.equal(await store.receive('new-input', { text: 'new synthetic text' }), true);
+  assert.equal(writes, 1);
+  const restarted = await new Store(store.directory).open();
+  assert.equal(restarted.data.inbox['original-input'].envelope.text, 'original synthetic text');
+  assert.equal(restarted.data.inbox['new-input'].status, 'pending');
+});
+
 test('线程时钟更新与全局回执共用串行队列，不丢新输入或复活删除的线程', async t => {
   const store = await fixture(t), key = 'thread';
   await store.bind(key, { projectId: 'project', conversationId: 'conversation' });

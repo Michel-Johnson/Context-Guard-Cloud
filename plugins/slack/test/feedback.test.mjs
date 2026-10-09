@@ -63,6 +63,22 @@ test('原消息与👀意图一次持久提交，崩溃重启而无 Slack 重投
   f.plugin.store = reopened; f.plugin.stopped = false;
   await f.settle(); assert.deepEqual(f.calls.map(c => c.name), ['eyes']);
 });
+
+test('重复反馈快照不写盘，新输入位置变化仍保存且不重复平台回应', async t => {
+  const f = await fixture(t), id = await f.receive(); await f.settle();
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1, controlRevision: 0, requestId: 'original' }); await f.settle();
+  const before = await fs.readFile(f.store.file), calls = f.calls.length, rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  for (let index = 0; index < 5; index++) {
+    await f.plugin.feedback.receive(id);
+    await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1, controlRevision: 0 });
+  }
+  assert.equal(writes, 0); assert.deepEqual(await fs.readFile(f.store.file), before); assert.equal(f.calls.length, calls);
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 2, controlRevision: 0 });
+  assert.equal(writes, 1);
+  assert.equal((await new Store(f.directory).open()).data.feedback[id].inputRevision, 2);
+});
 for (const [desired, emoji] of [['silent', 'see_no_evil'], ['reply', 'speech_balloon'], ['completed', 'white_check_mark'], ['failed', 'warning'], ['stopped', 'stop_sign']]) {
   test(`状态 ${desired} 先确认 ${emoji} 再移除仅本机器人 👀`, async t => {
     const f = await fixture(t), id = await f.receive(); await f.settle();
