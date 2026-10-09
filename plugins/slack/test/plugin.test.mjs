@@ -20,10 +20,12 @@ import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
-  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归' };
+  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');
   const text = blocks.filter(block => block.type === 'section').map(block => block.text.text).join('\n');
   assert.ok(text.includes(proposal.pathText)); assert.match(text, /同意绑定|暂不绑定/);
+  assert.match(text, /理由：该需求主要影响测试模块。/);
+  assert.doesNotMatch(JSON.stringify(bindingBlocks({ ...proposal, reason: undefined }, 'internal-thread')), /理由：|undefined/);
   assert.doesNotMatch(text, /internal-/); assert.ok(blocks.filter(block => block.type === 'section').every(block => block.text.type === 'plain_text'));
   assert.deepEqual(blocks.at(-1).elements.map(button => button.action_id), ['approve_binding', 'reject_binding']);
   assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'internal-thread', proposalId: proposal.id, version: proposal.version });
@@ -52,6 +54,23 @@ test('Slack 绑定建议只发一次，确认回读后在原线程更新卡片�
   await f.plugin.mirror(key); await f.plugin.mirror(key);
   assert.equal(f.sent.filter(item => item.update).length, 1);
   assert.doesNotMatch(JSON.stringify(f.sent.at(-1)), /approve_binding|reject_binding/);
+});
+test('纯绑定工具回执只显示确认卡，不另发空的 Coordinator 回复；真实正文保留', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'binding-one', kind: 'binding-proposal', version: 'v1', pending: true,
+    pathText: '项目：目标\n└─ 登录：认证', reason: '登录错误归登录模块。' };
+  const messages = [{ id: 'tool-proposal', role: 'assistant', text: '', actions: [proposal] },
+    { id: 'tool-confirmed', role: 'assistant', text: '', actions: [{ kind: 'conversation-mounted' }] }];
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages, approvals: [proposal] });
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.channel).length, 1, '确认卡精确一次，没有额外占位消息');
+  assert.match(JSON.stringify(f.sent[0].blocks), /approve_binding/);
+  assert.doesNotMatch(JSON.stringify(f.sent), /Coordinator 回复/);
+  messages[0].text = '请确认这个主节点。';
+  await f.plugin.mirror(key);
+  assert.ok(f.sent.some(item => item.text?.includes(messages[0].text)), '有真实正文时不因绑定动作丢失正文');
+  assert.equal(f.sent.filter(item => JSON.stringify(item.blocks).includes('approve_binding')).length, 1);
 });
 test('改绑使旧需求卡失效，不误报人类退回且移除审批与导出按钮', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
@@ -588,6 +607,38 @@ test('native Slack reaction uses real publicMessages projection without inventin
   f.gateway.command = async () => ({ status: state.status, acceptedRequestIds: [f.requestId], messages: projected, approvals: [] });
   f.plugin.stopped = false; await f.plugin.mirror(f.key); await settleReactions(f.plugin);
   assert.deepEqual(f.sent, [{ method: 'reactions.add', input: { channel, timestamp: '123.001', name: 'smile' } }]);
+});
+test('native Slack explicit reaction completion checkpoint preserves its exact assistant and never first mirrors a superseded intent', async t => {
+  for (const stopped of [false, true]) {
+    const f = await reactionFixture(t);
+    const state = { activeTurnId: f.requestId, activeRequestIds: [f.requestId], activeInput: { id: f.requestId, source: 'slack', actor: f.input.actor },
+      messages: [{ ...f.input, content: f.input.text, serverContext: { participation: { inputs: [{ id: f.requestId, text: f.input.text }] } } }], toolReceipts: {} };
+    await coordinatorStep({ turnId: 'explicit-terminal', state, system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}),
+      save: async () => {}, checkpoint: async () => {
+        if (!state.pending && state.messages.at(-1).content?.[0]?.type === 'tool_result') {
+          state.messages.push({ ...f.input, requestId: 'new-current-input', content: '当前新输入', serverContext: {} });
+          return { interrupted: stopped, steered: !stopped };
+        }
+        return { interrupted: false, steered: false };
+      }, model: { next: async ({ onText, onToolStart }) => {
+        await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+        return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+          { type: 'tool_use', id: 'explicit-react', name: 'react_to_user', input: { emoji: 'heart', replyComplete: true } }] };
+      } } });
+    assert.equal(state.status, stopped ? 'interrupted' : 'running');
+    assert.equal(state.messages.length, 4); assert.equal(state.messages[1].superseded, true);
+    assert.equal(state.messages[2].content[0].tool_use_id, 'explicit-react');
+    assert.equal(state.messages[2].superseded, undefined); assert.equal(state.messages[3].superseded, undefined);
+    const [receipt] = Object.values(state.toolReceipts);
+    assert.equal(receipt.result.status, 'intent'); assert.equal(receipt.result.requestId, f.requestId);
+    assert.equal(state.messages[1].actions[0].actionId, receipt.result.actionId);
+    const projected = publicMessages(state);
+    assert.equal(projected.find(message => message.requestId === f.requestId && message.role === 'assistant').partial, true);
+    f.gateway.command = async () => ({ status: state.status, activeTurnId: f.requestId, acceptedRequestIds: [f.requestId], messages: projected, approvals: [] });
+    f.plugin.stopped = false; await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+    assert.equal(f.sent.filter(call => call.method === 'reactions.add').length, 0);
+    assert.equal(Object.keys(f.plugin.store.data.reactionOutbox || {}).length, 0);
+  }
 });
 test('native Slack reaction contract enum stays aligned and necessary emoji text remains intact', async t => {
   const f = await reactionFixture(t); f.plugin.stopped = false;
@@ -2460,6 +2511,10 @@ test('global form can explicitly select project before first Home preference', a
 test('brief approval carries original version and prompt export uses shared gateway', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001'); await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
   await f.plugin.review('E1', user, { key, proposalId: 'approval-1', version: 'brief-version' }, 'approved', 'approved by user');
+  const confirmation = f.sent.at(-1);
+  assert.match(confirmation.text, /Main 事项已保存/);
+  assert.match(JSON.stringify(confirmation.blocks), /Claude Code CLI 或 Cursor；开发记录只保存在本地/);
+  assert.doesNotMatch(JSON.stringify(confirmation), /hooks 写回 Session|Codex/);
   assert.equal(f.calls.find(call => call.type === 'brief.review').payload.version, 'brief-version');
   await f.plugin.exportPrompt('E2', user, { key, proposalId: 'approval-1' }); assert.equal(f.sent.find(call => call.export).export.text, 'execute login');
 });

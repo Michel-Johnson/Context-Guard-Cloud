@@ -7,10 +7,15 @@ const encode = value => JSON.stringify(value, null, 2) + '\n';
 const fail = (code, text, status = 409) => { throw new MapError(code, text, status); };
 const actorId = actor => actor?.kind === 'human' && typeof actor.sessionId === 'string' && actor.sessionId;
 const focus = item => ({ nodeId: item.nodeId || null, kind: item.kind || null, itemId: item.itemId || null });
-export const bindingReplyDecision = text => /^(同意绑定|确认绑定)[。！!]?$/u.test(text.trim()) ? 'approved' :
-  /^(暂不绑定|不绑定|拒绝绑定)[。！!]?$/u.test(text.trim()) ? 'rejected' : null;
+export const bindingReplyDecision = (text, { slackAttribution = false } = {}) => {
+  // Slack 连接器的固定署名不是指令，也不参与身份判定；仍只接受整句明确确认。
+  const body = (slackAttribution ? text.replace(/\s+\*Sent using\* <@[A-Z0-9]{1,32}>\s*$/u, '') : text).trim();
+  return /^(同意绑定|确认绑定)[。！!]?$/u.test(body) ? 'approved' :
+    /^(暂不绑定|不绑定|拒绝绑定)[。！!]?$/u.test(body) ? 'rejected' : null;
+};
 const visible = proposal => ({ id: proposal.id, kind: 'binding-proposal', version: proposal.version,
   conversationId: proposal.conversationId, node: proposal.node, path: proposal.path, pathText: proposal.pathText,
+  ...(typeof proposal.input.description === 'string' && proposal.input.description.trim() ? { reason: proposal.input.description.trim() } : {}),
   itemKind: proposal.input.kind, title: proposal.input.title, requiresHumanApproval: true,
   pending: !proposal.review, ...(proposal.review ? { decision: proposal.review.decision } : {}) });
 
@@ -39,8 +44,8 @@ export class CoordinatorBindings {
       await atomicWrite(this.file, encode(state));
     });
   }
-  async naturalReview(text, { id, conversationId, actor, reference }) {
-    const decision = bindingReplyDecision(text);
+  async naturalReview(text, { id, conversationId, actor, reference, slackAttribution = false }) {
+    const decision = bindingReplyDecision(text, { slackAttribution });
     if (!decision || !actorId(actor)) return null;
     const state = await this.state(), proposal = state.proposals[reference?.id || state.pending[conversationId]];
     if (!proposal || proposal.actorId !== actorId(actor)) return null;

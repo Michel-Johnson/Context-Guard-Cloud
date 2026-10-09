@@ -26,7 +26,7 @@ const participationTransient = error => {
 // A read action is retained by Cloud for provenance/focus, but has no Slack UI.
 // Preserve actual text, questions, attachments and other presentation actions.
 const hasSlackContent = message => !!(message.text || message.questions?.length || message.attachments?.length ||
-  message.actions?.some(action => action && !['map-read', 'node-read', 'slack-reaction'].includes(action.kind)));
+  message.actions?.some(action => action && !['map-read', 'node-read', 'slack-reaction', 'binding-proposal', 'conversation-mounted'].includes(action.kind)));
 const isMessage = event => ['message', 'app_mention'].includes(event?.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share');
 const indirectMessage = (event, botUserId) => isMessage(event) && event.user !== botUserId &&
   event.channel_type !== 'im' && !event.channel?.startsWith('D') && !explicitlyAddressed(event, botUserId);
@@ -1196,8 +1196,9 @@ export class SlackPlugin {
   async review(id, userId, value, decision, reason) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const result = await this.command('brief.review', binding, userId, operationId(id, 'review'), { proposalId: value.proposalId, decision, reason, version: value.version });
-    await this.io.post({ id: operationId(id, 'review-result'), channel: binding.channel, threadTs: binding.threadTs, text: decision === 'approved' ? 'brief 已确认，Main 事项已保存。执行提示可直接粘贴到 Codex / Cursor / Claude。' : 'brief 已退回。直接在这个线程告诉我你想怎么修改。',
-      ...(decision === 'approved' ? { blocks: [section('brief 已确认。由厂商 Agent 执行，结果通过 hooks 写回 Session。'), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
+    const confirmed = 'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
+    await this.io.post({ id: operationId(id, 'review-result'), channel: binding.channel, threadTs: binding.threadTs, text: decision === 'approved' ? confirmed : 'brief 已退回。直接在这个线程告诉我你想怎么修改。',
+      ...(decision === 'approved' ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     if (decision === 'approved' && result.itemId && result.nodeId) await this.store.update(state => {
       const thread = state.threads[value.key]; thread.watchedItems ||= {};

@@ -4,7 +4,7 @@ import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.
 import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
-import { mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
+import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -69,7 +69,7 @@ export const coordinatorCanAutoResume = (state, maxRetries = 2) => !!state?.acti
 function questionsAt(state, index) {
   const message = state.messages[index], replies = state.messages[index + 1]?.content;
   if (message.role !== 'assistant' || !Array.isArray(message.content) || !Array.isArray(replies)) return [];
-  return message.content.filter(block => block.type === 'tool_use' && block.name === 'ask_user' && typeof block.input?.question === 'string' &&
+  return message.content.filter(block => block.type === 'tool_use' && businessToolName(block.name) === 'ask_user' && typeof block.input?.question === 'string' &&
     replies.some(reply => reply.type === 'tool_result' && reply.tool_use_id === block.id && !reply.is_error))
     .map(block => {
       const id = 'question-' + hash(`${index}:${block.id}`);

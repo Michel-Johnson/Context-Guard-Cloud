@@ -121,9 +121,10 @@ export function coordinatorStructureOperations(actions, operationId) {
     const id = action.id || `NCC${digest(`${operationId}:${index}`).slice(0, 20)}`;
     if (action.op === 'create') {
       if (typeof action.parentId !== 'string' || !action.parentId || typeof action.title !== 'string' || !action.title.trim()) protocolFail('INVALID_ARGUMENT', 'Create needs parentId and title');
+      if (action.kind !== undefined && !['module', 'work', 'node'].includes(action.kind)) protocolFail('INVALID_ARGUMENT', 'Create kind must be module or work; node uses the default module kind');
       return { type: 'create', parentId: action.parentId, ...(action.order === undefined ? {} : { order: action.order }), node: {
         id, title: action.title, purpose: action.purpose || '', ...(action.memoryDocument === undefined ? {} : { memoryDocument: action.memoryDocument }),
-        kind: action.kind || 'module', state: action.state || 'untested', owns: action.owns || [],
+        kind: action.kind === 'node' ? 'module' : action.kind || 'module', state: action.state || 'untested', owns: action.owns || [],
       } };
     }
     if (action.op === 'delete') {
@@ -142,7 +143,8 @@ export function coordinatorStructureOperations(actions, operationId) {
       if (typeof action.parentId !== 'string' || !action.parentId) protocolFail('INVALID_ARGUMENT', 'Move needs parentId');
       return { type: 'move', id, parentId: action.parentId, ...(action.order === undefined ? {} : { order: action.order }) };
     }
-    const fields = Object.fromEntries(Object.entries(action).filter(([key]) => ['title', 'purpose', 'memoryDocument', 'kind', 'state', 'owns'].includes(key)));
+    if (action.kind !== undefined && !['module', 'work', 'node'].includes(action.kind)) protocolFail('INVALID_ARGUMENT', 'Structural update kind must be module or work; node preserves the existing kind');
+    const fields = Object.fromEntries(Object.entries(action).filter(([key, value]) => ['title', 'purpose', 'memoryDocument', 'kind', 'state', 'owns'].includes(key) && !(key === 'kind' && value === 'node')));
     if (!Object.keys(fields).length) protocolFail('INVALID_ARGUMENT', 'Update needs at least one structural field');
     return { type: 'update', id, fields };
   });
@@ -1159,10 +1161,11 @@ export async function startCloudServer({
           context: loadContext,
           beforeAcceptHumanInput: async ({ inputs, context, source, actor }) => {
             if (!context?.bindingRef || !['human', 'slack'].includes(source) || actor?.kind !== 'human') return context;
-            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text));
+            const slackAttribution = source === 'slack';
+            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution }));
             if (!confirmation) return context;
             try {
-              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef });
+              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef, slackAttribution });
               return result ? await loadContext() : context;
             } catch (error) {
               if (!(error instanceof MapError)) throw error;

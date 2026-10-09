@@ -100,6 +100,9 @@ try {
     const proposal = s.approvals.find(value => value.kind === 'binding-proposal' && value.pending);
     assert.equal(proposal.node.id, 'ERROR'); assert.equal(proposal.itemKind, kind);
     assert.match(proposal.pathText, /对话验收[\s\S]*登录[\s\S]*错误提示/);
+    assert.ok(typeof proposal.reason === 'string' && proposal.reason.trim(), '真实模型须说明推荐理由');
+    assert.ok((await panel.textContent()).includes('理由：' + proposal.reason));
+    await panel.screenshot({ path: path.join(output, kind + '-binding.png') });
     assert.ok(calls.slice(firstCall).some(call => call.tools.includes('read_map')), '真实模型须实际查询节点');
     assert.deepEqual(await readMemoryView(memoryConfig, projectId), initial, '建议不能改 Main');
     record(kind + '：查询资料并提出归属，不提前绑定');

@@ -35,13 +35,28 @@ export class Gateway {
     const reader = response.body.getReader(), decoder = new TextDecoder('utf-8', { fatal: true });
     const limit = 8 * 1024 * 1024;
     let buffer = '';
+    const interrupted = () => signal?.reason || new DOMException('Event subscription interrupted', 'AbortError');
+    const checkActive = () => { if (signal?.aborted) throw interrupted(); };
+    const read = async () => {
+      checkActive();
+      if (!signal) return reader.read();
+      let abort;
+      try {
+        return await Promise.race([reader.read(), new Promise((_, reject) => {
+          abort = () => reject(interrupted());
+          signal.addEventListener('abort', abort, { once: true });
+          if (signal.aborted) abort();
+        })]);
+      } finally { signal.removeEventListener('abort', abort); }
+    };
     try {
       while (true) {
-        const { value, done } = await reader.read();
+        const { value, done } = await read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         let boundary;
         while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+          checkActive();
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary[0].length);
           if (Buffer.byteLength(frame) > limit) throw new GatewayError('GATEWAY_EVENT_TOO_LARGE', 'Event frame exceeds the size limit');
@@ -59,6 +74,10 @@ export class Gateway {
       }
       buffer += decoder.decode();
       if (buffer.trim()) throw new GatewayError('GATEWAY_EVENT_INVALID', 'Event stream ended with an incomplete frame');
-    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+    } finally {
+      // 已中断的 fetch 在部分 Node 版本仍可能卡住读取或取消；清理不能拖住插件停机。
+      try { void reader.cancel().catch(() => {}); } catch {}
+      reader.releaseLock();
+    }
   }
 }

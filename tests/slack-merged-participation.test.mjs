@@ -326,10 +326,83 @@ test('Slack 合并工具答复：同轮决定后调用真实 read_map，续轮�
   assert.deepEqual(await f.main(), before);
 });
 
+test('Slack 合并纯表情：读取原生回执后空续轮结束，无占位正文或空历史，重启仍精确一次', async t => {
+  const f = await fixture(t, async ({ onText, onToolStart, messages }, calls) => {
+    if (calls === 1) {
+      await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+      return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+        { type: 'tool_use', id: 'social-heart', name: 'react_to_user', input: { emoji: 'heart' } }] };
+    }
+    if (calls === 2) {
+      const receipt = JSON.parse(messages.at(-1).content[0].content);
+      assert.equal(receipt.status, 'intent'); assert.equal(receipt.kind, 'slack-reaction');
+      assert.doesNotMatch(JSON.stringify(receipt), /delivered|approved|passed/);
+      return { stop: 'end_turn', content: [] };
+    }
+    assert.equal(messages.some(message => message.role === 'assistant' && message.content.length === 0), false);
+    return result('[CG_REPLY]\n新的问题已收到。');
+  });
+  const before = await f.main();
+  await f.send('只用表情回应，不需要解释。');
+  const state = await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId &&
+    Object.values(f.plugin.store.data.reactionOutbox || {}).some(item => item.emoji === 'heart' && item.status === 'sent'));
+  assert.equal(f.modelCalls.length, 2); assert.equal(state.participationDecision, 'reply');
+  assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
+  assert.deepEqual(f.posts, []);
+  assert.deepEqual(f.reactions.filter(reaction => reaction.name === 'heart'), [{ channel: 'CTEST', timestamp: '100.001', name: 'heart' }]);
+  const binding = Object.values(f.store.data.threads)[0];
+  const file = path.join(f.directory, 'coordinators', projectId, 'chats', binding.conversationId, 'conversation.json');
+  const raw = JSON.parse(await fs.readFile(file, 'utf8')), assistant = raw.messages.find(message => message.role === 'assistant');
+  assert.equal(raw.messages.length, 3); assert.equal(assistant.requestId, raw.activeInput.id);
+  assert.equal(assistant.actor.userId, userId); assert.equal(raw.messages.at(-1).content[0].tool_use_id, 'social-heart');
+  assert.equal(Object.values(raw.toolReceipts)[0].result.status, 'intent');
+  assert.doesNotMatch(JSON.stringify(raw.messages), /CG_REPLY|CG_SILENT/);
+  f.plugin.store = await new Store(path.join(f.directory, 'slack')).open();
+  for (const key of Object.keys(f.plugin.store.data.threads)) { await f.plugin.mirror(key); await f.plugin.mirror(key); }
+  await Promise.allSettled([...f.plugin.reactions]); await f.plugin.store.tail;
+  assert.equal(f.reactions.filter(reaction => reaction.name === 'heart').length, 1); assert.deepEqual(f.posts, []);
+  await f.send('现在请简短回复。', '100.002', { thread_ts: '100.001' });
+  await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.posts.some(post => post.text.includes('新的问题已收到')));
+  assert.equal(f.modelCalls.length, 3);
+  const after = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.deepEqual(after.toolReceipts, raw.toolReceipts); assert.deepEqual(await f.main(), before);
+});
+
+test('Slack 合并纯表情：模型已结束不等于原生投递确认，失回保留 unknown 后精确恢复', async t => {
+  const f = await fixture(t, async ({ onText, onToolStart }, calls) => {
+    if (calls === 1) {
+      await onText?.('[CG_REPLY]'); await onToolStart?.('react_to_user');
+      return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+        { type: 'tool_use', id: 'social-wave', name: 'react_to_user', input: { emoji: 'wave' } }] };
+    }
+    return { stop: 'end_turn', content: [] };
+  });
+  const before = await f.main(), native = f.plugin.io.call; let attempts = 0;
+  f.plugin.io.call = async (method, input) => {
+    if (method === 'reactions.add' && input.name === 'wave' && ++attempts === 1) throw new Error('synthetic lost acknowledgement');
+    return native(method, input);
+  };
+  await f.send('仅用表情确认收到。');
+  const state = await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId &&
+    Object.values(f.plugin.store.data.reactionOutbox || {}).some(item => item.emoji === 'wave' && item.status === 'unknown'));
+  assert.equal(f.modelCalls.length, 2); assert.deepEqual(f.posts, []); assert.equal(attempts, 1);
+  assert.equal(state.messages.find(message => message.actions?.some(action => action.emoji === 'wave')).actions[0].status, 'intent');
+  f.plugin.store = await new Store(path.join(f.directory, 'slack')).open();
+  await f.plugin.store.update(data => { for (const record of Object.values(data.reactionOutbox)) if (record.emoji === 'wave') record.next = 0; });
+  for (const key of Object.keys(f.plugin.store.data.threads)) await f.plugin.mirror(key);
+  await Promise.allSettled([...f.plugin.reactions]); await f.plugin.store.tail;
+  const record = Object.values(f.plugin.store.data.reactionOutbox).find(item => item.emoji === 'wave');
+  assert.equal(record.status, 'sent'); assert.equal(record.timestamp, '100.001'); assert.equal(record.userId, userId);
+  assert.equal(attempts, 2); assert.deepEqual(f.reactions.filter(item => item.name === 'wave'), [{ channel: 'CTEST', timestamp: '100.001', name: 'wave' }]);
+  for (const key of Object.keys(f.plugin.store.data.threads)) await f.plugin.mirror(key);
+  await Promise.allSettled([...f.plugin.reactions]); assert.equal(attempts, 2);
+  assert.equal(f.modelCalls.length, 2); assert.deepEqual(f.posts, []); assert.deepEqual(await f.main(), before);
+});
+
 test('Slack 未决定接话便返回工具：失败关闭，显示真实错误而不是🙈', async t => {
   const f = await fixture(t, async ({ onToolStart }) => {
     await onToolStart?.('read_map');
-    assert.fail('工具起始必须被拒绝');
+    return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'missing-decision', name: 'read_map', input: {} }] };
   });
   const before = await f.main();
   await f.send('仅存档，不要回复。');
@@ -337,6 +410,29 @@ test('Slack 未决定接话便返回工具：失败关闭，显示真实错误�
   assert.equal(state.error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(state.participationDecision, 'pending');
   assert.ok(f.posts.some(post => /处理失败/.test(post.text)));
   assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning']); assert.deepEqual(await f.main(), before);
+});
+
+test('Slack 原生接话工具通过 HTTP 查询 Main，业务参数与原生历史保持原样', async t => {
+  let calls = 0;
+  const f = await fixture(t, async ({ tools, onToolStart }) => {
+    if (++calls === 1) {
+      assert.ok(tools.some(tool => tool.name === 'reply_read_map'));
+      await onToolStart?.('reply_read_map');
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'native-declared-read', name: 'reply_read_map', input: { nodeId: 'T0' } }] };
+    }
+    assert.ok(tools.some(tool => tool.name === 'read_map'));
+    return result('已读取项目。');
+  });
+  const before = await f.main(); await f.send('请查询项目资料。');
+  const state = await f.wait(value => value.status === 'waiting-for-user' && !value.activeTurnId && f.posts.some(post => post.text.includes('已读取项目。')));
+  assert.equal(state.participationDecision, 'reply'); assert.equal(f.modelCalls.length, 2);
+  assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
+  assert.deepEqual(await f.main(), before);
+  assert.doesNotMatch(JSON.stringify(f.posts), /reply_read_map|CG_REPLY|CG_SILENT/);
+  const second = f.modelCalls[1].messages;
+  assert.equal(second.find(message => message.role === 'assistant').content[0].name, 'reply_read_map');
+  const receipt = second.find(message => message.role === 'user' && Array.isArray(message.content) && message.content.some(block => block.type === 'tool_result'));
+  assert.equal(JSON.parse(receipt.content[0].content).kind, 'map-read');
 });
 
 test('合并接话参考校验：拒绝空项、错序、改文、重试夹带及伪造身份', () => {
