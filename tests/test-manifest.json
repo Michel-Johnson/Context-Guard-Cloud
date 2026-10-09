@@ -48,6 +48,8 @@
     }
   ],
   "productFiles": [
+    "tests/merged-participation-independent.test.mjs",
+    "tests/slack-merged-participation.test.mjs",
     "tests/map-translations.test.mjs",
     "tests/map-relations-independent.test.mjs",
     "tests/helpers/openclaw-map.mjs",

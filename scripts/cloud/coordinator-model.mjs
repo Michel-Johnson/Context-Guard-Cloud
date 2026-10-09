@@ -1,5 +1,6 @@
 import { hash } from '../shared/io.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
+import { createParticipationGate, mergedParticipationInput, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
@@ -349,20 +350,32 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   };
   if (!state.pending) {
     const messages = materializeMessages ? await materializeMessages(state) : coordinatorModelMessages(state);
-    const systemHash = hash(system), toolsHash = hash(JSON.stringify(modelTools));
+    const participationInput = trustedSlackInput && mergedParticipationInput(state);
+    const gateKey = participationInput?.requestId;
+    const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
+    const needsGate = gateKey && !alreadyAllowed;
+    const generationSystem = needsGate ? system + MERGED_PARTICIPATION_POLICY : alreadyAllowed
+      ? system + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : system;
+    const systemHash = hash(generationSystem), toolsHash = hash(JSON.stringify(modelTools));
     const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
       prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
         historyHash: hash(JSON.stringify(messages)), messageCount: messages.length,
         ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
+    const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
+      if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+      await onText?.(text);
+    }, { continuation: !!alreadyAllowed }) : null;
     let next;
     try {
       if (signal?.aborted) throw interruptionProblem(signal);
-      next = await model.next({ system, messages, tools: modelTools, signal, onText: measurement ? async text => {
+      next = await model.next({ system: generationSystem, messages, tools: modelTools, signal, onText: measurement ? async text => {
         if (signal?.aborted) return;
-        if (text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
-        await onText?.(text);
-      } : onText, onToolStart });
+        if (!gate && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+        if (gate) await gate.consume(text); else await onText?.(text);
+      } : gate ? text => gate.consume(text) : onText, onToolStart: async name => {
+        gate?.toolStart(); await onToolStart?.(name);
+      } });
       if (signal?.aborted) {
         // An adapter may finish despite cancellation. Preserve only visible text;
         // incomplete thinking signatures and tool blocks are never replayed.
@@ -370,12 +383,17 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         cause.partialText = next.content?.filter(block => block.type === 'text').map(block => block.text).join('') || '';
         throw cause;
       }
+      if (gate) {
+        next = await gate.finish(next);
+        state.slackParticipation = { requestId: gateKey, decision: gate.decision };
+      }
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started,
         stop: next.stop, inputTokens: coordinatorInputTokens(next.usage),
         cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens
           : Number.isSafeInteger(next.usage?.prompt_tokens_details?.cached_tokens) && next.usage.prompt_tokens_details.cached_tokens >= 0
             ? next.usage.prompt_tokens_details.cached_tokens : null });
     } catch (cause) {
+      if (gate && cause.partialText !== undefined) cause.partialText = gate.visible;
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started, errorCode: cause.code || 'MODEL_UNAVAILABLE' });
       throw cause;
     } finally {
@@ -387,6 +405,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const inputTokens = coordinatorInputTokens(next.usage);
     if (inputTokens !== null) state.lastInputTokens = inputTokens;
     if (next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) await onToolStart?.('ask_user');
+    if (gate?.decision === 'silent') {
+      const changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
+      state.pending = null;
+      state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user';
+      await save(state); return state;
+    }
     const metadata = state.activeInput || {};
     state.messages.push({ role: 'assistant', content: next.content,
       ...(state.activeModelRoute?.providerId ? { providerId: state.activeModelRoute.providerId } : {}),

@@ -331,7 +331,14 @@ export class SlackPlugin {
       await this.store.update(state => { for (const member of members) { state.inbox[member].status = 'done'; state.inbox[member].doneAt = Date.now(); } });
     } catch (error) {
       const classificationFailure = error.participationFailure === true;
-      const transient = error.historyTransient === true || (classificationFailure ? participationTransient(error) :
+      const event = entry.projectResume?.event || entry.envelope?.body?.event;
+      // Context capture can fail before the frozen snapshot exists. An ordinary
+      // message still has no permission to publish an error into its thread.
+      const mergedFailure = !!this.store.data.inbox[id]?.participation || isMessage(event) && !event.ts?.startsWith('command-');
+      const deliveryTransient = ['DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error',
+        'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code);
+      const transient = error.historyTransient === true || (classificationFailure ? participationTransient(error) : mergedFailure
+        ? participationTransient(error) || deliveryTransient :
         ['BUSY', 'COORDINATOR_BUSY', 'GATEWAY_ERROR', 'DELIVERY_UNCERTAIN', 'SLACK_UPLOAD_UNAVAILABLE', 'slack_webapi_http_error', 'slack_webapi_rate_limited_error', 'slack_webapi_request_error'].includes(error.code) || error.name === 'TimeoutError' || error instanceof TypeError || error.modelSelectionUncertain === true);
       const retryAfter = Number(error.retryAfter ?? error.data?.retry_after ?? 0);
       const validDelay = Number.isFinite(retryAfter) && retryAfter >= 0 && retryAfter <= 86400;
@@ -344,7 +351,7 @@ export class SlackPlugin {
         }
       });
       this.logger.warn('Slack operation failed', { id: digest(id).slice(0, 12), code: error.code || 'PLUGIN_ERROR' });
-      if (!transient && !error.silent) await this.reportError(id, entry.envelope.body, error).catch(() => {});
+      if (!transient && !error.silent && !mergedFailure) await this.reportError(id, entry.envelope.body, error).catch(() => {});
     }
   }
   async command(type, binding, userId, id, payload = {}) { return this.gateway.command(type, { ...contextFrom(binding, userId, id), payload }); }
@@ -739,7 +746,7 @@ export class SlackPlugin {
       return [key, existing];
     }
     const explicit = explicitlyAddressed(event, this.botUserId);
-    if (!direct && !explicit && !this.store.data.inbox[id]?.relevance?.respond) return [];
+    if (!direct && !explicit && !this.store.data.inbox[id]?.participation) return [];
     if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Channel project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
     if (!projectId) {
       await this.chooseProject(id, event);
@@ -899,41 +906,24 @@ export class SlackPlugin {
       const projectId = existing?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
       if (!projectId) { if (direct || explicit) await this.chooseProject(id, event); return; }
       if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Project changed after accepting this message batch'), { code: 'CONFLICT', silent: true });
-      let decision = this.store.data.inbox[id]?.relevance;
-      if (!decision) {
-        try {
-          let request = this.store.data.inbox[id]?.relevanceRequest;
-          if (!request) {
-            const context = direct && existing && (!event.thread_ts || existingKey !== originalKey)
-              ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);
-            const routing = await this.mentionRoute(id, { ...event, text });
-            routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
-            request = { id: operationId(id, 'relevance'), userId: event.user, projectId,
-              ...(existing ? { conversationId: existing.conversationId } : {}),
-              payload: { text, inputs: batchInputs, context, routing, files: events.flatMap(item => item.files || []).map(file => ({
-                name: String(file.name || file.title || '').slice(0, 200), mimeType: String(file.mimetype || '').slice(0, 100) })) } };
-            await this.store.update(state => {
-              state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
-              state.inbox[id].relevanceRequest = request;
-            });
-          }
-          if (request.projectId !== projectId) throw Object.assign(new Error('Channel project changed before the relevance decision'), { code: 'CONFLICT' });
-          decision = await this.gateway.command('conversation.relevance', request);
-          if (typeof decision?.respond !== 'boolean' || typeof decision?.mainVersion !== 'string') {
-            throw Object.assign(new Error('Message relevance could not be determined'), { code: 'RELEVANCE_INVALID_RESPONSE' });
-          }
-          decision = { ...decision, projectId };
-          await this.store.update(state => {
-            state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
-            state.inbox[id].relevance = decision;
-          });
-        } catch (error) { error.silent = true; error.participationFailure = true; throw error; }
+      let participation = this.store.data.inbox[id]?.participation;
+      if (!participation) {
+        const context = direct && existing && (!event.thread_ts || existingKey !== originalKey)
+          ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);
+        const routing = await this.mentionRoute(id, { ...event, text });
+        routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
+        participation = { projectId, payload: { text, inputs: batchInputs.map(({ id, text }) => ({ id, text })), context, routing,
+          files: events.flatMap(item => item.files || []).map(file => ({
+            name: String(file.name || file.title || '').slice(0, 200), mimeType: String(file.mimetype || '').slice(0, 100) })) } };
+        await this.store.update(state => {
+          state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+          state.inbox[id].participation = participation;
+        });
       }
       const currentBinding = this.store.data.threads[existingKey];
       const currentProject = currentBinding?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
-      if (decision.projectId !== currentProject) throw Object.assign(new Error('Channel project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
-      if (!decision.respond) return;
-      expectedProjectId = decision.projectId;
+      if (participation.projectId !== currentProject) throw Object.assign(new Error('Channel project changed before submission'), { code: 'CONFLICT', silent: true });
+      expectedProjectId = participation.projectId;
     }
     const [key, binding] = await this.ensureBinding(id, event, expectedProjectId);
     if (!binding) return;
@@ -984,13 +974,16 @@ export class SlackPlugin {
       }
       item.nextPoll = 0;
     });
-    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', slackChannelId: event.channel, ...(history?.length ? { history } : {}) });
+    const participation = this.store.data.inbox[id]?.participation?.payload;
+    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', slackChannelId: event.channel,
+      ...(participation ? { participation } : {}), ...(history?.length ? { history } : {}) });
     await this.store.update(state => {
       state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0;
       if (history !== undefined) state.threads[key].historyAccepted = true;
     });
     if (replyContext?.answerTo) await this.store.update(state => { if (state.threads[key].pendingQuestionId === replyContext.answerTo) delete state.threads[key].pendingQuestionId; });
-    for (const item of events) if (!item.ts?.startsWith('command-')) this.readReaction(item);
+    // 普通消息是否接话由本轮模型决定，不在决定前添加“处理中”反应。
+    if (!participation) for (const item of events) if (!item.ts?.startsWith('command-')) this.readReaction(item);
   }
   async openForm(triggerId, userId, id, kind, context) {
     const draftId = `draft-${digest(id)}`, binding = context.key && this.store.data.threads[context.key];
@@ -1341,7 +1334,7 @@ export class SlackPlugin {
           text: '当前轮次已停止。已完成的操作和部分回复保留；未处理的补充仍保留，不会自动继续。' });
         await this.store.update(data => { data.threads[key].mirrored[noticeId] = { ts }; });
       }
-    } else if (state.status === 'running' && Number.isSafeInteger(state.inputRevision) && state.inputRevision > 1 &&
+    } else if (!['pending', 'silent'].includes(state.participationDecision) && state.status === 'running' && Number.isSafeInteger(state.inputRevision) && state.inputRevision > 1 &&
         (state.pendingInputCount > 0 || binding.inputNotice)) {
       const text = state.pendingInputCount > 0 ? `已保存 ${state.pendingInputCount} 条补充，等待纳入当前轮次。` : '补充已纳入当前轮次，仍在处理。';
       const prior = binding.inputNotice;
@@ -1375,7 +1368,7 @@ export class SlackPlugin {
       });
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
-    if (state.status === 'error') await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs, text: `Coordinator 当前失败：${state.error?.code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。` });
+    if (state.status === 'error' && !['pending', 'silent'].includes(state.participationDecision)) await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs, text: `Coordinator 当前失败：${state.error?.code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。` });
     const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer);
     await this.store.update(data => {
       const thread = data.threads[key];
