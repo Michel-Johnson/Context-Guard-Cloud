@@ -1,3 +1,5 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { slackReactionEmojis } from './slack-reactions.mjs';
 export { slackReactionEmojis } from './slack-reactions.mjs';
 const string = { type: 'string', minLength: 1 };
@@ -14,9 +16,27 @@ const task = { executionSessionId, taskId: string };
 export const coordinatorReferences = ['map-read.md', 'map-mount.md', 'user-reply.md', 'agent-handoff.md', 'plan-review.md', 'test-check.md', 'memory-definition.md', 'memory-filesystem.md'];
 // 资料标识保持兼容；只映射白名单文件，不接受模型提供的磁盘路径。
 export const coordinatorReferenceFiles = Object.freeze(Object.fromEntries(
-  coordinatorReferences.map(name => [name, ({ 'memory-definition.md': 'design/design-memory-definition-v0.2.0.md',
+  coordinatorReferences.map(name => [name, ({ 'map-mount.md': 'map-read.md',
+    'plan-review.md': 'agent-handoff.md', 'test-check.md': 'agent-handoff.md',
+    'memory-definition.md': 'design/design-memory-definition-v0.2.0.md',
     'memory-filesystem.md': 'design/design-memory-filesystem-v1.0.1.md' })[name] || name])));
 const fail = (message) => { throw Object.assign(new Error(message), { code: 'INVALID_ARGUMENT', toolHint: message }); };
+
+export async function readCoordinatorReferenceFile(runtimeRoot, name) {
+  if (!coordinatorReferences.includes(name)) fail('Reference is not available to the Coordinator');
+  const shared = path.join(runtimeRoot, 'scripts/shared');
+  const current = path.join(shared, 'skill-reference');
+  const stat = await fs.stat(current).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  // 新包存在时只读取新入口；缺失文件不能回退到遗留资料掩盖损坏。
+  if (stat) return fs.readFile(path.join(current, coordinatorReferenceFiles[name]), 'utf8');
+  const legacy = path.join(shared, 'references');
+  // 旧固定包保留原独立资料，合并过渡包才按映射回退。
+  if (['map-mount.md', 'plan-review.md', 'test-check.md'].includes(name)) {
+    try { return await fs.readFile(path.join(legacy, name), 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  return fs.readFile(path.join(legacy, coordinatorReferenceFiles[name]), 'utf8');
+}
 
 export const coordinatorTools = [
   definition('list_projects', 'List live projects accessible to the verified Slack DM operator. total is the exact count, including each same-name project once; never recount from display lines. Reply with names only, no IDs or copied descriptions except same-name clarification. Do not reuse historical lists.', {}),

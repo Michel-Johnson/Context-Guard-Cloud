@@ -1,5 +1,9 @@
 # Cloud 验证台账
 
+## REFERENCE-DOCS-01 · 合并指南的兼容入口
+
+- [ ] Skill 新 core 发布后固定消费准确版本，再验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并后的 Map 与交接指南；角色的相对链接与章节定位正确，不修改生成物绕过固定包。已更新映射及正式测试，未运行功能回归、Required 或部署。
+
 ## SLACK-MERGED-EMOJI-03 · 纯表情完成的批次与耐久边界（2026-10-09）
 
 - [x] Coordinator 审核最小代码 Plan 与 Main 整合：保留 Main `16790590b838a7ca416713df7d184b9d7549f0a3` 的即时反馈、17种交流表情/单原消息两次限额、决定先持久发布和恢复 controlRevision；不重复开发纯表情功能。只补 current batch 与原 activeInput 目标分离、原生配对/持久回执完整性、零内容不新增空 assistant、确切 checkpoint 对象；无产品节点或 Main 绑定冒名。
