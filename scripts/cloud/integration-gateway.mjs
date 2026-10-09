@@ -173,6 +173,10 @@ export function validateIntegrationCommand(config, input) {
   if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
+  if (Object.hasOwn(input.payload || {}, 'slackChannelId')) {
+    if (input.type !== 'conversation.submit' || !/^[DCG][A-Z0-9]{1,31}$/.test(input.payload.slackChannelId || '')) fail('INVALID_ARGUMENT', 'Provide the current Slack delivery channel');
+    actor.channelId = input.payload.slackChannelId;
+  }
   if (Object.hasOwn(input.payload || {}, 'history')) {
     if (input.type !== 'conversation.submit' || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', 'Only a verified Slack input batch may supply reference history');
     validateSlackHistory(input.payload.history, { projectId: input.projectId });
