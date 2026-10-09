@@ -55,6 +55,23 @@ test('Slack 绑定建议只发一次，确认回读后在原线程更新卡片�
   assert.equal(f.sent.filter(item => item.update).length, 1);
   assert.doesNotMatch(JSON.stringify(f.sent.at(-1)), /approve_binding|reject_binding/);
 });
+test('纯绑定工具回执只显示确认卡，不另发空的 Coordinator 回复；真实正文保留', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'binding-one', kind: 'binding-proposal', version: 'v1', pending: true,
+    pathText: '项目：目标\n└─ 登录：认证', reason: '登录错误归登录模块。' };
+  const messages = [{ id: 'tool-proposal', role: 'assistant', text: '', actions: [proposal] },
+    { id: 'tool-confirmed', role: 'assistant', text: '', actions: [{ kind: 'conversation-mounted' }] }];
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages, approvals: [proposal] });
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.channel).length, 1, '确认卡精确一次，没有额外占位消息');
+  assert.match(JSON.stringify(f.sent[0].blocks), /approve_binding/);
+  assert.doesNotMatch(JSON.stringify(f.sent), /Coordinator 回复/);
+  messages[0].text = '请确认这个主节点。';
+  await f.plugin.mirror(key);
+  assert.ok(f.sent.some(item => item.text?.includes(messages[0].text)), '有真实正文时不因绑定动作丢失正文');
+  assert.equal(f.sent.filter(item => JSON.stringify(item.blocks).includes('approve_binding')).length, 1);
+});
 test('改绑使旧需求卡失效，不误报人类退回且移除审批与导出按钮', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
   await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
