@@ -1529,6 +1529,56 @@ test('plain section boundaries preserve paragraphs code and emoji and transport 
   assert.equal(calls.filter(call => call.method === 'chat.update').length, count, 'Retire every old continuation after a stream shrinks');
 });
 
+test('1687字符4059字节的旧回复更新按编码预算拆分，完整保留且续段重试不重复', async t => {
+  const f = await fixture(t), text = '中'.repeat(1186) + 'a'.repeat(501), calls = [];
+  assert.equal(text.length, 1687); assert.equal(Buffer.byteLength(text), 4059);
+  await f.store.update(state => { state.outgoing.original = { id: 'original', channel, threadTs: '1.0', ts: '100.0', status: 'sent', hash: 'old' }; });
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    assert.ok(Buffer.byteLength(args.text) <= 4000);
+    assert.ok(args.blocks.every(block => Buffer.byteLength(block.text?.text || '') <= 2800));
+    calls.push({ method, args }); return { ts: method === 'chat.update' ? args.ts : '101.0' };
+  } } });
+  const blocks = [{ type: 'section', text: { type: 'plain_text', text } }];
+  await io.update(channel, '100.0', text, blocks);
+  assert.deepEqual(calls.map(call => call.method), ['chat.update', 'chat.postMessage']);
+  assert.equal(calls.flatMap(call => call.args.blocks).map(block => block.text.text).join(''), text);
+  assert.equal(f.store.data.outgoing.original.partCount, 2);
+  await io.update(channel, '100.0', text, blocks);
+  assert.equal(calls.filter(call => call.method === 'chat.postMessage').length, 1);
+  assert.equal((await new Store(f.directory).open()).data.outgoing['original:part:1'].ts, '101.0');
+});
+
+test('UTF8与HTML转义共同计入预算，代码字面量和emoji不丢失且不拆代理对', async t => {
+  const f = await fixture(t), literal = '🙂中<>&**Status'.repeat(1200), text = `\`\`\`txt\n${literal}\n\`\`\``, calls = [];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    assert.ok(Buffer.byteLength(args.text) <= 4000);
+    assert.ok(!/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(args.text));
+    calls.push({ method, args }); return { ts: `${calls.length + 100}.0` };
+  } } });
+  await io.post({ id: 'escaped-code', channel, text });
+  const decode = value => value.replace(/&(amp|lt|gt);/g, (_, entity) => ({ amp: '&', lt: '<', gt: '>' })[entity]);
+  assert.equal(calls.map(call => decode(call.args.text)).join(''), literal);
+  const chunks = plainChunks(literal, 16, { rendered: true, measure: value => Buffer.byteLength(value) });
+  assert.equal(chunks.join(''), literal); assert.ok(chunks.every(chunk => Buffer.byteLength(chunk) <= 16));
+  assert.throws(() => plainChunks('🙂', 1, { measure: value => Buffer.byteLength(value), rendered: true }), RangeError);
+});
+
+test('大段落拆分只保留一次原控件，生成唯一稳定block身份而不截正文', async t => {
+  const f = await fixture(t), text = '项目说明'.repeat(800), calls = [];
+  const accessory = { type: 'button', action_id: 'existing-action', text: { type: 'plain_text', text: '查看' }, value: 'synthetic-original' };
+  const blocks = [{ type: 'section', block_id: 'original-block', text: { type: 'plain_text', text }, accessory }];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    calls.push({ method, args }); return { ts: `${calls.length + 100}.0` };
+  } } });
+  await io.post({ id: 'controlled-long', channel, text, blocks });
+  const actual = calls.flatMap(call => call.args.blocks);
+  assert.equal(actual.map(block => block.text.text).join(''), text);
+  assert.deepEqual(actual.filter(block => block.accessory).map(block => block.accessory), [accessory]);
+  assert.equal(new Set(actual.map(block => block.block_id)).size, actual.length);
+  assert.ok(actual.every(block => block.block_id.length <= 255));
+  const before = calls.length; await io.post({ id: 'controlled-long', channel, text, blocks }); assert.equal(calls.length, before);
+});
+
 async function uncertainMultipart(t) {
   const f = await fixture(t), remote = new Map(), calls = [];
   let visible = false, losePost = true, loseUpdate = false;
