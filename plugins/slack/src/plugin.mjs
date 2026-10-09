@@ -124,8 +124,8 @@ export class SlackPlugin {
     if (message.partial) {
       for (const action of message.actions || []) if (action.kind === 'slack-reaction') {
         const id = `reaction-${digest([key, action.actionId])}`;
-        if (this.store.data.reactionOutbox?.[id]?.status === 'pending') await this.store.update(state => {
-          if (state.reactionOutbox[id].status === 'pending') state.reactionOutbox[id].status = 'superseded';
+        if (this.store.data.reactionOutbox?.[id]?.status === 'pending') await this.store.updateReaction(id, item => {
+          if (item.status === 'pending') item.status = 'superseded';
         });
       }
       return ready;
@@ -151,8 +151,12 @@ export class SlackPlugin {
       const id = `reaction-${digest([key, read ? `read:${action.actionId}` : action.actionId])}`;
       const target = { key, requestId: action.requestId, projectId: binding.projectId, conversationId: binding.conversationId,
         channel: input.channel, timestamp: input.timestamp, userId: input.userId, emoji: action.emoji };
-      await this.store.update(state => {
-        const previous = (state.reactionOutbox ||= {})[id], fingerprint = digest(target);
+      const fingerprint = digest(target);
+      if (this.store.data.reactionOutbox?.[id]) await this.store.updateReaction(id, previous => {
+        if (previous.fingerprint !== fingerprint) throw Object.assign(new Error('Reaction intent changed'), { code: 'ID_REUSED' });
+      });
+      else await this.store.update(state => {
+        const previous = (state.reactionOutbox ||= {})[id];
         if (previous && previous.fingerprint !== fingerprint) throw Object.assign(new Error('Reaction intent changed'), { code: 'ID_REUSED' });
         state.reactionOutbox[id] ||= { ...target, fingerprint, status: 'pending', attempts: 0, next: 0 };
       });
@@ -197,24 +201,23 @@ export class SlackPlugin {
         // Persist the original destination before any platform call. A crash or
         // lost acknowledgement replays only this same user/message/emoji.
         if (record.attempts >= 8) {
-          await this.store.update(state => { state.reactionOutbox[id].status = 'attention'; });
+          await this.store.updateReaction(id, item => { item.status = 'attention'; });
           return;
         }
-        await this.store.update(state => { const item = state.reactionOutbox[id]; item.status = 'sending'; item.attempts++; });
+        await this.store.updateReaction(id, item => { item.status = 'sending'; item.attempts++; });
         if (this.stopped) {
-          await this.store.update(state => { state.reactionOutbox[id].status = 'pending'; state.reactionOutbox[id].attempts--; });
+          await this.store.updateReaction(id, item => { item.status = 'pending'; item.attempts--; });
           return;
         }
         try {
           await this.io.call('reactions.add', { channel: record.channel, timestamp: record.timestamp, name: record.emoji });
-          await this.store.update(state => { state.reactionOutbox[id].status = 'sent'; });
+          await this.store.updateReaction(id, item => { item.status = 'sent'; });
         } catch (error) {
           const confirmed = error.code === 'slack_webapi_platform_error' && error.data?.error === 'already_reacted';
           // Platform fatal/internal errors may have applied the reaction. Only
           // precise permanent rejections and exhausted SDK 429 are non-delivery.
           const known = error.code === 'slack_webapi_rate_limited_error' || error.code === 'slack_webapi_platform_error' && reactionRejected.has(error.data?.error);
-          await this.store.update(state => {
-            const item = state.reactionOutbox[id];
+          await this.store.updateReaction(id, item => {
             item.status = confirmed ? 'sent' : known ? 'failed' : item.attempts >= 8 ? 'attention' : 'unknown';
             if (!confirmed) { item.error = error.code || 'REACTION_UNCERTAIN'; item.next = Date.now() + Math.min(60000, 1000 * 2 ** item.attempts); }
           });

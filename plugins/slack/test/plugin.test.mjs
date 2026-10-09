@@ -600,6 +600,25 @@ test('native Slack reaction adds only the chosen emoji and never posts a placeho
   assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'sent');
   await f.plugin.mirror(f.key); await settleReactions(f.plugin); assert.equal(f.sent.length, 1);
 });
+
+test('重复交流表情镜像只核对原记录，不复制整个账本或改变原指纹', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  const [id] = Object.keys(f.store.data.reactionOutbox), original = f.store.data.reactionOutbox[id], inbox = f.store.data.inbox;
+  const clone = structuredClone; let recordCopies = 0;
+  t.mock.method(globalThis, 'structuredClone', value => {
+    assert.notEqual(value, f.store.data, '重放原交流意图不复制全部消息和历史');
+    if (value === f.store.data.reactionOutbox[id]) recordCopies++;
+    return clone(value);
+  });
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.equal(recordCopies, 1); assert.equal(f.store.data.inbox, inbox);
+  assert.equal(f.store.data.reactionOutbox[id], original); assert.equal(f.sent.length, 1);
+  const changed = { ...f.message, actions: [{ ...f.message.actions[0], emoji: 'smile' }] };
+  await assert.rejects(f.plugin.queueReactions(f.key, changed, [f.input, changed]), { code: 'ID_REUSED' });
+  assert.equal(f.store.data.reactionOutbox[id], original);
+  assert.equal((await new Store(f.directory).open()).data.reactionOutbox[id].emoji, 'heart');
+});
 test('native Slack reaction uses real publicMessages projection without inventing a delivery receipt', async t => {
   const f = await reactionFixture(t), state = { activeInput: { id: f.requestId, source: 'slack', actor: f.input.actor }, messages: [{ ...f.input, content: f.input.text }], toolReceipts: {} };
   await coordinatorStep({ turnId: 'trusted-projection', state, system: 'role', tools: coordinatorTools, execute: createCoordinatorExecutor({}), save: async () => {},

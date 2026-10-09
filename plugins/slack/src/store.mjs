@@ -12,7 +12,10 @@ const durableThread = ({ nextPoll, nextItemPoll, ...thread }) => thread;
 // A single process owns this file. Every acknowledgement follows a file fsync
 // and atomic rename; Unix also flushes the directory before acknowledging.
 export class Store {
-  constructor(directory) { this.directory = directory; this.file = path.join(directory, 'state.json'); this.tail = Promise.resolve(); }
+  constructor(directory, { onCommit = null } = {}) {
+    if (onCommit !== null && typeof onCommit !== 'function') throw new TypeError('Commit observer must be a function');
+    this.directory = directory; this.file = path.join(directory, 'state.json'); this.tail = Promise.resolve(); this.onCommit = onCommit;
+  }
   async open() {
     await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
     try { this.data = JSON.parse(await fs.readFile(this.file, 'utf8')); }
@@ -24,7 +27,7 @@ export class Store {
     const run = this.tail.then(async () => {
       const next = structuredClone(this.data), result = await operation(next);
       // A replay may inspect an existing durable receipt without changing it.
-      if (!isDeepStrictEqual(this.data, next)) await this.#publish(next);
+      if (!isDeepStrictEqual(this.data, next)) await this.#publish(next, 'global');
       return result;
     });
     this.tail = run.catch(() => {});
@@ -36,6 +39,9 @@ export class Store {
   updateFeedback(id, operation) {
     return this.#updateRecord('feedback', id, operation);
   }
+  updateReaction(id, operation) {
+    return this.#updateRecord('reactionOutbox', id, operation);
+  }
   async #updateRecord(collection, key, operation, durable = null) {
     const run = this.tail.then(async () => {
       const previous = this.data[collection]?.[key];
@@ -46,16 +52,17 @@ export class Store {
       // Poll deadlines alone are volatile; restart can only advance a read.
       // Every identity, status, input, mirror or receipt change remains durable.
       if (durable && isDeepStrictEqual(durable(previous), durable(record))) this.data = next;
-      else await this.#publish(next);
+      else await this.#publish(next, collection);
       return result;
     });
     this.tail = run.catch(() => {});
     return run;
   }
-  async #publish(next) {
+  async #publish(next, kind) {
+    const started = performance.now(), payload = JSON.stringify(next);
     const temporary = path.join(this.directory, `.state-${randomUUID()}`);
     const handle = await fs.open(temporary, 'wx', 0o600);
-    try { await handle.writeFile(JSON.stringify(next)); await handle.sync(); } finally { await handle.close(); }
+    try { await handle.writeFile(payload); await handle.sync(); } finally { await handle.close(); }
     await fs.rename(temporary, this.file);
     // Windows does not support directory fsync. File fsync remains mandatory.
     if (process.platform !== 'win32') {
@@ -63,6 +70,10 @@ export class Store {
       try { await directory.sync(); } finally { await directory.close(); }
     }
     this.data = next;
+    // 诊断只包含固定更新类型、字节数和耗时；失败不能改变耐久回执。
+    if (this.onCommit) try {
+      void Promise.resolve(this.onCommit(Object.freeze({ kind, bytes: Buffer.byteLength(payload), elapsedMs: Math.round(performance.now() - started) }))).catch(() => {});
+    } catch { /* An observer is not part of the commit or acknowledgement. */ }
   }
   async receive(id, envelope, { collectMs = 800, maxCollectMs = 2000, feedback = null } = {}) {
     return this.update(state => {
