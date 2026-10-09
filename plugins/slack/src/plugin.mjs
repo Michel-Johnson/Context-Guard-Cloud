@@ -19,6 +19,7 @@ function modelFailureText(code, ownsFeedback, outgoing) {
 }
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
+const EVENT_RECONCILE_MS = 10000;
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
 const reactionEventHash = event => digest({ ...event, type: 'message' });
@@ -301,7 +302,7 @@ export class SlackPlugin {
     if (this.stopped) return;
     for (const [key, stream] of this.eventStreams) {
       const binding = this.store.data.threads[key];
-      if (!binding || !(binding.live || binding.awaitingReplyId || stream.latest) || binding.conversationId !== stream.conversationId || binding.projectId !== stream.projectId) {
+      if (!binding || !(binding.live || binding.awaitingReplyId || stream.latest) || binding.conversationId !== stream.conversationId || binding.projectId !== stream.projectId || binding.userId !== stream.userId) {
         stream.latest = null;
         stream.controller.abort();
         this.eventStreams.delete(key);
@@ -315,7 +316,7 @@ export class SlackPlugin {
     // deadline, so sustained activity cannot starve another due thread.
     const due = bindings.filter(([key, binding]) => {
       const stream = this.eventStreams.get(key);
-      return (binding.nextPoll || 0) <= Date.now() && (!stream?.lastEventAt || stream.latest || Date.now() - stream.lastFallbackAt >= 15000);
+      return (binding.nextPoll || 0) <= Date.now() && (!stream?.lastEventAt || stream.latest || Date.now() - stream.lastFallbackAt >= EVENT_RECONCILE_MS);
     })
       .sort(([, a], [, b]) => (a.nextPoll || 0) - (b.nextPoll || 0));
     const hot = due.filter(([, binding]) => binding.awaitingReplyId || binding.live);
@@ -330,18 +331,18 @@ export class SlackPlugin {
   }
   watchEvents(key, binding) {
     if (this.stopped || typeof this.gateway.events !== 'function' || this.eventStreams.has(key) || this.eventStreams.size >= 4 || (this.eventRetry.get(key) || 0) > Date.now()) return;
-    const stream = { controller: new AbortController(), projectId: binding.projectId, conversationId: binding.conversationId, lastFallbackAt: Date.now(), latest: null };
+    const stream = { controller: new AbortController(), userId: binding.userId, projectId: binding.projectId, conversationId: binding.conversationId, lastFallbackAt: Date.now(), latest: null };
     this.eventStreams.set(key, stream);
     stream.promise = (async () => {
       try {
         for await (const state of this.gateway.events({ userId: binding.userId, projectId: stream.projectId, conversationId: stream.conversationId, signal: stream.controller.signal })) {
           const current = this.store.data.threads[key];
-          if (this.stopped || stream.controller.signal.aborted || current?.projectId !== stream.projectId || current?.conversationId !== stream.conversationId) break;
+          if (this.stopped || stream.controller.signal.aborted || current?.projectId !== stream.projectId || current?.conversationId !== stream.conversationId || current?.userId !== stream.userId) break;
           if (state?.conversationId !== stream.conversationId) throw Object.assign(new Error('Event scope mismatch'), { code: 'GATEWAY_EVENT_INVALID' });
           stream.latest = state; stream.lastEventAt = Date.now();
           await this.store.update(data => {
             const thread = data.threads[key];
-            if (thread?.projectId === stream.projectId && thread?.conversationId === stream.conversationId) thread.nextPoll = 0;
+            if (thread?.projectId === stream.projectId && thread?.conversationId === stream.conversationId && thread?.userId === stream.userId) thread.nextPoll = 0;
           });
           this.kick();
         }
@@ -1245,13 +1246,18 @@ export class SlackPlugin {
     await this.io.uploadPrompt({ id: operationId(id, 'file-export'), channel: binding.channel, threadTs: binding.threadTs, ...prompt });
   }
   async mirror(key) {
-    const binding = this.store.data.threads[key];
+    let binding = this.store.data.threads[key];
     if (!binding) return;
     const stream = this.eventStreams.get(key);
-    const sameScope = stream && !stream.controller.signal.aborted && stream.projectId === binding.projectId && stream.conversationId === binding.conversationId;
-    const cached = sameScope ? stream.latest : null;
-    if (stream) { stream.latest = null; stream.lastFallbackAt = Date.now(); }
+    const sameScope = stream && !stream.controller.signal.aborted && stream.projectId === binding.projectId && stream.conversationId === binding.conversationId && stream.userId === binding.userId;
+    // 快照消费不能推迟独立补读；过期时即使事件不断到来也核对服务器状态。
+    const cached = sameScope && Date.now() - stream.lastFallbackAt < EVENT_RECONCILE_MS ? stream.latest : null;
+    if (sameScope) { stream.latest = null; if (!cached) stream.lastFallbackAt = Date.now(); }
     const state = cached || await this.command('conversation.state', binding, binding.userId, operationId(`${key}:${Date.now()}`, 'state'));
+    const current = this.store.data.threads[key];
+    if (!current || ['projectId', 'conversationId', 'userId', 'channel', 'threadTs'].some(field => current[field] !== binding[field])) return;
+    if (state?.conversationId !== undefined && state.conversationId !== binding.conversationId) throw Object.assign(new Error('State scope mismatch'), { code: 'GATEWAY_BAD_RESPONSE' });
+    binding = current;
     if (Number.isSafeInteger(binding.controlRevision) && binding.controlRevision > 0 &&
         (!Number.isSafeInteger(state.controlRevision) || state.controlRevision < binding.controlRevision)) return;
     if (Number.isSafeInteger(state.inputRevision) && Number.isSafeInteger(binding.inputRevision) &&
