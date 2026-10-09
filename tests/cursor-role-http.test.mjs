@@ -406,7 +406,9 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   assert.equal(object.isError, undefined); const plan = object.structuredContent.data;
   const ready = await exchange('plan-ready', 'task.report', { taskId, stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } });
   assert.equal(ready.isError, undefined);
-  assert.equal((await f.store.taskRecord(f.human, context.session, taskId)).stage, 'plan-ready');
+  const submittedPlan = await f.store.taskRecord(f.human, context.session, taskId);
+  assert.equal(submittedPlan.stage, 'plan-ready');
+  assert.equal(submittedPlan.planSourceSha, sourceSha, 'The fixed Core package persists the submitted Plan baseline');
   const forged = await exchange('self-approve', 'review.result', { kind: 'plan', ref: plan.ref, version: plan.version, decision: 'approved', reason: 'forged' });
   assert.equal(forged.isError, true); assert.equal(f.nativeCalls.length, 1);
   await f.poll(state => state.status === 'waiting-for-user');
@@ -441,6 +443,11 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   });
   assert.equal(proposed.isError, undefined); assert.equal(proposed.structuredContent.data.state, 'proof-pending');
   await f.poll(async () => (await f.store.taskRecord(f.human, current.session, taskId)).stage === 'awaiting-ci');
+  const handedOff = await new ProtocolStore(path.dirname(f.store.file)).taskRecord(f.human, current.session, taskId);
+  assert.equal(handedOff.planSourceSha, sourceSha, 'A fresh store retains the original Plan baseline after handoff');
+  assert.equal(handedOff.sourceSha, handoffSha);
+  assert.deepEqual(handedOff.plan, { ref: plan.ref, version: plan.version }, 'The strict public Plan identity remains unchanged');
+  assert.equal(handedOff.planReview.decision, 'approved');
   assert.equal(f.gitCalls.length, 4); assert.equal(f.nativeCalls.length, 2);
   await f.poll(state => state.status === 'waiting-for-user');
   f.commands.push({ name: 'request_ci', input: { executionSessionId: current.session.id, taskId } });
@@ -468,6 +475,8 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   assert.equal(ciResult.isError, undefined); assert.equal(ciResult.structuredContent.data.state, 'proof-pending');
   await f.poll(async () => (await f.store.taskRecord(f.human, current.session, taskId)).stage === 'awaiting-merge');
   const completedCi = await f.store.taskRecord(f.human, current.session, taskId);
+  assert.equal(completedCi.planSourceSha, sourceSha);
+  assert.equal(completedCi.sourceSha, handoffSha);
   assert.equal(completedCi.ci.verdict, 'passed'); assert.equal(completedCi.acceptanceReview, undefined);
   assert.equal(f.nativeCalls.length, 3, 'Verification does not start a replacement model');
   assert.equal(f.gitCalls.filter(url => url.includes('/check-runs?')).length, 2, 'Exact-source workflow facts are read before and after the independent Run');
