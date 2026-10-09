@@ -218,6 +218,38 @@ async function restartFeedback(t, f) {
   } };
 }
 
+test('重复反馈决定和既有接收只复制原记录，不复制整个账本或重发平台操作', async t => {
+  const f = await fixture(t), id = await f.receive(); await f.settle();
+  await f.plugin.feedback.decide(id, 'completed', { inputRevision: 2 }); await f.settle();
+  const original = await fs.readFile(f.store.file), state = f.store.data, count = f.calls.length;
+  const clone = structuredClone, copies = [];
+  t.mock.method(globalThis, 'structuredClone', value => {
+    assert.equal(value, f.store.data.feedback[id], '只复制当前反馈，不复制 Inbox、其他线程或整份账本');
+    copies.push(value); return clone(value);
+  });
+  await f.plugin.feedback.receive(id);
+  await f.plugin.feedback.decide(id, 'completed', { inputRevision: 2 });
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 });
+  await f.settle();
+  assert.equal(copies.length, 3); assert.equal(f.store.data, state);
+  assert.equal(f.calls.length, count); assert.deepEqual(await fs.readFile(f.store.file), original);
+});
+
+test('反馈队列内再次核验原目标，迟到决定不借用被改变的消息身份', async t => {
+  const f = await fixture(t), id = await f.receive(); await f.settle();
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const preceding = f.store.update(async state => { entered(); await gate; state.feedback[id].userId = 'UOTHER'; });
+  await ready;
+  const decision = f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 });
+  release(); await Promise.all([preceding, decision]);
+  assert.equal(f.store.data.feedback[id].desired, 'received');
+  await assert.rejects(f.plugin.feedback.receive(id), { code: 'ID_REUSED' });
+  const restarted = await new Store(f.directory).open();
+  assert.equal(restarted.data.feedback[id].desired, 'received');
+  assert.equal(restarted.data.feedback[id].userId, 'UOTHER');
+});
+
 test('完成对勾添加失回后重启确认原操作，再移除本机器人接话状态', async t => {
   const f = await fixture(t), id = await f.receive(); await f.settle();
   await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 }); await f.settle();

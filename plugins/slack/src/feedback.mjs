@@ -27,6 +27,10 @@ export class SlackFeedback {
   async receive(id) {
     const original = this.store.data.inbox[id], target = this.target(original?.envelope);
     if (!target) return;
+    // 新输入的首次反馈仍与 Inbox 原子保存；旧记录核对只复制当前消息。
+    if (this.store.data.feedback?.[id]) return this.store.updateFeedback(id, previous => {
+      if (Object.entries(target).some(([key, value]) => previous[key] !== value)) throw Object.assign(new Error('反馈目标已改变'), { code: 'ID_REUSED' });
+    });
     await this.store.update(state => {
       const previous = (state.feedback ||= {})[id];
       if (previous) {
@@ -39,8 +43,8 @@ export class SlackFeedback {
   }
   async decide(id, desired, { inputRevision = 0, controlRevision = 0, requestId } = {}) {
     if (!Object.hasOwn(slackStatusEmojis, desired) || !this.valid(id)) return;
-    await this.store.update(state => {
-      const item = state.feedback[id];
+    await this.store.updateFeedback(id, item => {
+      if (!this.valid(id, item)) return;
       if (inputRevision < item.inputRevision || inputRevision === item.inputRevision && controlRevision < item.controlRevision) return;
       // 新消息使全局输入版本递增，也不能把旧原消息的完成状态重置为处理中。
       if (item.desired === 'completed' && desired !== 'completed' && controlRevision <= item.controlRevision) return;
@@ -82,15 +86,15 @@ export class SlackFeedback {
         const method = item.applied[wanted] ? 'remove' : 'add', emoji = method === 'add' ? wanted : remove;
         if (!emoji) return;
         pending = { method, emoji, revision: item.revision, attempts: 0, status: 'pending', next: 0 };
-        await this.store.update(state => { state.feedback[id].pending = pending; });
+        await this.store.updateFeedback(id, item => { item.pending = pending; });
       }
-      if (pending.attempts >= 8) { await this.store.update(state => { state.feedback[id].pending.status = 'attention'; }); return; }
-      await this.store.update(state => {
-        const record = state.feedback[id]; record.firstAttemptAt ||= Date.now();
+      if (pending.attempts >= 8) { await this.store.updateFeedback(id, item => { item.pending.status = 'attention'; }); return; }
+      await this.store.updateFeedback(id, record => {
+        record.firstAttemptAt ||= Date.now();
         record.pending.status = 'sending'; record.pending.attempts++; record.pending.startedAt = Date.now();
       });
       if (this.plugin.stopped || !this.valid(id)) {
-        await this.store.update(state => { state.feedback[id].pending.status = 'pending'; state.feedback[id].pending.attempts--; }); return;
+        await this.store.updateFeedback(id, item => { item.pending.status = 'pending'; item.pending.attempts--; }); return;
       }
       item = this.store.data.feedback[id]; pending = item.pending;
       try {
@@ -102,8 +106,8 @@ export class SlackFeedback {
           (pending.method === 'add' && code === 'already_reacted' || pending.method === 'remove' && code === 'no_reaction');
         if (confirmed) { await this.confirm(id, pending); continue; }
         const known = error.code === 'slack_webapi_platform_error' && rejected.has(code);
-        await this.store.update(state => {
-          const operation = state.feedback[id].pending;
+        await this.store.updateFeedback(id, item => {
+          const operation = item.pending;
           operation.status = known ? 'failed' : operation.attempts >= 8 ? 'attention' : 'unknown';
           operation.error = error.code || 'REACTION_UNCERTAIN';
           const retryAfter = Number(error.retryAfter);
@@ -115,8 +119,7 @@ export class SlackFeedback {
     }
   }
   async confirm(id, operation) {
-    await this.store.update(state => {
-      const item = state.feedback[id];
+    await this.store.updateFeedback(id, item => {
       item.applied[operation.emoji] = operation.method === 'add';
       item.receipts = [...item.receipts, { method: operation.method, emoji: operation.emoji, revision: operation.revision,
         attempts: operation.attempts, confirmedAt: Date.now() }].slice(-40);
