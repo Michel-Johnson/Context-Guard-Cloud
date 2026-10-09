@@ -22,6 +22,20 @@ const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 const EVENT_RECONCILE_MS = 10000;
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
+const mirrorPlatformCodes = new Set([...reactionRejected, 'cant_update_message', 'edit_window_closed', 'invalid_blocks',
+  'invalid_blocks_format', 'msg_too_long', 'no_permission', 'invalid_arguments', 'invalid_metadata', 'invalid_charset',
+  'too_many_attachments', 'fatal_error', 'internal_error', 'request_timeout', 'ratelimited', 'ekm_access_denied', 'org_login_required']);
+const mirrorErrorNames = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'TimeoutError', 'AbortError', 'GatewayError']);
+const mirrorNetworkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_ABORTED']);
+function mirrorFailureDetails(error) {
+  const details = { code: error.code || 'MIRROR_ERROR' };
+  if (mirrorErrorNames.has(error.name)) details.name = error.name;
+  if (mirrorNetworkCodes.has(error.cause?.code)) details.causeCode = error.cause.code;
+  if (error.code === 'slack_webapi_platform_error') details.platformCode = mirrorPlatformCodes.has(error.data?.error)
+    ? error.data.error : 'UNKNOWN_PLATFORM_ERROR';
+  return details;
+}
 const reactionEventHash = event => digest({ ...event, type: 'message' });
 const participationTransient = error => {
   // Authentication, identity and contract failures require attention, even when
@@ -329,7 +343,14 @@ export class SlackPlugin {
     for (const [key] of selected) {
       if (this.stopped) return;
       try { await this.mirror(key); }
-      catch (error) { this.logger.warn('Slack mirror failed', { code: error.code || 'MIRROR_ERROR' }); await this.store.updateThread(key, thread => { thread.nextPoll = Date.now() + 30000; thread.error = error.code || 'MIRROR_ERROR'; }); }
+      catch (error) {
+        const details = mirrorFailureDetails(error);
+        // One-line diagnostics retain only classified errors, never SDK payloads.
+        this.logger.warn('Slack mirror failed', JSON.stringify(details));
+        await this.store.updateThread(key, thread => {
+          thread.nextPoll = Date.now() + 30000; thread.error = error.code || 'MIRROR_ERROR'; thread.lastMirrorError = details;
+        });
+      }
     }
   }
   watchEvents(key, binding) {

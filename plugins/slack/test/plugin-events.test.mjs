@@ -72,6 +72,49 @@ test('空闲镜像不重复写整份账本，新状态仍耐久保存且轮询�
   assert.equal(writes, 1); assert.equal((await new Store(f.directory).open()).data.threads[key].inputRevision, 2);
 });
 
+test('镜像平台失败保存安全子类型，重复错误不写盘，恢复仍保留首次失败诊断', async t => {
+  const f = await fixture(t);
+  const failure = Object.assign(Error('synthetic private message'), { code: 'slack_webapi_platform_error',
+    data: { error: 'invalid_blocks', response_metadata: { messages: ['synthetic private payload'] }, token: 'synthetic private credential' } });
+  f.gateway.command = async () => { throw failure; };
+  const started = Date.now(); await f.plugin.tick();
+  const details = { code: 'slack_webapi_platform_error', name: 'Error', platformCode: 'invalid_blocks' };
+  assert.deepEqual(JSON.parse(f.warnings[0][1]), details);
+  assert.equal(f.warnings[0][0], 'Slack mirror failed');
+  assert.doesNotMatch(JSON.stringify(f.warnings), /private|credential|payload|token|response_metadata/);
+  const thread = f.store.data.threads[key];
+  assert.deepEqual(thread.lastMirrorError, details); assert.equal(thread.error, failure.code);
+  assert.ok(thread.nextPoll >= started + 30000); assert.equal(f.posts.length, 0);
+  assert.deepEqual((await new Store(f.directory).open()).data.threads[key].lastMirrorError, details);
+  const rename = fs.rename.bind(fs); let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  await f.store.updateThread(key, item => { item.nextPoll = 0; }); await f.plugin.tick();
+  assert.equal(writes, 0); assert.deepEqual(f.store.data.threads[key].lastMirrorError, details);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null });
+  await f.store.updateThread(key, item => { item.nextPoll = 0; }); await f.plugin.tick();
+  assert.equal(f.store.data.threads[key].error, null);
+  assert.deepEqual(f.store.data.threads[key].lastMirrorError, details, '恢复不删除旧失败证据');
+});
+
+test('镜像诊断只取已知名称和网络代码，未识别平台值不泄露私有异常内容', async t => {
+  const scenarios = [
+    { error: Object.assign(new TypeError('synthetic private url'), { cause: { code: 'ECONNREFUSED', token: 'synthetic private' } }),
+      details: { code: 'MIRROR_ERROR', name: 'TypeError', causeCode: 'ECONNREFUSED' } },
+    { error: Object.assign(Error('synthetic private body'), { name: 'synthetic private name', code: 'slack_webapi_platform_error',
+      data: { error: 'https://private.invalid/credential' }, cause: { code: 'SYNTHETIC_PRIVATE' } }),
+      details: { code: 'slack_webapi_platform_error', platformCode: 'UNKNOWN_PLATFORM_ERROR' } },
+    { error: new DOMException('synthetic private timeout', 'TimeoutError'), details: { code: 23, name: 'TimeoutError' } },
+  ];
+  for (const { error, details } of scenarios) {
+    const f = await fixture(t); f.gateway.command = async () => { throw error; };
+    await f.plugin.tick();
+    assert.deepEqual(JSON.parse(f.warnings[0][1]), details);
+    assert.deepEqual(f.store.data.threads[key].lastMirrorError, details);
+    assert.doesNotMatch(JSON.stringify(f.warnings), /synthetic|private|credential|stack/);
+    assert.equal(f.posts.length, 0);
+  }
+});
+
 test('相同事件仅唤醒原线程不写盘，新最终状态仍镜像一次并保留回执', async t => {
   const f = await fixture(t); await f.plugin.tick();
   const rename = fs.rename.bind(fs); let writes = 0;
