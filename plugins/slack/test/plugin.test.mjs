@@ -53,6 +53,20 @@ test('Slack 绑定建议只发一次，确认回读后在原线程更新卡片�
   assert.equal(f.sent.filter(item => item.update).length, 1);
   assert.doesNotMatch(JSON.stringify(f.sent.at(-1)), /approve_binding|reject_binding/);
 });
+test('改绑使旧需求卡失效，不误报人类退回且移除审批与导出按钮', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'old-brief', manual: true, pending: true, version: 'v1', text: '旧需求', acceptance: '旧条件' };
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages: [], approvals: [proposal] });
+  await f.plugin.mirror(key);
+  assert.match(JSON.stringify(f.sent.at(-1)), /approve_brief/);
+  proposal.pending = false; proposal.stale = true;
+  await f.plugin.mirror(key); const updated = f.sent.at(-1);
+  assert.match(JSON.stringify(updated), /主节点已改绑/);
+  assert.doesNotMatch(JSON.stringify(updated), /退回|approve_brief|reject_brief|export_prompt/);
+  const count = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+});
+
 test('Home presents names and states without exposing internal identities', () => {
   const value = { id: 'private-project-id', name: '博客', version: 'a'.repeat(64),
     map: { id: 'internal-root', title: '博客', children: [{ id: 'internal-login', title: '登录',

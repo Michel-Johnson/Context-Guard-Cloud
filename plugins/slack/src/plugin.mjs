@@ -1458,7 +1458,8 @@ export class SlackPlugin {
       if (prior?.hash === hash) continue;
       if (approval.pending === false && !prior) continue;
       const resolved = approval.pending === false;
-      const text = resolved ? `brief 已${approval.decision === 'approved' ? '确认' : '退回'}` : 'Coordinator：等待人工确认 brief';
+      const text = approval.stale ? '主节点已改绑，这份需求说明已过期，请重新整理。' :
+        resolved ? `brief 已${approval.decision === 'approved' ? '确认' : '退回'}` : 'Coordinator：等待人工确认 brief';
       const blocks = resolved ? [section(text), ...(approval.decision === 'approved' ? [{ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key, proposalId: approval.id }) }] }] : [])] : approvalBlocks(approval, key);
       const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${id}`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
       await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
