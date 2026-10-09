@@ -13,6 +13,7 @@ import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { INTEGRATION_COMMANDS } from '../scripts/cloud/integration-gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store, threadKey } from '../plugins/slack/src/store.mjs';
+import { CoordinatorConversations } from '../scripts/cloud/coordinator-service.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const templateId = '11111111-1111-4111-8111-111111111111';
@@ -314,29 +315,41 @@ test('Slack Cursor mode change rejects a live original model turn and preserves 
 test('Slack Cursor mode change rejects an old registry read arriving after cache retirement', async t => {
   const f = await fixture(t, { slack: true }), created = await f.gateway('conversation.create');
   assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
-  const registryFile = path.join(f.directory, 'coordinators', 'context-guard', 'conversations.json');
-  const originalRead = fs.readFile;
-  let captured = false, releaseRead;
+  const registryDirectory = path.join(f.directory, 'coordinators', 'context-guard');
+  const originalGet = CoordinatorConversations.prototype.get;
+  let captured = false, releaseRead, markReadEntered, readDeadline;
+  const readEntered = new Promise(resolve => { markReadEntered = resolve; });
   const heldRead = new Promise(resolve => { releaseRead = resolve; });
-  // Hold only this test's first real registry snapshot, after the file has
-  // been read. The original HTTP request now carries the old manual revision.
-  fs.readFile = async function(file, ...args) {
-    const value = await originalRead.call(this, file, ...args);
-    if (file === registryFile && !captured) { captured = true; await heldRead; }
+  // Stop the first get of coordinatorFor called directly by this HTTP handler,
+  // not startup/inbox list() or a later public-state read. Capture the caller
+  // before awaiting real disk I/O; those other reads may finish first in CI.
+  CoordinatorConversations.prototype.get = async function(id) {
+    const callers = new Error().stack.split('\n').slice(2);
+    const targeted = this.directory === registryDirectory && id === conversationId && !captured &&
+      /\bat coordinatorFor\b/.test(callers[0] || '') && /\bat handleRequest\b/.test(callers[1] || '');
+    if (targeted) captured = true;
+    const value = await originalGet.call(this, id);
+    if (targeted) {
+      assert.equal(value.executionMode, 'manual', 'Hold the real pre-transition registry snapshot');
+      assert.equal(value.id, conversationId);
+      markReadEntered();
+      await heldRead;
+    }
     return value;
   };
-  t.after(() => { releaseRead(); fs.readFile = originalRead; });
+  t.after(() => { releaseRead(); CoordinatorConversations.prototype.get = originalGet; });
   const late = f.request(f.endpoint + '?conversation=' + encodeURIComponent(conversationId));
   try {
-    const deadline = Date.now() + 3000;
-    while (!captured) { assert.ok(Date.now() < deadline, 'The original registry read was not reached'); await new Promise(resolve => setTimeout(resolve, 10)); }
+    await Promise.race([readEntered, new Promise((_, reject) => {
+      readDeadline = setTimeout(() => reject(new Error('The original HTTP registry read was not reached')), 3000);
+    })]);
     const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId });
     assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
-  } finally { releaseRead(); }
+  } finally { clearTimeout(readDeadline); releaseRead(); }
   const stale = await late;
   assert.equal(stale.status, 409, JSON.stringify(stale.body));
   assert.equal(stale.body.error.code, 'COORDINATOR_BUSY');
-  fs.readFile = originalRead;
+  CoordinatorConversations.prototype.get = originalGet;
   const state = await f.gateway('conversation.state', {}, { conversationId });
   assert.equal(state.status, 200); assert.equal(state.body.data.executionMode, 'automatic');
   assert.equal((await f.gateway('conversation.submit', { text: 'Use the current Cursor host' }, { conversationId })).status, 200);

@@ -8,6 +8,9 @@
 
 ## CURSOR-SLACK-ENTRY-01 · 原对话执行入口（2026-10-10）
 
+- [ ] 准确 `3a5cb1e` 的 CI `37988037705` 失败：旧 registry 交错用例期望 409、实际 200；本机旧用例单跑及全文件通过不能覆盖该失败。夹具的全局 `fs.readFile` 按首个完成抢占，未限定 HTTP→coordinatorFor 初始读取；现在只拦目标对话的真实初始 get，在 await 前固定来源、读取实际 manual 快照后用 Promise barrier 交错。原 409、后续 automatic/新 brief/零 native 调用断言保留；不据此改产品或认定所有竞态已消除。准确修订完整 CI 与独立复验仍待完成。
+- 反例验证仅在隔离进程内移除两项陈旧 getter 门禁，正式用例实际因 200≠409 失败；没有改磁盘产品源码。首轮 loader 重复注册造成入口断言失败，不能作为产品反例；首轮新调用来源匹配错误也保留。修正后的精确用例 1/1、exit0；上述结果不是供应商原生或线上任务验收。
+
 - [x] 原 Slack/manual 对话增加默认关闭的 `conversation.cursor`：显式仓库/模板/真人授权、空闲模式 CAS、原 ProjectTask/准确 brief 人审/既有 Plan 与独立 CI 回传；不另开聊天、转换旧批准或恢复通用派发。固定 core 2.3.0/UI 1.4.1 不变。
 - [x] 保留首次完整回归失败：804 项、801 通过、1 失败、2 既有跳过、exit1，183444.84175ms。模式保护误拦普通 shutdown 的持久步骤；分离 retired/stopping，既有正式 shutdown/restart Oracle 未改。另真实 HTTP 固定交错复现旧 registry 快照晚回复污染缓存；模式代次及持久授权校验拒绝旧初始化，锁外只收拢自有实例。
 - [x] 修复后冻结源码完整回归：807 项、805 通过、0 失败/取消、2 既有跳过、实际 exit0，205680.772625ms；日志 `temp/cursor-slack-entry-full-fixed-20261010.log`。独立最小正式组合14/14、exit0，29194.769667ms，六项 hash 前后一致；日志 `temp/cursor-slack-epoch-independent-c38a9f5-20261010.log`。这些结果绑定同步 Main52 前、夹具预置修改前字节，不冒充后续修订通过。
