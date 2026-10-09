@@ -67,7 +67,10 @@ const options = { host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig, 
 let service, browser, context, page, conversationId, passed = false, activeRound = null, savedTodo;
 const statePath = () => `/api/workbench/projects/${projectId}/api/coordinator?conversation=${encodeURIComponent(conversationId)}`;
 const state = async () => (await context.request.get(service.url + statePath())).json();
-const privateState = async () => JSON.parse(await fs.readFile(new CoordinatorConversations(path.join(directory, 'coordinators', projectId)).conversationFile(conversationId), 'utf8'));
+const privateState = async () => {
+  try { return JSON.parse(await fs.readFile(new CoordinatorConversations(path.join(directory, 'coordinators', projectId)).conversationFile(conversationId), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+};
 const settle = async text => {
   const deadline = Date.now() + 150000;
   for (;;) {
