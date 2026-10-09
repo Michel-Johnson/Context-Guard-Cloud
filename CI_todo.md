@@ -2,7 +2,8 @@
 
 ## REFERENCE-DOCS-01 · 合并指南的兼容入口
 
-- [ ] Skill 新 core 发布后固定消费准确版本，再验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并后的 Map 与交接指南；角色的相对链接与章节定位正确，不修改生成物绕过固定包。已更新映射及正式测试，未运行功能回归、Required 或部署。
+- [ ] Skill 新 core 发布后固定消费准确版本，从该构建验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并指南，角色相对链接与章节定位正确。源码的目录迁移与工具读取已有正式回归；旧固定包及合成迁移测试不代替新版共享包消费验收，不修改生成物绕过固定包。本次不部署。
+
 ## SLACK-FAILED-TURN-STOP-01 · 失败轮次的耐久停止（2026-10-10）
 
 - [x] 真正原生停止的接收和执行分离缺陷已确认：原1.9.7同一真人/轮次回执与interrupt journal均已保存，journalControlRevision=1，conversation仍error/controlRevision=0，无追加模型或工具。代码run在处理journal前因不可自动恢复错误提前返回，停止请求未应用；不将该接收回执称执行完成。
