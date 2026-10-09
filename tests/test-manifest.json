@@ -44,6 +44,7 @@
     }
   ],
   "productFiles": [
+    "tests/cursor-role-channel.test.mjs",
     "tests/cursor-provider.test.mjs",
     "tests/cursor-sessions.test.mjs",
     "tests/cursor-workbench.test.mjs",

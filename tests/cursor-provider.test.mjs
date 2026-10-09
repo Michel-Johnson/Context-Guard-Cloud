@@ -54,3 +54,44 @@ test('Cursor REST marks malformed successful writes as uncertain', async t => {
   const provider = await fixture(t, (_req, res) => { res.writeHead(200); res.end('not json'); });
   await assert.rejects(provider.followUp(agentId, 'first'), cause => cause.code === 'CURSOR_PROTOCOL_ERROR' && cause.deliveryUncertain === true);
 });
+
+test('Coordinator can start Cursor in Plan mode and replace scoped MCP credentials only on the approved execution Run', async t => {
+  const requests = [];
+  const provider = await fixture(t, async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    requests.push({ route: req.url, body: JSON.parse(Buffer.concat(chunks)) });
+    if (req.url === '/v1/agents') respond(res, { agent: { id: agentId }, run: { id: runId, agentId, status: 'CREATING' } });
+    else respond(res, { run: { id: 'approved-run', agentId, status: 'CREATING' } });
+  });
+  const server = token => ({ name: 'context_guard', type: 'http', url: 'https://workbench.example.invalid/api/cursor-mcp', headers: { Authorization: 'Bearer cgc_' + token.repeat(43) } });
+  await provider.create({ agentId, repositoryUrl: 'https://github.com/example/lab', startingRef: 'a'.repeat(40), text: 'Read the approved brief and submit a Plan without editing source', mode: 'plan', mcpServers: [server('a')] });
+  assert.equal(requests[0].body.mode, 'plan');
+  assert.deepEqual(requests[0].body.mcpServers, [server('a')]);
+  assert.equal(Object.hasOwn(requests[0].body, 'envVars'), false);
+  const run = await provider.followUp(agentId, 'Execute only the reviewed Plan', { mode: 'agent', mcpServers: [server('b')] });
+  assert.equal(run.id, 'approved-run');
+  assert.equal(requests[1].route, `/v1/agents/${agentId}/runs`);
+  assert.deepEqual(requests[1].body, { prompt: { text: 'Execute only the reviewed Plan' }, mode: 'agent', mcpServers: [server('b')] });
+  await provider.followUp(agentId, 'Read-only clarification');
+  assert.deepEqual(requests[2].body, { prompt: { text: 'Read-only clarification' } }, 'ordinary follow-up keeps the existing mode and delegated tools');
+});
+
+test('Cursor role options fail before any provider call for unsafe MCP or secret environment injection', async t => {
+  let calls = 0;
+  const provider = await fixture(t, (_req, res) => { calls++; respond(res, { run: { id: runId, agentId, status: 'CREATING' } }); });
+  const server = { name: 'context_guard', type: 'http', url: 'https://workbench.example.invalid/api/cursor-mcp', headers: { Authorization: 'Bearer cgc_' + 'x'.repeat(43) } };
+  const invalid = [
+    { mode: 'unreviewed-force' }, { force: true }, { envVars: { ADMIN_TOKEN: 'fixture-only' } },
+    { mcpServers: [{ ...server, url: 'https://user:fixture@workbench.example.invalid/api/cursor-mcp' }] },
+    { mcpServers: [{ ...server, url: 'http://untrusted.example.invalid/api/cursor-mcp' }] },
+    { mcpServers: [{ ...server, headers: { Authorization: 'Bearer fixture-only' } }] },
+    { mcpServers: [{ ...server, command: 'sh', type: 'stdio' }] },
+    { mcpServers: [{ ...server, headers: { ...server.headers, 'X-Admin-Token': 'fixture-only' } }] },
+    { mcpServers: [server, server] },
+  ];
+  for (const options of invalid) {
+    await assert.rejects(provider.followUp(agentId, 'No native invocation', options), { code: 'INVALID_CURSOR_OPTIONS' });
+    await assert.rejects(provider.create({ agentId, repositoryUrl: 'https://github.com/example/lab', startingRef: 'a'.repeat(40), text: 'No native invocation', ...options }), { code: 'INVALID_CURSOR_OPTIONS' });
+  }
+  assert.equal(calls, 0, 'reject bad delegation before transmitting credentials or invoking the vendor');
+});

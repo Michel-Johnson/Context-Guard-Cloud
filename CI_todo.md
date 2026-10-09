@@ -28,6 +28,13 @@
 
 ## CURSOR-WORKBENCH-01 · Cursor Cloud 首版适配（进行中）
 
+- [x] 用户已确认 Cursor 作为现有 Coordinator 的 Executor/Tester，不另建用户聊天。Cloud REST 支持显式 Plan/执行模式和单任务 MCP 凭据替换；正式提供方隔离 HTTP 测试通过，不表示原生角色任务已通过。
+- [x] Cloud 自有短期角色凭据、持久撤销/过期、原任务事务内权限复查与窄 MCP HTTP 传输开发完成。独立审查发现的任务前缀碰撞、证据 ref 版本漂移已修正并补回归；受影响 Cursor 四文件 27/27 隔离测试通过，后续准确冻结修订验证另记，不拼接旧结果。
+- [x] 当前冻结源码完整 `npm test` 实际 492 项、490通过、0失败、2既有跳过，退出0、86173.060083ms；日志 `temp/cursor-roles-npm-test.td5KiH`。独立安全39项通过；独立角色/MCP Review通过且正式17/17、退出0、5036.099333ms，前后源码哈希一致。新增并发用例首轮16/17的观察点竞态已保留，改为观察真实 store.handle 入口后通过，不放宽过期拒绝条件。
+- [ ] 公共 Cloud 服务接线；MCP 目前只有模块级真实 loopback HTTP，不冒称已提供生产入口。源码阶段通过不代替 Required、部署、安装及真实任务。
+- [ ] Cloud-host 角色工厂、Coordinator 调度、生产 receiver/source/test 验证器、新独立原生 Tester 和三路径真实任务验收。凭据委托不是厂商 shell 沙箱；没有可信证明时不接受交接或测试通过。旧独立聊天只能证明传输，历史与既有 Session 不删除。
+- [x] 官方 API 对本次自有隔离 Agent 的只读执行证据探测完成：固定 Skill main SHA、新分支、无自动 PR、无源码修改；实际单条 `run_terminal_cmd` 参数精确匹配原命令、结果未截断，stdout 含原 nonce/SHA 及 Node tests2/pass2/fail0。创建期间首次 stream409，仅 GET 同 Run 恢复，未重复 POST。实际 success 输出没有 exitCode 字段，不将缺失写成0；此探测不是 Coordinator 角色验收。
+
 - [x] Cloud `4253814` 准确完整 npm test 实际 467 项、465通过、0失败、2既有跳过、91212.169959ms，独立自有接口8/8通过；PR #33 初次 Required/完整七项 CI `37827680426` 全绿，保留旧固定消费范围，不冒称真实厂商验收。
 - [x] 从已合 Skill main `2ccae20` 的公开不可变共享 Release，经包管理器固定 core2.2.0/UI1.2.0并更新锁完整性；构建57文件，未编辑生成物。Cloud候选1.4.0，新功能次版本；旧测试客户端fixture0.7.1不变。新增公共配对HTTP用例：实际设备认证/绑定/心跳→真人POST入队→设备sync.read→原生result HTTP回显→同Session追问/重放/未绑定拒绝，Cursor公共工作台两项实际2/2 exit0，原生模型边界为合成接收器。
 - [ ] 当前固定新包准确修订的全量、独立Review/Required、Cloud真实配对Cursor、Cursor Cloud API key与真实任务仍待完成；不部署或宣称交付。
