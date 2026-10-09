@@ -66,7 +66,7 @@ test('Native Coordinator read_map projection produces no empty Slack reply befor
     'Cloud tool provenance remains complete');
 });
 
-async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects, bindingNodeId = 'T0', modelSelection = false, projectSelection = false, integrationActions } = {}) {
+async function fixture(t, { enabled = true, visionProvider, nodeIds, targetNodeIds, childNodes = [], prepareInput, initialMap, mapProjects, bindingNodeId = 'T0', modelSelection = false, projectSelection = false, readTarget, integrationActions } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-slack-cloud-'));
   let cloud;
   const held = new Set(), plugins = new Set();
@@ -83,6 +83,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
   if (visionProvider) await fs.writeFile(visionProviderFile, JSON.stringify({ token: 'synthetic', baseUrl: 'https://fixture.invalid', ...visionProvider }));
   const projects = Object.fromEntries([projectId, otherProjectId].map(id => [id, { root: directory, ref: 'refs/heads/main',
     coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true, ...(nodeIds ? { nodeIds } : {}),
+      ...(id === otherProjectId && targetNodeIds ? { nodeIds: targetNodeIds } : {}),
       ...(modelSelection ? { modelProviders: { original: { label: '原模型', providerFile }, target: { label: '目标模型', providerFile } }, defaultProviderId: 'original' } : {}) } }]));
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'fixture-memory-credential', projects };
   await fs.writeFile(path.join(directory, 'projects.json'), JSON.stringify({ v: 2, projects: [projectId, otherProjectId].map(id => ({ id, name: id, description: 'Isolated synthetic project' })) }));
@@ -118,10 +119,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
         ? message.content.split('[以下为原始输入]\n').at(-1).split('\n\n[服务器本轮输出格式；')[0] : '';
       if (projectSelection && ['列出项目', '切换到另一个项目'].includes(text)) return { stop: 'tool_use', content: [
         { type: 'tool_use', id: 'live-projects', name: 'list_projects', input: {} }] };
+      if (readTarget && text === '读项目节点') return { stop: 'tool_use', content: [
+        { type: 'tool_use', id: 'project-node', name: 'read_project_map', input: { ...readTarget } }] };
       if (projectSelection && Array.isArray(message?.content)) {
         const block = message.content.find(block => block.type === 'tool_result');
         if (block) {
           const result = JSON.parse(block.content);
+          if (result.kind === 'project-map-read') return { stop: 'end_turn', content: [{ type: 'text', text: JSON.stringify(result.node) }] };
           if (result.projects) assert.equal(result.total, result.projects.length, '目录工具提供权威总数，不从展示行估算');
           if (result.projects && request.messages.some(m => typeof m.content === 'string' && m.content.includes('切换到另一个项目'))) {
             return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch-project', name: 'switch_project', input: {
@@ -283,7 +287,7 @@ test('真实 Cloud 项目工具沿原目录授权交接，对话和 Main 隔离�
   assert.equal(invalid.status, 400);
 });
 
-test('频道和群组查询在模型读取前过滤私有目录，私聊保留完整授权目录与实时总数', async t => {
+test('频道和私聊按当前用户查询完整授权目录，无授权用户仍只能读取开放项目', async t => {
   const f = await fixture(t, { projectSelection: true, mapProjects: true });
   const overview = async () => (await (await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers })).json());
   const edit = async (operationId, operations) => {
@@ -298,28 +302,30 @@ test('频道和群组查询在模型读取前过滤私有目录，私聊保留�
   ]);
   const before = await overview();
   const conversations = {};
-  for (const channel of ['CTESTCHANNEL', 'GTESTGROUP', 'DTESTDM']) {
+  for (const [channel, user] of [['CTESTCHANNEL', userId], ['GTESTGROUP', userId], ['DTESTDM', userId], ['COTHERCHANNEL', 'UOTHER']]) {
     const conversationId = conversations[channel] = await f.newConversation(`directory-${channel}`);
     const start = f.modelCalls.length;
     const submission = { text: '列出项目', slackChannelId: channel };
-    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId })).status, 200);
+    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId, user })).status, 200);
     const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
     const calls = f.modelCalls.slice(start), receipts = calls.flatMap(call => call.messages)
       .flatMap(message => Array.isArray(message.content) ? message.content : []).filter(block => block.type === 'tool_result')
       .map(block => JSON.parse(block.content)).filter(result => result.projects);
     assert.equal(receipts.length, 1);
-    const directory = receipts[0], personal = channel.startsWith('D');
-    assert.equal(directory.scope, personal ? 'personal' : 'channel');
-    assert.equal(directory.total, personal ? 3 : 2);
-    assert.deepEqual(directory.projects.slice(0, 2).map(p => p.name), ['同名项目', '同名项目']);
-    if (personal) assert.match(state.messages.at(-1).text, /PRIVATE_DIRECTORY_SENTINEL/);
+    const directory = receipts[0], authorized = user === userId;
+    assert.equal(directory.scope, 'authorized');
+    assert.equal(directory.total, authorized ? 3 : 2);
+    if (authorized) {
+      assert.deepEqual(directory.projects.slice(0, 2).map(p => p.name), ['同名项目', '同名项目']);
+      assert.match(state.messages.at(-1).text, /PRIVATE_DIRECTORY_SENTINEL/);
+    }
     else {
       assert.doesNotMatch(JSON.stringify(calls), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL|N-private/);
       assert.doesNotMatch(JSON.stringify(state), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL|N-private/);
       assert.equal(calls[0].tools.some(tool => tool.name === 'switch_project'), false);
     }
     const count = f.modelCalls.length;
-    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId })).status, 200);
+    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId, user })).status, 200);
     assert.equal(f.modelCalls.length, count, '同操作回执重放不重复模型查询');
   }
   assert.equal((await overview()).version, before.version, '查询不写 Main');
@@ -329,7 +335,71 @@ test('频道和群组查询在模型读取前过滤私有目录，私聊保留�
   await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'CTESTCHANNEL' }, { id: 'fresh-after-restart', conversationId });
   const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
   assert.match(state.messages.at(-1).text, /新项目名/);
-  assert.doesNotMatch(JSON.stringify(f.modelCalls.slice(start)), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL/);
+  assert.match(JSON.stringify(f.modelCalls.slice(start)), /PRIVATE_DIRECTORY_SENTINEL/);
+});
+
+test('频道跨项目读取按需下降，不换绑定、不写 Main，并重查真实用户和目标权限', async t => {
+  const readTarget = {}, f = await fixture(t, { projectSelection: true, mapProjects: true, readTarget });
+  const overview = async () => (await (await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers })).json());
+  const edit = async (id, operations) => {
+    const response = await fetch(f.cloud.url + '/api/workbench/overview/api/commit', { method: 'POST', headers,
+      body: JSON.stringify({ operationId: id, baseVersion: (await overview()).version, operations }) });
+    assert.equal(response.status, 200, JSON.stringify(await response.json()));
+  };
+  await edit('cross-read-seed', [
+    { type: 'create', parentId: 'T0', node: { id: 'N-target', title: '另一个项目', memoryDocument: 'TARGET_ROOT_MEMORY' } },
+    { type: 'create', parentId: 'N-target', node: { id: 'N-target-child', title: '目标模块', memoryDocument: 'TARGET_CHILD_MEMORY' } },
+    { type: 'create', parentId: 'N-target-child', node: { id: 'N-target-deep', title: '深层模块', memoryDocument: 'TARGET_DEEP_MEMORY' } },
+  ]);
+  const catalog = (await f.gateway('project.list')).body.data.projects;
+  readTarget.projectId = catalog.find(p => p.mapNodeId === 'N-target').id;
+  const conversationId = await f.newConversation('read-without-switch'), before = await overview(), sourceBefore = await f.main();
+  const read = async (id, user = userId) => {
+    const start = f.modelCalls.length;
+    assert.equal((await f.gateway('conversation.submit', { text: '读项目节点', slackChannelId: 'CTESTCHANNEL' }, { id, conversationId, user })).status, 200);
+    const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+    const result = f.modelCalls.slice(start).at(-1).messages.at(-1).content[0];
+    return { state, result, value: JSON.parse(result.content) };
+  };
+  const root = await read('cross-root');
+  assert.equal(root.value.project.id, readTarget.projectId); assert.equal(root.value.node.id, 'N-target');
+  assert.match(root.value.node.memoryDocument, /TARGET_ROOT_MEMORY/);
+  assert.deepEqual(root.value.node.children.map(({ id, title }) => ({ id, title })), [{ id: 'N-target-child', title: '目标模块' }]);
+  assert.doesNotMatch(JSON.stringify(root.value), /TARGET_CHILD_MEMORY|TARGET_DEEP_MEMORY|N-target-deep/);
+  const calls = f.modelCalls.length;
+  await f.gateway('conversation.submit', { text: '读项目节点', slackChannelId: 'CTESTCHANNEL' }, { id: 'cross-root', conversationId });
+  assert.equal(f.modelCalls.length, calls);
+  readTarget.nodeId = 'N-target-child';
+  const child = await read('cross-child');
+  assert.match(child.value.node.memoryDocument, /TARGET_CHILD_MEMORY/);
+  assert.doesNotMatch(JSON.stringify(child.value), /TARGET_ROOT_MEMORY|TARGET_DEEP_MEMORY/);
+  assert.equal(child.state.messages.flatMap(m => m.actions || []).some(a => a.kind === 'project-switch'), false);
+  assert.deepEqual(await f.main(), sourceBefore); assert.equal((await overview()).version, before.version);
+  const denied = await read('cross-non-owner', 'UOTHER');
+  assert.equal(denied.result.is_error, true); assert.equal(denied.value.error.code, 'FORBIDDEN');
+  await f.restart();
+  const restored = await read('cross-after-restart'); assert.equal(restored.value.node.id, 'N-target-child');
+  await edit('cross-delete-target', [{ type: 'delete', id: 'N-target' }]);
+  const deleted = await read('cross-deleted'); assert.equal(deleted.result.is_error, true);
+  assert.equal(deleted.value.error.code, 'NOT_FOUND');
+});
+
+test('跨项目读取保留目标节点限制与现有动作白名单', async t => {
+  for (const actions of [undefined, ['project.list', 'conversation.create', 'conversation.submit', 'conversation.state']]) {
+    const readTarget = { projectId: otherProjectId }, f = await fixture(t, { projectSelection: true, readTarget,
+      targetNodeIds: ['N-allowed'], childNodes: [{ id: 'N-allowed', title: '可读节点', memoryDocument: 'ALLOWED_NODE_MEMORY' }], integrationActions: actions });
+    const conversationId = await f.newConversation('restricted-target');
+    await f.gateway('conversation.submit', { text: '读项目节点', slackChannelId: 'CTESTCHANNEL' }, { id: 'restricted-root', conversationId });
+    await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+    let result = JSON.parse(f.modelCalls.at(-1).messages.at(-1).content[0].content);
+    assert.equal(result.error.code, 'FORBIDDEN');
+    readTarget.nodeId = 'N-allowed';
+    await f.gateway('conversation.submit', { text: '读项目节点', slackChannelId: 'CTESTCHANNEL' }, { id: 'restricted-child', conversationId });
+    await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+    result = JSON.parse(f.modelCalls.at(-1).messages.at(-1).content[0].content);
+    if (actions) assert.equal(result.error.code, 'FORBIDDEN');
+    else assert.equal(result.node.memoryDocument, 'ALLOWED_NODE_MEMORY');
+  }
 });
 
 test('目录工具仍执行项目和动作授权，不把未授权来源降级成成功查询', async t => {
@@ -683,7 +753,7 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   assert.doesNotMatch(manualCall.system, /系统为新任务创建独立执行 Session|自动发起中断恢复/);
   assert.match(manualCall.system, /Current project facts/);
   assert.match(manualCall.system, /本轮答复发往 Slack/);
-  const nonDMTools = coordinatorTools.filter(tool => !['list_projects', 'switch_project'].includes(tool.name));
+  const nonDMTools = coordinatorTools.filter(tool => !['list_projects', 'read_project_map', 'switch_project'].includes(tool.name));
   assert.deepEqual(manualCall.tools, selectCoordinatorTools(filterManualTools(nonDMTools), { fileWrite: false }),
     'Retain enabled manual native definitions, not a text-only substitute');
   for (const name of ['show_model_menu', 'react_to_user']) assert.ok(manualCall.tools.some(tool => tool.name === name),

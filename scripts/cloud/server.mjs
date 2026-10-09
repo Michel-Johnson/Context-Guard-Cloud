@@ -409,6 +409,17 @@ export async function authorizeCiReceiver({ principal, ciSessionId, message, rec
   return { ...principal, agentId: ciSessionId, role: 'ci', bindings: { [executorId]: executorBinding.worktreeId } };
 }
 
+function readCoordinatorMapNode(snapshot, id, nodeIds) {
+  const root = snapshot?.memory?.map?.root;
+  id ||= root?.id;
+  const node = root && entries(root).get(id)?.node;
+  if (!node || Array.isArray(nodeIds) && !nodeIds.includes(id)) protocolFail('FORBIDDEN', 'Requested Main node is not in the Coordinator scope');
+  const { children = [], _inbox, ...fields } = node;
+  return { version: snapshot.version, mainSha: snapshot.mainSha, node: { ...fields,
+    children: children.filter(child => !Array.isArray(nodeIds) || nodeIds.includes(child.id))
+      .map(child => ({ id: child.id, title: child.title, purpose: child.purpose })) } };
+}
+
 export async function startCloudServer({
   host = process.env.CONTEXT_GUARD_CLOUD_HOST || '127.0.0.1',
   port = Number(process.env.CONTEXT_GUARD_CLOUD_PORT || 8787),
@@ -768,6 +779,7 @@ export async function startCloudServer({
               // file-scoped authorization contract, so restricted callers may
               // not use it even when project-wide file writing is enabled.
               if (name === 'write_file') protocolFail('FORBIDDEN', 'Repository file writing requires project-wide authorization');
+              if (name === 'read_project_map') protocolFail('FORBIDDEN', 'Cross-project reading requires project-wide authorization');
               const ids = [input.nodeId, input.parentId, ...(input.nodeIds || [])].filter(Boolean);
               if (name === 'edit_map') {
                 const snapshot = (await readMemoryProject(configuredMemory, project.id)).main;
@@ -843,15 +855,20 @@ export async function startCloudServer({
             validateIntegrationCommand(integrations, { id: `projects-${digest(operationId)}`, teamId: actor.teamId,
               userId: actor.userId, type: 'project.list', payload: {} });
             await authorizeIntegrationProject(project.id, actor);
-            const personal = actor.channelId.startsWith('D');
-            if (!personal && !integrations.projectIds.includes(project.id)) protocolFail('FORBIDDEN', '私有项目目录不能在频道查询');
             const result = await integrationCommand({ type: 'project.list' }, { actor, operationId });
-            // 先按现有开放范围过滤，再交给模型；不泄露私有条目或其数量。
-            const projects = result.projects.filter(item => personal || integrations.projectIds.includes(item.id))
-              .map(({ id, name, description }) => ({ id, name, description }));
-            return { currentProjectId: project.id, scope: personal ? 'personal' : 'channel', total: projects.length, projects,
-              instruction: (personal ? '这是当前用户的授权目录。' : '这是频道已开放项目，不是完整私有目录。') +
-                '总数以 total 为准，同名项目各计一次；只列名称，同名才用简介澄清，不展示内部 ID。' };
+            const projects = result.projects.map(({ id, name, description }) => ({ id, name, description }));
+            return { currentProjectId: project.id, scope: 'authorized', total: projects.length, projects,
+              instruction: '这是当前用户的完整授权目录，不是当前绑定项目的模块。总数以 total 为准，同名项目各计一次；只列名称，同名才用简介澄清，不展示内部 ID。' };
+          },
+          readProjectMap: async ({ projectId: targetId, nodeId }, { operationId, actor }) => {
+            if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持读取 Slack 项目');
+            validateIntegrationCommand(integrations, { id: `read-${digest(operationId)}`, teamId: actor.teamId,
+              userId: actor.userId, projectId: targetId, type: 'project.read', payload: {} });
+            await authorizeIntegrationProject(project.id, actor); await authorizeIntegrationProject(targetId, actor);
+            const target = await integrationProject(targetId);
+            const result = await integrationCommand({ type: 'project.read', projectId: targetId }, { actor, operationId });
+            return { kind: 'project-map-read', project: { id: target.id, name: target.name },
+              ...readCoordinatorMapNode({ version: result.version, memory: { map: result.map } }, nodeId, coordinatorConfigFor(target)?.nodeIds) };
           },
           switchProject: async ({ projectId: targetId }, { operationId, actor, requestId }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');
@@ -995,14 +1012,9 @@ export async function startCloudServer({
           },
           readMap: async id => {
             const memory = await readMemoryProject(configuredMemory, project.id);
-            const snapshot = memory.main;
-            id ||= snapshot?.memory?.map?.root?.id;
-            const node = snapshot?.memory?.map?.root && entries(snapshot.memory.map.root).get(id)?.node;
-            if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(id)) protocolFail('FORBIDDEN', 'Requested Main node is not in the Coordinator scope');
             // Inbox entries are nested nodes, not fields of this authorized
             // node. Read them separately through the same node-scope check.
-            const { children = [], _inbox, ...fields } = node;
-            return { version: snapshot.version, mainSha: snapshot.mainSha, node: { ...fields, children: children.map(child => ({ id: child.id, title: child.title, purpose: child.purpose })) } };
+            return readCoordinatorMapNode(memory.main, id, config.nodeIds);
           },
           readReference: async name => {
             if (!references.has(name)) protocolFail('FORBIDDEN', 'Reference is not available to the Coordinator');
