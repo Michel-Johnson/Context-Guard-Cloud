@@ -87,8 +87,10 @@ async function coordinatorControlAcceptance() {
   const file = legacyProjectMemoryFile(memory.dataDir, 'control-fixture');
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, JSON.stringify({ revision: 1, main: { version: 'control-main', memory: { records: {}, map: {
-    project: 'Control fixture', bootstrap: 'ready', root: { id: 'T0', title: 'Controls', kind: 'module', state: 'dirty', owns: [], children: [
-      { id: 'N1', title: 'Login', kind: 'module', state: 'dirty', owns: [], memoryDocument: 'BROWSER-DURABLE-FOCUS-MEMORY', children: [] },
+    project: 'Control fixture', bootstrap: 'ready', root: { id: 'T0', title: 'Controls', purpose: '项目目标', memoryDocument: 'BROWSER-ROOT-CONSTRAINT', kind: 'module', state: 'dirty', owns: [], children: [
+      { id: 'N1', title: 'Login', purpose: '登录模块', kind: 'module', state: 'dirty', owns: [], memoryDocument: 'BROWSER-PARENT-CONSTRAINT', children: [
+        { id: 'N3', title: 'Testing', purpose: '登录回归', kind: 'module', state: 'dirty', owns: [], memoryDocument: 'BROWSER-DURABLE-FOCUS-MEMORY', children: [] },
+      ] },
     ] },
   } } }, sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
   const held = new Set(), errors = [], modelInputs = []; let heldGenerations = 0, cloud, fixtureContext, fixturePage;
@@ -109,7 +111,7 @@ async function coordinatorControlAcceptance() {
           });
         }
         if (text === '记住登录节点') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'browser-mount', name: 'mount_conversation',
-          input: { nodeId: 'N1', kind: 'todo', title: 'Login discussion', description: 'Keep login focus', mainVersion: 'control-main' } }] };
+          input: { nodeId: 'N3', kind: 'todo', title: 'Login discussion', description: 'Keep login focus', mainVersion: 'control-main' } }] };
         return { stop: 'end_turn', content: [{ type: 'text', text: '已继续当前讨论。' }] };
       } }) });
     fixtureContext = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
@@ -208,9 +210,14 @@ async function coordinatorControlAcceptance() {
     assert.deepEqual(state.messages.filter(message => message.partial).map(message => message.id), partialIds, 'Retry preserves the exact original output identities and ordering');
     await fixturePage.waitForFunction(() => document.querySelector('.coordinator-send')?.getAttribute('aria-label') === '发送');
     await input.fill('记住登录节点'); await panel.getByRole('button', { name: '发送', exact: true }).click();
+    await panel.getByRole('button', { name: '确认绑定', exact: true }).waitFor();
+    state = await (await fixtureContext.request.get(stateUrl)).json();
+    assert.equal(state.focus.nodeId, null, '模型提出建议不能直接绑定');
+    assert.match(await panel.textContent(), /Controls：项目目标[\s\S]*Login：登录模块[\s\S]*Testing：登录回归/);
+    await panel.getByRole('button', { name: '确认绑定', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel [data-conversation="main"]')?.textContent.includes('Login discussion'));
     state = await (await fixtureContext.request.get(stateUrl)).json();
-    assert.equal(state.conversations.find(value => value.id === 'main').nodeId, 'N1');
+    assert.equal(state.conversations.find(value => value.id === 'main').nodeId, 'N3');
     assert.deepEqual(await readMemoryView(memory, 'control-fixture'), before, 'Clicking stop and mounting focus never change Main or create an execution Session');
     await fixturePage.reload(); await fixturePage.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
     await fixturePage.locator('#btn-coordinator').click();
@@ -221,7 +228,11 @@ async function coordinatorControlAcceptance() {
     state = await (await fixtureContext.request.get(stateUrl)).json();
     assert.deepEqual(state.messages.filter(message => message.partial).map(message => message.id), partialIds, 'New turns and another reload retain each original fragment exactly once');
     await panel.screenshot({ path: path.join(output, 'coordinator-partial-after-resume-new-turn-reload.png') });
-    assert.ok(modelInputs.at(-1).messages.at(-1).content.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
+    assert.ok(modelInputs.at(-1).system.includes('BROWSER-DURABLE-FOCUS-MEMORY'));
+    const actualInput = modelInputs.at(-1).system + JSON.stringify(modelInputs.at(-1).messages.at(-1));
+    for(const marker of ['BROWSER-ROOT-CONSTRAINT','BROWSER-PARENT-CONSTRAINT','BROWSER-DURABLE-FOCUS-MEMORY']){
+      assert.equal(actualInput.split(marker).length - 1, 1, '所有祖先正文在当前输入中各出现一次');
+    }
     assert.ok(!JSON.stringify(modelInputs.at(-1).messages).includes('已经输出的完整段落'), 'Aborted display history never enters later native model requests');
     assert.deepEqual(errors, []);
     record('CONTROL-01 real ink-click stop uses an idempotent original-turn request and preserves text across reload/resume');

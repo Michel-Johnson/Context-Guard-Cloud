@@ -7,7 +7,7 @@ import { Store, threadKey, digest } from '../src/store.mjs';
 import { SlackPlugin, envelopeId } from '../src/plugin.mjs';
 import { SlackIO, UncertainDelivery } from '../src/slack-io.mjs';
 import { Gateway } from '../src/gateway.mjs';
-import { homeView, formValues, messageBlocks, approvalBlocks, modelChoiceBlocks } from '../src/views.mjs';
+import { homeView, formValues, messageBlocks, approvalBlocks, bindingBlocks, modelChoiceBlocks } from '../src/views.mjs';
 import { plainText, plainChunks } from '../src/plain-text.mjs';
 import { activeMentions, explicitlyAddressed } from '../src/mentions.mjs';
 import { startIntegrationGateway, integrationActor } from '../../../scripts/cloud/integration-gateway.mjs';
@@ -19,6 +19,54 @@ import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cl
 import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
+test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
+  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归' };
+  const blocks = bindingBlocks(proposal, 'internal-thread');
+  const text = blocks.filter(block => block.type === 'section').map(block => block.text.text).join('\n');
+  assert.ok(text.includes(proposal.pathText)); assert.match(text, /同意绑定|暂不绑定/);
+  assert.doesNotMatch(text, /internal-/); assert.ok(blocks.filter(block => block.type === 'section').every(block => block.text.type === 'plain_text'));
+  assert.deepEqual(blocks.at(-1).elements.map(button => button.action_id), ['approve_binding', 'reject_binding']);
+  assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'internal-thread', proposalId: proposal.id, version: proposal.version });
+});
+
+test('Slack 绑定建议只发一次，确认回读后在原线程更新卡片而不改其他线程', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'proposal-one', kind: 'binding-proposal', version: 'v1', pending: true,
+    node: { id: 'login', title: '登录' }, pathText: '项目：目标\n└─ 登录：会话' };
+  const command = f.gateway.command;
+  f.gateway.command = async (type, args) => {
+    if (type === 'conversation.state') return { status: 'waiting-for-user', activeTurnId: null, messages: [], approvals: [proposal] };
+    if (type === 'binding.review') { f.calls.push({ type, ...args }); return { decision: 'approved', message: '已确认绑定到登录' }; }
+    return command(type, args);
+  };
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.channel).length, 1);
+  assert.equal(f.sent[0].threadTs, '123.001'); assert.match(JSON.stringify(f.sent[0].blocks), /approve_binding/);
+  await f.plugin.reviewBinding('human-action', user, { key, proposalId: proposal.id, version: proposal.version }, 'approved');
+  const review = f.calls.find(call => call.type === 'binding.review');
+  assert.equal(review.userId, user); assert.equal(review.projectId, 'lab'); assert.equal(review.conversationId, 'chat-one');
+  assert.deepEqual(review.payload, { proposalId: proposal.id, version: proposal.version, decision: 'approved' });
+  assert.equal(f.sent.at(-1).threadTs, '123.001');
+  proposal.pending = false; proposal.decision = 'approved';
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(item => item.update).length, 1);
+  assert.doesNotMatch(JSON.stringify(f.sent.at(-1)), /approve_binding|reject_binding/);
+});
+test('改绑使旧需求卡失效，不误报人类退回且移除审批与导出按钮', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const proposal = { id: 'old-brief', manual: true, pending: true, version: 'v1', text: '旧需求', acceptance: '旧条件' };
+  f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, messages: [], approvals: [proposal] });
+  await f.plugin.mirror(key);
+  assert.match(JSON.stringify(f.sent.at(-1)), /approve_brief/);
+  proposal.pending = false; proposal.stale = true;
+  await f.plugin.mirror(key); const updated = f.sent.at(-1);
+  assert.match(JSON.stringify(updated), /主节点已改绑/);
+  assert.doesNotMatch(JSON.stringify(updated), /退回|approve_brief|reject_brief|export_prompt/);
+  const count = f.sent.length; await f.plugin.mirror(key); assert.equal(f.sent.length, count);
+});
+
 test('Home presents names and states without exposing internal identities', () => {
   const value = { id: 'private-project-id', name: '博客', version: 'a'.repeat(64),
     map: { id: 'internal-root', title: '博客', children: [{ id: 'internal-login', title: '登录',

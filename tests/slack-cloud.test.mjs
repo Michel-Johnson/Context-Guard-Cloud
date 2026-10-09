@@ -66,7 +66,7 @@ test('Native Coordinator read_map projection produces no empty Slack reply befor
     'Cloud tool provenance remains complete');
 });
 
-async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects, modelSelection = false, projectSelection = false, integrationActions } = {}) {
+async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects, bindingNodeId = 'T0', modelSelection = false, projectSelection = false, integrationActions } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-slack-cloud-'));
   let cloud;
   const held = new Set(), plugins = new Set();
@@ -161,9 +161,10 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       }
       if (message?.role === 'user' && text === 'hold-busy-turn') await new Promise(resolve => held.add(resolve));
       if (message?.role === 'user' && ['mount-bug', 'mount-todo'].includes(text)) {
-        const version = (await readMemoryView(memoryConfig, projectId)).main.version;
+        const version = mapProjects ? (await (await fetch(cloud.url + '/api/workbench/overview/api/state', { headers })).json()).version :
+          (await readMemoryView(memoryConfig, projectId)).main.version;
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'tool-mount-bug', name: 'mount_conversation', input: {
-          mainVersion: version, nodeId: 'T0', kind: text === 'mount-bug' ? 'bug' : 'todo', title: 'Mounted refresh failure', description: 'Expired tokens produce a reproducible renewal failure',
+          mainVersion: version, nodeId: bindingNodeId, kind: text === 'mount-bug' ? 'bug' : 'todo', title: 'Mounted refresh failure', description: 'Expired tokens produce a reproducible renewal failure',
         } }] };
       }
       if (message?.role === 'user' && text === 'prepare-explicit-routing' && prepareInput) {
@@ -172,12 +173,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
           text:'Fix existing B1 only',acceptance:'Keep the requested item identity',nodeIds:['T0'],mainVersion:version,...prepareInput,
         }}] };
       }
-      if (message?.role === 'user' && /^prepare-(new|bug|stale)$/.test(text)) {
+      if (message?.role === 'user' && /^prepare-(new|new-bug|bug|stale)$/.test(text)) {
         const version = (await readMemoryView(memoryConfig, projectId)).main.version;
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: `tool-${text}`, name: 'prepare_task', input: {
           taskId: text === 'prepare-bug' ? 'B1' : 'new-item', text: text === 'prepare-bug' ? 'Fix token refresh' : 'Add token refresh guidance',
           acceptance: 'Verified expired token handling', nodeIds: ['T0'], mainVersion: version,
           ...(text === 'prepare-bug' ? { nodeId: 'T0', kind: 'bug', itemId: 'B1' } : {}),
+          ...(text === 'prepare-new-bug' ? { kind: 'bug' } : {}),
         } }] };
       }
       return { stop: 'end_turn', content: [{ type: 'text', text: `Fixture response${text ? ': ' + text : ''}` }] };
@@ -200,11 +202,12 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
       body: JSON.stringify({ id, type, teamId, userId: user, projectId: project, ...(conversationId ? { conversationId } : {}), payload }) });
     return { status: response.status, body: await response.json() };
   };
-  const browser = async (conversationId, { suffix = '', body, authorization = browserCredential, project = projectId } = {}) => {
+  const browser = async (conversationId, { suffix = '', body, authorization = browserCredential, project = projectId, human = false } = {}) => {
     let response;
     try {
       response = await fetch(`${cloud.url}/api/workbench/projects/${project}/api/coordinator${suffix}?conversation=${encodeURIComponent(conversationId || 'main')}`, {
-        method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}` }, ...(body ? { body: JSON.stringify(body) } : {}) });
+        method: body ? 'POST' : 'GET', headers: { ...headers, Authorization: `Bearer ${authorization}`,
+          ...(human ? { Cookie: `cg_workbench=${encodeURIComponent(authorization)}`, Origin: cloud.url } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
     } catch (error) {
       // Diagnose the actual OS-assigned loopback port without logging credentials
       // or changing fetch restrictions, allocated ports or the assertion path.
@@ -315,7 +318,7 @@ test('隔离端到端：Slack 自然切换经真实 HTTP 和原生工具交接�
 });
 
 test('Map 新建项目自动可选：沿原分支对话和写入，改名、同名、删除及重启保持身份与隔离', async t => {
-  const f = await fixture(t, { mapProjects: true });
+  const f = await fixture(t, { mapProjects: true, bindingNodeId: 'N-new' });
   const overview = async () => {
     const response = await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers });
     assert.equal(response.status, 200); return response.json();
@@ -379,6 +382,7 @@ test('Map 新建项目自动可选：沿原分支对话和写入，改名、同�
   assert.equal((await list()).find(project => project.id === selected.id).name, '新的博客名称');
   await f.restart();
   assert.equal((await f.gateway('conversation.state', {}, { project: selected.id, conversationId })).status, 200);
+  await confirmBinding(f, conversationId, 'todo', { project: selected.id });
   const reply = await f.gateway('conversation.submit', { text: '准备测试任务' }, { id: 'map-brief-turn', project: selected.id, conversationId });
   assert.equal(reply.status, 200, JSON.stringify(reply.body));
   const prepared = await wait(state => state.approvals?.some(proposal => proposal.manual && !proposal.review));
@@ -655,7 +659,35 @@ test('Browser retries of a failed Slack turn retain verified Slack actor/source 
   assert.equal(users.length, 1); assert.equal(users[0].source, 'slack'); assert.equal(users[0].actor.userId, userId);
 });
 
+async function confirmBinding(f, conversation, kind = 'todo', { project = projectId } = {}) {
+  const request = 'bind-' + conversation + '-' + kind;
+  assert.equal((await f.gateway('conversation.submit', { text: 'mount-' + kind }, { id: request, project, conversationId: conversation })).status, 200);
+  const deadline = Date.now() + 4000; let pending;
+  while (Date.now() < deadline) {
+    const state = (await f.gateway('conversation.state', {}, { id: 'poll-' + request + '-' + Date.now(), project, conversationId: conversation })).body.data;
+    if (state.status === 'waiting-for-user' && !state.activeTurnId && state.approvals.some(item => item.kind === 'binding-proposal' && item.pending)) { pending = state; break; }
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  assert.ok(pending, '真实 HTTP 必须返回待确认绑定，不能直接写焦点');
+  const proposal = pending.approvals.find(item => item.kind === 'binding-proposal' && item.pending);
+  const result = await f.gateway('binding.review', { proposalId: proposal.id, version: proposal.version, decision: 'approved' }, {
+    id: 'confirm-' + request, project, conversationId: conversation });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  const finalDeadline = Date.now() + 4000;
+  while (Date.now() < finalDeadline) {
+    const state = (await f.gateway('conversation.state', {}, { id: 'settle-' + request + '-' + Date.now(), project, conversationId: conversation })).body.data;
+    if (state.status === 'waiting-for-user' && !state.activeTurnId) return state;
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  assert.fail('确认通知未收口');
+}
 async function prepared(f, conversation, name, id) {
+  if (['prepare-new', 'prepare-stale', 'prepare-new-bug'].includes(name)) {
+    const kind = name === 'prepare-new-bug' ? 'bug' : 'todo', state = (await f.browser(conversation)).body;
+    if (state.focus?.kind !== kind || !state.approvals.some(item => item.kind === 'binding-proposal' && item.decision === 'approved')) {
+      await confirmBinding(f, conversation, kind);
+    }
+  }
   const result = await f.gateway('conversation.submit', { text: name }, { id, conversationId: conversation });
   assert.equal(result.status, 200, JSON.stringify(result.body));
   const state = await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId &&
@@ -672,6 +704,68 @@ async function assertNoDispatch(f, existingBindings = {}) {
     assert.deepEqual(state.bindings || {}, existingBindings[repositoryId] || {}, 'Existing bindings stay exact; mounting cannot create or modify a Session');
   }
 }
+
+test('绑定确认通知不是新的需求指令，模型不能据此自行生成待审批 brief', async t => {
+  const f = await fixture(t);
+  f.options.coordinatorModelFactory = () => ({ next: async request => {
+    const content = request.messages.at(-1)?.content;
+    if (typeof content === 'string' && content.includes('mount-todo')) return { stop: 'tool_use', content: [{ type: 'tool_use',
+      id: 'propose-focus', name: 'mount_conversation', input: { mainVersion: 'main-initial', nodeId: 'T0', kind: 'todo', title: '需求讨论', description: '先确认归属' } }] };
+    if (typeof content === 'string' && content.includes('human.binding-review')) return { stop: 'tool_use', content: [{ type: 'tool_use',
+      id: 'unsolicited-brief', name: 'prepare_task', input: { taskId: 'notification-brief', text: '未经用户要求整理需求', acceptance: '不得创建', nodeIds: ['T0'], mainVersion: 'main-initial' } }] };
+    return { stop: 'end_turn', content: [{ type: 'text', text: '归属已确认，等待继续讨论。' }] };
+  } });
+  await f.restart(); const conversation = await f.newConversation('notification-is-not-brief-request');
+  const before = await f.main(); await confirmBinding(f, conversation);
+  const state = (await f.browser(conversation)).body;
+  assert.equal(state.focus.nodeId, 'T0'); assert.equal(state.approvals.some(p => p.manual), false);
+  const registry = new CoordinatorConversations(path.join(f.directory, 'coordinators', projectId));
+  const native = await readJSON(registry.conversationFile(conversation));
+  assert.ok(Object.values(native.toolReceipts).some(receipt => receipt.isError && receipt.result.error.code === 'APPROVAL_REQUIRED'));
+  assert.deepEqual(await f.main(), before);
+});
+
+test('真实 HTTP 拒绝未经确认创建节点、未绑定或跨主节点 brief，并拒绝改绑后的旧审批', async t => {
+  const f = await fixture(t, { childNodes: [{ id: 'OTHER', title: '另一模块', kind: 'module', children: [], todos: [], bugs: [] }] });
+  f.options.coordinatorModelFactory = () => ({ next: async request => {
+    const last = request.messages.at(-1)?.content;
+    const text = typeof last === 'string' ? last.split('[以下为原始输入]\n').at(-1) : '';
+    const version = (await f.main()).main.version;
+    const call = (name, input) => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'native-' + text, name, input }] });
+    if (text === '未经确认新建') return call('edit_map', { mainVersion: version, actions: [{ op: 'create', parentId: 'T0', title: '不能偷偷创建' }] });
+    if (text.startsWith('整理')) return call('prepare_task', { taskId: 'new-request', text: '新需求说明', acceptance: '保持确认的主节点',
+      nodeIds: text === '整理其他' ? ['OTHER'] : text === '整理多个' ? ['T0', 'OTHER'] : ['T0'], mainVersion: version });
+    if (['mount-todo', '改绑其他'].includes(text)) return call('mount_conversation', { mainVersion: version,
+      nodeId: text === '改绑其他' ? 'OTHER' : 'T0', kind: 'todo', title: '需求讨论', description: '人工确认归属' });
+    return { stop: 'end_turn', content: [{ type: 'text', text: '继续讨论，以真实回执为准。' }] };
+  } });
+  await f.restart(); const conversation = await f.newConversation('routing-guards');
+  const send = async (id, text) => {
+    const result = await f.gateway('conversation.submit', { text }, { id, conversationId: conversation });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    return f.wait(conversation, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  };
+  const before = await f.main();
+  await send('blocked-node', '未经确认新建'); await send('unbound-brief', '整理需求');
+  assert.deepEqual(await f.main(), before);
+  const registry = new CoordinatorConversations(path.join(f.directory, 'coordinators', projectId));
+  const errors = async () => Object.values((await readJSON(registry.conversationFile(conversation))).toolReceipts).filter(receipt => receipt.isError).map(receipt => receipt.result.error.code);
+  assert.deepEqual(await errors(), ['APPROVAL_REQUIRED', 'APPROVAL_REQUIRED']);
+  await confirmBinding(f, conversation, 'todo');
+  await send('wrong-primary', '整理其他'); await send('multiple-primary', '整理多个');
+  assert.equal((await f.browser(conversation)).body.approvals.some(proposal => proposal.manual), false);
+  assert.equal((await errors()).length, 4); assert.deepEqual(await f.main(), before);
+  const prepared = await send('valid-brief', '整理需求');
+  const brief = prepared.approvals.find(proposal => proposal.manual && proposal.pending); assert.ok(brief);
+  const changed = await send('change-primary', '改绑其他');
+  const proposal = changed.approvals.find(proposal => proposal.kind === 'binding-proposal' && proposal.pending);
+  assert.equal((await f.gateway('binding.review', { proposalId: proposal.id, version: proposal.version, decision: 'approved' }, {
+    id: 'human-rebind', conversationId: conversation })).status, 200);
+  const stale = await f.gateway('brief.review', { proposalId: brief.id, version: brief.version, decision: 'approved' }, {
+    id: 'stale-brief-review', conversationId: conversation });
+  assert.equal(stale.status, 409); assert.equal(stale.body.error.code, 'VERSION_CONFLICT');
+  assert.deepEqual(await f.main(), before); await assertNoDispatch(f);
+});
 
 test('Slack brief approval and browser approval use shared Main CAS, receipts and manual work-item identities', async t => {
   const f = await fixture(t), conversation = await f.newConversation('create-approval');
@@ -779,11 +873,16 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
   const before = await f.main();
   const bindingsBefore = {};
   if (scope === 'session') bindingsBefore['123'] = (await readJSON(path.join(f.directory, 'interface-v2', hash('123'), 'protocol-v2.json'), {})).bindings;
-  const mounted = await f.browser(id, { body: { id: 'mount-focus', text: 'mount-focus-node' } });
+  const mounted = await f.browser(id, { human: true, body: { id: 'mount-focus', text: 'mount-focus-node' } });
   assert.equal(mounted.status, 202, JSON.stringify(mounted.body));
-  const final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
-  const action = final.messages.flatMap(message => message.actions || []).find(value => value.kind === 'conversation-mounted');
+  let final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  const action = final.messages.flatMap(message => message.actions || []).find(value => value.kind === 'binding-proposal');
   assert.equal(action?.node.id, 'N1');
+  assert.equal(final.conversations.find(value => value.id === id).nodeId, undefined);
+  const reviewed = await f.browser(id, { human: true, suffix: '/binding-review', body: {
+    id: 'confirm-focus', proposalId: action.id, version: action.version, decision: 'approved' } });
+  assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
+  final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
   assert.equal(final.conversations.find(value => value.id === id).nodeId, 'N1');
   assert.deepEqual(await f.main(), before, 'Mounting cannot change the Main memory, version or Session store');
   await assertNoDispatch(f, bindingsBefore);
@@ -793,7 +892,8 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
     assert.equal(state.body.conversations.find(value => value.id === id).nodeId, 'N1');
     assert.equal((await f.browser(id, { body: { id: `focused-followup-${restart}`, text: 'followup' } })).status, 202);
     await f.wait(id, value => value.status === 'waiting-for-user' && !value.activeTurnId);
-    assert.ok(f.modelCalls.at(-1).messages.at(-1).content.includes('MOUNT-FOCUS-UNIQUE-MEMORY'), 'Next turn uses the saved node in trailing snapshot, not merely a display label');
+    assert.ok(f.modelCalls.at(-1).system.includes('MOUNT-FOCUS-UNIQUE-MEMORY'), '后续轮次从固定上下文复用已确认节点正文');
+    assert.equal(JSON.stringify(f.modelCalls.at(-1)).split('MOUNT-FOCUS-UNIQUE-MEMORY').length - 1, 1);
   }
 });
 
@@ -807,7 +907,7 @@ test('Automatic mount rejects an out-of-scope node without saving focus or chang
   assert.deepEqual(await f.main(), before); await assertNoDispatch(f);
 });
 
-test('Manual mount does not write Main and keeps node focus without an execution Session', async t => {
+test('Manual 新 Bug 先确认主节点，再审批 brief；不写 TODO 或创建执行 Session', async t => {
   const f = await fixture(t), conversation = await f.newConversation('create-mounted-bug');
   const before = await f.main();
   const mounted = await f.gateway('conversation.submit', { text: 'mount-bug' }, { id: 'mount-bug-message', conversationId: conversation });
@@ -819,21 +919,26 @@ test('Manual mount does not write Main and keeps node focus without an execution
   assert.equal(main.main.memory.map.root.bugs.length, 1);
   assert.equal(main.main.memory.map.root.bugs[0].id, 'B1');
   assert.equal(main.main.memory.map.root.todos.length, 1);
-  const focus = settled.conversations.find(item => item.id === conversation);
+  assert.equal(settled.focus.nodeId, null, '建议阶段未绑定');
+  const natural = await f.gateway('conversation.submit', { text: '同意绑定' }, { id: 'confirm-bug-natural', conversationId: conversation });
+  assert.equal(natural.status, 200, JSON.stringify(natural.body));
+  const confirmed = await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId && value.focus.nodeId === 'T0');
+  const focus = confirmed.conversations.find(item => item.id === conversation);
   assert.equal(focus.nodeId, 'T0'); assert.equal(focus.kind, 'bug'); assert.equal(focus.itemId, undefined);
   await assertNoDispatch(f);
   await f.restart();
   const restored = (await f.browser(conversation)).body.conversations.find(item => item.id === conversation);
   assert.equal(restored.itemId, undefined); assert.equal(restored.kind, 'bug'); assert.equal(restored.nodeId, 'T0'); assert.equal(restored.executionMode, 'manual');
-  const proposal = await prepared(f, conversation, 'prepare-new', 'prepare-mounted-bug-message');
-  assert.equal(proposal.kind, 'todo'); assert.equal(proposal.nodeId, 'T0'); assert.notEqual(proposal.itemId, 'B1');
+  const proposal = await prepared(f, conversation, 'prepare-new-bug', 'prepare-mounted-bug-message');
+  assert.equal(proposal.kind, 'bug'); assert.equal(proposal.nodeId, 'T0'); assert.notEqual(proposal.itemId, 'B1');
   const approved = await f.gateway('brief.review', { proposalId: proposal.id, version: proposal.version,
     decision: 'approved', reason: 'Approve the brief after mount' }, { id: 'approve-mounted-bug', conversationId: conversation });
   assert.equal(approved.status, 200, JSON.stringify(approved.body));
-  assert.equal(approved.body.data.itemId, proposal.itemId); assert.equal(approved.body.data.kind, 'todo');
+  assert.equal(approved.body.data.itemId, proposal.itemId); assert.equal(approved.body.data.kind, 'bug');
   const after = (await f.main()).main.memory.map.root;
-  assert.equal(after.bugs.length, 1); assert.equal(after.bugs[0].id, 'B1'); assert.equal(after.bugs[0].createdAt, 'original-bug');
-  assert.equal(after.todos.find(item => item.id === proposal.itemId).executionMode, 'manual');
+  assert.equal(after.bugs.length, 2); assert.equal(after.bugs[0].id, 'B1'); assert.equal(after.bugs[0].createdAt, 'original-bug');
+  assert.equal(after.todos.length, 1);
+  assert.equal(after.bugs.find(item => item.id === proposal.itemId).executionMode, 'manual');
   await assertNoDispatch(f);
 });
 
@@ -879,7 +984,8 @@ test('Long exported execution prompt does not exceed workflow input limits or le
   const state = await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId &&
     value.approvals.find(item => item.id === proposal.id)?.review?.notified === true);
   const approval = state.approvals.find(item => item.id === proposal.id);
-  assert.equal(approval.review.result.prompt, undefined); assert.doesNotMatch(JSON.stringify(approval), new RegExp(sentinel));
+  assert.equal(approval.review.result.prompt, undefined);
+  assert.ok(approval.pathText.length < 500, '主节点描述摘要不能复制长正文');
   const workflow = state.messages.filter(message => message.role === 'user' && message.source === 'workflow' && message.text.includes(proposal.id));
   assert.equal(workflow.length, 1); assert.ok(workflow[0].text.length < 8000); assert.doesNotMatch(workflow[0].text, new RegExp(sentinel));
   const exported = await f.gateway('prompt.read', { proposalId: proposal.id }, { conversationId: conversation });
