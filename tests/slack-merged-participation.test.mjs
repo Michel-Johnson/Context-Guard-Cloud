@@ -300,6 +300,8 @@ test('Cloud restart applies a durable stop on a non-retryable failed Slack turn 
   const f = await fixture(t, async ({ onText }) => { await onText('missing-header'); return result('missing-header'); });
   const main = await f.main();
   await f.send('请确认。'); const failed = await f.wait(state => state.status === 'error');
+  const callsBeforeStop = f.modelCalls.length;
+  assert.equal(callsBeforeStop, 3, '格式错误按新恢复规则耗尽两次追加尝试');
   const binding = Object.values(f.store.data.threads)[0];
   const directory = path.join(f.directory, 'coordinators', projectId, 'chats', binding.conversationId);
   const file = path.join(directory, 'conversation.json'), journalFile = path.join(directory, 'input-journal.json');
@@ -321,7 +323,7 @@ test('Cloud restart applies a durable stop on a non-retryable failed Slack turn 
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   assert.equal(restored.status, 'interrupted'); assert.equal(restored.controlRevision, 1);
-  assert.equal(restored.activeTurnId, failed.activeTurnId); assert.equal(f.modelCalls.length, 1);
+  assert.equal(restored.activeTurnId, failed.activeTurnId); assert.equal(f.modelCalls.length, callsBeforeStop, '应用原停止不能新增模型调用');
   const saved = JSON.parse(await fs.readFile(file, 'utf8'));
   assert.deepEqual(saved.messages, original.messages); assert.deepEqual(saved.requests, original.requests);
   assert.deepEqual(saved.toolReceipts, original.toolReceipts); assert.deepEqual(saved.error, original.error);

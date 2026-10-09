@@ -73,7 +73,7 @@ export const coordinatorTools = [
     }, required: ['op'], additionalProperties: false } },
   }),
   definition('mount_conversation', '提出唯一主节点的绑定或改绑建议，返回完整路径供人类确认。此工具不会直接绑定；用户同意后由宿主保存。相关模块仅按需读取，绑定不代表批准开发。', {
-    mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'] }, title: string,
+    mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'], description: '遵循用户明确的事项类型：待办/TODO用todo，Bug用bug；仅明确记录想法时用idea。建议挂载不创建事项，不能因用户说“先不要创建”而改成idea。' }, title: string,
     description: { ...string, description: '用一句话说明为什么这个节点是需求的主要归属，供人类确认。' },
   }),
   definition('ask_user', '每轮只问一个核心澄清问题，不重复已知信息。方向明确先用mount_conversation建议主节点，不能连续追问而跳过挂载；选择题必须填短options，允许自由补充。答问不代表绑定或批准开发。', { question: string, options: { type: 'array', items: { ...string, maxLength: 120 }, minItems: 2, maxItems: 6, uniqueItems: true }, nodeIds }, ['question']),
