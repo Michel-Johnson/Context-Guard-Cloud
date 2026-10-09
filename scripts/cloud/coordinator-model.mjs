@@ -34,7 +34,7 @@ function safeModelDiagnostic(value) {
       ...safeTermination(ownValue(value, 'termination')) };
   } catch { return null; }
 }
-export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
+export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'APPROVAL_REQUIRED', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
 export function coordinatorInputTokens(usage) {
   const input = usage?.input_tokens;
   if (Number.isSafeInteger(input) && input >= 0) {
@@ -563,6 +563,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           // Model settings use the integration's identifier alphabet, while
           // the original native tool receipt keeps its unchanged identity.
           const result = await execute(call.name, call.input, { operationId: call.name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
+            ...(call.name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
+              ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(['select_text_model', ...projectTools].includes(call.name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
               ...(projectTools.includes(call.name) ? { requestId: state.activeInput.id } : {}) } : {}) });
           receipt = { fingerprint, result: call.name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
@@ -585,7 +587,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       kind: 'node-read', actionId: receipt.result.actionId, node: { id: receipt.result.node.id, title: receipt.result.node.title || '' },
     });
     else if (!receipt.isError && call.name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
-    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
+    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'binding-proposal', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
     if (!receipt.isError && ['conversation-mounted', 'project-switch'].includes(receipt.result?.kind)) transferred = true;
     responses.push(toolReply(call, receipt));
   }
@@ -613,7 +615,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
     transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
-      (block.name === 'ask_user' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
+      (block.name === 'ask_user' || block.name === 'mount_conversation' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }
