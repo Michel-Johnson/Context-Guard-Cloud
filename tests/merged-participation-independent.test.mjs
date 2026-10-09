@@ -97,7 +97,8 @@ test('回复重试生成新的工具ID也复用同轮相同写入回执', async 
   const f = await fixture(t, async () => {
     calls++;
     if (calls === 1 || calls === 3) return { stop: 'tool_use', content: [
-      { type: 'tool_use', id: 'write-' + calls, name: calls === 1 ? 'reply_write' : 'write', input: { id: 'one-value' } },
+      { type: 'tool_use', id: 'write-' + calls, name: calls === 1 ? 'reply_write' : 'write', input: calls === 1
+        ? { id: 'one-value', details: { first: 1, second: 2 } } : { details: { second: 2, first: 1 }, id: 'one-value' } },
     ] };
     return answer(calls === 2 ? '长'.repeat(61) : '已保存。');
   }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
@@ -110,10 +111,10 @@ test('回复重试生成新的工具ID也复用同轮相同写入回执', async 
 test('选项标签的内部编号在展示和工具执行前被拒绝', async t => {
   let calls = 0, saved = 0;
   const f = await fixture(t, async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'choice-' + ++calls,
-    name: 'reply_ask_user', input: { question: '挂载到哪里？', options: [calls === 1 ? 'NCM1234567890' : '阅读助手', '暂不绑定'] } }] }),
+    name: 'reply_ask_user', input: { question: '挂载到哪里？', options: [calls === 1 ? '```text\nNCM1234567890\n```' : '阅读助手', '暂不绑定'] } }] }),
   { tools: [{ name: 'ask_user' }], context: async () => ({ internalIds: ['NCM1234567890'] }), validateReplies: true,
     maxModelRetries: 2, retryDelayMs: 0, execute: async () => { saved++; return {}; } });
-  await submit(f.service, '继续'); await f.service.close();
+  await submit(f.service, '请给执行提示，先用按钮确定范围'); await f.service.close();
   assert.equal(calls, 2); assert.equal(saved, 1);
   assert.ok(!(JSON.stringify((await f.service.state()).messages).includes('NCM1234567890')));
 });

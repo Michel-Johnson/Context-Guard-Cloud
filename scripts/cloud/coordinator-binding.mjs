@@ -15,7 +15,8 @@ export const bindingReplyDecision = (text, { slackAttribution = false, allowBare
     /^(暂不绑定|不绑定|拒绝绑定)[。！!]?$/u.test(body) ? 'rejected' : null;
 };
 const visible = proposal => ({ id: proposal.id, kind: 'binding-proposal', version: proposal.version,
-  conversationId: proposal.conversationId, node: proposal.node, path: proposal.path, pathText: proposal.pathText,
+  conversationId: proposal.conversationId, node: { ...proposal.node, label: coordinatorNodeLabel(proposal.node) },
+  path: proposal.path.map(node => ({ ...node, label: coordinatorNodeLabel(node) })), pathText: coordinatorPathText(proposal.path),
   ...(typeof proposal.input.description === 'string' && proposal.input.description.trim() ? { reason: proposal.input.description.trim() } : {}),
   itemKind: proposal.input.kind, title: proposal.input.title, requiresHumanApproval: true,
   pending: !proposal.review, ...(proposal.review ? { decision: proposal.review.decision } : {}) });

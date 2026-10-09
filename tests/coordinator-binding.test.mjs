@@ -45,6 +45,17 @@ test('TODO 和 Bug 建议不改变归属，人类确认后只绑定一个主节�
   assert.equal(JSON.stringify(f.snapshot), original, '绑定不写 Main 或创建执行 Session');
 });
 
+test('旧绑定卡片只更新展示路径，不改已保存版本或审批内容', async t => {
+  const f = await fixture(t), proposal = await f.propose('legacy-view');
+  const stored = await f.bindings.state();
+  stored.proposals[proposal.id].pathText = '项目\n└─ 工程\n  └─ 测试';
+  await fs.writeFile(f.bindings.file, JSON.stringify(stored));
+  const before = await fs.readFile(f.bindings.file, 'utf8');
+  const displayed = (await f.bindings.approvals(f.conversationId))[0];
+  assert.equal(displayed.pathText, '项目 → 工程 → 测试'); assert.equal(displayed.version, proposal.version);
+  assert.equal(await fs.readFile(f.bindings.file, 'utf8'), before);
+});
+
 test('拒绝、冒用身份、过期版本和被替换的建议均不能绑定', async t => {
   const f = await fixture(t), first = await f.propose('first');
   await assert.rejects(f.bindings.review(f.review(first), { ...f.context, actor: { kind: 'human', sessionId: 'other' } }), { code: 'FORBIDDEN' });

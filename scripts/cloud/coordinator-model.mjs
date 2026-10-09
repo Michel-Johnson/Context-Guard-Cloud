@@ -1,4 +1,5 @@
 import { hash } from '../shared/io.mjs';
+import { canonical } from '../shared/protocol.mjs';
 import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { canUseSlackProjectTool } from './coordinator-tools.mjs';
@@ -559,7 +560,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         const displayed = [text, ...questions.flatMap(call => [call.input?.question || '',
           ...(Array.isArray(call.input?.options) ? call.input.options : [])]),
           ...calls.filter(call => businessToolName(call.name) === 'mount_conversation').flatMap(call => [call.input?.title || '', call.input?.description || ''])];
-        const rejected = displayed.map(value => ({ value, issue: coordinatorReplyIssue(value, options) })).find(item => item.issue);
+        const rejected = displayed.map((value, index) => ({ value, issue: coordinatorReplyIssue(value,
+          index === 0 ? options : { ...options, technical: false, detailed: false }) })).find(item => item.issue);
         if (rejected) throw invalidReply(rejected.issue, rejected.value, repairTools.length ? repairTools : state.modelRepairTools);
         if (state.modelRepairTools?.some(name => !calls.some(call => businessToolName(call.name) === name))) {
           throw invalidReply('RECOVERY_TOOL_OMITTED', text, state.modelRepairTools);
@@ -648,7 +650,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     // 写入的已知成功回执，读取仍取当前状态；不重放未知或失败写入。
     if (!receipt && (state.modelRetries || 0) > 0 && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
       'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu'].includes(name)) {
-      const businessFingerprint = hash(JSON.stringify({ name, input: call.input }));
+      const businessFingerprint = hash(canonical({ name, input: call.input }));
       const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
         item.businessFingerprint === businessFingerprint);
       if (completed) {
@@ -690,7 +692,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       }
       receipt.turnId = turnId;
       receipt.inputRevision = state.consumedInputRevision;
-      receipt.businessFingerprint = hash(JSON.stringify({ name, input: call.input }));
+      receipt.businessFingerprint = hash(canonical({ name, input: call.input }));
       state.toolReceipts[operationId] = receipt;
       await save(state);
     }
