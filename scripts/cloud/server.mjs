@@ -34,6 +34,8 @@ import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
+import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
+import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -446,11 +448,13 @@ export async function startCloudServer({
   if (cursorConfigFile && !path.isAbsolute(cursorConfigFile)) throw new MapError('INVALID_CURSOR_CONFIG', 'Cursor configuration requires an absolute private file');
   const cursorConfiguration = cursorConfigFile ? await readJson(cursorConfigFile) : null;
   const cursorServices = new Map();
+  const cursorRoleServices = new Map();
+  const initializedCursorRoles = new Map();
   const cursorFor = async project => {
     const config = cursorConfiguration?.projects?.[project.id];
     if (!config) throw new MapError('CURSOR_NOT_CONFIGURED', '服务器尚未配置此项目的 Cursor Cloud', 503);
     if (cursorServices.has(project.id)) return cursorServices.get(project.id);
-    if (!path.isAbsolute(config.apiKeyFile || '') || Object.keys(config).some(key => !['apiKeyFile', 'repositoryUrl', 'startingRef', 'model'].includes(key))) throw new MapError('INVALID_CURSOR_CONFIG', '配置私有密钥文件、仓库和固定提交', 503);
+    if (!path.isAbsolute(config.apiKeyFile || '') || Object.keys(config).some(key => !['apiKeyFile', 'repositoryUrl', 'startingRef', 'model', 'roles'].includes(key))) throw new MapError('INVALID_CURSOR_CONFIG', '配置私有密钥文件、仓库和固定提交', 503);
     let apiKey;
     try {
       const secret = (await fs.readFile(config.apiKeyFile, 'utf8')).trim();
@@ -557,6 +561,42 @@ export async function startCloudServer({
     const principal = { repositoryId: repository.repositoryId, deviceId: 'cloud-browser', agentId: 'cloud-human', role: 'human' };
     return { repository, principal, ...interfaceStorage(principal) };
   };
+  const cursorRolesFor = async project => {
+    const config = cursorConfiguration?.projects?.[project?.id], roles = config?.roles;
+    if (!roles) return null;
+    const coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
+    const { repository, store } = interfaceProject(project);
+    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId'].includes(key)) ||
+        !coordinator.sessionTemplates?.includes(roles.templateSessionId) || coordinator.bindings?.[roles.templateSessionId] !== cursorTemplateWorktree(roles.templateSessionId) ||
+        config.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase() || !allowedOrigin) protocolFail('FORBIDDEN', 'Configure the hosted Cursor template explicitly for this repository Coordinator');
+    if (!cursorRoleServices.has(project.id)) {
+      const creating = (async () => {
+        // The same private provider, not a human chat Session or device identity.
+        const transport = await cursorFor(project);
+        const service = new CursorRoleFactory({ directory: path.join(dataDir, 'cursor-roles', digest(project.id)), projectId: project.id,
+          repositoryId: repository.repositoryId, templateSessionId: roles.templateSessionId, repositoryUrl: config.repositoryUrl,
+          startingRef: config.startingRef, model: config.model, store, provider: transport.provider,
+          endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
+          allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
+          authorizeSource: async ({ state, task }) => {
+            const template = state.bindings[digest(JSON.stringify([repository.repositoryId, roles.templateSessionId]))];
+            if (!template || template.deviceId !== 'cloud-cursor:' + project.id || template.worktreeId !== coordinator.bindings[roles.templateSessionId]) return false;
+            const memory = await readMemoryProject(configuredMemory, project.id), document = memory.main?.memory?.map;
+            if (!document?.root || memory.main.version !== task.assignment?.mainVersion) return false;
+            const readable = filterNodeAccess(document, [...entries(document.root).keys()], task.session.id, 'read');
+            return task.assignment.nodeIds.every(id => readable.includes(id));
+          } });
+        await service.initialize();
+        service.mcp = createCursorRoleMcpHandler({ channel: service.channel, projectId: project.id, endpoint: service.endpoint,
+          allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:') });
+        initializedCursorRoles.set(project.id, service);
+        return service;
+      })();
+      cursorRoleServices.set(project.id, creating);
+      creating.catch(() => { if (cursorRoleServices.get(project.id) === creating) cursorRoleServices.delete(project.id); });
+    }
+    return cursorRoleServices.get(project.id);
+  };
   const verifyInterfaceRouting = async (identity, message) => {
     const repository = interfaceConfig?.repositories?.find(item => item.repositoryId === identity.repositoryId);
     if (!repository?.projectId || !configuredMemory?.projects?.[repository.projectId]) return false;
@@ -568,11 +608,20 @@ export async function startCloudServer({
     return message.payload.nodeIds.every(id => readable.includes(id));
   };
   const interfaceWorkflow = {
-    verifyCiReceiver: (state, principal, session) => {
+    verifyCiReceiver: async (state, principal, session) => {
       // An authenticated CI identity is itself the receiver; session authority
       // has already been checked by ProtocolStore before reaching the reducer.
       if (principal.role === 'ci') return true;
       const repository = interfaceConfig?.repositories?.find(item => item.repositoryId === principal.repositoryId);
+      const project = projectById(repository?.projectId);
+      if (project && cursorConfiguration?.projects?.[project.id]?.roles && Object.hasOwn(configuredMemory?.projects?.[project.id]?.coordinator?.bindings || {}, cursorConfiguration.projects[project.id].roles.templateSessionId)) {
+        // Initialize outside task transactions. Never acquire a factory/lease
+        // lock here; callbacks already hold ProtocolStore's transaction lock.
+        // Initialization itself needs ProtocolStore. Awaiting its promise here
+        // would deadlock when this verifier already holds the store lock.
+        const roles = initializedCursorRoles.get(project.id);
+        if (roles && await roles.owns(session.id)) return roles.hasCiReceiver(state, session);
+      }
       return hasCiReceiver(state, principal, session, configuredMemory?.projects?.[repository?.projectId]?.coordinator);
     },
     verifyRouting: verifyInterfaceRouting,
@@ -1048,6 +1097,9 @@ export async function startCloudServer({
           exchange: async (sessionId, id, type, payload, { caller } = {}) => {
             const message = validateMessage({ v: 2, id, type, session: await sessionFor(sessionId), payload });
             const identity = await executionPrincipal(caller, sessionId);
+            const binding = await store.registeredBinding(identity, sessionId);
+            const hosted = binding?.deviceId === 'cloud-cursor:' + project.id ? await cursorRolesFor(project) : null;
+            if (type === 'ci.request' && hosted && await hosted.owns(sessionId)) await hosted.reserveCi(message.session, payload.taskId);
             if (type === 'brief.submit') {
               const existing = (await store.workflowTasks(identity, message.session)).find(task => task.id === payload.taskId);
               // Do not let a second conversation redefine an existing brief.
@@ -1055,7 +1107,9 @@ export async function startCloudServer({
               if (existing && coordinatorTaskOwnerRequired(type)) await assertTaskOwner(sessionId, payload.taskId);
               await conversations.bind(conversationId, sessionId, payload.taskId);
             }
-            return (await store.handle(identity, message, { workflow: interfaceWorkflow })).data;
+            const reply = (await store.handle(identity, message, { workflow: interfaceWorkflow })).data;
+            if (hosted && await hosted.owns(sessionId)) kickTaskScheduler(project);
+            return reply;
           },
         });
         const itemScoped = conversationId.startsWith('item-');
@@ -1319,28 +1373,35 @@ export async function startCloudServer({
       const config = configuredMemory?.projects?.[project.id]?.coordinator;
       if (!config?.enabled) return;
       const { store, principal: human } = interfaceProject(project);
+      const hostedTemplateId = cursorConfiguration?.projects?.[project.id]?.roles?.templateSessionId;
       const principal = { ...human, role: 'coordinator', deviceId: 'cloud-scheduler', agentId: `scheduler:${project.id}`,
         bindings: { ...config.bindings }, creationTemplates: config.sessionTemplates || [] };
       const limit = Number.isSafeInteger(config.maxConcurrentTasks) && config.maxConcurrentTasks > 0 ? config.maxConcurrentTasks : 2;
       for (let task of await store.projectTasks(principal)) {
         if (stopping) break;
         try {
+        let hosted;
         if (task.stage === 'dispatched') {
           const binding = await store.registeredBinding(human, task.sessionId);
+          if (binding?.deviceId === 'cloud-cursor:' + project.id) hosted = await cursorRolesFor(project);
           const current = binding && await store.taskRecord(human, { id: task.sessionId, generation: binding.generation }, task.taskId);
+          if (hosted && current && await hosted.owns(task.sessionId)) await hosted.pump(current.session, current.id);
           if (current && !current.busy && ['accepted', 'closed', 'finished', 'cancelled'].includes(current.stage)) await store.updateProjectTask(principal, task.taskId, { stage: 'completed' });
           continue;
         }
         if (task.stage === 'queued') {
             const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id]);
             const templateSessionId = templates.find(id => {
+              if (hostedTemplateId === id) return true;
               const presence = interfacePresence.get(presenceKey(principal.repositoryId, id));
               return presence && cloudSessionPresence(presence.lastHeartbeatAt) !== 'offline';
             });
             if (!templateSessionId) { await store.updateProjectTask(principal, task.taskId, { error: 'WAITING_DEVICE' }); continue; }
+            if (templateSessionId === hostedTemplateId) hosted = await cursorRolesFor(project);
             task = await store.updateProjectTask(principal, task.taskId, { stage: 'creating', templateSessionId, error: null }, { reserveLimit: limit });
             if (task.stage === 'queued') continue;
         }
+        if (!hosted && hostedTemplateId && task.templateSessionId === hostedTemplateId) hosted = await cursorRolesFor(project);
         if (task.stage === 'creating') {
           if (task.creationId && task.sessionId) task = await store.updateProjectTask(principal, task.taskId, { stage: 'starting' });
           else {
@@ -1355,6 +1416,12 @@ export async function startCloudServer({
         }
         if (task.stage !== 'starting') continue;
         const creation = (await store.sessionCreations(human)).find(item => item.id === task.creationId);
+        if (hosted?.templateSessionId === task.templateSessionId && creation?.state === 'pending') {
+          await hosted.reserveExecutor({ id: creation.id, sessionId: creation.sessionId, taskId: task.taskId });
+          // Registration reserves a logical cloud workspace, not an online VM.
+          // The next pass dispatches through the original approved-task gate.
+          continue;
+        }
         if (creation?.state === 'failed') {
           const retries = task.creationRetries || 0;
           if (retries >= 2) {
@@ -1386,6 +1453,7 @@ export async function startCloudServer({
           text: JSON.stringify({ v: 1, taskId: task.taskId, text: task.text, acceptance: task.acceptance, nodeIds: task.nodeIds, mainVersion: task.mainVersion }),
           nodeIds: task.nodeIds, mainVersion: task.mainVersion }), interfaceWorkflow);
         await store.updateProjectTask(principal, task.taskId, { stage: 'dispatched', dispatch: result, error: null });
+        if (hosted?.templateSessionId === task.templateSessionId) await hosted.pump({ id: task.sessionId, generation: binding.generation }, task.taskId);
         } catch (cause) {
           await store.updateProjectTask(principal, task.taskId, { error: cause.code || 'SCHEDULING_FAILED',
             ...(['FORBIDDEN', 'INVALID_ARGUMENT', 'CONFLICT'].includes(cause.code) ? { stage: 'failed' } : {}) });
@@ -2015,6 +2083,18 @@ export async function startCloudServer({
     try {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const route = url.pathname;
+      const roleMcp = route.match(/^\/api\/workbench\/projects\/([a-z0-9-]{1,64})\/api\/cursor-role-mcp$/);
+      if (roleMcp) {
+        // Scoped native bearer authority only; do not apply browser cookie or
+        // device pairing fallback before the purpose-built MCP authorization.
+        const project = projectById(roleMcp[1]);
+        if (!project) protocolFail('NOT_FOUND', 'Project is unavailable');
+        // Native callbacks cannot initialize templates or acquire the store
+        // initialization lock. The Coordinator scheduler owns that lifecycle.
+        const hosted = initializedCursorRoles.get(project.id);
+        if (!hosted) protocolFail('UNAVAILABLE', 'Cursor roles are not configured');
+        return hosted.mcp(req, res);
+      }
       if (route === '/api/v2/heartbeat') {
         if (!interfaceAuth) protocolFail('INVALID_ARGUMENT', 'Interface v2 is not configured');
         if (req.method !== 'POST') protocolFail('INVALID_ARGUMENT', 'Use POST');

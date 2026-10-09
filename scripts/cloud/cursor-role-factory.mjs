@@ -1,0 +1,340 @@
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
+import { canonical } from '../shared/protocol.mjs';
+import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
+import { CursorRoleChannel } from './cursor-role-channel.mjs';
+import { cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
+
+const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const sha = /^[a-f0-9]{40}$/;
+const fail = (code, message) => { throw Object.assign(new Error(message), { code, status: code === 'INVALID_CURSOR_ROLES' ? 400 : code === 'CURSOR_ROLE_CONFLICT' ? 409 : 503 }); };
+const bindingKey = (repositoryId, id) => hash(canonical([repositoryId, id]));
+const taskKey = (repositoryId, session, id) => scopedObjectKey({ repositoryId }, session, 'task:' + id);
+export const cursorTemplateWorktree = id => `cursor-cloud-template:${id}`;
+
+// A hosted receiver for the existing Coordinator scheduler. Reservations are
+// logical workspace handles, NOT a claim that Cursor has created a VM or Run.
+// Cursor remains the harness; business tasks and approvals stay in ProtocolStore.
+export class CursorRoleFactory {
+  constructor({ directory, projectId, repositoryId, templateSessionId, repositoryUrl, startingRef, model,
+    endpoint, store, provider, authorizeSource, allowLoopback = false }) {
+    validateCursorSource({ repositoryUrl, startingRef, model });
+    let url;
+    try { url = new URL(endpoint); } catch { fail('INVALID_CURSOR_ROLES', 'Configure a fixed role MCP endpoint'); }
+    if (!path.isAbsolute(directory || '') || !projectId || !repositoryId || !uuid.test(templateSessionId || '') || !sha.test(startingRef) ||
+        !store || !provider || typeof authorizeSource !== 'function' || url.username || url.password || url.search || url.hash ||
+        url.protocol !== 'https:' && !(allowLoopback && url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) fail('INVALID_CURSOR_ROLES', 'Configure an explicitly authorized hosted Cursor template');
+    Object.assign(this, { directory, projectId, repositoryId, templateSessionId, repositoryUrl, startingRef, model, endpoint, store, provider, authorizeSource });
+    this.ownerId = 'cloud-cursor:' + projectId;
+    this.channel = new CursorRoleChannel({ directory: path.join(directory, 'capabilities'), store,
+      resolveReceiver: (scope, state) => this.resolveReceiver(scope, state) });
+  }
+
+  principal(id, role = 'executor') { return { repositoryId: this.repositoryId, deviceId: this.ownerId, agentId: id, role }; }
+  observer() { return this.principal('hosted-role-controller', 'human'); } // Read-only internal project observer; never issues human decisions.
+  executorFile(id) {
+    if (!uuid.test(id || '') || id === this.templateSessionId) fail('CURSOR_ROLE_CONFLICT', 'Use a reserved child Session, not the template');
+    return path.join(this.directory, 'executors', id + '.json');
+  }
+  ciFile(session, taskId, sourceSha) { return path.join(this.directory, 'testers', hash(canonical([session, taskId, sourceSha])) + '.json'); }
+  actorFile(scope) { return scope.phase === 'ci' ? this.ciFile(scope.session, scope.taskId, scope.sourceSha) : this.executorFile(scope.session.id); }
+
+  async initialize() {
+    const principal = this.principal(this.templateSessionId), worktreeId = cursorTemplateWorktree(this.templateSessionId);
+    return this.store.handle(principal, { v: 2, id: 'cursor-template:' + this.templateSessionId, type: 'session.bind', payload: {
+      sessionId: this.templateSessionId, agentId: this.templateSessionId, worktreeId, expectedBindingVersion: '',
+    } }, {
+      verifyBinding: (p, payload) => p.repositoryId === this.repositoryId && p.deviceId === this.ownerId &&
+        p.agentId === this.templateSessionId && payload.sessionId === this.templateSessionId && payload.worktreeId === worktreeId,
+      authorize: state => {
+        const existing = state.bindings[bindingKey(this.repositoryId, this.templateSessionId)];
+        if (existing && (existing.deviceId !== this.ownerId || existing.agentId !== this.templateSessionId || existing.worktreeId !== worktreeId)) fail('CURSOR_ROLE_CONFLICT', 'Template is already assigned; preserve its existing binding');
+      },
+    });
+  }
+
+  creation(state, request) {
+    const creation = state.sessionCreations?.[request.id];
+    const result = creation?.result, template = state.bindings[bindingKey(this.repositoryId, this.templateSessionId)];
+    const task = Object.values(state.projectTasks || {}).find(item => item.repositoryId === this.repositoryId && item.taskId === request.taskId);
+    if (!creation || creation.repositoryId !== this.repositoryId || creation.deviceId !== this.ownerId ||
+        !['pending', 'registered'].includes(result?.state) || result.sessionId !== request.sessionId || result.templateSessionId !== this.templateSessionId ||
+        !template || template.deviceId !== this.ownerId || template.agentId !== this.templateSessionId || template.worktreeId !== cursorTemplateWorktree(this.templateSessionId) ||
+        creation.templateWorktreeId !== template.worktreeId || !task || task.review?.decision !== 'approved' || task.reviewIssuer?.role !== 'human' ||
+        task.sessionId !== request.sessionId || task.creationId !== request.id || !['starting', 'dispatched'].includes(task.stage) || task.templateSessionId !== this.templateSessionId) fail('CURSOR_ROLE_CONFLICT', 'The hosted reservation must belong to this exact approved project task and creation');
+    return task;
+  }
+
+  async reserveExecutor(request) {
+    if (!request || Object.keys(request).some(key => !['id', 'sessionId', 'taskId'].includes(key)) || !/^[a-f0-9]{64}$/.test(request.id || '') || !request.taskId) fail('INVALID_CURSOR_ROLES', 'Use the original Coordinator creation');
+    const file = this.executorFile(request.sessionId), fingerprint = hash(canonical({ request, repositoryId: this.repositoryId, template: this.templateSessionId, repositoryUrl: this.repositoryUrl, sourceSha: this.startingRef }));
+    return withFileLock(file + '.lock', async () => {
+      const approval = await this.store.transaction(state => this.creation(state, request), { readOnly: true });
+      let actor = await readJSON(file, null);
+      if (actor && actor.fingerprint !== fingerprint) fail('CURSOR_ROLE_CONFLICT', 'Reserved Session belongs to another Cursor task or source');
+      if (!actor) {
+        const nativeAgentId = 'bc-' + randomUUID();
+        const template = await this.store.registeredBinding(this.observer(), this.templateSessionId);
+        actor = { format: 1, kind: 'executor', fingerprint, request, approval: { brief: approval.brief, review: approval.review },
+          templateGeneration: template.generation,
+          session: { id: request.sessionId, generation: 1 }, nativeAgentId, worktreeId: 'cursor-cloud:' + nativeAgentId,
+          sourceSha: this.startingRef, state: 'reserved', invocations: [] };
+        await atomicWrite(file, encode(actor));
+      }
+      const reply = await this.store.handle(this.principal(actor.session.id), { v: 2, id: 'cursor-reserve:' + request.id, type: 'session.bind', payload: {
+        sessionId: actor.session.id, agentId: actor.session.id, worktreeId: actor.worktreeId, expectedBindingVersion: '',
+      } }, {
+        verifyBinding: (p, payload) => p.deviceId === this.ownerId && p.agentId === actor.session.id &&
+          payload.sessionId === actor.session.id && payload.worktreeId === actor.worktreeId && actor.worktreeId !== cursorTemplateWorktree(this.templateSessionId),
+        authorize: state => {
+          const current = this.creation(state, request);
+          if (canonical({ brief: current.brief, review: current.review }) !== canonical(actor.approval)) fail('CURSOR_ROLE_CONFLICT', 'The original human requirement changed');
+          const previous = state.bindings[bindingKey(this.repositoryId, actor.session.id)];
+          if (previous && (previous.deviceId !== this.ownerId || previous.agentId !== actor.session.id || previous.worktreeId !== actor.worktreeId)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the existing execution binding');
+        },
+      });
+      actor.session = reply.data.session;
+      await atomicWrite(file, encode(actor));
+      return { session: actor.session, worktreeId: actor.worktreeId, nativeState: actor.state };
+    });
+  }
+
+  requireActor(state, actor) {
+    const binding = state.bindings[bindingKey(this.repositoryId, actor.session.id)];
+    if (!binding || binding.deviceId !== this.ownerId || binding.agentId !== actor.session.id || binding.worktreeId !== actor.worktreeId || binding.generation !== actor.session.generation) fail('CURSOR_ROLE_CONFLICT', 'Hosted actor binding changed');
+  }
+  currentTask(state, actor, taskId) {
+    this.requireActor(state, actor);
+    const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
+    const task = state.tasks[taskKey(this.repositoryId, session, taskId)];
+    if (!task || task.briefReview?.decision !== 'approved') fail('CURSOR_ROLE_CONFLICT', 'Use the original approved execution task');
+    const project = Object.values(state.projectTasks || {}).find(item => item.repositoryId === this.repositoryId && item.taskId === taskId && item.sessionId === session.id);
+    if (!project || project.review?.decision !== 'approved' || project.reviewIssuer?.role !== 'human') fail('CURSOR_ROLE_CONFLICT', 'Original project approval is unavailable');
+    const template = state.bindings[bindingKey(this.repositoryId, this.templateSessionId)];
+    if (!template || template.deviceId !== this.ownerId || template.agentId !== this.templateSessionId || template.worktreeId !== cursorTemplateWorktree(this.templateSessionId) || template.generation !== actor.templateGeneration ||
+        canonical({ brief: project.brief, review: project.review }) !== canonical(actor.approval)) fail('CURSOR_ROLE_CONFLICT', 'Hosted template or original approval changed');
+    return task;
+  }
+
+  async reserveCi(session, taskId) {
+    const executor = await readJSON(this.executorFile(session.id), null);
+    if (!executor || canonical(executor.session) !== canonical(session)) fail('CURSOR_ROLE_CONFLICT', 'CI requires its registered hosted Executor');
+    const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+    if (!['awaiting-ci', 'testing'].includes(task.stage) || !sha.test(task.handoff?.sourceSha || '') || task.handoff.sourceSha !== task.sourceSha) fail('CURSOR_ROLE_CONFLICT', 'Reserve CI only after the verified original handoff');
+    const file = this.ciFile(session, taskId, task.sourceSha);
+    return withFileLock(file + '.lock', async () => {
+      let actor = await readJSON(file, null);
+      if (!actor) {
+        const nativeAgentId = 'bc-' + randomUUID();
+        actor = { format: 1, kind: 'ci', session: { id: randomUUID(), generation: 1 }, executorSession: session, taskId,
+          approval: executor.approval, templateGeneration: executor.templateGeneration,
+          nativeAgentId, executorNativeAgentId: executor.nativeAgentId, worktreeId: 'cursor-cloud:' + nativeAgentId,
+          executorWorktreeId: executor.worktreeId, sourceSha: task.sourceSha, handoff: structuredClone(task.handoff), state: 'reserved', invocations: [] };
+        await atomicWrite(file, encode(actor));
+      }
+      const reply = await this.store.handle(this.principal(actor.session.id, 'ci'), { v: 2, id: 'cursor-ci-reserve:' + hash(canonical([session, taskId, actor.sourceSha])), type: 'session.bind', payload: {
+        sessionId: actor.session.id, agentId: actor.session.id, worktreeId: actor.worktreeId, expectedBindingVersion: '',
+      } }, {
+        verifyBinding: (p, payload) => p.deviceId === this.ownerId && payload.agentId === actor.session.id && payload.worktreeId === actor.worktreeId && actor.worktreeId !== executor.worktreeId && actor.nativeAgentId !== executor.nativeAgentId,
+        authorize: state => {
+          const current = this.currentTask(state, executor, taskId);
+          if (!['awaiting-ci', 'testing'].includes(current.stage) || current.sourceSha !== actor.sourceSha || canonical(current.handoff) !== canonical(actor.handoff)) fail('CURSOR_ROLE_CONFLICT', 'CI handoff changed during reservation');
+          const prior = state.bindings[bindingKey(this.repositoryId, actor.session.id)];
+          if (prior && (prior.deviceId !== this.ownerId || prior.agentId !== actor.session.id || prior.worktreeId !== actor.worktreeId)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the existing Tester binding');
+        },
+      });
+      actor.session = reply.data.session; await atomicWrite(file, encode(actor));
+      return { session: actor.session, worktreeId: actor.worktreeId, nativeState: actor.state };
+    });
+  }
+
+  async hasCiReceiver(state, session) {
+    const executor = await readJSON(this.executorFile(session.id), null);
+    if (!executor || canonical(session) !== canonical(executor.session)) return false;
+    const tasks = Object.values(state.tasks || {}).filter(task => task.repositoryId === this.repositoryId && canonical(task.session) === canonical(session) && ['awaiting-ci', 'testing'].includes(task.stage));
+    if (tasks.length !== 1) return false;
+    const task = tasks[0], actor = await readJSON(this.ciFile(session, task.id, task.sourceSha), null);
+    if (!actor || actor.kind !== 'ci' || actor.executorNativeAgentId !== executor.nativeAgentId || actor.nativeAgentId === executor.nativeAgentId || actor.worktreeId === executor.worktreeId || actor.sourceSha !== task.handoff?.sourceSha || canonical(actor.handoff) !== canonical(task.handoff)) return false;
+    try { this.requireActor(state, executor); this.requireActor(state, actor); return true; } catch { return false; }
+  }
+
+  scope(actor, task, phase) {
+    const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
+    return { projectId: this.projectId, repositoryId: this.repositoryId, ownerId: this.ownerId, session, actor: actor.session,
+      worktreeId: actor.kind === 'ci' ? actor.executorWorktreeId : actor.worktreeId, actorWorktreeId: actor.worktreeId,
+      nativeAgentId: actor.nativeAgentId, taskId: task.id, phase,
+      sourceSha: phase === 'plan' ? actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
+  }
+  async authorizeLaunch(state, actor, taskId, phase) {
+    const task = this.currentTask(state, actor, taskId);
+    if (phase === 'plan' && task.stage !== 'assigned' || phase === 'execution' && (task.stage !== 'executing' || task.planReview?.decision !== 'approved' || task.sourceSha !== actor.sourceSha) ||
+        phase === 'ci' && (actor.kind !== 'ci' || task.stage !== 'testing' || task.sourceSha !== actor.sourceSha || canonical(task.handoff) !== canonical(actor.handoff))) fail('CURSOR_ROLE_CONFLICT', 'Cursor launch does not match the current approved stage and revision');
+    if (!await this.authorizeSource({ state, actor: structuredClone(actor), task: structuredClone(task) })) fail('CURSOR_ROLE_CONFLICT', 'Approved source or template access changed');
+    return task;
+  }
+
+  prompt(scope) {
+    const common = `You are the ${scope.phase === 'ci' ? 'independent Tester' : 'Executor'} of the original Context Guard Coordinator task ${scope.taskId}. Never start a separate user chat, approve a requirement or Plan, or write Main. Use context_guard_context, then context_guard_exchange object.read for immutable references. Identity is fixed by MCP, never include Session/principal fields. Use the returned writePrefix and stable message IDs. If ROLE_UNAVAILABLE appears during native startup, retry the SAME MCP operation, do not create a new task. Source revision: ${scope.sourceSha}.`;
+    if (scope.phase === 'plan') return common + ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance, then task.report stage:planReady with planRef/planVersion and the specified sourceSha. Stop after that; Coordinator must review the exact Plan before implementation.';
+    if (scope.phase === 'ci') return common + ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.';
+    return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit to your own branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
+  }
+
+  async launch(file, actor, taskId, phase) {
+    let task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
+    const scope = this.scope(actor, task, phase), operationId = hash(canonical(scope));
+    let invocation = actor.invocations.find(item => item.id === operationId);
+    if (invocation) {
+      // A lost follow-up confirmation has no client Run ID. Do not POST again
+      // or adopt the Agent's unrelated latest Run to make the ledger look ready.
+      if (['dispatching', 'unknown'].includes(invocation.state)) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Preserve the original invocation and inspect its native result');
+      if (invocation.state === 'confirmed') return invocation;
+      if (invocation.state !== 'prepared') fail('CURSOR_ROLE_FAILED', 'The saved invocation failed or was stopped; preserve its receipt rather than silently retrying');
+    }
+    const previous = invocation ? actor.invocations.at(-2) : actor.invocations.at(-1);
+    if (previous) {
+      const run = await this.provider.getRun(actor.nativeAgentId, previous.runId);
+      if (!cursorRunTerminal(run)) fail('CURSOR_ROLE_BUSY', 'Wait for the current native Run');
+      if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'The native Agent was used outside the saved task');
+      await this.channel.revoke(previous.token);
+    }
+    const lease = await this.channel.issue({ operationId, scope });
+    if (!invocation) {
+      invocation = { id: operationId, scope, token: lease.token, state: 'prepared', mode: phase === 'plan' ? 'plan' : 'agent' };
+      actor.invocations.push(invocation); await atomicWrite(file, encode(actor));
+    }
+    // Persist the authorization tuple in the SAME transaction as the task
+    // check, not in a second authoritative task state machine or native status.
+    await this.store.transaction(async state => {
+      task = await this.authorizeLaunch(state, actor, taskId, phase);
+      if (canonical(this.scope(actor, task, phase)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
+      state.cursorRoleLaunches ||= {};
+      state.cursorRoleLaunches[hash(canonical([this.repositoryId, operationId]))] = { scopeHash: operationId, taskVersion: task.version,
+        briefReview: task.briefReview, planReview: task.planReview || null, state: 'authorized' };
+    });
+    // Final current-state check before a network side effect. A concurrent
+    // revocation AFTER this boundary invalidates all callbacks, not time travel.
+    await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
+    invocation.state = 'dispatching'; await atomicWrite(file, encode(actor));
+    const mcpServers = [{ name: 'context_guard', type: 'http', url: this.endpoint, headers: { Authorization: 'Bearer ' + lease.token } }];
+    try {
+      const run = previous ? await this.provider.followUp(actor.nativeAgentId, this.prompt(scope), { mode: invocation.mode, mcpServers })
+        : (await this.provider.create({ agentId: actor.nativeAgentId, repositoryUrl: this.repositoryUrl, startingRef: scope.sourceSha,
+          name: phase === 'ci' ? 'Context Guard independent Tester' : 'Context Guard Executor', text: this.prompt(scope), mode: invocation.mode, mcpServers,
+          ...(this.model ? { model: this.model } : {}) })).run;
+      invocation.runId = run.id; invocation.run = run; invocation.state = 'confirmed'; actor.state = 'confirmed';
+      await atomicWrite(file, encode(actor));
+      await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
+      await this.channel.activate(lease.token);
+      return invocation;
+    } catch (cause) {
+      invocation.state = cause.deliveryUncertain ? 'unknown' : invocation.runId ? 'invalidated' : 'failed';
+      invocation.error = String(cause.code || 'CURSOR_ROLE_FAILED').slice(0, 100); await atomicWrite(file, encode(actor));
+      if (!cause.deliveryUncertain) await this.channel.revoke(lease.token);
+      throw cause;
+    }
+  }
+
+  async pump(session, taskId) {
+    const executorFile = this.executorFile(session.id), executor = await readJSON(executorFile, null);
+    if (!executor || canonical(executor.session) !== canonical(session)) return null;
+    const control = await this.store.transaction(state => {
+      this.requireActor(state, executor);
+      return state.tasks[taskKey(this.repositoryId, session, taskId)];
+    }, { readOnly: true });
+    if (['cancelling', 'interrupted'].includes(control?.stage)) return this.stopTask(executorFile, executor, control);
+    const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+    if (task.stage === 'awaiting-ci') return this.reserveCi(session, taskId);
+    const phase = task.stage === 'assigned' ? 'plan' : task.stage === 'executing' ? 'execution' : task.stage === 'testing' ? 'ci' : null;
+    if (!phase) return null;
+    const file = phase === 'ci' ? this.ciFile(session, taskId, task.sourceSha) : executorFile;
+    return withFileLock(file + '.lock', async () => {
+      const actor = await readJSON(file, null);
+      if (!actor) fail('CURSOR_ROLE_CONFLICT', 'Reserve the independent receiver before CI dispatch');
+      return this.launch(file, actor, taskId, phase);
+    });
+  }
+
+  async stopActor(file, expected, control) {
+    return withFileLock(file + '.lock', async () => {
+      const actor = await readJSON(file, null);
+      if (!actor || canonical(actor.session) !== canonical(expected.session) || actor.nativeAgentId !== expected.nativeAgentId) fail('CURSOR_ROLE_CONFLICT', 'Stop only the original owned actor');
+      const invocation = actor.invocations.at(-1);
+      if (!invocation) return true; // Only a logical reservation, no native POST.
+      if (invocation.scope.taskId !== control.id) fail('CURSOR_ROLE_CONFLICT', 'Stop belongs to another task');
+      if (['dispatching', 'unknown'].includes(invocation.state)) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Unknown native acceptance cannot be guessed or stopped by latest Agent state');
+      if (invocation.state === 'prepared' || invocation.state === 'failed' && !invocation.runId) {
+        await this.channel.revoke(invocation.token);
+        invocation.state = 'invalidated'; await atomicWrite(file, encode(actor)); return true;
+      }
+      if (!invocation.runId) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Native stop requires the saved confirmed Run');
+      await this.channel.revoke(invocation.token);
+      let run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
+      if (!cursorRunTerminal(run)) {
+        if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== invocation.runId) fail('CURSOR_ROLE_CONFLICT', 'Never stop an unrelated native Run');
+        if (!invocation.stop) {
+          // Save intent first. An unknown cancel acknowledgement permits GET
+          // observation only, never repeated POST or adoption of another Run.
+          invocation.stop = { state: 'requested', controlId: control.control?.id || null };
+          await atomicWrite(file, encode(actor));
+          try { await this.provider.cancel(actor.nativeAgentId, invocation.runId); }
+          catch (cause) {
+            invocation.stop.state = cause.deliveryUncertain ? 'unknown' : 'rejected';
+            invocation.stop.error = String(cause.code || 'CURSOR_STOP_FAILED').slice(0, 100);
+            await atomicWrite(file, encode(actor)); throw cause;
+          }
+        }
+        run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
+      }
+      if (!cursorRunTerminal(run)) return false;
+      invocation.stop = { ...invocation.stop, state: 'confirmed', status: run.status, runId: run.id };
+      invocation.state = 'invalidated'; actor.state = 'stopped'; await atomicWrite(file, encode(actor));
+      return true;
+    });
+  }
+
+  async stopTask(file, executor, task) {
+    const stopped = await this.stopActor(file, executor, task);
+    const ciFile = this.ciFile(executor.session, task.id, task.sourceSha);
+    const ci = await readJSON(ciFile, null);
+    const ciStopped = !ci || await this.stopActor(ciFile, ci, task);
+    if (!stopped || !ciStopped) return { state: 'stopping' };
+    if (task.stage === 'interrupted') return { state: 'stopped' }; // No automatic resume or new model Run.
+    return (await this.store.handle(this.principal(executor.session.id), { v: 2,
+      id: 'cursor-native-stop:' + hash(canonical([executor.session, task.id, task.control.id])), type: 'task.report', session: executor.session,
+      payload: { taskId: task.id, stage: 'cancelled', data: { controlId: task.control.id } },
+    }, { authorize: state => {
+      this.requireActor(state, executor);
+      const current = state.tasks[taskKey(this.repositoryId, executor.session, task.id)];
+      if (!current || current.control?.id !== task.control.id || !['cancelling', 'cancelled'].includes(current.stage)) fail('CURSOR_ROLE_CONFLICT', 'Control changed before the native stop report');
+    } })).data;
+  }
+
+  async resolveReceiver(scope, state) {
+    if (scope.projectId !== this.projectId || scope.repositoryId !== this.repositoryId || scope.ownerId !== this.ownerId) return null;
+    const actor = await readJSON(this.actorFile(scope), null);
+    if (!actor || canonical(actor.session) !== canonical(scope.actor) || actor.nativeAgentId !== scope.nativeAgentId || actor.worktreeId !== scope.actorWorktreeId) return null;
+    const invocation = actor.invocations.find(item => item.id === hash(canonical(scope)) && canonical(item.scope) === canonical(scope));
+    if (!invocation || invocation.state !== 'confirmed' || !invocation.runId || actor.invocations.at(-1) !== invocation) return null;
+    const authorized = async current => {
+      try {
+        const task = this.currentTask(current, actor, scope.taskId);
+        return await this.authorizeSource({ state: current, actor: structuredClone(actor), task: structuredClone(task) });
+      } catch (cause) {
+        if (cause.code === 'CURSOR_ROLE_CONFLICT') return false;
+        throw cause;
+      }
+    };
+    // The channel passes its existing transaction snapshot. Do not reacquire
+    // ProtocolStore while callbacks already hold it; activation is outside it.
+    if (!await (state ? authorized(state) : this.store.transaction(authorized, { readOnly: true }))) return null;
+    return { active: true, scopeHash: invocation.id, nativeAgentId: actor.nativeAgentId, runId: invocation.runId,
+      ...(actor.kind === 'ci' ? { executorNativeAgentId: actor.executorNativeAgentId } : {}) };
+  }
+
+  async owns(sessionId) {
+    if (!uuid.test(sessionId || '') || sessionId === this.templateSessionId) return false;
+    return !!await readJSON(this.executorFile(sessionId), null);
+  }
+}

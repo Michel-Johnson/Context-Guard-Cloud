@@ -72,8 +72,8 @@ export class CursorRoleChannel {
     });
   }
 
-  async receiver(lease) {
-    const receiver = await this.resolveReceiver(structuredClone(lease.scope));
+  async receiver(lease, state) {
+    const receiver = await this.resolveReceiver(structuredClone(lease.scope), state);
     if (!receiver || receiver.active !== true || receiver.scopeHash !== lease.scopeHash || receiver.nativeAgentId !== lease.scope.nativeAgentId || !bounded(receiver.runId) ||
         lease.scope.phase === 'ci' && (!nativeId(receiver.executorNativeAgentId) || receiver.executorNativeAgentId === lease.scope.nativeAgentId) ||
         lease.runId && receiver.runId !== lease.runId) fail('ROLE_UNAVAILABLE', 'Cursor receiver or native Run changed');
@@ -202,9 +202,9 @@ export class CursorRoleChannel {
     return this.withLease(token, async lease => {
       const scope = lease.scope, principal = this.principal(scope);
       return this.store.transaction(async state => {
-        await this.receiver(lease);
-        if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired');
         const task = this.task(state, scope, principal);
+        await this.receiver(lease, state);
+        if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired');
         return { taskId: task.id, actor: scope.actor, session: scope.session, phase: scope.phase, stage: task.stage,
           sourceSha: scope.sourceSha, writePrefix: this.prefix(scope), brief: task.brief, assignment: task.assignment, plan: task.plan, references: this.refs(task, scope) };
       }, { readOnly: true });
@@ -219,7 +219,10 @@ export class CursorRoleChannel {
       return this.store.handle(this.principal(scope), { v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) }, {
         // The core invokes this inside its task transaction BEFORE retry replay.
         // A saved success must not outlive a Plan change or role revocation.
-        authorize: async (state, principal, message) => this.authorize(state, principal, message, lease, await this.receiver(lease)),
+        authorize: async (state, principal, message) => {
+          this.task(state, scope, principal);
+          this.authorize(state, principal, message, lease, await this.receiver(lease, state));
+        },
       });
     });
   }
