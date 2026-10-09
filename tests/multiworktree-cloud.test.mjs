@@ -13,7 +13,7 @@ const { stopServer } = await skillImport('scripts/workbench/cli.mjs');
 import { completeSessionMemory, startMemoryServer } from '../scripts/cloud/memory.mjs';
 const { memoryConfigPath, sessionMemoryDir } = await skillImport('scripts/workbench/memory.mjs');
 
-import { readJSON } from '../scripts/shared/io.mjs';
+import { readJSON, hash } from '../scripts/shared/io.mjs';
 const repo = skillRoot;
 const fixtureRoot = fileURLToPath(new URL('../temp/', import.meta.url));
 import { pythonCommand } from '../.github/scripts/python-command.mjs';
@@ -51,13 +51,12 @@ async function call(service, route, token, body) {
   const r = await fetch(new URL(route, service.state?.url || service.url), { method: body ? 'POST' : 'GET', headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) }, body: body && JSON.stringify(body) });
   return { status: r.status, data: await r.json() };
 }
-test('a later lifecycle hook heals an unavailable Cloud Session without a sync daemon', async t => {
+test('a later lifecycle hook recovers Cloud context reads without uploading local Session records', async t => {
   const { dir, root } = await fixture(t, false);
   let memory;
   t.after(async () => {
     await memory?.close().catch(() => {});
     await stopServer(root).catch(() => {});
-    await fs.rm(dir, { recursive: true, force: true });
   });
   await saveMainBinding(root, { mode: 'local', branch: 'trunk' });
   await initialize(root);
@@ -67,31 +66,69 @@ test('a later lifecycle hook heals an unavailable Cloud Session without a sync d
   const local = await startServer({ root, port: 0 });
   const registered = await call(local, '/api/session', local.state.adminToken, { sessionId, worktreeRoot: root });
   assert.equal(registered.status, 200, JSON.stringify(registered));
+  const recorded = await hook(root, sessionId, 'session-start');
+  assert.equal(recorded.code, 0, recorded.stderr);
+  const map = { v: 1, project: 'Hook fixture', bootstrap: 'ready', flows: [], root: {
+    id: 'REMOTE', title: 'Cloud-only Hook marker', purpose: 'Read established remote context',
+    kind: 'module', state: 'dirty', children: [], memoryDocument: 'Remote baseline before outage',
+  } };
   await local.close();
 
   const project = await resolveProject(root);
   const memoryOptions = { dataDir: path.join(dir, 'hook-memory'), adminToken: randomUUID(), projects: { example: { token: randomUUID() } } };
+  const memoryFile = path.join(memoryOptions.dataDir, hash('example'), 'memory.json');
+  await fs.mkdir(path.dirname(memoryFile), { recursive: true });
+  // The current Hook reads established Main context, never creates a remote
+  // Session or uploads notes. Seed synthetic published data before startup.
+  const legacyRecords = { 'legacy.md': 'Preserved pre-existing synthetic record' };
+  await fs.writeFile(memoryFile, JSON.stringify({ revision: 1,
+    main: { version: 'main-v1', mainSha: project.head, memory: { map, records: {} } },
+    sessions: { [sessionId]: { sessionId, version: 'session-v1', baseMainVersion: 'main-v1',
+      memory: { map, records: legacyRecords } } }, receipts: {}, history: [], events: [], eventCursors: {} }));
   memory = await startMemoryServer(memoryOptions);
   const memoryPort = new URL(memory.url).port;
   await fs.mkdir(project.sharedDir, { recursive: true });
   await fs.writeFile(memoryConfigPath(project), JSON.stringify({ url: memory.url, projectId: 'example', token: memoryOptions.projects.example.token }));
   await memory.close(); memory = null;
 
+  const bindingBefore = (await bindingStatus(project, sessionId)).session;
+  const notes = path.join(root, '.codex/context/sessions', sessionId + '.md');
+  const notesBefore = await fs.readFile(notes, 'utf8');
   const unavailable = await hook(root, sessionId, 'session-start');
-  assert.match(unavailable.stdout, /Cloud Session registration pending/i);
+  assert.match(unavailable.stdout, /Server memory unavailable or conflicting/i);
+  assert.doesNotMatch(unavailable.stdout, /已获取轻量导航|Server memory confirmed/i);
+  const offlineNotes = await fs.readFile(notes, 'utf8');
+  assert.ok(offlineNotes.startsWith(notesBefore)); assert.ok(offlineNotes.length > notesBefore.length);
+  // Change only the stopped synthetic server's published baseline. Restoring
+  // this unique marker/version proves a real read, not an old local cache.
+  const restoredState = await readJSON(memoryFile);
+  restoredState.revision++; restoredState.main.version = 'restored-main-v2';
+  restoredState.main.memory.map.root.memoryDocument = 'Remote context after outage';
+  await fs.writeFile(memoryFile, JSON.stringify(restoredState));
   memory = await startMemoryServer({ ...memoryOptions, port: Number(memoryPort) });
+  const requests = [];
+  memory.server.on('request', req => requests.push({ method: req.method, path: req.url }));
+  const before = await fs.readFile(memoryFile, 'utf8');
   const healed = await hook(root, sessionId, 'user-prompt-submit');
   assert.equal(healed.code, 0, healed.stderr);
-  assert.doesNotMatch(healed.stdout, /Cloud Session sync pending/i);
+  assert.match(healed.stdout, /已获取轻量导航与项目说明/);
+  assert.doesNotMatch(healed.stdout, /Server memory unavailable|Cloud Session sync pending/i);
   const remote = await call(memory, '/v1/projects/example/sessions/' + sessionId, memoryOptions.projects.example.token);
   assert.equal(remote.status, 200, JSON.stringify(remote));
   assert.equal(remote.data.snapshot.sessionId, sessionId);
-  assert.equal(remote.data.snapshot.lastSync.sessionId, sessionId);
-  assert.equal(remote.data.snapshot.lastSync.hookEvent, 'UserPromptSubmit');
-  assert.match(remote.data.snapshot.lastSync.eventId, /^hook-/);
-  assert.equal(Number.isNaN(Date.parse(remote.data.snapshot.lastSync.occurredAt)), false);
-  assert.ok(remote.data.snapshot.memory.records['sessions.jsonl'].includes(sessionId));
-  assert.equal((await bindingStatus(await resolveProject(root), sessionId)).session.bound, true);
+  assert.deepEqual(remote.data.snapshot.memory.records, legacyRecords);
+  assert.equal(remote.data.snapshot.lastSync, undefined);
+  assert.equal(await fs.readFile(memoryFile, 'utf8'), before, 'context recovery must not alter Cloud memory or receipts');
+  assert.ok(requests.some(request => request.path.startsWith('/v1/projects/example/context?')));
+  assert.ok(requests.filter(request => request.path.startsWith('/v1/projects/example/sessions/'))
+    .every(request => request.method === 'GET'), 'the Hook cannot upload records or register a remote Session');
+  const healedNotes = await fs.readFile(notes, 'utf8');
+  assert.ok(healedNotes.startsWith(offlineNotes)); assert.match(healedNotes, /user-prompt-submit/);
+  const cache = await readJSON(path.join(sessionMemoryDir(project, sessionId), 'context-cache.json'));
+  assert.equal(cache.origin, `${memory.url}\0example`);
+  assert.equal(cache.index.version, 'restored-main-v2');
+  assert.equal(cache.fragments.REMOTE.node.memoryDocument, 'Remote context after outage');
+  assert.deepEqual((await bindingStatus(await resolveProject(root), sessionId)).session, bindingBefore);
 });
 test('a legacy worktree seed is replaced by the confirmed main baseline without overwriting divergent Session edits', async t => {
   const { dir, root, other } = await fixture(t, false);

@@ -29,7 +29,7 @@
     "build:runtime": "node scripts/build-runtime.mjs"
   },
   "devDependencies": {
-    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-98ed9287178806a80409d9a59dbf01cefe55a52a/michelj-context-guard-0.7.1.tgz",
+    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-0ce5a2a528f0a56ebc5af525a74316eb0166c561/michelj-context-guard-0.11.0.tgz",
     "marked": "15.0.12",
     "playwright": "1.62.1"
   },

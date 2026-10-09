@@ -2,7 +2,7 @@
 
 ## CURSOR-CI-TASK-SCOPE-01 · 原任务范围与回执
 
-- [ ] 已在真实设备委托后的原 Core authorize 接入固定 Task/Plan 基线/批准回执/交接 SHA/TODO 版本校验；原读保持只读，写入范围与业务回执同事务提交，旧回执不得升级、降级省略范围或跨重绑/返工重放。正式隔离 HTTP 与 Core 故障测试已覆盖；正常发布后的本机 owning 后端、固定传输、实际 Cloud 服务完整组合及原生角色验收仍未完成，不将 header 当成隔离或通过证明。
+- [ ] 已在真实设备委托后的原 Core authorize 接入固定 Task/Plan 基线/批准回执/交接 SHA/TODO 版本校验；原读保持只读，写入范围与业务回执同事务提交，旧回执不得升级、降级省略范围或跨重绑/返工重放。正式隔离 HTTP/Core 故障及固定测试包的 owning 后端准备组合已覆盖：`tests/cursor-owning-backend.test.mjs` 经原设备 pump、真实 Node IPC、原生产 factory 与 Cloud HTTP，核不同 Plan/交接提交、撤权、重绑、缺 ACK、零普通写通道 fallback。固定 fixture 为准确 Skill `0ce5a2a` 的 test-only 0.11.0，不是用户安装或正式交付；该组合只验证只读准备，业务写入/缓存/宿主证明的失 ACK 恢复、正常安装与原生三路径验收仍未完成，不将 header、原生硬停或测试包当成通过证明。
 
 ## CURSOR-SLACK-ENTRY-01 · 原对话执行入口（2026-10-10）
 
