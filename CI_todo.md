@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## SLACK-MARKDOWN-BOUNDARY-01 · 未闭合强调残片展示边界（2026-10-09）
+
+- [x] Coordinator 批准最小范围：只在流式、生成失败、补充调整和停止残片的显示副本投影未闭合强调；完整 Markdown 默认行为、Cloud 历史和导出原文不变。此前项目关联卡片的 typed fallback 已有精确原消息证据，本轮不重复造 Slack 解析器或改 IO。
+- [x] Executor 开发：沿既有 marked 的 text/code/escape token，仅投影最后一段中可验证的星号强调开头。代码、转义、数学与标识符、歧义边界保原行为；不补链接/表格/HTML，不全局删除标点。仅当前未消费流槽及精确失败槽的指纹纳入显示模式，保原 TS、修订、失败标签与回执，不升级全局 final 指纹、不重刷完成历史。
+- [ ] Executor：正常整合 Main `45655e12`、候选 Cloud1.7.1/Slack0.4.1 后首轮唯一78受影响正式组合 actual `87fe37` exit1，77通过/1失败、0跳过/取消，10239.9878ms。新增 error/stop/steer 用例重复快照断言5≠3；其简单 IO mock 把同一稳定错误通知操作的重复调用计为外发，拟改本用例复用真实 SlackIO 耐久回执并保零平台写断言，待 Coordinator 审核，不以77通过称完成。日志 `temp/slack-partial-markdown-main456-executor-20261009.log` SHA256 `1f3688525b073409d1e6990006f1fce4bef1c7df37182d83cf375bfacf24a6df`。原builder `87a62f` exit0及59文件parity0差异、30产品/测试/版本冻结前后相同；未全量、付费模型、UI或CI重跑。
+- [x] Executor 经审核仅修上述新用例的 IO 夹具：真实 SlackIO、合成 native apiCall 平台写入计数，重启后 plugin/IO 指向同一重新打开的 Store；保重复零平台写、原TS/source/revision与非最终断言，未改产品通知或增加第二去重层。唯一批准窄组合 actual `5e45fd` exit0、10/10通过、0失败/跳过/取消、819.127ms；日志 `temp/slack-partial-markdown-main456-fixture-fix-executor-20261009.log`。其他77通过仍绑定首次旧测试hash，不能套作最终78全部通过；独立 Tester 须按最终准确字节跑同78组合。最终正式 plugin.test SHA256 `c45ccb411941219b92b5d23aeacec31e06be279a98c0166a595ce0b09e2c7aec`，全部30冻结文件及59生成物parity前后不变，原失败保留。
+- [ ] 独立 Tester：核准确整合字节，特别是代码/escape 与已 plain_text 内容不二次解析、流式到最终同槽、失败/停止/补充残片非最终状态、失 ACK/重启/重复去重、已消费或另一修订槽不能被晚到 partial 覆写。mock 模块通过不代替真实 Slack 验收。
+
 ## SLACK-FAILED-STREAM-01 · 失败流标签与安全终止诊断（2026-10-09）
 
 - [x] Coordinator：批准最小范围，修观察器缺省修订为公共合同的0；失败预览仅原位标记同轮同修订的已保存TS，持久去重，保原错误通知/回执，不把半截生成当最终答案或完整模型历史。
@@ -12,6 +20,18 @@
 - [x] 整合独立 Tester：准确 pending merge 父 `f161d537` / `45e3f1f` 的11源码/测试及四版本等17项冻结hash前后不变；唯一同46目标 actual `1cccca` exit0，46/46、0失败/跳过/取消、2651.4899ms。报告 `temp/slack-failed-stream-main45-independent-20261009.md`，日志 SHA256 `382383d3edd5068c1a617898a96b5bee2236c3aceee1d251984ce68df6a7216a`。原29项不套用到新字节；本46不包含后来的Markdown需求、真实供应商、生产或真人验收。
 - [x] 第二次整合：Main `756e452` 的 Map Beta / 展示翻译已正常整合，候选 Cloud1.6.1 / Slack0.3.1，保留固定 core2.2.0 / UI1.3.2 及全部新增源码/测试。精确锁安装、原生成器59文件字节匹配，Executor 唯一正式52目标 actual `88d552` exit0、52/52、0失败/跳过/取消、3501.0852ms；日志 `temp/slack-failed-stream-main756-executor-20261009.log` SHA256 `cffb916483395dd437a7c17db37a7c2ec9dcdd1700b21be97ccd6d795e0e1318`。原46与其 Required 绑定19b837，不作为本轮新依赖证据。
 - [x] 第二次整合独立 Tester：同 pending 父19b837/756e工作树22冻结文件与59生成物parity、core2.2.0/UI1.3.2全部匹配；唯一同52目标 actual `a57194` exit0、52/52、0失败/跳过/取消、3270.5546ms。报告 `temp/slack-failed-stream-main756-independent-20261009.md`，日志 SHA256 `8e759c5fbdf1ea99a87b0f71522cc2ce728b0917d1ab6eb7e54421800504abd1`。translation fixture原两条未配置派发deferred提示保留，不扩权、不作为生产自动派发验收；未全量/付费模型/线上/最新Markdown验证。准确提交Required/正常合并/MainCI/上线及真人验收继续待完成。
+
+## SLACK-MERGED-01 · 接话判断与答复合并（2026-10-09）
+
+- [x] 开发者验证：普通 Slack 消息不再调用独立分类接口；同轮决定后直接回答或调用原工具。隔离真实 HTTP 覆盖短答、静默、读取、重复事件和非法输入；静默无外发、业务工具或 Main 写入。原身份、审批、Map 格式、模型选择和工具权限不变。
+- [x] 旧场景迁移不删除、不跳过：冻结有序批次、绑定变更、失回重启及八次提交预算保留。独立设计的 15 项服务测试覆盖分块控制头、工具续轮、取消、补充及非法协议；执行者自检不代替独立验收。
+- [x] 真实 GLM-5.3、合成上下文：初轮 11/12，定位纯工具标识省略尾换行后，按原生工具边界修正；修正轮 12/12。缺失或半个标识仍拒绝工具。该验证不执行生产工具、不发送 Slack 消息；模型选项及配置校验未变。简单短答约 5–7 秒，不保证两秒。
+- [x] 开发者最终回归：Cloud 552 通过、0 失败、2 个既有跳过；Slack 224/224，浏览器三个入口及 39 项安全验收通过。暂存内容 144 文件安全扫描通过；既有浏览器专用及未配置 live-provider 两项跳过不算验收通过。
+- [x] 上述完整回归对应 `be4dfa5`。随后补齐服务层 Slack 身份格式校验，防止非法内部调用回落到未受保护的模型路径；新修订目标 21/21 自检通过，不沿用旧 SHA 的独立结论。
+- [x] 独立提交 `35869ba`：21/21 目标检查、Slack 224/224、Cloud 553 通过/2 既有跳过/0 失败；源码和运行文件前后哈希一致。未部署或发送真实 Slack 消息。
+- [x] 后续升级审查发现旧 submit 失回时新增字段会造成 `ID_REUSED`；已保留旧缓存记录按原 ID、原 payload 恢复，仅新消息带接话参考。三项新增检查确认回执恢复不再调用模型、旧静默无外发、身份或批次错配拒绝；首轮新负例错误码预期修正的记录保留。
+- [x] 独立兼容提交 `7939510`：关联检查 66/66、Slack 227/227、0 失败或跳过；源码与运行文件前后哈希一致，工作树干净。Cloud/UI 功能源码未改；`35869ba` 的完整 Cloud 证据仍明确绑定旧 SHA，不冒充新提交的全量回归。
+- [ ] 部署后真实 Slack 验收：直接短答、通知静默、连续追问、只读工具和延迟；本地与模型接口验证不算线上验收。
 
 ## MAP-WORKBENCH-BETA-01 · 新工作台与模型展示翻译
 
@@ -1654,3 +1674,13 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] GitHub Required、生产部署和真实 Slack 问答待完成。私有 Map 与本人 Slack 账号的新增关联范围等待用户确认，不默认扩大权限。
 - 初次基线 78 项中 1 项角色文字断言失败；本地生成物不是锁定依赖版本。重新 `npm ci` 并由固定包生成运行文件后该断言通过，未改共享源码或放宽预期。
 - 首次改动回归 183 项中 6 项失败：Home/空列表/动态菜单断言仍针对旧静态结构，两项 HTTP fixture 未提供项目目录，及一项调用序列缺少实时校验。修正消费者 fixture 和新菜单契约断言后重跑；保留身份、原输入、跨项目拒绝与幂等断言。
+
+## MINIMUM-DIAG-001：定位 Node 18 Linux CI 未退出 worker（2026-10-09）
+
+- [x] Coordinator 审核通过的只读诊断开发：仅 minimum-runtime 显式开启 --require preload；原发现清单、排序、全部测试、并发 2、15 分钟期限、Required、权限及 Action pins 保留。未修改业务资源清理或固定 Skill 0.7.1 fixture。
+- [x] 正式发现清单与原生测试父进程核验 worker 来源；元数据仅包含 PID、批准的相对测试文件、事件与时间、资源种类计数、数字退出码。唯一 30 秒观察定时器 unref；诊断文件独占且单文件至多 64 KiB、合计至多 2 MiB，失败或超限明确记录证据不完整，不替代原测试结果。
+- [x] 故障 artifact 仅上传 JSONL 白名单元数据，留存 1 天；不上传配置、正文、原始错误、环境或凭据，也不宣称公开仓库 artifact 绝对私有。
+- [ ] 首批模块结果保留：官方 Node18.20.8，候选为 b198a4f + MERGE_HEAD 45655e1 的未提交修订（Cloud 1.7.1 / Slack 0.4.1），session89735 / terminal20a7b7 退出 1；8 项中 7 通过、1 失败、0 skip/cancel，35255.9797ms，9 文件前后哈希一致。失败是限额回归的合成 fixture 在 node:test 用例内人为循环触发 beforeExit，子进程退出 1；真实保活 worker 快照、正常退出及其他边界通过，但不据此宣称整批通过。原 stdout SHA256 683f24de6f49aa69b9c58bb9b8369f8de35300219fccfca931a1e02737f658e3，result d938aa3086aaf5b5ae4ce36da1733d09ed2f6e2c754a87997c78d63722bb8d4a；失败即停，三项治理尚未运行，不自主重跑。限额测试修订须经 Coordinator 审核。
+- [x] Coordinator 审核后仅抽取封闭元数据 writer 并修改限额用例，取消人为生命周期事件；其余 7 目标源码不变。唯一返工批次 Node18.20.8 / actual chunk6ac49a 退出 0：定向 4 项通过、4 项名称筛选跳过、0 fail/cancel，4325.6503ms；正常退出、原 7/1 退出码、敏感内容不进入产物及限额均验证。首次三项治理各退出 0，发现 42 个自动文件；9 文件前后哈希一致。helper fe78f2c22c7429ff408ecf6b35acb0c3fac6b4a39b634a7b38a9478ace3b3d83，test bae66e6e92514ef0250e82ba5e77f0a864859e7fd4442aefc44b81412ce3062b；stdout cb8152b3b568d342e187aa38a04dd2063b38a018540acd88b645fccdbc73308f，result e3f2608eb3f94a0427d9ccf7e211d15b440eca3c66d5b8b93317195976d163d3。未重复 32 秒保活用例、不以 4 项代替最终独立 8 项或 Linux CI。
+- [ ] 独立 Tester：核对准确修订和前后字节；验证默认关闭、原始退出码、正常退出、原生未退出 worker 的只读快照、限额、来源拒绝及写入失败；核查 Required 与安全边界不变。
+- [ ] 下一次必要代码 CI 的实际 Ubuntu 证据。保留 b198a4f 的 run 37884367488 / job 113671043498 首次 15 分钟失败；Windows Slack 36 项及 Legacy 2 项通过不能证明该 Linux 根因已修复，最后已输出用例不是卡点证明。

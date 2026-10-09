@@ -4,6 +4,7 @@ import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.
 import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
+import { mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -374,7 +375,11 @@ export class CoordinatorService {
     const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
     const inputs = await this.inputJournal();
     const mounts = await readJSON(this.mountFile, { receipts: {}, byProposal: {} });
+    const participationInput = mergedParticipationInput(state);
+    const participationDecision = participationInput ? state.slackParticipation?.requestId === participationInput.requestId
+      ? state.slackParticipation.decision : 'pending' : null;
     return { status: state.status, error: state.error || null, activeTurnId: state.activeTurnId || null,
+      participationDecision,
       acceptedRequestIds: [...new Set([...Object.keys(state.requests || {}), ...Object.keys(inputs.requests)])].slice(-100),
       inputRevision: inputs.revision,
       controlRevision: state.controlRevision || 0,
@@ -543,12 +548,12 @@ export class CoordinatorService {
     const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
     return { id, text, answerTo, metadata, hasImages, fingerprint };
   }
-  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history } = {}) {
+  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation } = {}) {
     if (inputs !== undefined) {
       if (text || retry || answerTo !== undefined || attachments.length) throw error('INVALID_INPUT', 'A batch cannot mix single-message controls');
-      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor, ...(history !== undefined ? { history } : {}) });
+      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) });
     }
-    if (history !== undefined) throw error('INVALID_INPUT', 'Reference history is only accepted on verified Slack batches');
+    if (history !== undefined || participation !== undefined) throw error('INVALID_INPUT', 'Reference context is only accepted on verified Slack batches');
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (!['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128) ||
         typeof retry !== 'boolean') throw error('INVALID_INPUT', 'Provide valid follow-up controls');
@@ -688,7 +693,7 @@ export class CoordinatorService {
     this.kick();
     return { accepted: true, id, ...(followup === 'steer' ? { followup } : {}) };
   }
-  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history } = {}) {
+  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation } = {}) {
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (typeof id !== 'string' || !id || id.length > 128 || !Array.isArray(inputs) || !inputs.length || inputs.length > 100 ||
         inputs.some(input => !input || Object.keys(input).some(key => !['id', 'text', 'attachments', 'answerTo'].includes(key))) ||
@@ -702,9 +707,10 @@ export class CoordinatorService {
         !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
         actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`)) throw error('INVALID_INPUT', 'Reference history requires a gateway-bound Slack operator');
     history = validateSlackHistory(history);
+    participation = validateMergedParticipation(participation, inputs, { source, actor });
     const prepared = await Promise.all(inputs.map(input => this.prepareInput(input, { source, actor })));
     const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor,
-      ...(history !== undefined ? { history } : {}) }));
+      ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) }));
     const mode = hash(JSON.stringify({ followup, expectedTurnId }));
     const receivedAt = Date.now(), nextContext = this.context ? await this.context() : null;
     const contextMs = Date.now() - receivedAt;
@@ -747,7 +753,8 @@ export class CoordinatorService {
             answered.add(input.answerTo);
           }
           return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
-            serverContext: { ...coordinatorInputContext(nextContext, source), ...(index === 0 && attachHistory ? { history } : {}) },
+            serverContext: { ...coordinatorInputContext(nextContext, source), ...(index === 0 && attachHistory ? { history } : {}),
+              ...(index === 0 && participation ? { participation } : {}) },
             content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
             ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
         });

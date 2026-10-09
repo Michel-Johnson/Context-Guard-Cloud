@@ -4,7 +4,7 @@ export const plain = (text, length = 2000) => ({ type: 'plain_text', text: Strin
 export const escape = text => String(text || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 export const section = text => ({ type: 'section', text: { type: 'mrkdwn', text: String(text || '—').slice(0, 2900) } });
 export const textSections = text => { const value = String(text || '—'); return Array.from({ length: Math.ceil(value.length / 2800) }, (_, index) => section(value.slice(index * 2800, (index + 1) * 2800))); };
-export const plainSections = text => plainChunks(text).map(value => ({ type: 'section', text: plain(value, 2800) }));
+export const plainSections = (text, options) => plainChunks(text, 2800, options).map(value => ({ type: 'section', text: plain(value, 2800) }));
 export const button = (label, action, value, style) => ({ type: 'button', text: plain(label, 75), action_id: action, value: JSON.stringify(value), ...(style ? { style } : {}) });
 export const projectOptions = (projects, query = '') => projects
   .filter(project => `${project.name || ''} ${project.description || ''}`.toLocaleLowerCase().includes(String(query).toLocaleLowerCase()))
@@ -115,15 +115,16 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId, mapNodeId } = {}) {
 }
 export function messageBlocks(message, key, context) {
   const questions = message.questions || [], open = questions.filter(question => !question.answer);
+  const projection = { partial: message.partial === true || context?.partial === true };
   // Cloud's question-only projection already supplies the exact joined question
   // text. Render those questions with their own options once, preserving order
   // and answered history. A partial-prefix or genuine prose is not that projection.
   const projectedQuestions = message.questionOnly === true && open.length > 0 &&
     message.text === questions.map(question => question.text).join('\n\n');
-  const body = plainText(message.text || '');
+  const body = plainText(message.text || '', projection);
   const sameWholeQuestion = questions.length === 1 && body && body === plainText(questions[0].text);
   const blocks = projectedQuestions || !message.text && context?.modelMenus?.length && !message.attachments?.length
-    ? [] : plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'));
+    ? [] : plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'), projection);
   const questionControls = question => {
     if (question.options?.length) blocks.push(...plainSections('可参考：\n' + question.options.map(option => `• ${option}`).join('\n')));
     blocks.push(...plainSections('直接在这个线程回复即可，不需要填写表单。'));

@@ -97,7 +97,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
     ...(enabled ? { integrationConfig: { host: '127.0.0.1', port: 0, token: integrationCredential, teamId, projectIds: [projectId, otherProjectId],
       ...(mapProjects ? { mapProjects: { coordinatorProjectId: projectId, userIds: [userId] } } : {}),
       ...(visionProvider ? { visionProviderFile } : {}), ...(integrationActions ? { actions: integrationActions } : {}) } } : {}),
-    coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
+    coordinatorModelFactory: () => { const next = async request => {
       modelCalls.push({ system: request.system, messages: request.messages, tools: request.tools, maxTokens: request.maxTokens });
       if (request.tools.length === 0 && request.maxTokens === 256) {
         // Identify the bounded no-tools contract, not a particular PE prefix.
@@ -175,7 +175,13 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
         } }] };
       }
       return { stop: 'end_turn', content: [{ type: 'text', text: `Fixture response${text ? ': ' + text : ''}` }] };
-    } }),
+    }; return { model: 'fixture-model', next: async request => {
+      const result = await next(request);
+      // Controlled provider follows the new first-round wire protocol. Business
+      // tool assertions below still use the real Cloud executor and HTTP route.
+      return request.system.includes('[Slack 合并接话协议]') ? { ...result,
+        content: [{ type: 'text', text: '[CG_REPLY]\n' }, ...result.content] } : result;
+    } }; },
   };
   // Default-off is evaluated without an ambient user's integration configuration.
   const previousIntegrationConfig = process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG;
