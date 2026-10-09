@@ -8,6 +8,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/server.mjs';
 import { cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
+import { CursorGitProof } from '../scripts/cloud/cursor-git-proof.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -40,19 +41,30 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
     v: 1, bootstrap: 'ready', root: { id: 'T0', title: 'Synthetic project', kind: 'module', state: 'dirty', owns: [], children: [] },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
   const commands = [{ name: 'prepare_task', input: { taskId, text: 'Implement one isolated fixture', acceptance: 'Formal assertion passes', nodeIds: ['T0'], mainVersion: 'main-1' } }];
-  const nativeCalls = [], runs = new Map(); let count = 0;
+  const nativeCalls = [], gitCalls = [], runs = new Map(); let count = 0;
   const provider = {
     create: async input => { nativeCalls.push({ method: 'create', input }); const run = { id: 'native-' + ++count, agentId: input.agentId, status: 'FINISHED' };
       runs.set(input.agentId, run); return { agent: { id: input.agentId }, run }; },
     followUp: async (agentId, text, options) => { nativeCalls.push({ method: 'followUp', agentId, text, options });
       const run = { id: 'native-' + ++count, agentId, status: 'FINISHED' }; runs.set(agentId, run); return run; },
-    getRun: async (agentId, runId) => { const run = runs.get(agentId); assert.equal(run.id, runId); return run; },
+    getRun: async (agentId, runId) => { const run = runs.get(agentId); assert.equal(run.id, runId);
+      return { ...run, git: { branches: [{ repoUrl: 'https://github.com/example/repo', branch: 'cursor/http-task' }] } }; },
     getAgent: async agentId => ({ id: agentId, latestRunId: runs.get(agentId)?.id }),
   };
   cloud = await startCloudServer({ dataDir: directory, port: 0, publicOrigin: 'https://roles.example', browserToken: 'synthetic-human', memoryConfig, cursorConfigFile,
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
     protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },
     cursorProviderFactory: () => provider,
+    cursorGitProofFactory: config => new CursorGitProof({ ...config, fetch: async (url, options) => {
+      assert.equal(options.method || 'GET', 'GET'); assert.equal(options.redirect, 'error');
+      assert.ok(url.startsWith('https://api.github.com/repos/example/repo/'));
+      gitCalls.push(url);
+      const value = url.includes('/branches/') ? { name: 'cursor/http-task', commit: { sha: 'b'.repeat(40) } }
+        : url.includes('/compare/') ? { base_commit: { sha: sourceSha }, merge_base_commit: { sha: sourceSha }, status: 'ahead', behind_by: 0,
+          total_commits: 1, commits: [{ sha: 'b'.repeat(40) }], files: [{ filename: 'src/fixture.mjs' }] }
+          : { sha: 'b'.repeat(40), parents: [{ sha: sourceSha }], files: [{ filename: 'src/fixture.mjs' }] };
+      return new Response(JSON.stringify(value));
+    } }),
     coordinatorModelFactory: () => ({ next: async () => { const command = commands.shift(); return command
       ? { stop: 'tool_use', content: [{ type: 'tool_use', id: 'model-' + ++count, ...command }] }
       : { stop: 'end_turn', content: [{ type: 'text', text: 'Synthetic Coordinator response' }] }; } }),
@@ -83,7 +95,7 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
   const poll = async predicate => {
     const deadline = Date.now() + 15000;
     for (;;) { const result = await request(endpoint); assert.equal(result.status, 200, JSON.stringify(result.body));
-      if (predicate(result.body)) return result.body;
+      if (await predicate(result.body)) return result.body;
       assert.ok(Date.now() < deadline, 'Coordinator state did not advance before its deadline');
       await new Promise(resolve => setTimeout(resolve, 30)); }
   };
@@ -121,11 +133,11 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   };
-  return { directory, store, human, nativeCalls, commands, config, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
+  return { directory, store, human, nativeCalls, gitCalls, commands, config, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
     url: cloud.url };
 }
 
-test('Cloud Coordinator public approval and MCP drive reviewed execution and independent CI routing for a synthetic verified handoff', async t => {
+test('Cloud Coordinator public approval and MCP verify the original handoff before independent CI routing with controlled native and Git providers', async t => {
   const f = await fixture(t), proposal = await f.prepare();
   assert.equal(f.nativeCalls.length, 0, 'A prepared requirement never calls Cursor');
   await f.approve(proposal);
@@ -172,12 +184,13 @@ test('Cloud Coordinator public approval and MCP drive reviewed execution and ind
   };
   const todo = await put('todo', 'ciTodo', { items: [{ id: 'CI-1', title: 'Independent formal check' }] });
   const unit = await put('unit', 'evidence', { synthetic: true });
-  // Routing fixture ONLY: seed a previously verified handoff through the real
-  // reducer. This bypass is test-owned, not an exposed API or native proof.
-  await f.store.handle({ repositoryId: '123', deviceId: 'cloud-cursor:context-guard', agentId: current.actor.id, role: 'executor' }, {
-    v: 2, id: 'synthetic-verified-handoff', type: 'task.report', session: current.session,
-    payload: { taskId, stage: 'handoff', data: { sourceSha: 'b'.repeat(40), ciTodoRef: todo.ref, unitTestRefs: [unit.ref], experienceRefs: [] } },
+  const proposed = await f.call(nextAuthorization, 'context_guard_exchange', {
+    id: 'original-http-handoff', type: 'task.report', payload: { taskId, stage: 'handoff',
+      data: { sourceSha: 'b'.repeat(40), ciTodoRef: todo.ref, unitTestRefs: [unit.ref], experienceRefs: [] } },
   });
+  assert.equal(proposed.isError, undefined); assert.equal(proposed.structuredContent.data.state, 'proof-pending');
+  await f.poll(async () => (await f.store.taskRecord(f.human, current.session, taskId)).stage === 'awaiting-ci');
+  assert.equal(f.gitCalls.length, 4); assert.equal(f.nativeCalls.length, 2);
   await f.poll(state => state.status === 'waiting-for-user');
   f.commands.push({ name: 'request_ci', input: { executionSessionId: current.session.id, taskId } });
   await f.post(f.endpoint, { id: 'ci-next', text: 'Continue the independent CI routing fixture' });

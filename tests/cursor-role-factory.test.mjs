@@ -12,7 +12,7 @@ import { hash } from '../scripts/shared/io.mjs';
 const templateId = '11111111-1111-4111-8111-111111111111', sourceSha = 'a'.repeat(40), handoffSha = 'b'.repeat(40);
 // ProtocolStore, approvals, bindings, durable intents and role channel are real.
 // The native provider is a controlled dependency, not real Cursor execution.
-async function fixture(t) {
+async function fixture(t, { gitProof } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-factory-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = new ProtocolStore(path.join(directory, 'protocol')), calls = [], runs = new Map();
@@ -32,7 +32,7 @@ async function fixture(t) {
   };
   const options = { directory: path.join(directory, 'roles'), projectId: 'project', repositoryId: '123', templateSessionId: templateId,
     repositoryUrl: 'https://github.com/example/repo', startingRef: sourceSha, endpoint: 'https://cloud.example/api/role-mcp', store, provider,
-    authorizeSource: async () => allowed };
+    authorizeSource: async () => allowed, ...(gitProof ? { gitProof } : {}) };
   const factory = new CursorRoleFactory(options);
   const human = { repositoryId: '123', deviceId: 'browser', agentId: 'human', role: 'human' };
   const coordinator = { ...human, role: 'coordinator', agentId: 'coordinator', bindings: { [templateId]: cursorTemplateWorktree(templateId) }, creationTemplates: [templateId] };
@@ -268,4 +268,153 @@ test('A definitely rejected hosted launch remains an explicit failure, not a suc
   await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_ROLE_FAILED' });
   assert.equal(f.calls.length, 1);
   assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
+});
+
+async function handoffFixture(t, verify) {
+  const inspected = [], f = await fixture(t, { gitProof: { verify: async input => {
+    inspected.push(input);
+    return verify ? verify(input, f) : { repository: 'example/repo', branch: 'cursor/task', baseSha: sourceSha, sourceSha: handoffSha, files: ['src/fixture.mjs'] };
+  } } });
+  const reserved = await f.assign(await f.reserve()), plan = await f.factory.pump(reserved.session, 'task');
+  await f.approvePlan(reserved.session, plan);
+  const invocation = await f.factory.pump(reserved.session, 'task'), prefix = f.factory.channel.prefix(invocation.scope);
+  const put = async (name, kind, content) => (await f.factory.channel.exchange(invocation.token, { id: 'handoff-' + name,
+    type: 'object.put', payload: { kind, ref: prefix + name, baseVersion: '', content } })).data;
+  const todo = await put('todo', 'ciTodo', { items: [{ id: 'CI-1', title: 'Independent check' }] });
+  const evidence = await put('unit', 'evidence', { observation: 'Executor module tests, not independent CI' });
+  const input = { id: 'original-handoff', type: 'task.report', payload: { taskId: 'task', stage: 'handoff',
+    data: { sourceSha: handoffSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref], experienceRefs: [] } } };
+  return Object.assign(f, { reserved, invocation, input, todo, evidence, inspected });
+}
+
+test('Original Cursor handoff is deferred, verified and applied through the same task message after native termination', async t => {
+  const f = await handoffFixture(t);
+  f.runs.get(f.invocation.scope.nativeAgentId).status = 'RUNNING';
+  const replies = await Promise.all([f.factory.channel.exchange(f.invocation.token, f.input), f.factory.channel.exchange(f.invocation.token, f.input)]);
+  assert.deepEqual(replies[0], replies[1]); assert.equal(replies[0].data.state, 'proof-pending');
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'executing');
+  assert.deepEqual(await f.factory.pump(f.reserved.session, 'task'), { state: 'proof-pending' });
+  assert.equal(f.inspected.length, 0); assert.equal(f.calls.length, 2);
+  f.runs.get(f.invocation.scope.nativeAgentId).status = 'FINISHED';
+  const reopened = new CursorRoleFactory(f.options);
+  const ci = await reopened.pump(f.reserved.session, 'task');
+  assert.equal(ci.nativeState, 'reserved'); assert.equal(f.calls.length, 2);
+  const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  assert.equal(task.stage, 'awaiting-ci'); assert.deepEqual(task.handoff, f.input.payload.data);
+  assert.deepEqual(task.references, { [f.todo.ref]: f.todo.version, [f.evidence.ref]: f.evidence.version });
+  assert.equal(task.ci, undefined); assert.equal(task.acceptanceReview, undefined);
+  assert.equal(f.inspected.length, 1); assert.equal(f.inspected[0].run.id, f.invocation.runId);
+  assert.deepEqual(f.inspected[0].approvedPaths, ['src/fixture.mjs']);
+  await reopened.pump(f.reserved.session, 'task'); assert.equal(f.inspected.length, 1);
+  const state = await f.store.transaction(value => value, { readOnly: true });
+  assert.equal(Object.values(state.cursorRoleHandoffs).length, 1);
+  const queue = Object.values(state.queues).flatMap(queue => queue.items);
+  assert.equal(queue.filter(item => item.message.type === 'task.report' && item.message.payload.stage === 'handoff').length, 1);
+});
+
+test('Deferred Cursor handoff rejects another request, malformed or foreign references without replacing its saved proposal', async t => {
+  const f = await handoffFixture(t);
+  await assert.rejects(f.factory.channel.exchange(f.invocation.token, { ...f.input, payload: { ...f.input.payload,
+    data: { ...f.input.payload.data, ciTodoRef: 'foreign' } } }), { code: 'ROLE_FORBIDDEN' });
+  await assert.rejects(f.factory.channel.exchange(f.invocation.token, { ...f.input, payload: { ...f.input.payload,
+    data: { ...f.input.payload.data, sourceSha: 'bad-sha' } } }), { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(f.factory.channel.exchange(f.invocation.token, { ...f.input, id: 'handoff-unit' }), { code: 'ID_REUSED' });
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.at(-1).handoff, undefined, 'A consumed ID cannot reserve a poisoned proposal');
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  await assert.rejects(f.factory.channel.exchange(f.invocation.token, { ...f.input, id: 'replacement-handoff' }), { code: 'ID_REUSED' });
+  await f.factory.pump(f.reserved.session, 'task');
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'awaiting-ci'); assert.equal(f.calls.length, 2);
+});
+
+test('Git read failure retains the original Cursor proposal and cannot start another model or fabricate CI', async t => {
+  let available = false;
+  const f = await handoffFixture(t, input => {
+    if (!available) throw Object.assign(new Error('Synthetic unavailable source host'), { code: 'SOURCE_UNVERIFIED' });
+    return { baseSha: input.baseSha, sourceSha: input.sourceSha, branch: 'cursor/task', repository: 'example/repo', files: ['src/fixture.mjs'] };
+  });
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  for (let i = 0; i < 2; i++) await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+  assert.equal(f.calls.length, 2); assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'executing');
+  available = true; await new CursorRoleFactory(f.options).pump(f.reserved.session, 'task');
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'awaiting-ci'); assert.equal(f.calls.length, 2);
+});
+
+test('Deferred handoff fails closed after authority, version, native identity or Plan paths drift', async t => {
+  for (const changed of ['evidence', 'task-version', 'template', 'source-access', 'capability', 'native-run', 'latest-run', 'run-failed', 'paths']) await t.test(changed, async child => {
+    const f = await handoffFixture(child);
+    if (changed === 'paths') {
+      await f.store.transaction(state => { state.objects[hash(canonical(['123', f.reserved.session.id, f.reserved.session.generation, f.invocation.scope.plan.ref]))].versions[f.invocation.scope.plan.version].content.paths = ['../outside']; });
+      await assert.rejects(f.factory.channel.exchange(f.invocation.token, f.input), { code: 'SOURCE_UNVERIFIED' });
+    } else {
+      await f.factory.channel.exchange(f.invocation.token, f.input);
+      if (changed === 'source-access') f.setAllowed(false);
+      else if (changed === 'capability') await f.factory.channel.revoke(f.invocation.token);
+      else if (changed === 'native-run') f.provider.getRun = async agentId => ({ agentId, id: 'another-run', status: 'FINISHED' });
+      else if (changed === 'latest-run') f.provider.getAgent = async agentId => ({ id: agentId, latestRunId: 'another-run' });
+      else if (changed === 'run-failed') f.runs.get(f.invocation.scope.nativeAgentId).status = 'ERROR';
+      else await f.store.transaction(state => {
+        if (changed === 'template') state.bindings[hash(canonical(['123', templateId]))].generation++;
+        else if (changed === 'task-version') Object.values(state.tasks)[0].version = 'new-progress-version';
+        else state.objects[hash(canonical(['123', f.reserved.session.id, f.reserved.session.generation, f.evidence.ref]))].latest = 'missing-evidence';
+      });
+      const code = ({ evidence: 'SOURCE_UNVERIFIED', 'task-version': 'SOURCE_UNVERIFIED', template: 'CURSOR_ROLE_CONFLICT',
+        'source-access': 'ROLE_UNAVAILABLE', capability: 'ROLE_EXPIRED' })[changed] || 'SOURCE_UNVERIFIED';
+      await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code });
+    }
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'executing');
+    assert.equal(f.calls.length, 2);
+  });
+});
+
+test('Concurrent hosted verifiers apply one original handoff and preserve the same independent CI reservation', async t => {
+  const f = await handoffFixture(t);
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  const reopened = new CursorRoleFactory(f.options);
+  const results = await Promise.all([f.factory.pump(f.reserved.session, 'task'), reopened.pump(f.reserved.session, 'task')]);
+  assert.deepEqual(results[0], results[1]); assert.equal(results[0].nativeState, 'reserved');
+  const state = await f.store.transaction(value => value, { readOnly: true });
+  assert.equal(Object.values(state.cursorRoleHandoffs).length, 1);
+  assert.equal(Object.values(state.queues).flatMap(queue => queue.items).filter(item => item.message.type === 'task.report' && item.message.payload.stage === 'handoff').length, 1);
+  assert.equal(f.calls.length, 2);
+});
+
+test('Lost handoff acknowledgement is resolved from its atomic core marker, not a model retry or adapter flag', async t => {
+  const f = await handoffFixture(t);
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  const exchange = f.factory.channel.exchange.bind(f.factory.channel);
+  f.factory.channel.exchange = async (...args) => {
+    const reply = await exchange(...args);
+    if (args[1].type === 'task.report' && reply.data.stage === 'awaiting-ci') throw Object.assign(new Error('Synthetic lost reply after core commit'), { code: 'ACK_UNKNOWN' });
+    return reply;
+  };
+  await f.factory.pump(f.reserved.session, 'task');
+  await new CursorRoleFactory(f.options).pump(f.reserved.session, 'task');
+  const state = await f.store.transaction(value => value, { readOnly: true });
+  assert.equal(Object.values(state.cursorRoleHandoffs).length, 1);
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'awaiting-ci');
+  assert.equal(f.inspected.length, 1); assert.equal(f.calls.length, 2);
+});
+
+test('Git verification holds no task or capability lock; evidence changed during the read is not applied', async t => {
+  const f = await handoffFixture(t, async (input, fixture) => {
+    // Actual exchange succeeds while the source read is in flight. A lock
+    // inversion would hang this test rather than produce the expected refusal.
+    await fixture.factory.channel.exchange(fixture.invocation.token, { id: 'changed-unit-during-git', type: 'object.put',
+      payload: { kind: 'evidence', ref: fixture.evidence.ref, baseVersion: fixture.evidence.version, content: { changed: true } } });
+    return { baseSha: input.baseSha, sourceSha: input.sourceSha, repository: 'example/repo', branch: 'cursor/task', files: [] };
+  });
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'executing'); assert.equal(f.calls.length, 2);
+});
+
+test('A native Agent reused while Git is being read cannot authorize the original pending handoff', async t => {
+  const f = await handoffFixture(t, (input, fixture) => {
+    fixture.provider.getAgent = async agentId => ({ id: agentId, latestRunId: 'external-later-run' });
+    return { baseSha: input.baseSha, sourceSha: input.sourceSha, repository: 'example/repo', branch: 'cursor/task', files: [] };
+  });
+  await f.factory.channel.exchange(f.invocation.token, f.input);
+  await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'executing'); assert.equal(f.calls.length, 2);
 });

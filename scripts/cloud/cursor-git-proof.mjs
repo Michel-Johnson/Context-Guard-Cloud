@@ -9,6 +9,11 @@ const relative = value => typeof value === 'string' && value.length > 0 && value
   !value.split('/').includes('.codex');
 const repositorySlug = url => typeof url === 'string' && /^(?:https:\/\/)?github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?$/i.exec(url)?.[1];
 
+export function cursorApprovedPaths(paths) {
+  if (!Array.isArray(paths) || !paths.length || paths.length > 100 || !paths.every(relative)) fail('Use bounded relative paths from the reviewed Plan');
+  return structuredClone(paths);
+}
+
 // Read-only verification against the source host, never an Agent's description
 // or a local cached checkout. No push, PR creation, merge or repository mutation.
 export class CursorGitProof {
@@ -18,8 +23,8 @@ export class CursorGitProof {
   }
 
   async verify({ run, baseSha, sourceSha, approvedPaths }) {
-    if (run?.status !== 'FINISHED' || !sha.test(baseSha || '') || !sha.test(sourceSha || '') || !Array.isArray(approvedPaths) ||
-        !approvedPaths.length || approvedPaths.length > 100 || !approvedPaths.every(relative)) fail('Use a completed native Run, exact revisions and reviewed source paths');
+    if (run?.status !== 'FINISHED' || !sha.test(baseSha || '') || !sha.test(sourceSha || '')) fail('Use a completed native Run, exact revisions and reviewed source paths');
+    approvedPaths = cursorApprovedPaths(approvedPaths);
     const branches = run.git?.branches?.filter(item => repositorySlug(item.repoUrl)?.toLowerCase() === this.repository.toLowerCase()) || [];
     if (branches.length !== 1 || !/^cursor\/.+/.test(branches[0].branch || '') || !relative(branches[0].branch)) fail('Use the one native-created branch in the approved repository');
     const branch = branches[0].branch;

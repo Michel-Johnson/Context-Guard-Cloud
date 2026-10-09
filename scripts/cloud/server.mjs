@@ -36,6 +36,7 @@ import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
 import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
 import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
+import { CursorGitProof } from './cursor-git-proof.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -420,6 +421,7 @@ export async function startCloudServer({
   protocolConfig,
   cursorConfigFile = process.env.CONTEXT_GUARD_CURSOR_CONFIG || '',
   cursorProviderFactory = config => new CursorCloudProvider(config),
+  cursorGitProofFactory = config => new CursorGitProof(config),
   coordinatorModelFactory = config => new CoordinatorModel(config),
   integrationConfig,
   attachmentProvider,
@@ -566,7 +568,7 @@ export async function startCloudServer({
     if (!roles) return null;
     const coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
     const { repository, store } = interfaceProject(project);
-    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId'].includes(key)) ||
+    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId', 'githubTokenFile'].includes(key)) ||
         !coordinator.sessionTemplates?.includes(roles.templateSessionId) || coordinator.bindings?.[roles.templateSessionId] !== cursorTemplateWorktree(roles.templateSessionId) ||
         config.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase() || !allowedOrigin) protocolFail('FORBIDDEN', 'Configure the hosted Cursor template explicitly for this repository Coordinator');
     if (!cursorRoleServices.has(project.id)) {
@@ -576,6 +578,7 @@ export async function startCloudServer({
         const service = new CursorRoleFactory({ directory: path.join(dataDir, 'cursor-roles', digest(project.id)), projectId: project.id,
           repositoryId: repository.repositoryId, templateSessionId: roles.templateSessionId, repositoryUrl: config.repositoryUrl,
           startingRef: config.startingRef, model: config.model, store, provider: transport.provider,
+          gitProof: cursorGitProofFactory({ repository: repository.slug, tokenFile: roles.githubTokenFile }),
           endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
           allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
           authorizeSource: async ({ state, task }) => {

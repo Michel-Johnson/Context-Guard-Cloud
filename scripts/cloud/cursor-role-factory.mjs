@@ -5,6 +5,7 @@ import { canonical } from '../shared/protocol.mjs';
 import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
 import { CursorRoleChannel } from './cursor-role-channel.mjs';
 import { cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
+import { CursorGitProof, cursorApprovedPaths } from './cursor-git-proof.mjs';
 
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const sha = /^[a-f0-9]{40}$/;
@@ -18,7 +19,7 @@ export const cursorTemplateWorktree = id => `cursor-cloud-template:${id}`;
 // Cursor remains the harness; business tasks and approvals stay in ProtocolStore.
 export class CursorRoleFactory {
   constructor({ directory, projectId, repositoryId, templateSessionId, repositoryUrl, startingRef, model,
-    endpoint, store, provider, authorizeSource, allowLoopback = false }) {
+    endpoint, store, provider, authorizeSource, gitProof, githubTokenFile, allowLoopback = false }) {
     validateCursorSource({ repositoryUrl, startingRef, model });
     let url;
     try { url = new URL(endpoint); } catch { fail('INVALID_CURSOR_ROLES', 'Configure a fixed role MCP endpoint'); }
@@ -26,9 +27,11 @@ export class CursorRoleFactory {
         !store || !provider || typeof authorizeSource !== 'function' || url.username || url.password || url.search || url.hash ||
         url.protocol !== 'https:' && !(allowLoopback && url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) fail('INVALID_CURSOR_ROLES', 'Configure an explicitly authorized hosted Cursor template');
     Object.assign(this, { directory, projectId, repositoryId, templateSessionId, repositoryUrl, startingRef, model, endpoint, store, provider, authorizeSource });
+    this.gitProof = gitProof || new CursorGitProof({ repository: new URL(repositoryUrl).pathname.slice(1).replace(/\.git$/, ''), tokenFile: githubTokenFile });
+    if (typeof this.gitProof.verify !== 'function') fail('INVALID_CURSOR_ROLES', 'Configure the source host verifier');
     this.ownerId = 'cloud-cursor:' + projectId;
     this.channel = new CursorRoleChannel({ directory: path.join(directory, 'capabilities'), store,
-      resolveReceiver: (scope, state) => this.resolveReceiver(scope, state) });
+      resolveReceiver: (scope, state) => this.resolveReceiver(scope, state), deferHandoff: (token, snapshot) => this.deferHandoff(token, snapshot) });
   }
 
   principal(id, role = 'executor') { return { repositoryId: this.repositoryId, deviceId: this.ownerId, agentId: id, role }; }
@@ -178,7 +181,92 @@ export class CursorRoleFactory {
     const common = `You are the ${scope.phase === 'ci' ? 'independent Tester' : 'Executor'} of the original Context Guard Coordinator task ${scope.taskId}. Never start a separate user chat, approve a requirement or Plan, or write Main. Use context_guard_context, then context_guard_exchange object.read for immutable references. Identity is fixed by MCP, never include Session/principal fields. Use the returned writePrefix and stable message IDs. If ROLE_UNAVAILABLE appears during native startup, retry the SAME MCP operation, do not create a new task. Source revision: ${scope.sourceSha}.`;
     if (scope.phase === 'plan') return common + ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance, then task.report stage:planReady with planRef/planVersion and the specified sourceSha. Stop after that; Coordinator must review the exact Plan before implementation.';
     if (scope.phase === 'ci') return common + ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.';
-    return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit to your own branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
+    return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit and push only your own Cursor branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. A proof-pending response saves only that original proposal: stop this Run so the host can verify it, do not send a replacement ID or claim completion. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
+  }
+
+  handoffIdentity(snapshot) {
+    const { verified, ...identity } = snapshot;
+    return hash(canonical(identity));
+  }
+
+  async deferHandoff(token, snapshot) {
+    cursorApprovedPaths(snapshot.approvedPaths);
+    const file = this.actorFile(snapshot.scope), fingerprint = this.handoffIdentity(snapshot);
+    return withFileLock(file + '.lock', async () => {
+      const actor = await readJSON(file, null), invocation = actor?.invocations.at(-1);
+      if (!invocation || invocation.token !== token || invocation.state !== 'confirmed' || invocation.runId !== snapshot.runId ||
+          canonical(invocation.scope) !== canonical(snapshot.scope)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the exact confirmed handoff invocation');
+      const current = await this.channel.handoffSnapshot(token, snapshot.input);
+      if (this.handoffIdentity(current) !== fingerprint) fail('SOURCE_UNVERIFIED', 'Handoff changed before its proposal was saved');
+      if (invocation.handoff && invocation.handoff.fingerprint !== fingerprint) fail('ID_REUSED', 'This native invocation already has a different handoff proposal');
+      invocation.handoff ||= { state: 'pending', fingerprint, snapshot: structuredClone(snapshot) };
+      await atomicWrite(file, encode(actor));
+      return { id: snapshot.input.id, ok: true, data: { state: 'proof-pending', taskId: snapshot.scope.taskId, sourceSha: snapshot.input.payload.data.sourceSha } };
+    });
+  }
+
+  async acceptedHandoff(actor, invocation) {
+    const pending = invocation.handoff;
+    if (!pending?.proof) return false;
+    return this.store.transaction(async state => {
+      const task = this.currentTask(state, actor, invocation.scope.taskId);
+      if (!await this.authorizeSource({ state, actor: structuredClone(actor), task: structuredClone(task) })) fail('CURSOR_ROLE_CONFLICT', 'Source access changed');
+      const applied = state.cursorRoleHandoffs?.[pending.proof.proofId];
+      return !!applied && applied.scopeHash === invocation.id && applied.runId === invocation.runId &&
+        applied.messageHash === hash(canonical(pending.snapshot.input));
+    }, { readOnly: true });
+  }
+
+  async verifyHandoff(file) {
+    const actor = await readJSON(file, null), invocation = actor?.invocations.at(-1), pending = invocation?.handoff;
+    if (!pending) return null;
+    if (await this.acceptedHandoff(actor, invocation)) return { state: 'handoff-accepted' };
+    const { snapshot } = pending;
+    let current;
+    try { current = await this.channel.handoffSnapshot(invocation.token, snapshot.input); }
+    catch (cause) {
+      const latest = await readJSON(file, null), owned = latest?.invocations.at(-1);
+      if (owned?.id === invocation.id && await this.acceptedHandoff(latest, owned)) return { state: 'handoff-accepted' };
+      throw cause;
+    }
+    if (this.handoffIdentity(current) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original handoff evidence or task changed');
+    // Network reads run outside actor, capability and ProtocolStore locks.
+    // Repeated pumps inspect the same confirmed Run, never create a model Run.
+    const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
+    if (run.agentId !== actor.nativeAgentId || run.id !== invocation.runId) fail('SOURCE_UNVERIFIED', 'Native handoff belongs to another Run');
+    if (!cursorRunTerminal(run)) return { state: 'proof-pending' };
+    if (run.status !== 'FINISHED' || (await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== invocation.runId) fail('SOURCE_UNVERIFIED', 'Original native handoff did not finish in its saved Run');
+    const facts = await this.gitProof.verify({ run, baseSha: snapshot.scope.sourceSha,
+      sourceSha: snapshot.input.payload.data.sourceSha, approvedPaths: snapshot.approvedPaths });
+    if (facts.baseSha !== snapshot.scope.sourceSha || facts.sourceSha !== snapshot.input.payload.data.sourceSha) fail('SOURCE_UNVERIFIED', 'Git facts do not match the original proposal');
+    const completed = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
+    if (completed.agentId !== actor.nativeAgentId || completed.id !== invocation.runId || completed.status !== 'FINISHED' ||
+        (await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== invocation.runId) fail('SOURCE_UNVERIFIED', 'Native handoff changed during the Git read');
+    const proof = { proofId: hash(canonical([pending.fingerprint, facts, invocation.runId])), nativeAgentId: actor.nativeAgentId,
+      runId: invocation.runId, baseSha: facts.baseSha, sourceSha: facts.sourceSha, references: snapshot.references,
+      taskVersion: snapshot.taskVersion, messageHash: hash(canonical(snapshot.input)) };
+    const ready = await withFileLock(file + '.lock', async () => {
+      const latest = await readJSON(file, null), owned = latest?.invocations.at(-1);
+      if (!owned || owned.id !== invocation.id || owned.runId !== invocation.runId || owned.token !== invocation.token || owned.state !== 'confirmed' ||
+          owned.handoff?.fingerprint !== pending.fingerprint) fail('CURSOR_ROLE_CONFLICT', 'Handoff invocation changed during verification');
+      if (await this.acceptedHandoff(latest, owned)) return false;
+      let rechecked;
+      try { rechecked = await this.channel.handoffSnapshot(invocation.token, snapshot.input); }
+      catch (cause) { if (await this.acceptedHandoff(latest, owned)) return false; throw cause; }
+      if (this.handoffIdentity(rechecked) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original handoff changed during verification');
+      owned.handoff.proof = proof; owned.handoff.facts = facts;
+      await atomicWrite(file, encode(latest));
+      return true;
+    });
+    if (!ready) return { state: 'handoff-accepted' };
+    // Release the actor lock before the original capability exchange. Its core
+    // transaction rechecks authority and writes the acceptance marker atomically.
+    try { return (await this.channel.exchange(invocation.token, snapshot.input)).data; }
+    catch (cause) {
+      const latest = await readJSON(file, null);
+      if (await this.acceptedHandoff(latest, latest.invocations.at(-1))) return { state: 'handoff-accepted' };
+      throw cause;
+    }
   }
 
   async launch(file, actor, taskId, phase) {
@@ -244,7 +332,12 @@ export class CursorRoleFactory {
       return state.tasks[taskKey(this.repositoryId, session, taskId)];
     }, { readOnly: true });
     if (['cancelling', 'interrupted'].includes(control?.stage)) return this.stopTask(executorFile, executor, control);
-    const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+    let task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+    if (executor.invocations.at(-1)?.handoff) {
+      const result = await this.verifyHandoff(executorFile);
+      task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+      if (task.stage === 'executing') return result;
+    }
     if (task.stage === 'awaiting-ci') return this.reserveCi(session, taskId);
     const phase = task.stage === 'assigned' ? 'plan' : task.stage === 'executing' ? 'execution' : task.stage === 'testing' ? 'ci' : null;
     if (!phase) return null;
@@ -330,6 +423,7 @@ export class CursorRoleFactory {
     // ProtocolStore while callbacks already hold it; activation is outside it.
     if (!await (state ? authorized(state) : this.store.transaction(authorized, { readOnly: true }))) return null;
     return { active: true, scopeHash: invocation.id, nativeAgentId: actor.nativeAgentId, runId: invocation.runId,
+      ...(invocation.handoff?.proof ? { verifiedHandoff: invocation.handoff.proof } : {}),
       ...(actor.kind === 'ci' ? { executorNativeAgentId: actor.executorNativeAgentId } : {}) };
   }
 

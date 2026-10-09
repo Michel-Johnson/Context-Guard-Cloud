@@ -2,8 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
-import { canonical, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
-import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
+import { canonical, MAX_MESSAGE_BYTES, validateMessage } from '../shared/protocol.mjs';
+import { reduceWorkflow, scopedObjectKey } from '../shared/protocol-workflow.mjs';
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const sha = /^[a-f0-9]{40}$/;
@@ -32,9 +32,10 @@ function validateScope(scope) {
 // schedule agents, approve plans or infer task success from native Run status.
 // resolveReceiver must read the private provider ledger, not agent arguments.
 export class CursorRoleChannel {
-  constructor({ directory, store, resolveReceiver, now = Date.now }) {
-    if (!path.isAbsolute(directory || '') || !store || typeof resolveReceiver !== 'function' || typeof now !== 'function') fail('INVALID_ARGUMENT', 'Use private role storage and a trusted receiver resolver');
+  constructor({ directory, store, resolveReceiver, deferHandoff, now = Date.now }) {
+    if (!path.isAbsolute(directory || '') || !store || typeof resolveReceiver !== 'function' || typeof now !== 'function' || deferHandoff !== undefined && typeof deferHandoff !== 'function') fail('INVALID_ARGUMENT', 'Use private role storage and a trusted receiver resolver');
     this.directory = directory; this.store = store; this.resolveReceiver = resolveReceiver; this.now = now;
+    this.deferHandoff = deferHandoff;
   }
 
   async issue({ operationId, scope, ttlMs = 3600000 }) {
@@ -178,6 +179,15 @@ export class CursorRoleChannel {
             proof.baseSha !== scope.sourceSha || !sha.test(proof.sourceSha || '') || proof.sourceSha !== p.data?.sourceSha) fail('SOURCE_UNVERIFIED', 'Handoff needs a trusted provider and Git revision proof');
         if (!own(p.data.ciTodoRef) || !p.data.unitTestRefs.every(own) || !p.data.experienceRefs.every(own)) fail('ROLE_FORBIDDEN', 'Handoff references belong to another role or task');
         this.verifyEvidenceVersions(state, principal, scope, proof, [p.data.ciTodoRef, ...p.data.unitTestRefs, ...p.data.experienceRefs]);
+        if (proof.messageHash) {
+          const input = { id: message.id, type: message.type, payload: message.payload };
+          if (proof.messageHash !== hash(canonical(input)) || proof.taskVersion !== task.version) fail('SOURCE_UNVERIFIED', 'The original handoff or task changed after verification');
+          // This marker commits with the original reducer and retry receipt.
+          // A crash after acceptance can be observed without replaying a stale
+          // phase or trusting an adapter-only "applied" flag.
+          state.cursorRoleHandoffs ||= {};
+          state.cursorRoleHandoffs[proof.proofId] = { scopeHash: lease.scopeHash, runId: lease.runId, messageHash: proof.messageHash };
+        }
         return;
       }
     }
@@ -211,9 +221,43 @@ export class CursorRoleChannel {
     });
   }
 
+  async handoffSnapshot(token, input) {
+    return this.withLease(token, async lease => {
+      const scope = lease.scope, principal = this.principal(scope);
+      const message = validateMessage({ v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) });
+      if (scope.phase !== 'execution' || message.type !== 'task.report' || message.payload.stage !== 'handoff' || message.payload.taskId !== scope.taskId) fail('ROLE_FORBIDDEN', 'Defer only this Executor\'s original handoff');
+      return this.store.transaction(async state => {
+        const task = this.task(state, scope, principal), receiver = await this.receiver(lease, state);
+        if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired');
+        // Match ProtocolStore's authenticated identity tuple. This is only a
+        // preflight read, covered against its actual receipt writer below;
+        // the final exchange remains the sole authority for accepting the ID.
+        const receipt = state.receipts[hash(canonical([principal.repositoryId, principal.deviceId, principal.agentId, message.id]))];
+        if (receipt && receipt.fingerprint !== hash(canonical(message))) fail('ID_REUSED', 'The original request ID already belongs to a different message');
+        const data = message.payload.data;
+        const refs = [...new Set([data.ciTodoRef, ...data.unitTestRefs, ...data.experienceRefs])];
+        if (refs.some(ref => !ref.startsWith(this.prefix(scope)) || ref.length <= this.prefix(scope).length)) fail('ROLE_FORBIDDEN', 'Handoff references belong to another role or task');
+        // Exercise the SAME semantic reducer on a throwaway snapshot. Nothing
+        // is written or emitted; missing objects/kinds cannot enter the ledger.
+        try { await reduceWorkflow(structuredClone(state), principal, message, () => 0); }
+        catch (cause) { if (cause.code === 'NOT_FOUND') fail('SOURCE_UNVERIFIED', 'Handoff references or versions are unavailable'); throw cause; }
+        const references = Object.fromEntries(refs.map(ref => [ref, state.objects[scopedObjectKey(principal, scope.session, ref)].latest]));
+        const plan = state.objects[scopedObjectKey(principal, scope.session, scope.plan.ref)]?.versions[scope.plan.version];
+        return { scope, runId: receiver.runId, input: structuredClone(input), references,
+          taskVersion: task.version, approvedPaths: plan?.content?.paths, verified: !!receiver.verifiedHandoff };
+      }, { readOnly: true });
+    });
+  }
+
   async exchange(token, input) {
     if (!record(input) || Object.keys(input).some(key => !['id', 'type', 'payload'].includes(key)) ||
         !bounded(input.id) || !bounded(input.type) || !record(input.payload) || Buffer.byteLength(JSON.stringify(input)) > MAX_MESSAGE_BYTES) fail('INVALID_ARGUMENT', 'Send only a bounded message ID, type and payload');
+    if (this.deferHandoff && input.type === 'task.report' && input.payload.stage === 'handoff') {
+      const snapshot = await this.handoffSnapshot(token, input);
+      // Release the capability/ProtocolStore locks before touching the actor
+      // ledger. Factory launch takes actor -> capability, never the reverse.
+      if (!snapshot.verified) return this.deferHandoff(token, snapshot);
+    }
     return this.withLease(token, async lease => {
       const scope = lease.scope;
       return this.store.handle(this.principal(scope), { v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) }, {
