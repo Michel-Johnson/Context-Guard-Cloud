@@ -31,6 +31,8 @@ test('TODO 和 Bug 建议不改变归属，人类确认后只绑定一个主节�
   for (const kind of ['todo', 'bug']) {
     const proposal = await f.propose('proposal-' + kind, kind);
     assert.equal(proposal.kind, 'binding-proposal'); assert.equal(proposal.pending, true);
+    assert.equal(proposal.reason, '需求');
+    assert.equal((await f.make().approvals(f.conversationId)).find(item => item.id === proposal.id).reason, proposal.reason);
     assert.equal((await f.conversations.get(f.conversationId)).kind, kind === 'todo' ? undefined : 'todo');
     assert.equal(proposal.pathText, '项目：目标\n└─ 工程：工程边界\n  └─ 测试：回归');
     assert.doesNotMatch(proposal.pathText, /ROOT|ENGINEERING|TESTING/);

@@ -20,10 +20,12 @@ import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
-  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归' };
+  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');
   const text = blocks.filter(block => block.type === 'section').map(block => block.text.text).join('\n');
   assert.ok(text.includes(proposal.pathText)); assert.match(text, /同意绑定|暂不绑定/);
+  assert.match(text, /理由：该需求主要影响测试模块。/);
+  assert.doesNotMatch(JSON.stringify(bindingBlocks({ ...proposal, reason: undefined }, 'internal-thread')), /理由：|undefined/);
   assert.doesNotMatch(text, /internal-/); assert.ok(blocks.filter(block => block.type === 'section').every(block => block.text.type === 'plain_text'));
   assert.deepEqual(blocks.at(-1).elements.map(button => button.action_id), ['approve_binding', 'reject_binding']);
   assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'internal-thread', proposalId: proposal.id, version: proposal.version });
@@ -2492,6 +2494,10 @@ test('global form can explicitly select project before first Home preference', a
 test('brief approval carries original version and prompt export uses shared gateway', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001'); await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
   await f.plugin.review('E1', user, { key, proposalId: 'approval-1', version: 'brief-version' }, 'approved', 'approved by user');
+  const confirmation = f.sent.at(-1);
+  assert.match(confirmation.text, /Main 事项已保存/);
+  assert.match(JSON.stringify(confirmation.blocks), /Claude Code CLI 或 Cursor；开发记录只保存在本地/);
+  assert.doesNotMatch(JSON.stringify(confirmation), /hooks 写回 Session|Codex/);
   assert.equal(f.calls.find(call => call.type === 'brief.review').payload.version, 'brief-version');
   await f.plugin.exportPrompt('E2', user, { key, proposalId: 'approval-1' }); assert.equal(f.sent.find(call => call.export).export.text, 'execute login');
 });

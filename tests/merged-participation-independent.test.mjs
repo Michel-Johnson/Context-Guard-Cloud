@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
+import { CoordinatorModel } from '../scripts/cloud/coordinator-model.mjs';
 
 // Independent acceptance uses the real durable service and a controlled model.
 // No external model, Slack transport, production data or credentials are used.
@@ -32,6 +33,169 @@ async function submit(service, text, options = {}) {
     { source: 'slack', actor, participation: participation(text) });
 }
 const streamed = snapshots => snapshots.map(state => state.streaming?.text || '').filter(Boolean);
+
+for (const name of ['ask_user', 'mount_conversation', 'show_model_menu']) test(`接话别名 ${name} 执行后等待人类，不追加模型总结`, async t => {
+  let calls = 0;
+  const input = name === 'ask_user' ? { question: '绑定到主页模块，可以吗？', options: ['可以', '暂不绑定'] } : {};
+  const native = { type: 'tool_use', id: 'wait', name: `reply_${name}`, input };
+  const f = await fixture(t, async () => {
+    calls++;
+    return calls === 1 ? { stop: 'tool_use', content: [native] } : answer('不应出现的额外总结。');
+  }, { tools: [{ name }], execute: async (actual, args) => {
+    assert.equal(actual, name); assert.deepEqual(args, input); return { saved: true };
+  } });
+  await submit(f.service, '先展示确认，不继续处理。'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(calls, 1);
+  assert.deepEqual((await f.service.readConversation()).messages.find(message => message.role === 'assistant').content, [native]);
+  if (name === 'ask_user') {
+    const question = state.messages.at(-1).questions[0];
+    assert.equal(state.messages.at(-1).text, input.question); assert.deepEqual(question.options, input.options);
+    assert.ok(f.snapshots.some(snapshot => snapshot.activity?.kind === 'preparing-question'));
+    await f.service.submit({ id: 'answer', text: '可以', answerTo: question.id }); await f.service.close();
+    const restored = await f.service.state();
+    assert.deepEqual(restored.messages.flatMap(message => message.questions || []).find(item => item.id === question.id).answer,
+      { text: '可以', requestId: 'answer' });
+    assert.equal(calls, 2); assert.equal(restored.approvals.length, 0, '提问答复不是事项批准');
+  }
+});
+
+test('接话别名纯表情完成后只执行一轮，原生工具对及精确回执保留', async t => {
+  let calls = 0;
+  const native = { type: 'tool_use', id: 'social-complete', name: 'reply_react_to_user', input: { emoji: 'wave', replyComplete: true } };
+  const f = await fixture(t, async () => {
+    calls++;
+    return calls === 1 ? { stop: 'tool_use', content: [native] } : answer('不应出现的占位正文。');
+  }, { tools: [{ name: 'react_to_user' }], execute: async (name, input, { operationId }) => {
+    assert.equal(name, 'react_to_user'); assert.deepEqual(input, native.input);
+    return { kind: 'slack-reaction', actionId: operationId, emoji: 'wave', status: 'intent' };
+  } });
+  await submit(f.service, '只挥手，不需要正文。'); await f.service.close();
+  assert.equal(calls, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  const raw = await f.service.readConversation();
+  assert.deepEqual(raw.messages.at(-2).content, [native]); assert.equal(raw.messages.at(-1).content[0].tool_use_id, native.id);
+  const receipt = Object.values(raw.toolReceipts)[0];
+  assert.equal(receipt.result.requestId, 'original'); assert.deepEqual(receipt.result.actor, actor);
+  assert.ok(receipt.result.actionId.startsWith('coordinator:')); assert.deepEqual(streamed(f.snapshots), []);
+});
+
+test('普通网页来源不能借用接话工具别名获得执行权限', async t => {
+  let calls = 0;
+  const f = await fixture(t, async ({ tools }) => {
+    assert.equal(tools[0].name, 'write');
+    return ++calls === 1 ? { stop: 'tool_use', content: [{ ...tool('forged'), name: 'reply_write' }] } : answer('此工具未开放。');
+  });
+  await f.service.submit({ id: 'browser', text: '测试' }, { source: 'human', actor: { kind: 'human', sessionId: 'browser-human' } });
+  await f.service.close(); assert.deepEqual(f.writes, []);
+  const raw = await f.service.readConversation();
+  assert.ok(Object.values(raw.toolReceipts).some(receipt => receipt.isError && receipt.result.error.code === 'TOOL_FORBIDDEN'));
+});
+
+test('群组没有项目切换权限时，接话别名也不能调用项目工具', async t => {
+  const f = await fixture(t, async ({ tools, onToolStart }) => {
+    assert.equal(tools.some(tool => tool.name === 'reply_switch_project'), false);
+    await onToolStart?.('reply_switch_project');
+    return { stop: 'tool_use', content: [{ ...tool('forged-project'), name: 'reply_switch_project' }] };
+  }, { tools: [{ name: 'write' }, { name: 'switch_project' }] });
+  const text = '测试项目切换';
+  await f.service.submit({ id: 'batch', inputs: [{ id: 'original', text }] },
+    { source: 'slack', actor: { ...actor, channelId: 'CTESTPUBLIC' }, participation: participation(text) });
+  await f.service.close(); assert.equal((await f.service.state()).status, 'error'); assert.deepEqual(f.writes, []);
+});
+
+test('显式选择接话工具：不增加分类轮次，业务参数和原生回执保持原样', async t => {
+  let calls = 0;
+  const native = { ...tool('declared'), name: 'reply_write' };
+  const f = await fixture(t, async ({ tools, onToolStart, onText }) => {
+    if (++calls === 1) {
+      assert.equal(tools[0].name, 'reply_write'); assert.equal(tools[0].input_schema, undefined);
+      await onToolStart?.('reply_write'); await onText?.('正在执行已授权的修改。');
+      assert.deepEqual(streamed(f.snapshots), [], '响应尚未确认前不发布正文');
+      return { stop: 'tool_use', content: [native, { type: 'text', text: '正在执行已授权的修改。' }] };
+    }
+    assert.equal(tools[0].name, 'write', '接续轮恢复原工具定义');
+    return answer('已保存。');
+  });
+  await submit(f.service, '执行已授权的修改。'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(calls, 2);
+  assert.deepEqual(f.writes, [{ id: 'declared' }], '业务参数不变');
+  const raw = await f.service.readConversation();
+  assert.deepEqual(raw.messages.find(message => message.role === 'assistant').content[0], native, '原生工具输入保持原样');
+  assert.ok(streamed(f.snapshots).includes('正在执行已授权的修改。'));
+});
+
+for (const name of ['write', 'reply_unknown', 'reply_reply_write', 'reply_']) test(`未选择本轮明确接话工具（${name}）时无正文、无执行`, async t => {
+  const input = { id: 'denied' };
+  const f = await fixture(t, async ({ onToolStart, onText }) => {
+    await onToolStart?.('write'); await onText?.('未验证的正文。');
+    return { stop: 'tool_use', content: [{ ...tool('denied'), name, input }, { type: 'text', text: '未验证的正文。' }] };
+  });
+  await submit(f.service, '仅供知悉，不要修改。'); await f.service.close();
+  assert.equal((await f.service.state()).status, 'error');
+  assert.deepEqual(f.writes, []); assert.deepEqual(streamed(f.snapshots), []);
+});
+
+test('工具声明与静默文本冲突时拒绝执行', async t => {
+  const f = await fixture(t, async ({ onToolStart, onText }) => {
+    await onToolStart?.('write'); await onText?.('[CG_SILENT]');
+    return { stop: 'tool_use', content: [{ ...tool('contradiction'), name: 'reply_write' }, { type: 'text', text: '[CG_SILENT]' }] };
+  });
+  await submit(f.service, '仅供知悉，不用回复。'); await f.service.close();
+  assert.equal((await f.service.state()).status, 'error');
+  assert.deepEqual(f.writes, []); assert.deepEqual(streamed(f.snapshots), []);
+});
+
+test('同轮后续工具含非法声明时，整轮都不执行', async t => {
+  const f = await fixture(t, async ({ onToolStart }) => {
+    await onToolStart?.('write');
+    return { stop: 'tool_use', content: [
+      { ...tool('first'), name: 'reply_write' },
+      { ...tool('second'), name: 'reply_unknown' },
+    ] };
+  });
+  await submit(f.service, '执行已授权的修改。'); await f.service.close();
+  assert.equal((await f.service.state()).status, 'error'); assert.deepEqual(f.writes, []);
+});
+
+test('工具声明未收齐时的新静默更正阻止旧轮执行', { timeout: 10000 }, async t => {
+  const entered = deferred(), release = deferred(); let calls = 0;
+  const f = await fixture(t, async ({ onToolStart, signal }) => {
+    if (++calls > 1) return answer('[CG_SILENT]');
+    await onToolStart?.('write'); entered.resolve();
+    await Promise.race([release.promise, new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))]);
+    return { stop: 'tool_use', content: [{ ...tool('stale'), name: 'reply_write' }] };
+  });
+  await submit(f.service, '执行已授权的修改。'); await entered.promise;
+  const correction = '更正：不用回复，也不要修改。';
+  await f.service.submit({ id: 'corrected-batch', followup: 'steer', expectedTurnId: 'original', inputs: [{ id: 'correction', text: correction }] },
+    { source: 'slack', actor, participation: { ...participation(correction), inputs: [{ id: 'correction', text: correction }] } });
+  release.resolve(); await f.service.close();
+  assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.deepEqual(f.writes, []); assert.deepEqual(streamed(f.snapshots), []);
+});
+
+for (const terminal of [true, false]) test(`原生 SSE 工具声明须在完整响应后才能执行（终止事件：${terminal}）`, async t => {
+  let calls = 0;
+  const requests = [];
+  const model = new CoordinatorModel({ baseUrl: 'https://provider.invalid', model: 'fixture', token: 'synthetic', fetch: async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    if (++calls > 1) return new Response(JSON.stringify({ model: 'fixture', stop_reason: 'end_turn', content: [{ type: 'text', text: '已保存。' }] }), { headers: { 'content-type': 'application/json' } });
+    const frames = [{ type: 'message_start', message: { model: 'fixture', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'wire', name: 'reply_write', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify({ id: 'wire' }) } },
+      { type: 'content_block_stop', index: 0 }, { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+      ...(terminal ? [{ type: 'message_stop' }] : [])];
+    return new Response(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\n\n').join(''), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const f = await fixture(t, async () => { throw new Error('unused'); }, { model });
+  await submit(f.service, '执行已授权的修改。'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(state.status, terminal ? 'waiting-for-user' : 'error');
+  assert.deepEqual(f.writes, terminal ? [{ id: 'wire' }] : []);
+  assert.equal(calls, terminal ? 2 : 1);
+    if (terminal) assert.equal(requests[1].messages.find(message => message.role === 'assistant').content[0].name, 'reply_write');
+});
 
 test('Independent merged reply uses one model round, strips every split control prefix and preserves original identity', async t => {
   let calls = 0;
