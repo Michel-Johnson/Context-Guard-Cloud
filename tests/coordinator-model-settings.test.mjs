@@ -37,7 +37,9 @@ test('model catalog exposes only safe metadata and selection survives restart', 
   assert.equal(result.selectedId, 'ds');
   const restarted = await CoordinatorModelSettings.open({ ...f, factory });
   assert.deepEqual(await restarted.state(), result);
-  assert.equal((await restarted.selection()).model.model, 'deepseek-flash');
+  const selected=await restarted.selection();
+  assert.equal(selected.model.model, 'deepseek-flash');
+  assert.equal(selected.version,(await restarted.state()).version,'selection and translation cache revision come from the same settings snapshot');
   assert.deepEqual(await restarted.select({ baseVersion: input.baseVersion, providerId: input.providerId, id: input.id }), result, 'property order does not change operation identity');
   await assert.rejects(restarted.select({ ...input, providerId: 'glm' }), { code: 'ID_REUSED' });
   await assert.rejects(restarted.select({ ...input, id: 'stale' }), { code: 'VERSION_CONFLICT' });

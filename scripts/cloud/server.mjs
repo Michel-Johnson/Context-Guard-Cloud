@@ -18,6 +18,7 @@ import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
 import { validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
 import { CoordinatorModel } from './coordinator-model.mjs';
 import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
+import { MapTranslations, translationInput } from './map-translations.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from './coordinator-service.mjs';
 import { coordinatorTools, coordinatorReferences, coordinatorReferenceFiles, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
@@ -41,6 +42,8 @@ const workbenchAssetTypes = new Map([
   ['prototype/workbench-app.js', 'text/javascript; charset=utf-8'],
   ['prototype/workbench-data.js', 'text/javascript; charset=utf-8'],
   ['prototype/workbench-sync.mjs', 'text/javascript; charset=utf-8'],
+  ['prototype/map-graph-view.mjs', 'text/javascript; charset=utf-8'],
+  ['prototype/map-translations.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/attachments.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/coordinator-markdown.mjs', 'text/javascript; charset=utf-8'],
   ['prototype/coordinator-working-blot.mjs', 'text/javascript; charset=utf-8'],
@@ -494,6 +497,7 @@ export async function startCloudServer({
   const integrationAttachments = integrations ? new IntegrationAttachmentStore({ directory: path.join(dataDir, 'integration-attachments'), maxBytes: 5 * 1024 * 1024 }) : null;
   const manualBriefStores = new Map();
   const modelSettings = new Map();
+  const mapTranslations = new MapTranslations();
   const modelSettingsFor = project => {
     if (!modelSettings.has(project.id)) {
       const config = coordinatorConfigFor(project);
@@ -2388,6 +2392,15 @@ export async function startCloudServer({
           if (match?.[2] && req.method === 'POST') return send(res, 202, await attachments.retry(project.id, viewId, match[1]));
           throw new MapError('NOT_FOUND', 'Attachment route not found', 404);
         }
+        if (action === '/api/map/translations' && project) {
+          requireHumanWorkbench(req);
+          if(req.method!=='POST')protocolFail('INVALID_ARGUMENT','Use POST for Map translation');
+          if(req.headers.origin && req.headers.origin!==(allowedOrigin||`http://${req.headers.host}`))protocolFail('FORBIDDEN','Untrusted translation origin');
+          const input=translationInput(await requestBody(req));
+          if(viewId.startsWith('session:'))await sessionSnapshot(project,viewId);
+          const {providerId,version,model}=await (await modelSettingsFor(project)).selection({timeoutMs:30000});
+          return send(res,200,await mapTranslations.translate(input,{providerId,model,scope:JSON.stringify([project.id,viewId,version])}));
+        }
         if (action === '/api/coordinator/model' && project) {
           const settings = await modelSettingsFor(project);
           if (req.method === 'GET') return send(res, 200, await settings.state());
@@ -2784,7 +2797,7 @@ export async function startCloudServer({
         res.writeHead(200, { 'Content-Type': asset.contentType, 'Cache-Control': 'private, max-age=31536000, immutable', Vary: 'Cookie', 'X-Content-Type-Options': 'nosniff' });
         return res.end(asset.body);
       }
-      if (req.method === 'GET' && /\/(map-model|workbench-sync|attachments|coordinator-markdown|coordinator-working-blot|marked)\.mjs$/.test(route)) {
+      if (req.method === 'GET' && /\/(map-model|map-graph-view|map-translations|workbench-sync|attachments|coordinator-markdown|coordinator-working-blot|marked)\.mjs$/.test(route)) {
         requirePrivateRead(req, url);
         const source = await fs.readFile(path.join(root, path.basename(route) === 'map-model.mjs' ? 'scripts/shared' : path.basename(route) === 'marked.mjs' ? 'prototype/vendor' : 'prototype', path.basename(route)));
         res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); return res.end(source);
@@ -2810,7 +2823,7 @@ export async function startCloudServer({
         if (/^\/projects\//.test(route) && !projectById(decodeURIComponent(route.slice('/projects/'.length)))) throw new MapError('NOT_FOUND', 'Project is missing', 404);
         const projectId = /^\/projects\//.test(route) ? decodeURIComponent(route.slice('/projects/'.length)) : null;
         const scope = projectId ? `projects/${encodeURIComponent(projectId)}` : 'overview';
-        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { deviceAuthorization: !!projectId && !!deviceAuthorization && !!interfaceConfig?.repositories?.find(item => item.projectId === projectId), sessionCompletion: !!projectId && !!configuredMemory?.projects?.[projectId], attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
+        const config = JSON.stringify({ root: `cloud:${projectId || 'overview'}`, protocol: 3, apiBase: `/api/workbench/${scope}`, interfaceCapabilities: { deviceAuthorization: !!projectId && !!deviceAuthorization && !!interfaceConfig?.repositories?.find(item => item.projectId === projectId), sessionCompletion: !!projectId && !!configuredMemory?.projects?.[projectId], attachments: !!projectId && !!configuredMemory?.projects?.[projectId] && !!attachments, taskDispatch: !!projectId && !!interfaceConfig, humanReview: !!projectId && !!interfaceConfig, mapTranslations: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled, coordinator: !!configuredMemory?.projects?.[projectId]?.coordinator?.enabled } }).replace(/</g, '\\u003c');
         const marker = `<script>window.__CG_SERVER=${config};</script>`;
         const html = workbenchHtml.replace('<!-- CG_SERVER_BOOT -->', marker);
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'", 'Referrer-Policy': 'no-referrer', 'X-Frame-Options': 'DENY' });

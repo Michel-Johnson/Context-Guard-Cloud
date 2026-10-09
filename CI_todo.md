@@ -10,6 +10,15 @@
 
 - [x] 合并验证：并行 Main `45e3f1f` 的项目切换已正常整合，保留其功能/授权/测试，候选 Cloud1.5.1/Slack0.3.1。Executor 唯一正式整合批次 actual `773b4b` exit0，46/46、0失败/跳过/取消、4453.7381ms；日志 `temp/slack-failed-stream-main45-integration-executor-20261009.log` SHA256 `e4e1fca181e555157cea7a29bc07ac847969cc2b87acbd4bb79c617d980c3288`。
 - [x] 整合独立 Tester：准确 pending merge 父 `f161d537` / `45e3f1f` 的11源码/测试及四版本等17项冻结hash前后不变；唯一同46目标 actual `1cccca` exit0，46/46、0失败/跳过/取消、2651.4899ms。报告 `temp/slack-failed-stream-main45-independent-20261009.md`，日志 SHA256 `382383d3edd5068c1a617898a96b5bee2236c3aceee1d251984ce68df6a7216a`。原29项不套用到新字节；本46不包含后来的Markdown需求、真实供应商、生产或真人验收。
+- [x] 第二次整合：Main `756e452` 的 Map Beta / 展示翻译已正常整合，候选 Cloud1.6.1 / Slack0.3.1，保留固定 core2.2.0 / UI1.3.2 及全部新增源码/测试。精确锁安装、原生成器59文件字节匹配，Executor 唯一正式52目标 actual `88d552` exit0、52/52、0失败/跳过/取消、3501.0852ms；日志 `temp/slack-failed-stream-main756-executor-20261009.log` SHA256 `cffb916483395dd437a7c17db37a7c2ec9dcdd1700b21be97ccd6d795e0e1318`。原46与其 Required 绑定19b837，不作为本轮新依赖证据。
+- [x] 第二次整合独立 Tester：同 pending 父19b837/756e工作树22冻结文件与59生成物parity、core2.2.0/UI1.3.2全部匹配；唯一同52目标 actual `a57194` exit0、52/52、0失败/跳过/取消、3270.5546ms。报告 `temp/slack-failed-stream-main756-independent-20261009.md`，日志 SHA256 `8e759c5fbdf1ea99a87b0f71522cc2ce728b0917d1ab6eb7e54421800504abd1`。translation fixture原两条未配置派发deferred提示保留，不扩权、不作为生产自动派发验收；未全量/付费模型/线上/最新Markdown验证。准确提交Required/正常合并/MainCI/上线及真人验收继续待完成。
+
+## MAP-WORKBENCH-BETA-01 · 新工作台与模型展示翻译
+
+- [x] Cloud 1.6.0 新增受既有真人 Cookie、同源和 Session 读取权限保护的翻译接口；复用当前项目已选择的 Coordinator 模型，不开放密钥、工具、聊天历史或文件访问，不写 Map。
+- [x] UI 1.3.0 固定消费阶段：独立 59/59、完整 Cloud 532 通过/0 失败/2 既有跳过，Slack 223/223；设备审批浏览器确实发现稳定工具栏恢复回归，源修复归 Skill。保留测试迁移错误与浏览器失败，不覆盖旧制品，不修改消费方原浏览器断言。
+- [ ] 正常固定 UI 1.3.2（Skill main 047fc77），完成准确修订完整 Cloud/Slack/浏览器、独立消费验证及 Required；不修改共享生成物。UI 1.3.1 后的稳定入口复核又恢复 Bug/TODO、lens 深链及 Beta 关闭时的原键盘行为；Skill 冻结修订完整 600 通过/2 既有跳过、独立 Map 85/85，不代替 Cloud 消费方验收。
+- [ ] 部署后 computer use 核验稳定版默认关闭、新版 Beta 与真实模型翻译。新增节点/关系写入仅在隔离本地项目测试，不任意修改生产 Map。
 
 ## SLACK-PROJECT-SWITCH-01 · 私聊查询与自然切换项目（2026-10-09）
 
