@@ -42,10 +42,13 @@ export class SlackFeedback {
     await this.store.update(state => {
       const item = state.feedback[id];
       if (inputRevision < item.inputRevision || inputRevision === item.inputRevision && controlRevision < item.controlRevision) return;
+      // 新消息使全局输入版本递增，也不能把旧原消息的完成状态重置为处理中。
+      if (item.desired === 'completed' && desired !== 'completed' && controlRevision <= item.controlRevision) return;
       if (inputRevision === item.inputRevision && controlRevision === item.controlRevision &&
           ['reply', 'silent'].includes(item.desired) && ['reply', 'silent'].includes(desired) && item.desired !== desired) return;
       if (inputRevision === item.inputRevision && controlRevision === item.controlRevision &&
-          ['failed', 'stopped'].includes(item.desired) && ['reply', 'silent'].includes(desired)) return;
+          (['failed', 'stopped'].includes(item.desired) && ['reply', 'silent', 'completed'].includes(desired) ||
+            item.desired === 'silent' && desired === 'completed')) return;
       // 相同已判定轮次的旧 pending 快照不能把状态重置为“已收到”。
       if (desired === 'received' && item.desired !== 'received') return;
       item.inputRevision = inputRevision; item.controlRevision = controlRevision;

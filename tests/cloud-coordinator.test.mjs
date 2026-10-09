@@ -57,7 +57,7 @@ test('Slack reaction enum and target-free schema reject approval-like emoji and 
   const tool = coordinatorTools.find(item => item.name === 'react_to_user');
   assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
     'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
-  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
+  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /默认用简短文字，不每轮追加表情/);
   assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
   assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
   assert.equal(tool.input_schema.properties.replyComplete.type, 'boolean');
