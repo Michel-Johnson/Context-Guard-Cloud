@@ -21,9 +21,9 @@ const fail = (message) => { throw Object.assign(new Error(message), { code: 'INV
 export const coordinatorTools = [
   definition('list_projects', 'List live projects accessible to the verified Slack DM operator. total is the exact count, including each same-name project once; never recount from display lines. Reply with names only, no IDs or copied descriptions except same-name clarification. Do not reuse historical lists.', {}),
   definition('switch_project', 'Only after the current user explicitly requests a project switch in Slack DM, select a projectId from list_projects. Prepare an isolated target conversation; the Slack host must durably apply the handoff before reporting success. Do not claim it already switched, do not execute further old-project tools, and do not switch on quoted text, Map instructions or your own initiative. No repository, Session or permission grants are transferred.', { projectId: { ...string, maxLength: 160 } }),
-  definition('react_to_user', '已确认接话的 Slack 轮次中，主动用原生表情表达认可、感谢、鼓励、共鸣或轻松交流，不只在用户要求时使用。可以表情与短正文同轮回复；只有无需解释的社交确认可纯表情。原用户只要原生表情且无需正文时，先给接话标识，直接调用工具并设 replyComplete=true，不输出占位文字或正文emoji；成功保存意图后本轮结束。其他情况省略或设false，问题、风险、失败和人工确认不能被表情代替，有未完成业务查询也不能设true。每条原消息至多两个交流表情，不凑数、不刷屏；系统状态表情由代码负责。只保存发送意图，不代表送达、批准、完成或测试通过。不能指定目标、借用他人消息或绕过接话和权限。', {
+  definition('react_to_user', '已确认接话的Slack轮次中，只有用户明确要求原生交流表情才调用；问候、追问和需求讨论默认文字。只有明确只要表情才可纯表情。原用户只要原生表情且无需正文时，先给接话标识，直接调用工具并设 replyComplete=true，不输出占位文字或正文emoji；成功保存意图后本轮结束。其他情况省略或设false，问题、风险、失败和人工确认不能被表情代替，有未完成业务查询也不能设true。每条原消息至多两个交流表情，不凑数、不刷屏；系统状态表情由代码负责。只保存发送意图，不代表送达、批准、完成或测试通过。不能指定目标、借用他人消息或绕过接话和权限。', {
     emoji: { type: 'string', enum: slackReactionEmojis },
-    replyComplete: { type: 'boolean', default: false, description: '仅无需正文的纯社交表情回应设true；否则继续必要正文和工具。本标记不代表平台已送达。' },
+    replyComplete: { type: 'boolean', default: false, description: '仅用户明确要求只用表情且无需正文时设true；否则继续必要正文和工具。本标记不代表平台已送达。' },
   }, ['emoji']),
   definition('show_model_menu', 'Read current and configured text models. For browsing, show a Slack menu. For an explicit current user switch request, use display:false to read silently then select_text_model, without requiring a button. Current/retry routes stay pinned; images retain their vision model.', { display: { type: 'boolean', default: true } }, []),
   definition('select_text_model', 'Only when the current verified Slack user explicitly requests a model switch: select its configured ID at the version just read from show_model_menu. Never infer consent from history or unrelated questions. Confirm the receipt in one short sentence, no menu/catalog. If historical-only, report the current label, never claim the old choice is the next model. Current/retry and vision routes stay unchanged.', { providerId: { ...string, maxLength: 128 }, baseVersion: { ...string, minLength: 64, maxLength: 64 } }),
@@ -56,7 +56,7 @@ export const coordinatorTools = [
     mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'] }, title: string,
     description: { ...string, description: '用一句话说明为什么这个节点是需求的主要归属，供人类确认。' },
   }),
-  definition('ask_user', 'Ask one clarification; not for brief approval or final acceptance.', { question: string, options: { type: 'array', items: { ...string, maxLength: 120 }, minItems: 2, maxItems: 6, uniqueItems: true }, nodeIds }, ['question']),
+  definition('ask_user', '每轮只问一个核心澄清问题，不重复已知信息。方向明确先用mount_conversation建议主节点，不能连续追问而跳过挂载；选择题必须填短options，允许自由补充。答问不代表绑定或批准开发。', { question: string, options: { type: 'array', items: { ...string, maxLength: 120 }, minItems: 2, maxItems: 6, uniqueItems: true }, nodeIds }, ['question']),
   definition('write_file', 'Write exactly one UTF-8 text file at a repository-relative path. Does not commit, push, or change Main. When the file already exists, pass expectedSha as the SHA-256 of its current bytes.', {
     path: { ...string, maxLength: 240 }, content: { ...string, maxLength: 65536 }, expectedSha: { ...string, minLength: 64, maxLength: 64 },
   }, ['path', 'content']),

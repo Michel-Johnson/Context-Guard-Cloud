@@ -25,7 +25,7 @@ import { coordinatorTools, coordinatorReferences, coordinatorReferenceFiles, cre
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
-import { coordinatorNodePath } from '../shared/coordinator-path.mjs';
+import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
@@ -935,8 +935,8 @@ export async function startCloudServer({
                 protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
               }
               const requirements = focused ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind } : input;
-              if (!requirements.itemId && (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId)) {
-                protocolFail('APPROVAL_REQUIRED', '新需求先提出主节点绑定建议，等人类确认后再整理 brief；相关模块按需读取，不加入绑定。');
+              if (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId) {
+                protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
               }
               return bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor }));
             }
@@ -983,9 +983,9 @@ export async function startCloudServer({
             return ids.map(id => {
               const entry = index.get(id), node = entry?.node;
               if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(id)) protocolFail('NOT_FOUND', 'Referenced Main node is unavailable');
-              return { id, title: node.title, purpose: node.purpose || '',
-                path: coordinatorNodePath(root, id, { nodeIds: config.nodeIds || null })
-                  .map(({ id, title, purpose }) => ({ id, title, purpose })) };
+              const path = coordinatorNodePath(root, id, { nodeIds: config.nodeIds || null })
+                .map(({ id, title, purpose }) => ({ id, title, purpose }));
+              return { id, title: node.title, label: coordinatorNodeLabel(node), purpose: node.purpose || '', path, pathText: coordinatorPathText(path) };
             });
           },
           readMap: async id => {
@@ -1077,7 +1077,7 @@ export async function startCloudServer({
         const service = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
-          ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true } : {}),
+          ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true, validateReplies: true } : {}),
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
           ...(integrations ? { onStateChange: () => integrationGateway?.notify({ projectId: project.id, conversationId }) } : {}),
@@ -1085,11 +1085,21 @@ export async function startCloudServer({
           beforeAcceptHumanInput: async ({ inputs, context, source, actor }) => {
             if (!context?.bindingRef || !['human', 'slack'].includes(source) || actor?.kind !== 'human') return context;
             const slackAttribution = source === 'slack';
-            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution }));
+            const current = await service.state();
+            const lastAssistant = current.messages.findLast(message => message.role === 'assistant');
+            const otherQuestion = current.messages.some(message => message.questions?.some(question => !question.answer && !question.superseded));
+            const otherApproval = (await manualBriefsFor(project).approvals(conversationId)).some(proposal => proposal.pending);
+            const allowBareConfirmation = current.status === 'waiting-for-user' && !otherQuestion && !otherApproval &&
+              lastAssistant?.actions?.some(action => action.kind === 'binding-proposal' && action.id === context.bindingRef.id && action.version === context.bindingRef.version);
+            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution, allowBareConfirmation }));
             if (!confirmation) return context;
             try {
-              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef, slackAttribution });
-              return result ? await loadContext() : context;
+              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef, slackAttribution, allowBareConfirmation });
+              if (!result) return context;
+              const refreshed = await loadContext();
+              return { ...refreshed, internalIds: [...(refreshed.internalIds || []), result.proposalId, result.conversationId],
+                dynamicText: refreshed.dynamicText + '\n[服务器已保存本条人类确认；不是新的开发审批]\n' + JSON.stringify(result) +
+                  '\n绑定已生效，不能重复提出同一候选要求再次确认；依据此回执简短报告结果。' };
             } catch (error) {
               if (!(error instanceof MapError)) throw error;
               return { ...context, dynamicText: context.dynamicText + '\n绑定未生效：' + error.message };

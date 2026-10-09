@@ -17,7 +17,7 @@ export const filterManualTools = tools => tools.filter(tool => !MANUAL_DISABLED_
     return result;
   }
   if (tool.name !== 'prepare_task') return tool;
-  const result = { ...tool, description: '整理 brief 供人类确认。新需求须已取得主节点绑定确认，nodeIds 只填这个主节点；相关模块按需读取。确认 brief 后保存 Main TODO/Bug 和可粘贴执行提示，不自动派发。' };
+  const result = { ...tool, description: '整理 brief 供人类确认。新需求及复用旧事项都须已取得本对话主节点绑定确认，nodeIds 只填这个主节点；相关模块按需读取。成功后宿主显示完整审批卡并等待确认，不在聊天重复brief。确认 brief 后保存 Main TODO/Bug 和可粘贴执行提示，不自动派发。' };
   if (tool.input_schema?.properties) {
     const properties = { ...tool.input_schema.properties };
     for (const [field, description] of [
@@ -118,7 +118,7 @@ export class CoordinatorManualBriefs {
     if (!identifier(operationId) || !identifier(conversationId)) fail('INVALID_ARGUMENT', 'Provide stable proposal and conversation IDs');
     const binding = this.readBinding ? await this.readBinding(conversationId) : null;
     const value = manualBriefInput(input, { allowNewBug: !!binding?.bindingApproval });
-    if (!value.itemId && this.readBinding && (!binding?.bindingApproval || binding.nodeId !== value.nodeId || binding.kind !== value.kind)) {
+    if (this.readBinding && (!binding?.bindingApproval || binding.nodeId !== value.nodeId || binding.kind !== value.kind)) {
       fail('APPROVAL_REQUIRED', '先由人类确认本需求的唯一主节点和事项类型，再整理 brief。', 409);
     }
     const fingerprint = hash(JSON.stringify({ value, conversationId }));
@@ -144,7 +144,7 @@ export class CoordinatorManualBriefs {
       }
       const proposal = { id, fingerprint, projectId: this.projectId, conversationId, operationId, ...value,
         itemId: value.itemId || `${value.kind === 'bug' ? 'B' : 'TD'}${hash(id).slice(0, 24)}`, itemIdentity: identity,
-        ...(!value.itemId && binding ? { bindingApproval: binding.bindingApproval } : {}),
+        ...(binding ? { bindingApproval: binding.bindingApproval } : {}),
         pathText: coordinatorPathText(coordinatorNodePath(document.root, value.nodeId)),
         createdAt: new Date().toISOString(), ...(actor ? { actor: structuredClone(actor) } : {}) };
       proposal.version = hash(JSON.stringify({ ...value, itemId: proposal.itemId, itemIdentity: identity, bindingApproval: proposal.bindingApproval }));

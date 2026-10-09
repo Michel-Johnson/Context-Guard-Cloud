@@ -1,16 +1,17 @@
 import path from 'node:path';
 import { atomicWrite, readJSON, withFileLock, hash } from '../shared/io.mjs';
 import { MapError } from '../shared/map-model.mjs';
-import { coordinatorNodePath, coordinatorPathText } from '../shared/coordinator-path.mjs';
+import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
 
 const encode = value => JSON.stringify(value, null, 2) + '\n';
 const fail = (code, text, status = 409) => { throw new MapError(code, text, status); };
 const actorId = actor => actor?.kind === 'human' && typeof actor.sessionId === 'string' && actor.sessionId;
 const focus = item => ({ nodeId: item.nodeId || null, kind: item.kind || null, itemId: item.itemId || null });
-export const bindingReplyDecision = (text, { slackAttribution = false } = {}) => {
+const pathIdentity = chain => JSON.stringify(chain.map(({ id, title, purpose }) => ({ id, title, purpose })));
+export const bindingReplyDecision = (text, { slackAttribution = false, allowBareConfirmation = false } = {}) => {
   // Slack 连接器的固定署名不是指令，也不参与身份判定；仍只接受整句明确确认。
   const body = (slackAttribution ? text.replace(/\s+\*Sent using\* <@[A-Z0-9]{1,32}>\s*$/u, '') : text).trim();
-  return /^(同意绑定|确认绑定)[。！!]?$/u.test(body) ? 'approved' :
+  return /^(同意绑定|确认绑定)[。！!]?$/u.test(body) || allowBareConfirmation && /^(确认|同意)[。！!]?$/u.test(body) ? 'approved' :
     /^(暂不绑定|不绑定|拒绝绑定)[。！!]?$/u.test(body) ? 'rejected' : null;
 };
 const visible = proposal => ({ id: proposal.id, kind: 'binding-proposal', version: proposal.version,
@@ -27,7 +28,15 @@ export class CoordinatorBindings {
   }
   async state() { return readJSON(this.file, { proposals: {}, reviews: {}, pending: {} }); }
   async withStableFocus(conversationId, action) {
-    return withFileLock(this.file + '.lock', async () => action(await this.conversations.get(conversationId)));
+    return withFileLock(this.file + '.lock', async () => {
+      const current = await this.conversations.get(conversationId), state = await this.state();
+      const approved = Object.values(state.proposals).find(proposal => current.bindingApproval === 'binding-confirm:' + proposal.id);
+      if (!approved || approved.conversationId !== conversationId || approved.review?.decision !== 'approved' ||
+          approved.input.nodeId !== current.nodeId || approved.input.kind !== current.kind) fail('APPROVAL_REQUIRED', '请先确认当前需求的主节点');
+      const snapshot = await this.readMain(), chain = coordinatorNodePath(snapshot.memory.map.root, current.nodeId, { nodeIds: this.nodeIds });
+      if (pathIdentity(chain) !== pathIdentity(approved.path)) fail('APPROVAL_REQUIRED', '节点路径或职责已变化，请重新确认归属');
+      return action(current);
+    });
   }
   async approvals(conversationId) {
     return Object.values((await this.state()).proposals).filter(item => item.conversationId === conversationId).map(visible);
@@ -44,8 +53,8 @@ export class CoordinatorBindings {
       await atomicWrite(this.file, encode(state));
     });
   }
-  async naturalReview(text, { id, conversationId, actor, reference, slackAttribution = false }) {
-    const decision = bindingReplyDecision(text, { slackAttribution });
+  async naturalReview(text, { id, conversationId, actor, reference, slackAttribution = false, allowBareConfirmation = false }) {
+    const decision = bindingReplyDecision(text, { slackAttribution, allowBareConfirmation });
     if (!decision || !actorId(actor)) return null;
     const state = await this.state(), proposal = state.proposals[reference?.id || state.pending[conversationId]];
     if (!proposal || proposal.actorId !== actorId(actor)) return null;
@@ -65,9 +74,14 @@ export class CoordinatorBindings {
       if (snapshot.version !== input.mainVersion) fail('VERSION_CONFLICT', 'Map 已变化，请重新读取候选节点');
       const chain = coordinatorNodePath(snapshot.memory.map.root, input.nodeId, { nodeIds: this.nodeIds });
       const node = chain.at(-1), before = await this.conversations.get(conversationId);
+      const confirmed = !state.pending[conversationId] && Object.values(state.proposals).find(proposal =>
+        proposal.conversationId === conversationId && proposal.actorId === actorId(actor) && pathIdentity(proposal.path) === pathIdentity(chain) &&
+        proposal.review?.decision === 'approved' && before.bindingApproval === 'binding-confirm:' + proposal.id &&
+        before.nodeId === input.nodeId && before.kind === input.kind);
+      if (confirmed) return visible(confirmed);
       const proposal = { id, fingerprint, conversationId, actorId: actorId(actor), input: structuredClone(input),
-        before: focus(before), node: { id: node.id, title: node.title, purpose: node.purpose },
-        path: chain.map(({ id, title, purpose }) => ({ id, title, purpose })),
+        before: focus(before), node: { id: node.id, title: node.title, purpose: node.purpose, label: coordinatorNodeLabel(node) },
+        path: chain.map(node => ({ id: node.id, title: node.title, purpose: node.purpose, label: coordinatorNodeLabel(node) })),
         pathText: coordinatorPathText(chain) };
       proposal.version = hash(JSON.stringify(proposal));
       const pending = state.proposals[state.pending[conversationId]];
@@ -112,7 +126,7 @@ export class CoordinatorBindings {
       const result = { proposalId: proposal.id, decision: input.decision, node: proposal.node,
         path: proposal.path, pathText: proposal.pathText, conversationId,
         ...(humanInputId ? { humanInputId } : {}),
-        message: input.decision === 'approved' ? '已确认绑定到' + proposal.node.title : '暂不绑定，继续讨论' };
+        message: input.decision === 'approved' ? '已确认绑定到' + coordinatorNodeLabel(proposal.node) : '暂不绑定，继续讨论' };
       proposal.review = { decision: input.decision, fingerprint, result };
       delete state.pending[conversationId]; state.reviews[input.id] = { fingerprint, result };
       await atomicWrite(this.file, encode(state));

@@ -1,6 +1,8 @@
 import { relevanceInput } from './integration-gateway.mjs';
 
-const invalid = () => Object.assign(new Error('接话决定缺失或不完整，未执行工具'), { code: 'MODEL_INVALID_RESPONSE' });
+const invalid = (validationCode = 'PARTICIPATION_HEADER_INVALID') => Object.assign(new Error('接话决定缺失或不完整，未执行工具'), {
+  code: 'MODEL_INVALID_RESPONSE', modelTermination: { validationCode }, retryableModelResponse: true,
+});
 export const REPLY_MARKER = '[CG_REPLY]';
 export const REPLY_HEADER = REPLY_MARKER + '\n';
 export const SILENT_HEADER = '[CG_SILENT]';
@@ -89,13 +91,13 @@ export function createParticipationGate(onText, { continuation = false, reaction
     async finish(next) {
       const first = next.content.find(block => ['text', 'tool_use'].includes(block.type));
       if (!continuation && first?.type === 'tool_use') {
-        if (decision === 'silent' || next.content.some(block => block.type === 'tool_use' && !declaredNames.has(block.name))) throw invalid();
+        if (decision === 'silent' || next.content.some(block => block.type === 'tool_use' && !declaredNames.has(block.name))) throw invalid('PARTICIPATION_TOOL_UNDECLARED');
         decision = 'reply'; declaredByTool = true;
       } else if (!continuation && first?.type !== 'text') throw invalid();
       const text = next.content.filter(block => block.type === 'text').map(block => block.text).join('');
       await consume(text, true, next.stop === 'tool_use' && next.content.some(block => block.type === 'tool_use'));
       if (decision === 'silent') {
-        if (next.stop !== 'end_turn' || next.content.some(block => block.type === 'tool_use')) throw invalid();
+        if (next.stop !== 'end_turn' || next.content.some(block => block.type === 'tool_use')) throw invalid('PARTICIPATION_SILENT_CONFLICT');
         return { ...next, content: [] };
       }
       let remaining = text.startsWith(REPLY_HEADER) ? REPLY_HEADER.length : text === REPLY_MARKER ? REPLY_MARKER.length : 0;
@@ -106,7 +108,7 @@ export function createParticipationGate(onText, { continuation = false, reaction
         return body ? [{ ...block, text: body }] : [];
       });
       if (next.stop === 'end_turn' && !visible.trim() && !(continuation && reactionOnlyCompletion &&
-          !content.some(block => block.type === 'tool_use'))) throw invalid();
+          !content.some(block => block.type === 'tool_use'))) throw invalid('PARTICIPATION_REPLY_EMPTY');
       return { ...next, content };
     },
   };

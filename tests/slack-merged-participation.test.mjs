@@ -266,7 +266,7 @@ test('消息接收即发送👀，控制头确认后切换💬，不等待完整
 test('无控制头的失败轮次不锁死线程，新消息接续且保留原失败、输入指纹和回执', async t => {
   const f = await fixture(t, async ({ onText, messages }, count) => {
     assert.match(JSON.stringify(messages.at(-1)), /服务器本轮输出格式/);
-    if (count === 1) { await onText('无控制头的正文'); return result('无控制头的正文'); }
+    if (count <= 3) { await onText('无控制头的正文'); return result('无控制头的正文'); }
     await onText('[CG_REPLY]\n在的。'); return result('[CG_REPLY]\n在的。');
   });
   const before = await f.main();
@@ -283,7 +283,7 @@ test('无控制头的失败轮次不锁死线程，新消息接续且保留原�
   assert.equal(saved.failedTurns[0].code, 'MODEL_INVALID_RESPONSE');
   assert.deepEqual(saved.requests[failed.activeTurnId], original.requests[failed.activeTurnId]);
   assert.deepEqual(saved.toolReceipts, original.toolReceipts);
-  assert.equal(f.modelCalls.length, 2);
+  assert.equal(f.modelCalls.length, 4);
   assert.equal(Object.values(f.store.data.inbox).every(entry => entry.status === 'done'), true);
   assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning', 'eyes', 'speech_balloon', 'white_check_mark']);
   assert.deepEqual(await f.main(), before);
@@ -303,7 +303,7 @@ test('Slack 合并静默：保存原输入，👀切换🙈，无正文或业务
 
 test('失败后的显式恢复提高控制代次，旧失败快照不能覆盖恢复后已送达的✅', async t => {
   const f = await fixture(t, async ({ onText }, count) => {
-    const text = count === 1 ? '没有控制头' : '[CG_REPLY]\n恢复成功。'; await onText(text); return result(text);
+    const text = count <= 3 ? '没有控制头' : '[CG_REPLY]\n恢复成功。'; await onText(text); return result(text);
   });
   await f.send('请确认。'); const failed = await f.wait(state => state.status === 'error');
   const binding = Object.values(f.store.data.threads)[0];
@@ -421,7 +421,7 @@ test('Slack 未决定接话便返回工具：失败关闭，显示真实错误�
   await f.send('仅存档，不要回复。');
   const state = await f.wait(state => state.status === 'error');
   assert.equal(state.error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(state.participationDecision, 'pending');
-  assert.ok(f.posts.some(post => /处理失败/.test(post.text)));
+  assert.ok(f.posts.some(post => /自动恢复未成功/.test(post.text)));
   assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning']); assert.deepEqual(await f.main(), before);
 });
 

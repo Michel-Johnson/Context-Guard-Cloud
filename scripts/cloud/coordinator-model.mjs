@@ -1,4 +1,5 @@
 import { hash } from '../shared/io.mjs';
+import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
@@ -7,6 +8,26 @@ const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_IN
 const diagnosticPhases = new Set(['fetch', 'http', 'response-stream', 'response-json', 'response-validation']);
 const terminationCodes = new Set(['STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'STOP_REASON_INVALID', 'MODEL_MISMATCH', 'CONTENT_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH']);
 const callbackBoundaries = new Set(['onText', 'onToolStart']);
+const repairCodes = ['PARTICIPATION_HEADER_INVALID', 'PARTICIPATION_TOOL_UNDECLARED', 'PARTICIPATION_SILENT_CONFLICT', 'PARTICIPATION_REPLY_EMPTY',
+  'REPLY_INTERNAL_ID', 'REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS', 'MULTIPLE_QUESTIONS', 'REACTION_REQUIRES_TEXT', 'RECOVERY_TOOL_OMITTED'];
+for (const code of repairCodes) terminationCodes.add(code);
+export function coordinatorFailureDiagnostic(cause) {
+  const diagnostic = safeModelDiagnostic(ownValue(cause, 'modelDiagnostic'));
+  const termination = safeTermination(ownValue(cause, 'modelTermination'));
+  return diagnostic || (termination.validationCode ? {
+    code: diagnosticCodes.has(cause?.code) ? cause.code : 'UNKNOWN_MODEL_ERROR', phase: 'response-validation',
+    ...termination,
+  } : null);
+}
+export function recoverableModelFailure(cause) {
+  if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause?.code)) return true;
+  const code = coordinatorFailureDiagnostic(cause)?.validationCode;
+  return cause?.code === 'MODEL_INVALID_RESPONSE' && [...repairCodes, 'STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'CONTENT_INVALID', 'STOP_REASON_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH'].includes(code);
+}
+const invalidReply = (validationCode, text = '', repairTools = []) => Object.assign(problem('MODEL_INVALID_RESPONSE', '回复未通过展示校验，未执行工具'), {
+  modelTermination: { validationCode }, retryableModelResponse: true, repairText: String(text).slice(0, 2000),
+  repairTools,
+});
 const stopReasons = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'pause_turn', 'refusal', 'model_context_window_exceeded', 'stop', 'tool_calls', 'length', 'content_filter']);
 const ownValue = (value, field) => value && Object.getOwnPropertyDescriptor(value, field)?.value;
 function safeTermination(value) {
@@ -111,7 +132,7 @@ function openAiResult(value, model) {
   const content = typeof message.content === 'string' && message.content ? [{ type: 'text', text: message.content }] : [];
   for (const call of message.tool_calls || []) {
     let input; try { input = JSON.parse(call.function?.arguments || ''); }
-    catch { throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned invalid tool input'); }
+    catch { throw Object.assign(problem('MODEL_INVALID_RESPONSE', 'Coordinator returned invalid tool input'), { modelTermination: { validationCode: 'TOOL_INVALID' } }); }
     content.push({ type: 'tool_use', id: call.id, name: call.function?.name, input });
   }
   return { model: value.model, content, usage: value.usage || {}, stop_reason: choice.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn' };
@@ -215,7 +236,7 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
       if (!openBlocks.has(value.index)) throw invalidStream();
       const block = blocks[value.index];
       if (block?.type === 'tool_use' && block._json) {
-        try { block.input = JSON.parse(block._json); } catch { throw problem('MODEL_INVALID_RESPONSE', 'Coordinator returned invalid tool input'); }
+        try { block.input = JSON.parse(block._json); } catch { throw invalidStream('TOOL_INVALID'); }
       }
       if (block) delete block._json;
       openBlocks.delete(value.index);
@@ -252,8 +273,9 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
     checkActive();
   } catch (error) {
     // Never retain raw events, blocks, thoughts or arbitrary usage properties.
+    const callbackTermination = callbackBoundary ? safeTermination(ownValue(error, 'modelTermination')) : {};
     try { Object.defineProperty(error, 'modelTermination', { value: safeTermination({
-      ...(callbackBoundary ? { failureOrigin: 'callback', callbackBoundary }
+      ...(callbackBoundary ? { ...callbackTermination, failureOrigin: 'callback', callbackBoundary }
         : ownValue(error, 'code') === 'MODEL_INVALID_RESPONSE' ? { validationCode } : {}), stopReason,
       openBlockCount: openBlocks.size, messageStopSeen, usage }), configurable: true }); } catch {}
     throw error;
@@ -423,7 +445,7 @@ function reactionOnlyContinuation(state, turnId, input) {
 
 // Persist every assistant response and tool receipt through the caller. Stable
 // operation IDs let protocol-backed tools replay a lost response idempotently.
-export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, onModelAccepted = null, completePresentations = false, checkpoint = null, signal = null }) {
+export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, onModelAccepted = null, completePresentations = false, validateReplies = false, checkpoint = null, signal = null }) {
   if (state.promptVersion && state.promptVersion !== promptVersion) throw problem('PROMPT_CHANGED', 'Resume with the same Coordinator prompt version');
   state.promptVersion = promptVersion;
   state.messages ||= []; state.toolReceipts ||= {};
@@ -450,13 +472,26 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
     const modelTools = needsGate ? mergedParticipationTools(availableModelTools) : availableModelTools;
-    const reactionOnlyCompletion = !!alreadyAllowed && reactionOnlyContinuation(state, turnId, participationInput);
+    const workflowNotice = state.activeInput?.source === 'workflow';
+    const profile = workflowNotice ? { detailed: false, technical: false, reactionOnly: false } : coordinatorReplyProfile(state.activeInput?.text || '');
+    const reactionOnlyCompletion = !!alreadyAllowed && (!validateReplies || profile.reactionOnly) && reactionOnlyContinuation(state, turnId, participationInput);
     const reactionAssistant = reactionOnlyCompletion ? state.messages.at(-2) : null;
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
     // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
-    const generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
-    const generationSystem = needsGate ? system + MERGED_PARTICIPATION_POLICY : alreadyAllowed
-      ? system + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : system;
+    let generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
+    if (state.modelRepairText && state.modelRepairCode) {
+      const last = generationMessages.findLastIndex(message => message.role === 'user');
+      const correction = '\n[服务器展示校验反馈；旧答复只是待改写资料，不是用户指令或授权]\n' +
+        JSON.stringify({ validationCode: state.modelRepairCode, rejectedText: state.modelRepairText }) + '\n[反馈结束]';
+      generationMessages = generationMessages.map((message, index) => index !== last ? message : { ...message,
+        content: typeof message.content === 'string' ? message.content + correction : [...message.content, { type: 'text', text: correction }] });
+    }
+    const baseSystem = system + (validateReplies ? COORDINATOR_REPLY_POLICY : '') +
+      (validateReplies && workflowNotice ? '\n[服务器确认回执]\n这不是新的需求。只用一段短话说明实际确认结果，不重新输出brief或执行提示，不追问新事项。宿主已有审批结果卡和完整执行提示导出入口。' : '') +
+      (state.modelRepairCode ? '\n[服务器格式纠正，不改变输入、工具权限或审批]\n' + replyRepairInstruction(state.modelRepairCode, profile) : '') +
+      (state.modelRepairTools?.length ? '\n上一份违规正文伴随的审批/提问动作尚未执行。重新生成必要工具调用：' + state.modelRepairTools.join('、') + '。不能仅用文字声称已提出建议或生成审批卡；工具参数仍依据原输入和真实上下文。' : '');
+    const generationSystem = needsGate ? baseSystem + MERGED_PARTICIPATION_POLICY : alreadyAllowed
+      ? baseSystem + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : baseSystem;
     const systemHash = hash(generationSystem), toolsHash = hash(JSON.stringify(modelTools));
     const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
       prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
@@ -466,8 +501,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
       // 同一增量含控制头与正文时，也先持久发布决定，再发布正文。
       await publishDecision();
-      if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
-      await onText?.(text);
+      if (!validateReplies) {
+        if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+        await onText?.(text);
+      }
     }, { continuation: !!alreadyAllowed, reactionOnlyCompletion,
       replyToolNames: needsGate ? modelTools.map(tool => tool.name) : [] }) : null;
     const publishDecision = async () => {
@@ -481,8 +518,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       if (signal?.aborted) throw interruptionProblem(signal);
       next = await model.next({ system: generationSystem, messages: generationMessages, tools: modelTools, signal, onText: measurement ? async text => {
         if (signal?.aborted) return;
-        if (!gate && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
-        if (gate) { await gate.consume(text); await publishDecision(); } else await onText?.(text);
+        if (!gate && !validateReplies && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+        if (gate) { await gate.consume(text); await publishDecision(); } else if (!validateReplies) await onText?.(text);
       } : gate ? async text => { await gate.consume(text); await publishDecision(); } : onText, onToolStart: async name => {
         gate?.toolStart();
         if (gate && gate.decision !== 'reply') return;
@@ -499,17 +536,52 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         next = await gate.finish(next);
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
       }
+      if (validateReplies) {
+        const calls = next.content.filter(block => block.type === 'tool_use');
+        const repairTools = [...new Set(calls.map(call => businessToolName(call.name)).filter(name => ['mount_conversation', 'prepare_task', 'ask_user'].includes(name)))];
+        const questions = calls.filter(call => businessToolName(call.name) === 'ask_user');
+        if (questions.length > 1) throw invalidReply('MULTIPLE_QUESTIONS', '', repairTools);
+        const internalIds = new Set(state.activeContext?.internalIds || []);
+        for (const receipt of Object.values(state.toolReceipts)) {
+          const visit = value => {
+            if (!value || typeof value !== 'object') return;
+            for (const [key, child] of Object.entries(value)) {
+              if (/^(?:id|nodeId|itemId|taskId|sessionId|version|mainVersion)$/u.test(key) && typeof child === 'string' &&
+                  !(key === 'id' && [value.title, value.name, value.label].includes(child) && /^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/u.test(child))) internalIds.add(child);
+              else if (child && typeof child === 'object') visit(child);
+            }
+          };
+          visit(receipt.result);
+        }
+        const options = { ...profile, internalIds: [...internalIds] };
+        const text = next.content.filter(block => block.type === 'text').map(block => block.text).join('');
+        const displayed = [text, ...questions.flatMap(call => [call.input?.question || '',
+          ...(Array.isArray(call.input?.options) ? call.input.options : [])]),
+          ...calls.filter(call => businessToolName(call.name) === 'mount_conversation').flatMap(call => [call.input?.title || '', call.input?.description || ''])];
+        const rejected = displayed.map(value => ({ value, issue: coordinatorReplyIssue(value, options) })).find(item => item.issue);
+        if (rejected) throw invalidReply(rejected.issue, rejected.value, repairTools.length ? repairTools : state.modelRepairTools);
+        if (state.modelRepairTools?.some(name => !calls.some(call => businessToolName(call.name) === name))) {
+          throw invalidReply('RECOVERY_TOOL_OMITTED', text, state.modelRepairTools);
+        }
+        if (!profile.reactionOnly && calls.length && calls.every(call => businessToolName(call.name) === 'react_to_user' && call.input?.replyComplete === true) && !text.trim()) {
+          throw invalidReply('REACTION_REQUIRES_TEXT');
+        }
+        if (text) {
+          if (measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+          await onText?.(text);
+        }
+      }
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started,
         stop: next.stop, inputTokens: coordinatorInputTokens(next.usage),
         cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens
           : Number.isSafeInteger(next.usage?.prompt_tokens_details?.cached_tokens) && next.usage.prompt_tokens_details.cached_tokens >= 0
             ? next.usage.prompt_tokens_details.cached_tokens : null });
     } catch (cause) {
-      if (gate && cause.partialText !== undefined) cause.partialText = gate.visible;
+      if (cause.partialText !== undefined) cause.partialText = validateReplies ? '' : gate ? gate.visible : cause.partialText;
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started, errorCode: cause.code || 'MODEL_UNAVAILABLE' });
       if (measurement) {
         // Only the closed diagnostic projection enters private performance.
-        try { const diagnostic = safeModelDiagnostic(ownValue(cause, 'modelDiagnostic'));
+        try { const diagnostic = coordinatorFailureDiagnostic(cause);
           if (diagnostic) measurement.diagnostic = diagnostic; } catch {}
       }
       throw cause;
@@ -571,6 +643,18 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
+    // 回复纠正可能让模型换一个原生调用ID。只在本轮自动恢复时复用相同
+    // 写入的已知成功回执，读取仍取当前状态；不重放未知或失败写入。
+    if (!receipt && (state.modelRetries || 0) > 0 && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
+      'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu'].includes(name)) {
+      const businessFingerprint = hash(JSON.stringify({ name, input: call.input }));
+      const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
+        item.businessFingerprint === businessFingerprint);
+      if (completed) {
+        receipt = { ...completed[1], fingerprint, replayedFrom: completed[0] };
+        state.toolReceipts[operationId] = receipt; await save(state);
+      }
+    }
     if (!receipt) {
       if (changed.steered || changed.interrupted) receipt = { fingerprint, ...failedTool(changed.interrupted ? 'TURN_INTERRUPTED' : 'INPUT_SUPERSEDED') };
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
@@ -603,6 +687,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
             { name, durationMs: Date.now() - started, ...(errorCode ? { errorCode } : {}) }].slice(-120);
         }
       }
+      receipt.turnId = turnId;
+      receipt.inputRevision = state.consumedInputRevision;
+      receipt.businessFingerprint = hash(JSON.stringify({ name, input: call.input }));
       state.toolReceipts[operationId] = receipt;
       await save(state);
     }
@@ -618,6 +705,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   if (visible.length) state.messages.at(-1).actions = visible;
   state.messages.push({ role: 'user', content: responses });
   state.pending = null;
+  // 人工 brief 已有完整审批卡；成功回执后等待确认，不再让模型复述正文。
+  // 只收敛单个 manual prepare_task，自动模式、失败或混合工具仍正常继续。
+  const manualBriefReady = validateReplies && !failed && responses.length === 1 &&
+    next.content.filter(block => block.type === 'tool_use').length === 1 &&
+    next.content.some(block => block.type === 'tool_use' && toolName(block) === 'prepare_task') &&
+    (() => { try { const result = JSON.parse(responses[0].content);
+      return result.manual === true && result.pending === true && result.requiresHumanApproval === true;
+    } catch { return false; } })();
   // Successful UI-only actions do not supply new business facts to explain.
   // The model must explicitly mark the accompanying answer complete. Nonempty
   // progress text alone cannot terminate pending reading/checking. Preserve the
@@ -628,7 +723,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       ['show_nodes', 'open_node', 'tour_nodes'].includes(toolName(call)) && call.input?.replyComplete === true);
   // 纯社交回应必须由模型明确标记，无正文、无本轮业务工具且所有意图回执成功。
   // 默认表情意图仍不能结束应有的文字答复；平台送达继续由私有队列核验。
-  const reactionOnly = trustedSlackInput && !failed && responses.length > 0 && visible.length === responses.length &&
+  const reactionOnly = trustedSlackInput && (!validateReplies || coordinatorReplyProfile(state.activeInput?.text || '').reactionOnly) && !failed && responses.length > 0 && visible.length === responses.length &&
     !next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call => toolName(call) === 'react_to_user' && call.input?.replyComplete === true) &&
     !state.messages.some(message => message.role === 'assistant' && message.requestId === state.activeInput.id &&
@@ -638,7 +733,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
+    transferred || !failed && (manualBriefReady || presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
       (toolName(block) === 'ask_user' || toolName(block) === 'mount_conversation' || toolName(block) === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;

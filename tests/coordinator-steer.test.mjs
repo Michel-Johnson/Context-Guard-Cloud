@@ -15,7 +15,7 @@ test('合并格式失败只释放已确定失败的生成，不丢弃未决工�
     context: [], files: [], routing: { coordinatorUserId: 'UBOT', mentionedUsers: [] } } });
   for (const mode of ['pending-tool', 'queued-input', 'interrupt', 'provider-error', 'non-slack']) {
     const root = await directory(t); let models = 0, executions = 0;
-    const service = new CoordinatorService({ directory: root, system: 'test', tools: [{ name: 'write' }],
+    const service = new CoordinatorService({ directory: root, system: 'test', tools: [{ name: 'write' }], maxModelRetries: 0,
       execute: async () => { executions++; }, model: { next: async () => { models++; return answer('missing-header'); } } });
     const first = input('original', '测试');
     await service.submitBatch(first, metadata(first)); await service.close();

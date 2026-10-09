@@ -58,15 +58,15 @@ test('Slack reaction enum and target-free schema reject approval-like emoji and 
   const tool = coordinatorTools.find(item => item.name === 'react_to_user');
   assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
     'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
-  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
-  assert.match(tool.description, /不只在用户要求时使用/); assert.match(tool.description, /无需解释的社交确认可纯表情/);
-  assert.doesNotMatch(tool.description, /默认用简短文字|问候和社交确认也应简短文字回应|用户明确要表情或确有必要.*才使用/);
-  assert.match(SLACK_INTERACTION_POLICY, /更主动、自然地使用 react_to_user/);
-  assert.match(SLACK_INTERACTION_POLICY, /不只在用户索要表情时使用/);
-  assert.match(SLACK_INTERACTION_POLICY, /简单社交确认无需解释时可以只用交流表情/);
-  assert.doesNotMatch(SLACK_INTERACTION_POLICY, /默认用简短文字回应|只有用户明确要表情|问候.*必须/);
+  assert.match(tool.description, /已确认接话的\s*Slack\s*轮次/); assert.match(tool.description, /只有用户明确要求原生交流表情才调用/);
+  assert.match(tool.description, /问候、追问和需求讨论默认文字/); assert.match(tool.description, /明确只要表情才可纯表情/);
+  assert.doesNotMatch(tool.description, /不只在用户要求时使用|无需解释的社交确认可纯表情/);
+  assert.match(SLACK_INTERACTION_POLICY, /普通交流优先给有用的短文字/);
+  assert.match(SLACK_INTERACTION_POLICY, /用户明确要求原生交流表情时才使用react_to_user/);
+  assert.match(SLACK_INTERACTION_POLICY, /只有用户明确要求只用表情时才省略文字/);
+  assert.doesNotMatch(SLACK_INTERACTION_POLICY, /不只在用户索要表情时使用|简单社交确认无需解释时可以只用交流表情/);
   assert.match(SLACK_INTERACTION_POLICY, /对勾不代表任务完成或人类批准/); assert.equal(slackStatusEmojis.completed, 'white_check_mark');
-  assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
+  assert.match(tool.description, /问题、风险、失败和人工确认不能被表情代替/); assert.match(tool.description, /不凑数、不刷屏/);
   assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
   assert.equal(tool.input_schema.properties.replyComplete.type, 'boolean');
   assert.deepEqual(tool.input_schema.required, ['emoji']);
@@ -1278,13 +1278,13 @@ test('Stream callback failures retain the original boundary in private performan
       assert.equal(error.modelDiagnostic.phase, 'response-stream');
       assert.equal(error.modelDiagnostic.termination.failureOrigin, 'callback');
       assert.equal(error.modelDiagnostic.termination.callbackBoundary, fixture.boundary);
-      assert.equal(error.modelDiagnostic.termination.validationCode, undefined);
+      assert.equal(error.modelDiagnostic.termination.validationCode, fixture.gate ? 'PARTICIPATION_HEADER_INVALID' : undefined);
       return true;
     });
     const diagnostic = state.performance.models[0].diagnostic;
     assert.equal(diagnostic.code, fixture.code || 'MODEL_INVALID_RESPONSE');
     assert.equal(diagnostic.failureOrigin, 'callback'); assert.equal(diagnostic.callbackBoundary, fixture.boundary);
-    assert.equal(diagnostic.validationCode, undefined); assert.equal(diagnostic.openBlockCount, 1);
+    assert.equal(diagnostic.validationCode, fixture.gate ? 'PARTICIPATION_HEADER_INVALID' : undefined); assert.equal(diagnostic.openBlockCount, 1);
     assert.equal(diagnostic.messageStopSeen, false); assert.equal(diagnostic.usage.input_tokens, 12);
     assert.doesNotMatch(JSON.stringify(state.performance), /callback-private|privateBody|privateArgument|synthetic-private/);
     assert.equal(requests, 1); assert.equal(executions, 0); assert.equal(state.pending, undefined);
@@ -1344,19 +1344,19 @@ test('Failed stream private performance survives restart without becoming comple
   await service.submit({ id: 'failure-turn', text: 'diagnostic-hidden-body' }); await service.close();
   const raw = JSON.parse(await fs.readFile(path.join(directory, 'conversation.json'), 'utf8'));
   assert.equal(raw.status, 'error'); assert.equal(raw.error.code, 'MODEL_INVALID_RESPONSE');
-  assert.equal(raw.performance.models.length, 1); assert.equal(raw.performance.models[0].diagnostic.phase, 'response-stream');
+  assert.equal(raw.performance.models.length, 3); assert.equal(raw.performance.models[0].diagnostic.phase, 'response-stream');
   assert.equal(raw.performance.models[0].diagnostic.validationCode, 'STOP_REASON_INVALID');
   assert.equal(raw.performance.models[0].diagnostic.stopReason, 'max_tokens');
   assert.deepEqual(raw.performance.models[0].diagnostic.usage, { input_tokens: 21, output_tokens: 100 });
   assert.doesNotMatch(JSON.stringify(raw.performance), /diagnostic-hidden-body|diagnostic-visible-partial|privatePrompt|synthetic/);
   assert.equal(raw.pending, undefined); assert.equal(raw.messages.filter(message => message.role === 'assistant').length, 0);
-  assert.equal(raw.toolReceipts && Object.keys(raw.toolReceipts).length || 0, 0); assert.equal(calls, 1); assert.equal(tools, 0);
+  assert.equal(raw.toolReceipts && Object.keys(raw.toolReceipts).length || 0, 0); assert.equal(calls, 3); assert.equal(tools, 0);
   const restarted = new CoordinatorService(options), publicState = await restarted.state();
   assert.equal(publicState.status, 'error'); assert.equal(publicState.performance, undefined);
   assert.equal(publicState.consumedInputRevision, 0, 'Public initial revision normalizes the absent private field');
   assert.equal(Object.hasOwn(raw, 'consumedInputRevision'), false);
   assert.doesNotMatch(JSON.stringify(publicState), /STOP_REASON_INVALID|messageStopSeen|output_tokens|diagnostic\.phase/);
-  assert.equal(calls, 1); await restarted.close();
+  assert.equal(calls, 3); await restarted.close();
 });
 
 test('Failed stream metrics reject forged diagnostic values and never invoke diagnostic getters', async () => {
@@ -2584,7 +2584,7 @@ test('Cloud Coordinator 编辑 Main，提出绑定建议并等人类确认后保
   const mounted = state.messages.findLast(message => message.actions)?.actions[0];
   assert.equal(mounted.kind, 'binding-proposal');
   assert.equal(state.focus.nodeId, null, '模型建议不是人类确认');
-  assert.equal(mounted.pathText, 'Lab：尚未填写描述');
+  assert.equal(mounted.pathText, 'Lab');
   assert.equal(mounted.item, undefined);
   assert.equal(mounted.executionSessionId, undefined);
   assert.equal(mounted.conversationId, 'legacy');

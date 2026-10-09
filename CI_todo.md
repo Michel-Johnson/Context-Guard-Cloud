@@ -1,5 +1,14 @@
 # Cloud 验证台账
 
+## COORDINATOR-BADCASE-20261010 · 修复计划的真实验收缺口
+
+- 正式受控验证在 `merged-participation-independent`、`coordinator-binding`、`slack-cloud`、`integration-gateway`、Slack 插件和 Cloud 浏览器测试中；覆盖格式恢复、非法 SSE 参数、回执复用、旧事项审批、过期/跨用户按钮。受控平台 IO 不算真实 Slack。
+- [ ] 冻结修订的真实 Map 三段十轮：新待办、新 Bug、旧事项；记录原输出、首次失败、恢复、按钮与保存回读。历史短流程和执行中改过源码的结果不套用到最终候选。
+- [ ] Chrome 中真实 Slack 三段十轮、原生选择/绑定按钮与 ✅ 送达。当前仅有正式机器人，尚无候选版独立测试入口，不拿线上旧版代替验收。
+- [ ] 人工检查每段最多60字、单个核心问题、挂载时机和事实准确性；首个有意义回复以两秒为目标，不能用表情或“正在处理”计时。
+- [ ] Skill 固定包公开发布后的精确锁安装、Required、合入部署及线上版本/真实入口复验。没有通过验收前保持 Draft。
+- DeepSeek 真实测试已出现 `MODEL_HTTP_402`；保留原失败，不盲重试、不静默换线上模型、不代用户充值。其他已配置模型的隔离测试单独标注名称。
+
 ## SLACK-MODEL-CALLBACK-DIAG-01 · 流回调失败的私有定位边界（2026-10-09）
 
 - [x] Coordinator 批准三文件窄范围：SSE 的 onText/onToolStart 真实回调失败不再附默认 STREAM_INVALID，仅以白名单 failureOrigin=callback 与 callbackBoundary 区分边界；原错误码、阶段、严格解析/gate、停止/补充/超时、预算/权限/重试不变。不能据此宣称原124语义评估中的12项无效响应根因或修复已获证实，原失败与未复现单例均保留。

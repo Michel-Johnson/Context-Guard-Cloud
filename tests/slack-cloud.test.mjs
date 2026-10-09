@@ -182,7 +182,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
           ...(text === 'prepare-new-bug' ? { kind: 'bug' } : {}),
         } }] };
       }
-      return { stop: 'end_turn', content: [{ type: 'text', text: `Fixture response${text ? ': ' + text : ''}` }] };
+      return { stop: 'end_turn', content: [{ type: 'text', text: text.startsWith('[服务器工作流事件') ? '确认结果已收到。' : `Fixture response${text ? ': ' + text : ''}` }] };
     }; return { model: 'fixture-model', next: async request => {
       const result = await next(request);
       // Controlled provider follows the new first-round wire protocol. Business
@@ -682,9 +682,9 @@ async function confirmBinding(f, conversation, kind = 'todo', { project = projec
   assert.fail('确认通知未收口');
 }
 async function prepared(f, conversation, name, id) {
-  if (['prepare-new', 'prepare-stale', 'prepare-new-bug'].includes(name)) {
-    const kind = name === 'prepare-new-bug' ? 'bug' : 'todo', state = (await f.browser(conversation)).body;
-    if (state.focus?.kind !== kind || !state.approvals.some(item => item.kind === 'binding-proposal' && item.decision === 'approved')) {
+  if (['prepare-new', 'prepare-stale', 'prepare-new-bug', 'prepare-bug'].includes(name)) {
+    const kind = ['prepare-new-bug', 'prepare-bug'].includes(name) ? 'bug' : 'todo', state = (await f.browser(conversation)).body;
+    if (state.focus?.kind !== kind || !state.approvals.some(item => item.kind === 'binding-proposal' && item.decision === 'approved' && item.itemKind === kind)) {
       await confirmBinding(f, conversation, kind);
     }
   }

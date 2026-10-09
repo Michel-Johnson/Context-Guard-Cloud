@@ -105,7 +105,7 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId, mapNodeId } = {}) {
       // a model-supplied URL, project, mrkdwn title or interaction payload.
       const url = new URL(mapNodeId ? '/' : `/projects/${encodeURIComponent(projectId)}`, origin.origin);
       url.searchParams.set('relation', node.id);
-      return { type: 'button', text: plain(plainText(node.title) || '打开节点', 75),
+      return { type: 'button', text: plain(plainText(node.label || node.title) || '打开节点', 75),
         action_id: `map_node:${group * 5 + offset}`, url: url.href };
     }) }));
   if (seen.size > nodes.length) blocks.push({ type: 'context', elements: [plain(`还有 ${seen.size - nodes.length} 个节点入口未展开，请打开完整 Map 查看。`)] },
@@ -114,7 +114,7 @@ function nodeLinkBlocks(actions, { cloudOrigin, projectId, mapNodeId } = {}) {
   return blocks;
 }
 export function messageBlocks(message, key, context) {
-  const questions = message.questions || [], open = questions.filter(question => !question.answer);
+  const questions = message.questions || [], open = questions.filter(question => !question.answer && !question.superseded);
   const projection = { partial: message.partial === true || context?.partial === true };
   // Cloud's question-only projection already supplies the exact joined question
   // text. Render those questions with their own options once, preserving order
@@ -126,21 +126,25 @@ export function messageBlocks(message, key, context) {
   const blocks = projectedQuestions || !message.text && context?.modelMenus?.length && !message.attachments?.length
     ? [] : plainSections(message.text || (message.attachments?.length ? '收到附件' : 'Coordinator 回复'), projection);
   const questionControls = question => {
-    if (question.options?.length) blocks.push(...plainSections('可参考：\n' + question.options.map(option => `• ${option}`).join('\n')));
+    if (question.options?.length) for (let index = 0; index < question.options.length; index += 5) {
+      blocks.push({ type: 'actions', elements: question.options.slice(index, index + 5).map((option, offset) =>
+        button(option, `answer_choice:${index + offset}`, { key, questionId: question.id, optionIndex: index + offset })) });
+    }
     blocks.push(...plainSections('直接在这个线程回复即可，不需要填写表单。'));
   };
   if (projectedQuestions) for (const question of questions) {
     blocks.push(...plainSections(question.text));
-    if (!question.answer) questionControls(question);
+    if (!question.answer && !question.superseded) questionControls(question);
   }
   for (const action of message.actions || []) {
     if (action.kind !== 'node-references') continue;
     for (const node of (action.nodes || []).slice(0, 3)) if (Array.isArray(node.path) && node.path.length) {
-      const path = node.path.map((item, index) => `${index ? '  '.repeat(index - 1) + '└─ ' : ''}${item.title}：${item.purpose || '尚未填写描述'}`).join('\n');
+      const path = node.pathText || node.path.map(item => item.title).join(' → ');
       blocks.push(...plainSections(path));
     }
   }
   blocks.push(...nodeLinkBlocks(message.actions, context));
+  if (questions.some(question => question.superseded)) blocks.push(...plainSections('此问题已被新的讨论替代。'));
   for (const menu of context?.modelMenus || []) blocks.push(...modelChoiceBlocks(menu));
   for (const attachment of message.attachments || []) blocks.push({ type: 'context', elements: [plain(`附件：${attachment.filename || attachment.id}`)] });
   if (!projectedQuestions) for (const question of open) {
@@ -155,10 +159,12 @@ export function approvalBlocks(approval, key) {
     { type: 'actions', elements: [button('确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
 }
 
-export function bindingBlocks(proposal, key) {
+export function bindingBlocks(proposal, key, context) {
   return [...plainSections('建议绑定到：\n' + proposal.pathText +
     (typeof proposal.reason === 'string' && proposal.reason.trim() ? '\n理由：' + proposal.reason.trim() : '') +
     '\n回复“同意绑定”或“暂不绑定”，也可点下方按钮。'),
     { type: 'actions', elements: [button('确认绑定', 'approve_binding', { key, proposalId: proposal.id, version: proposal.version }, 'primary'),
-      button('暂不绑定', 'reject_binding', { key, proposalId: proposal.id, version: proposal.version })] }];
+      button('暂不绑定', 'reject_binding', { key, proposalId: proposal.id, version: proposal.version }),
+      ...(context?.cloudOrigin && context?.projectId && proposal.node?.id ? [{ type: 'button', text: plain('查看节点说明'),
+        action_id: 'binding_details', url: new URL(`/projects/${encodeURIComponent(context.projectId)}?relation=${encodeURIComponent(proposal.node.id)}`, context.cloudOrigin).href }] : [])] }];
 }
