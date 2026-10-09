@@ -22,7 +22,7 @@ export function coordinatorFailureDiagnostic(cause) {
   } : null);
 }
 export function recoverableModelFailure(cause) {
-  if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause?.code)) return true;
+  if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_HTTP_408', 'MODEL_HTTP_429', 'MODEL_HTTP_500', 'MODEL_HTTP_502', 'MODEL_HTTP_503', 'MODEL_HTTP_504'].includes(cause?.code)) return true;
   const code = coordinatorFailureDiagnostic(cause)?.validationCode;
   return cause?.code === 'MODEL_INVALID_RESPONSE' && [...repairCodes, 'STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'CONTENT_INVALID', 'STOP_REASON_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH'].includes(code);
 }

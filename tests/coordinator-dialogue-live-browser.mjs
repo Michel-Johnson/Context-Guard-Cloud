@@ -57,6 +57,8 @@ const options = { host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig, 
       catch (error) { calls.push({ durationMs: Date.now() - start, errorCode: error.code, diagnostic: coordinatorFailureDiagnostic(error) }); throw error; }
       calls.push({ durationMs: Date.now() - start, bodyCounts, backgroundCounts,
         text: result.content.filter(block => block.type === 'text').map(block => block.text).join(''),
+        toolRouting: result.content.filter(block => block.type === 'tool_use').map(block => ({ name: block.name,
+          ...(block.input?.kind ? { kind: block.input.kind } : {}), ...(block.input?.nodeId ? { nodeId: block.input.nodeId } : {}) })),
         tools: result.content.filter(block => block.type === 'tool_use').map(block => block.name) });
       return result;
     } };

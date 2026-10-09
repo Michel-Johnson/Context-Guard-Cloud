@@ -51,6 +51,19 @@ test('格式错误自动恢复两次内成功，原始输入不变且坏正文�
   assert.deepEqual(privateState.performance.models.filter(item => item.errorCode).map(item => item.diagnostic.validationCode),
     ['PARTICIPATION_HEADER_INVALID', 'REPLY_PARAGRAPH_LONG']);
 });
+for (const [code, recovered] of [['MODEL_HTTP_503', true], ['MODEL_HTTP_401', false], ['MODEL_HTTP_402', false]])
+test(`供应商 ${code} 的恢复边界：临时失败恢复，权限或支付错误不盲重试`, async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => {
+    if (++calls === 1) throw Object.assign(new Error('private-provider-body'), { code });
+    return answer('[CG_REPLY]\n已收到。');
+  }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '你好'); await f.service.close();
+  const state = await f.service.state(); assert.equal(calls, recovered ? 2 : 1);
+  assert.equal(state.status, recovered ? 'waiting-for-user' : 'error');
+  assert.ok(!JSON.stringify(state).includes('private-provider-body')); assert.deepEqual(f.writes, []);
+});
+
 test('连续格式失败只尝试三次，不执行工具或声称成功', async t => {
   let calls = 0;
   const f = await fixture(t, async () => { calls++; return answer('未声明接话'); }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
