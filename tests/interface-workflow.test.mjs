@@ -155,11 +155,29 @@ test('four approved Session tasks finish in durable FIFO order across success, f
   assert.equal((await messages()).some(task => task.busy), false);
 });
 
+test('Consumed Core never infers a missing legacy Plan baseline from final code during reads', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cloud-core-legacy-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const store = new ProtocolStore(directory), session = { id: 'legacy-session', generation: 1 };
+  const principal = { repositoryId: 'synthetic-repo', deviceId: 'synthetic-device', agentId: session.id, role: 'executor' };
+  await store.handle(principal, { v: 2, id: 'synthetic-bind', type: 'session.bind', payload: {
+    sessionId: session.id, worktreeId: 'synthetic-tree', agentId: principal.agentId, expectedBindingVersion: '',
+  } }, { verifyBinding: () => true });
+  const legacy = { id: 'legacy-task', repositoryId: principal.repositoryId, session, stage: 'awaiting-ci',
+    sourceSha: 'b'.repeat(40), version: 'legacy-version', plan: { ref: 'old-plan', version: 'old-plan-version' } };
+  await store.transaction(state => { state.tasks[scopedObjectKey(principal, session, `task:${legacy.id}`)] = legacy; });
+  const bytes = await fs.readFile(store.file), reopened = new ProtocolStore(directory);
+  const coordinator = { ...principal, role: 'coordinator' };
+  assert.deepEqual(await reopened.taskRecord(coordinator, session, legacy.id), legacy);
+  assert.equal(Object.hasOwn((await reopened.workflowTasks(coordinator, session))[0], 'planSourceSha'), false);
+  assert.deepEqual(await fs.readFile(store.file), bytes, 'Reading does not rewrite legacy records or guess an approval baseline');
+});
+
 for (const completionMode of ['merged', 'experiment']) test(`IF-027: ${completionMode} closure requires acceptance and host receipt without releasing another task`, async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-workflow-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   let store = new ProtocolStore(directory), counter = 0;
-  const session = { id: 's', generation: 1 }, sourceSha = 'a'.repeat(40);
+  const session = { id: 's', generation: 1 }, sourceSha = 'b'.repeat(40), planSourceSha = 'a'.repeat(40);
   const executor = { repositoryId: 'repo', deviceId: 'local', agentId: 'executor', role: 'executor' };
   const coordinator = { ...executor, deviceId: 'cloud', agentId: 'coordinator', role: 'coordinator', bindings: { s: 'wt' } };
   const human = { ...executor, agentId: 'human', role: 'human' }, ci = { ...coordinator, agentId: 'ci', role: 'ci' };
@@ -185,7 +203,12 @@ for (const completionMode of ['merged', 'experiment']) test(`IF-027: ${completio
   await send(coordinator, 'task.assign', { taskId: 'task-3', briefRef: thirdBrief.ref, briefVersion: thirdBrief.version, sessionId: 's', nodeIds: ['node'], mainVersion: 'main-1' }, { workflow: { verifyRouting: () => true } });
   await assert.rejects(send(executor, 'executor.state', { agentId: 'executor', state: 'idle' }), { code: 'CONFLICT' });
   const plan = await send(executor, 'object.put', { kind: 'plan', ref: 'plan', baseVersion: '', content: { steps: ['Inspect', 'Implement', 'Test'] } });
-  await send(executor, 'task.report', { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } });
+  const planReport = { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha: planSourceSha } };
+  await send(executor, 'task.report', planReport);
+  const planMessage = { v: 2, id: `request-${counter}`, type: 'task.report', session, payload: planReport };
+  const planReceipt = await store.handle(executor, planMessage);
+  assert.equal((await store.taskRecord(coordinator, session, 'task')).planSourceSha, planSourceSha);
+  assert.equal((await store.taskRecord(coordinator, session, 'task')).stage, 'plan-ready', 'Baseline is not approval');
   await send(coordinator, 'review.request', { taskId: 'task', kind: 'plan', ref: plan.ref, version: plan.version, requirementsRef: brief.ref, requirementsVersion: brief.version, rulesVersion: 'rules-1' });
   await assert.rejects(send(executor, 'task.report', { taskId: 'task', stage: 'progress', data: { seq: 1, summary: 'Started too early' } }), { code: 'CONFLICT' });
   await send(coordinator, 'review.result', { kind: 'plan', ref: plan.ref, version: plan.version, decision: 'approved', reason: 'Consistent with the brief and rules' });
@@ -195,6 +218,11 @@ for (const completionMode of ['merged', 'experiment']) test(`IF-027: ${completio
   await send(executor, 'object.put', { kind: 'ciTodo', ref: 'ci-todo', baseVersion: '', content: { items: [{ id: 'todo-1', title: 'Cross-module regression' }, { id: 'todo-2', title: 'Recovery' }] } });
   await send(executor, 'object.put', { kind: 'evidence', ref: 'evidence', baseVersion: '', content: { command: 'node --test', exitCode: 0 } });
   await send(executor, 'task.report', { taskId: 'task', stage: 'handoff', data: { sourceSha, ciTodoRef: 'ci-todo', unitTestRefs: ['evidence'], experienceRefs: [] } });
+  const handedOff = await store.taskRecord(coordinator, session, 'task');
+  assert.equal(handedOff.planSourceSha, planSourceSha);
+  assert.equal(handedOff.sourceSha, sourceSha, 'Final code cannot overwrite the submitted Plan baseline');
+  assert.deepEqual(await store.handle(executor, planMessage), planReceipt);
+  assert.deepEqual(await store.taskRecord(coordinator, session, 'task'), handedOff, 'Old Plan receipt never rewinds handoff');
   assert.equal((await send(executor, 'executor.state', { agentId: 'executor', state: 'busy', taskId: 'task' })).state, 'busy');
   await send(ci, 'ci.request', { taskId: 'task', sourceSha, ciTodoRef: 'ci-todo', unitTestRefs: ['evidence'] });
   await assert.rejects(send(ci, 'ci.result', { taskId: 'task', sourceSha, verdict: 'passed', checks: [{ testId: 'CI-1', todoId: 'unknown-todo', status: 'passed', evidenceRef: 'evidence' }] }), { code: 'CONFLICT' });
@@ -230,7 +258,7 @@ for (const completionMode of ['merged', 'experiment']) test(`IF-027: ${completio
     ? verifyTaskCompletion({ project: { completion: { experiments: [{ taskId: current.id, sessionId: session.id,
       generation: session.generation, sourceSha }] } }, task: current, receipts,
       fetch: () => { throw new Error('No GitHub call for experiments'); } })
-    : receipts.gitReceiptRef === 'merge' && receipts.archiveReceiptRef === 'archive' && { sourceSha: current.sourceSha, mergeSha: 'b'.repeat(40) } };
+    : receipts.gitReceiptRef === 'merge' && receipts.archiveReceiptRef === 'archive' && { sourceSha: current.sourceSha, mergeSha: 'd'.repeat(40) } };
   await send(coordinator, 'task.control', complete, { workflow });
   const controlId = `request-${counter}`;
   const controlRequest = { v: 2, id: controlId, type: 'task.control', session, payload: complete };
@@ -238,6 +266,8 @@ for (const completionMode of ['merged', 'experiment']) test(`IF-027: ${completio
   store = new ProtocolStore(directory);
   assert.deepEqual(await store.handle(coordinator, controlRequest, { workflow }), originalReceipt);
   const savedTask = await store.taskRecord(coordinator, session, 'task');
+  assert.equal(savedTask.planSourceSha, planSourceSha, 'Original Plan baseline survives reopening, CI and acceptance');
+  assert.equal(savedTask.sourceSha, sourceSha);
   assert.equal(savedTask.stage, 'closing', 'receiving a control is not host completion');
   assert.equal(savedTask.completion.closeReceiptId, controlId);
   assert.equal(savedTask.completion.proof.sourceSha, savedTask.sourceSha);

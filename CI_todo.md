@@ -33,9 +33,17 @@
 - [ ] 独立 Tester：核准确修订的多线程及 HTTP 故障合同与生产长时观察。当前人类要求不调用 subagent，Root 自检/Required CI 不冒充独立角色；全目标保持未完成。
 - [ ] Required CI、正常 Main 合并和精确版本上线，数据/配置保留；当前账号完整 Map 的真实模型查询仍须单独验收。
 
+## CORE-PLAN-BASELINE-01 · 固定消费 Core 2.3.1（2026-10-10）
+
+- [x] Root 核对已发布包及来源：Skill Main `71b1fc3dcec009750cf6a1f3d31a8e8582312d11` 的完整 CI/Required `37973185347` 成功；tar SHA256 `72ec960467ffc52c96e5c1e203faacee8335c3c67763cfa8b2d8fa72858a5a39` 与发布 digest/SHA256SUMS 一致。实际差异为独立 planSourceSha、资料目录迁移及支持目录判定；角色行为不变，manual 指令不加静态资料。
+- [x] Cloud 固定依赖发布包，不修改 scripts/shared 生成物、不从本地 dirty Skill 打包、不猜旧记录的 Plan 基线。既有闭环回归使用不同的 Plan/交接提交，核审批门禁、重放不回退、重启/CI/验收后双版本保留。
+- [x] 开发完成后唯一六目标模块批次：Node22.18.0、actual `7ad342` exit0，6/6、零失败/跳过/取消，1634.6896ms。涵盖两种不同源码提交的 Plan→CI/人审/关闭闭环及原回执/重启、旧任务只读不猜基线、当前固定包八资料入口及按需调用、参考迁移不掩盖缺文件和生成目录迁移。日志 SHA256 `b47007b4d31818f68310357dfa3d6b01701857bbf988cf1f095eda3b5e2ec8e7`，`verify-boundaries` exit0；模块自检和自动 CI 不冒充独立 Tester。
+- [ ] 准确 Required、正常 Main 合并和上线后只读核运行包/旧数据兼容，保持原配置/模型/暂停状态；不以更新依赖证明原生 Cursor/Claude 或全部计划完成。
+
 ## REFERENCE-DOCS-01 · 合并指南的兼容入口
 
-- [ ] Skill 新 core 发布后固定消费准确版本，从该构建验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并指南，角色相对链接与章节定位正确。源码的目录迁移与工具读取已有正式回归；旧固定包及合成迁移测试不代替新版共享包消费验收，不修改生成物绕过固定包。本次不部署。
+- [x] 固定消费正式 Core2.3.1，从其真实构建验证全部八个原资料标识；`map-mount.md`、`plan-review.md`、`test-check.md` 读取现行合并指南，角色链接与枚举一致、显式工具读取前不加载。证据见本轮 CORE-PLAN-BASELINE-01，非旧固定包/仅合成迁移，不修改生成物。
+- [ ] 本次精确发布后核现行参考目录、旧生成入口清理和运行函数读取；模型主动调用仍是另一项真实对话验收。
 
 ## SLACK-FAILED-TURN-STOP-01 · 失败轮次的耐久停止（2026-10-10）
 
