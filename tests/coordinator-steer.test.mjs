@@ -8,6 +8,38 @@ import { CoordinatorConversations, CoordinatorService, publicMessages } from '..
 import { CoordinatorModel, coordinatorModelMessages } from '../scripts/cloud/coordinator-model.mjs';
 import { hash } from '../scripts/shared/io.mjs';
 
+test('合并格式失败只释放已确定失败的生成，不丢弃未决工具、补充、中断或其他来源', async t => {
+  const actor = { kind: 'human', integration: 'slack', teamId: 'TTEST', userId: 'UTEST', sessionId: 'slack:TTEST:UTEST' };
+  const input = (id, text) => ({ id, inputs: [{ id: `${id}-input`, text }], followup: 'steer' });
+  const metadata = request => ({ source: 'slack', actor, participation: { text: request.inputs[0].text, inputs: request.inputs,
+    context: [], files: [], routing: { coordinatorUserId: 'UBOT', mentionedUsers: [] } } });
+  for (const mode of ['pending-tool', 'queued-input', 'interrupt', 'provider-error', 'non-slack']) {
+    const root = await directory(t); let models = 0, executions = 0;
+    const service = new CoordinatorService({ directory: root, system: 'test', tools: [{ name: 'write' }],
+      execute: async () => { executions++; }, model: { next: async () => { models++; return answer('missing-header'); } } });
+    const first = input('original', '测试');
+    await service.submitBatch(first, metadata(first)); await service.close();
+    const state = await service.readConversation(null);
+    assert.equal(state.error.code, 'MODEL_INVALID_RESPONSE');
+    if (mode === 'pending-tool') state.pending = { stop: 'tool_use', content: [tool('unknown-effect')] };
+    if (mode === 'provider-error') state.error.code = 'MODEL_HTTP_503';
+    if (mode === 'non-slack') state.activeInput.source = 'human';
+    await service.saveState(state);
+    if (mode === 'queued-input') {
+      const journal = await service.inputJournal();
+      journal.requests['retained-steer'] = { id: 'retained-steer', revision: 1, text: '保留补充' }; journal.revision = 1;
+      await fs.writeFile(service.inputFile, JSON.stringify(journal));
+    }
+    if (mode === 'interrupt') await service.interrupt({ id: 'human-stop', expectedTurnId: state.activeTurnId });
+    const snapshot = await service.readConversation(null), journal = await service.inputJournal();
+    const second = input('new', '在吗');
+    await assert.rejects(service.submitBatch(second, metadata(second)), { code: 'COORDINATOR_BUSY' });
+    assert.deepEqual(await service.readConversation(null), snapshot, mode);
+    assert.deepEqual(await service.inputJournal(), journal, mode);
+    assert.equal(models, 1); assert.equal(executions, 0);
+  }
+});
+
 const deferred = () => { let resolve; const promise = new Promise(value => { resolve = value; }); return { promise, resolve }; };
 const answer = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
 const tool = id => ({ type: 'tool_use', id, name: 'write', input: { id } });

@@ -18,6 +18,7 @@ const participationTransient = error => {
     'UPGRADE_REQUIRED', 'VERSION_MISMATCH', 'IDENTITY_MISMATCH', 'MODEL_ROUTE_CHANGED', 'PROTOCOL_MISMATCH',
     'RELEVANCE_SCOPE_MISMATCH', 'RELEVANCE_ROUTING_LIMIT', 'RELEVANCE_INPUT_LIMIT'].includes(error.code) ||
     /(?:^|_)(?:AUTH|IDENTITY|VERSION|UPGRADE|PERMISSION)(?:_|$)/.test(error.code || '')) return false;
+  if (error.status === 409 && ['BUSY', 'COORDINATOR_BUSY'].includes(error.code)) return true;
   if (Number.isInteger(error.status) && error.status >= 400 && error.status < 500 && error.status !== 429) return false;
   return Number.isInteger(error.status) && (error.status === 429 || error.status >= 500 && error.status <= 599) ||
     ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'RELEVANCE_INVALID_RESPONSE', 'GATEWAY_BAD_RESPONSE', 'GATEWAY_ERROR', 'BUSY', 'COORDINATOR_BUSY'].includes(error.code) ||
@@ -100,7 +101,7 @@ export class SlackPlugin {
       .catch(() => {}).finally(() => this.reactions.delete(pending));
     this.reactions.add(pending);
   }
-  async queueReactions(key, message, messages) {
+  async queueReactions(key, message, messages, { read = false } = {}) {
     const ready = [];
     if (message.role !== 'assistant') return ready;
     if (message.partial) {
@@ -119,7 +120,7 @@ export class SlackPlugin {
       const original = input && this.store.data.inbox[input.inboxId];
       const event = original?.projectResume?.event || original?.envelope?.body?.event;
       const source = messages.find(item => item.role === 'user' && item.requestId === action.requestId);
-      if (!action.actionId || !slackReactionEmojis.includes(action.emoji) || action.status !== 'intent' ||
+      if (!action.actionId || !(read ? action.emoji === 'eyes' : slackReactionEmojis.includes(action.emoji)) || action.status !== 'intent' ||
           message.source !== 'slack' || message.requestId !== action.requestId || source?.source !== 'slack' ||
           actor?.kind !== 'human' || actor.integration !== 'slack' || actor.teamId !== this.teamId ||
           actor.sessionId !== `slack:${this.teamId}:${actor.userId}` || source.actor?.userId !== actor.userId ||
@@ -130,7 +131,7 @@ export class SlackPlugin {
           event.user !== actor.userId || event.channel !== binding.channel || input.channel !== binding.channel || event.ts !== input.timestamp ||
           !/^\d+\.\d+$/.test(event.ts || '') || original.envelope?.body?.team_id !== this.teamId ||
           reactionEventHash(event) !== input.eventHash) continue;
-      const id = `reaction-${digest([key, action.actionId])}`;
+      const id = `reaction-${digest([key, read ? `read:${action.actionId}` : action.actionId])}`;
       const target = { key, requestId: action.requestId, projectId: binding.projectId, conversationId: binding.conversationId,
         channel: input.channel, timestamp: input.timestamp, userId: input.userId, emoji: action.emoji };
       await this.store.update(state => {
@@ -139,6 +140,20 @@ export class SlackPlugin {
         state.reactionOutbox[id] ||= { ...target, fingerprint, status: 'pending', attempts: 0, next: 0 };
       });
       ready.push(id);
+    }
+    return ready;
+  }
+  async queueReadReactions(key, state) {
+    if (state.participationDecision !== 'reply' || !Array.isArray(state.participationRequestIds) || state.participationRequestIds.length > 20) return [];
+    const ready = [], messages = state.messages || [];
+    for (const requestId of new Set(state.participationRequestIds)) {
+      if (!state.acceptedRequestIds?.includes(requestId)) continue;
+      const source = messages.find(message => message.role === 'user' && message.requestId === requestId);
+      if (!source) continue;
+      // 系统已读反馈复用原消息校验与耐久发送，不开放模型的表情白名单。
+      ready.push(...await this.queueReactions(key, { role: 'assistant', source: source.source,
+        actor: source.actor, requestId, actions: [{ kind: 'slack-reaction', actionId: requestId,
+          emoji: 'eyes', status: 'intent', requestId, actor: source.actor }] }, messages, { read: true }));
     }
     return ready;
   }
@@ -1239,7 +1254,8 @@ export class SlackPlugin {
           id === streamIdFor(turnId, state.consumedInputRevision)));
       return slot ? { ...slot[1], slotId: slot[0], turnId } : null;
     };
-    const readyReactions = new Set();
+    const readyReactions = new Set(await this.queueReadReactions(key, state));
+    this.drainReactions(readyReactions);
     for (const { message, index, requestId, id, userId } of entries) {
       if (message.actions?.some(action => action.kind === 'project-switch')) {
         const switched = await this.applyProjectSwitch(key, message, messages, state);

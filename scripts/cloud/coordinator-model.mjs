@@ -1,6 +1,6 @@
 import { hash } from '../shared/io.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
-import { createParticipationGate, mergedParticipationInput, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
+import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
@@ -354,27 +354,36 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
+    // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
+    // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
+    const generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
     const generationSystem = needsGate ? system + MERGED_PARTICIPATION_POLICY : alreadyAllowed
       ? system + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : system;
     const systemHash = hash(generationSystem), toolsHash = hash(JSON.stringify(modelTools));
     const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
       prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
-        historyHash: hash(JSON.stringify(messages)), messageCount: messages.length,
+        historyHash: hash(JSON.stringify(generationMessages)), messageCount: generationMessages.length,
         ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
     const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
       if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
       await onText?.(text);
     }, { continuation: !!alreadyAllowed }) : null;
+    const publishDecision = async () => {
+      if (gate?.decision && (state.slackParticipation?.requestId !== gateKey || state.slackParticipation.decision !== gate.decision)) {
+        state.slackParticipation = { requestId: gateKey, decision: gate.decision };
+        await save(state);
+      }
+    };
     let next;
     try {
       if (signal?.aborted) throw interruptionProblem(signal);
-      next = await model.next({ system: generationSystem, messages, tools: modelTools, signal, onText: measurement ? async text => {
+      next = await model.next({ system: generationSystem, messages: generationMessages, tools: modelTools, signal, onText: measurement ? async text => {
         if (signal?.aborted) return;
         if (!gate && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
-        if (gate) await gate.consume(text); else await onText?.(text);
-      } : gate ? text => gate.consume(text) : onText, onToolStart: async name => {
-        gate?.toolStart(); await onToolStart?.(name);
+        if (gate) { await gate.consume(text); await publishDecision(); } else await onText?.(text);
+      } : gate ? async text => { await gate.consume(text); await publishDecision(); } : onText, onToolStart: async name => {
+        gate?.toolStart(); await publishDecision(); await onToolStart?.(name);
       } });
       if (signal?.aborted) {
         // An adapter may finish despite cancellation. Preserve only visible text;
