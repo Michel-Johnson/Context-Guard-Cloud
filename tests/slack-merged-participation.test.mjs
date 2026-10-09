@@ -8,6 +8,7 @@ import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
+import { validateMergedParticipation } from '../scripts/cloud/merged-participation.mjs';
 import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store } from '../plugins/slack/src/store.mjs';
@@ -163,4 +164,13 @@ test('合并接话参考校验：拒绝空项、错序、改文、重试夹带�
     { ...input.payload, retry: true },
     { ...input.payload, actor: { kind: 'human' } },
   ]) assert.throws(() => validateIntegrationCommand(config, { ...input, payload }), error => error.code === 'INVALID_ARGUMENT');
+});
+
+test('服务层接话参考拒绝非法 Slack 身份格式，不得回落到未受保护的模型路径', () => {
+  const inputs = [{ id: 'original', text: '请确认。' }], snapshot = participation('original', '请确认。');
+  for (const [badTeam, badUser] of [['bad-team', userId], [teamId, 'bad-user'], [undefined, undefined]]) {
+    const actor = { kind: 'human', integration: 'slack', teamId: badTeam, userId: badUser,
+      sessionId: `slack:${badTeam}:${badUser}` };
+    assert.throws(() => validateMergedParticipation(snapshot, inputs, { source: 'slack', actor }), error => error.code === 'INVALID_INPUT');
+  }
 });

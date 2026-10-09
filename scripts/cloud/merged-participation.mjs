@@ -9,6 +9,7 @@ export const MERGED_PARTICIPATION_POLICY = '\n[Slack 合并接话协议]\n在同
 export function validateMergedParticipation(value, inputs, { source, actor } = {}) {
   if (value === undefined) return undefined;
   if (source !== 'slack' || actor?.kind !== 'human' || actor.integration !== 'slack' ||
+      !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
       actor.sessionId !== `slack:${actor.teamId}:${actor.userId}` || !Array.isArray(inputs)) {
     throw Object.assign(new Error('接话上下文只接受已鉴权的 Slack 批次'), { code: 'INVALID_INPUT' });
   }
