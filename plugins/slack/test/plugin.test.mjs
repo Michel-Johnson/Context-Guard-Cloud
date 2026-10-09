@@ -2494,6 +2494,10 @@ test('global form can explicitly select project before first Home preference', a
 test('brief approval carries original version and prompt export uses shared gateway', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001'); await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
   await f.plugin.review('E1', user, { key, proposalId: 'approval-1', version: 'brief-version' }, 'approved', 'approved by user');
+  const confirmation = f.sent.at(-1);
+  assert.match(confirmation.text, /Main 事项已保存/);
+  assert.match(JSON.stringify(confirmation.blocks), /Claude Code CLI 或 Cursor；开发记录只保存在本地/);
+  assert.doesNotMatch(JSON.stringify(confirmation), /hooks 写回 Session|Codex/);
   assert.equal(f.calls.find(call => call.type === 'brief.review').payload.version, 'brief-version');
   await f.plugin.exportPrompt('E2', user, { key, proposalId: 'approval-1' }); assert.equal(f.sent.find(call => call.export).export.text, 'execute login');
 });
