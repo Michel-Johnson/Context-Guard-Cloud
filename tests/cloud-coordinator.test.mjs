@@ -10,7 +10,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, coordinatorStructureOperations, coordinatorTaskOwnerRequired } from '../scripts/cloud/server.mjs';
+import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, authorizeCiTransaction, coordinatorStructureOperations, coordinatorTaskOwnerRequired } from '../scripts/cloud/server.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
@@ -3074,6 +3074,15 @@ test('CI delegation requires server registration, the owning device and an indep
   assert.deepEqual(createdPrincipal.bindings, { [creation.sessionId]: 'created-worktree' });
   assert.ok((await store.handle(createdPrincipal, createdMessage)).data.version);
   await assert.rejects(authorizeCiReceiver({ ...options, message: createdMessage, templates: ['developer'], principal: { ...principal, deviceId: 'other' } }), { code: 'FORBIDDEN' });
+  const accepted = await store.handle(delegated, message, { authorize: authorizeCiTransaction });
+  const before = await store.registeredBinding(principal, 'ci');
+  await store.handle(principal, { v: 2, id: 'ci-rebind', type: 'session.bind', payload: {
+    sessionId: 'ci', worktreeId: 'replacement-ci-worktree', agentId: 'ci', expectedBindingVersion: before.version,
+  } }, { verifyBinding: () => true, allowMigration: true });
+  assert.ok(accepted.data.version);
+  await assert.rejects(store.handle(delegated, message, { authorize: authorizeCiTransaction }), { code: 'FORBIDDEN' },
+    'a stale delegation must be rejected inside the transaction before replaying its accepted write');
+  await assert.rejects(authorizeCiReceiver(options), { code: 'FORBIDDEN' });
 });
 
 test('An external device calls the same Coordinator tools as the built-in Coordinator', async t => {

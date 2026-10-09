@@ -13,6 +13,7 @@ import { verifyChangeReferences } from '../shared/protocol-map.mjs';
 import { ProtocolAuth } from './protocol-auth.mjs';
 import { DeviceAuthorization } from './device-authorization.mjs';
 import { ProtocolStore, hasCiReceiver } from '../shared/protocol-store.mjs';
+import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
 import { reviewInput, reviewOperations, pendingReviewFeedback } from './task-review.mjs';
 import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
 import { validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
@@ -404,7 +405,26 @@ export async function authorizeCiReceiver({ principal, ciSessionId, message, rec
   const ciBinding = await store.registeredBinding(principal, ciSessionId);
   const executorBinding = await store.registeredBinding(principal, executorId);
   if (!ciBinding || ciBinding.worktreeId !== receiver.worktreeId || !executorBinding || executorBinding.worktreeId === ciBinding.worktreeId) protocolFail('FORBIDDEN', 'CI must use its registered independent worktree on the owning device');
-  return { ...principal, agentId: ciSessionId, role: 'ci', bindings: { [executorId]: executorBinding.worktreeId } };
+  return { ...principal, agentId: ciSessionId, role: 'ci', ciBindingVersion: ciBinding.version, bindings: { [executorId]: executorBinding.worktreeId } };
+}
+
+export function authorizeCiTransaction(state, principal, message) {
+  if (principal.role !== 'ci') return;
+  // Recheck the delegated identity on the same authoritative snapshot as the
+  // object read, before ProtocolStore can reuse any accepted receipt.
+  const binding = state.bindings[digest(JSON.stringify([principal.repositoryId, principal.agentId]))];
+  if (!binding || binding.version !== principal.ciBindingVersion || binding.deviceId !== principal.deviceId ||
+      binding.worktreeId === principal.bindings?.[message.session.id]) protocolFail('FORBIDDEN', 'CI binding changed before the operation');
+  if (message.type !== 'object.read') return;
+  const tasks = Object.values(state.tasks).filter(task => task.repositoryId === principal.repositoryId &&
+    task.session?.id === message.session.id && task.session.generation === message.session.generation && task.busy && task.stage === 'testing');
+  if (tasks.length !== 1) protocolFail('FORBIDDEN', 'CI reads require one current testing task');
+  const task = tasks[0], { ref, version } = message.payload;
+  const assigned = [task.handoff?.ciTodoRef, ...(task.handoff?.unitTestRefs || [])].includes(ref) &&
+    Object.hasOwn(task.references || {}, ref) && task.references[ref] === version;
+  const ownEvidence = ref.startsWith(`ci:${principal.agentId}:`) &&
+    state.objects[scopedObjectKey(principal, message.session, ref)]?.versions?.[version]?.kind === 'evidence';
+  if (!assigned && !ownEvidence) protocolFail('FORBIDDEN', 'CI may only read current handoff versions and its own evidence');
 }
 
 export async function startCloudServer({
@@ -2300,6 +2320,7 @@ export async function startCloudServer({
           }
           const reply = await store.handle(principal, input, {
             blobs,
+            authorize: authorizeCiTransaction,
             allowMigration: principal.role === 'device',
             workbenchRead: async (identity, message) => {
               const repository = interfaceConfig.repositories.find(item => item.repositoryId === identity.repositoryId);
