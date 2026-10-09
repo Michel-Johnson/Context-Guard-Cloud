@@ -109,7 +109,8 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
           ? 'not a decision' : JSON.stringify({ target: addressed ? 'coordinator' : 'none', intent: addressed ? 'reply' : 'notice', reason: 'Controlled decision' }) }] };
       }
       const message = request.messages.at(-1), text = typeof message?.content === 'string'
-        ? message.content.split('[以下为原始输入]\n').at(-1) : '';
+        // 替身按原始人类输入路由；保留 modelCalls 中完整服务器格式提醒供断言。
+        ? message.content.split('[以下为原始输入]\n').at(-1).split('\n\n[服务器本轮输出格式；')[0] : '';
       if (projectSelection && ['列出项目', '切换到另一个项目'].includes(text)) return { stop: 'tool_use', content: [
         { type: 'tool_use', id: 'live-projects', name: 'list_projects', input: {} }] };
       if (projectSelection && Array.isArray(message?.content)) {
