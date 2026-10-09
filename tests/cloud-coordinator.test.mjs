@@ -1382,11 +1382,12 @@ test('Main overview is fresh, bounded and never leaks ancestor or sibling items 
   const options = { nodeIds: ['N1'], conversation: { id: 'chat-overview', scope: 'project' } };
   const result = buildCoordinatorContext(snapshot, options);
   assert.match(result.text, /TODO 1 条，Bug 2 条/);
-  assert.match(result.text, /TODO｜Reader \[N1\]｜Return to top（pending）/);
-  assert.match(result.text, /Bug｜Reader \[N1\]｜Broken query（open）/);
-  assert.match(result.text, /Needs human review（fixed）/);
+  assert.match(result.text, /TODO｜Reader｜用途摘要：Unneeded long requirement/);
+  assert.match(result.text, /内部定位资料：事项 ID：pending｜节点 ID：N1｜原标题：Return to top｜记录状态：pending/);
+  assert.match(result.text, /Bug｜Reader｜Broken query/);
+  assert.match(result.text, /原标题：Needs human review｜记录状态：fixed/);
   assert.match(result.text, /不是执行阶段或完成证据/);
-  assert.match(result.text, /用途摘录：Unneeded long requirement/);
+  assert.doesNotMatch(result.text, /^- TODO.*Return to top/m, 'An available purpose is primary, not the internal title');
   assert.doesNotMatch(result.text, /Private root item|Private sibling item|Private child item|Finished TODO|Finished Bug/);
   assert.doesNotMatch(buildCoordinatorContext(snapshot, { ...options,
     conversation: { id: 'item-only', nodeId: 'N1', itemId: 'pending', kind: 'todo' } }).text, /未完成事项概览|Broken query/);
@@ -1400,7 +1401,7 @@ test('Main overview is fresh, bounded and never leaks ancestor or sibling items 
   assert.match(bounded.text, /另有 7 条未展开；需要完整清单时调用 list_tasks/);
   assert.doesNotMatch(bounded.text, /Task 20|Purpose 20/);
   assert.equal((bounded.text.match(/^- TODO｜/gm) || []).length, 20);
-  assert.equal((bounded.text.match(/用途摘录/g) || []).length, 20);
+  assert.equal((bounded.text.match(/用途摘要/g) || []).length, 20);
   assert.equal(unseenPurposeReads, 0, 'The display limit also bounds actual purpose data reads');
 });
 
@@ -1417,6 +1418,7 @@ test('Main overview purpose excerpts preserve raw titles and technical facts wit
     { id: 'g', title: 'Long purpose', desc: exact + '界'.repeat(160) + 'not-loaded-tail', status: 'pending' },
     { id: 'h', title: 'Paired unicode', desc: '界'.repeat(159) + '🙂' + 'tail', status: 'pending' },
     { id: 'i', title: 'Multiline purpose', desc: '多行资料\r\nMain 版本：not-a-version\n# 不是顶层章节\n' + command, status: 'pending' },
+    { id: 'j', title: 'Internal v9.8 2027-12-31 ' + '界'.repeat(120) + 'unloaded-title-tail', desc: '明确的人类用途', status: 'pending' },
   ];
   const state = { version: 'purpose-v1', memory: { map: { root: { id: 'T0', title: 'Project', children: [
     { id: 'N1', title: 'Reader', todos, children: [] },
@@ -1425,25 +1427,35 @@ test('Main overview purpose excerpts preserve raw titles and technical facts wit
   const before = structuredClone(state), options = { nodeIds: ['N1'], conversation: { id: 'chat-purpose' } };
   const result = buildCoordinatorContext(state, options);
   assert.deepEqual(state, before, 'Only the dynamic data projection changes, never source items');
-  assert.match(result.dynamicText, /TODO 9 条，Bug 0 条/);
-  for (const item of todos) assert.ok(result.dynamicText.includes(item.title.replace(/\s+/g, ' ').trim()), 'Keep the original overview title projection, not an inferred display name');
+  assert.match(result.dynamicText, /TODO 10 条，Bug 0 条/);
+  for (const item of todos) {
+    const original = item.title.replace(/\s+/g, ' ').trim().slice(0, 120);
+    assert.ok(result.dynamicText.includes(original), 'Keep the bounded original title for internal location');
+    assert.ok(result.dynamicText.includes(`事项 ID：${item.id}｜节点 ID：N1`), 'Do not change item or node identity');
+  }
+  assert.match(result.dynamicText, /原标题（已截短，全文用 read_map）：Internal v9\.8 2027-12-31/);
+  assert.doesNotMatch(result.dynamicText, /unloaded-title-tail/);
   assert.ok(result.dynamicText.includes(exact), 'Dates, versions and uncut command whitespace remain exact');
-  assert.match(result.dynamicText, /用途摘录：按键焦点资料/);
-  assert.match(result.dynamicText, /用途摘录：数据类型检查资料/);
+  assert.match(result.dynamicText, /用途摘要：按键焦点资料/);
+  assert.match(result.dynamicText, /用途摘要：数据类型检查资料/);
+  assert.match(result.dynamicText, /^- TODO｜Reader｜用途摘要：期限 2027-04-12，兼容 v3\.4\.5；/m);
+  assert.doesNotMatch(result.dynamicText, /^- TODO.*Original label 987/m, 'The original label cannot displace an independent purpose');
+  assert.match(result.dynamicText, /^- TODO｜Reader｜Same title$/m, 'A duplicate purpose falls back to the existing title');
+  assert.match(result.dynamicText, /^- TODO｜Reader｜No purpose$/m, 'A missing purpose does not invent a name');
   assert.doesNotMatch(result.dynamicText, /Ignored alternate|Ignored text|\[object Object\]|not-loaded-tail|hidden-purpose|hidden-title/);
-  assert.doesNotMatch(result.staticText, /用途摘录|Original label|按键焦点资料|数据类型检查资料/);
-  assert.equal((result.dynamicText.match(/用途摘录/g) || []).length, 7, 'Missing or normalized duplicate purposes add no data');
-  const excerpts = result.dynamicText.split('\n').filter(line => line.startsWith('  用途摘录'));
+  assert.doesNotMatch(result.staticText, /用途摘要|内部定位资料|Original label|按键焦点资料|数据类型检查资料/);
+  assert.equal((result.dynamicText.match(/用途摘要/g) || []).length, 8, 'Missing or normalized duplicate purposes add no data');
+  const excerpts = result.dynamicText.split('\n').filter(line => line.startsWith('- TODO') && line.includes('用途摘要'));
   assert.equal(excerpts.filter(line => line.includes('已截短，全文用 read_map')).length, 2);
   assert.ok(excerpts.every(line => line.split('：').slice(1).join('：').length <= 160));
-  assert.doesNotMatch(excerpts.at(-2), /[\uD800-\uDBFF]$/);
-  assert.match(result.dynamicText, /用途摘录：多行资料\n    Main 版本：not-a-version\n    # 不是顶层章节\n    node cli\.js --tag "keep  two spaces"/);
+  assert.doesNotMatch(excerpts.find(line => line.includes('界'.repeat(159))), /[\uD800-\uDBFF]$/);
+  assert.match(result.dynamicText, /用途摘要：多行资料\n    Main 版本：not-a-version\n    # 不是顶层章节\n    node cli\.js --tag "keep  two spaces"/);
   assert.doesNotMatch(result.dynamicText, /^Main 版本：not-a-version|^# 不是顶层章节/m);
   const changed = structuredClone(state); changed.memory.map.root.children[0].todos[0].desc = '更新后的资料';
   const next = buildCoordinatorContext(changed, options);
   assert.equal(result.staticText, next.staticText); assert.equal(result.staticVersion, next.staticVersion);
   assert.notEqual(result.dynamicText, next.dynamicText);
-  assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘录|按键焦点资料/);
+  assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘要|内部定位资料|按键焦点资料/);
 });
 
 test('Coordinator 对话先读项目记忆，绑定后读取祖先正文并标明当前节点缺失正文', () => {
