@@ -1133,7 +1133,8 @@ export async function startCloudServer({
         // idle conversation creates a transient in-memory `running` state, so
         // its first user submission can incorrectly fail with COORDINATOR_BUSY.
         const restored = await service.state();
-        if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored))) service.kick();
+        if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
+            (await service.inputSignals(restored)).interrupted)) service.kick();
         return service;
       })();
       coordinators.set(key, creating);
