@@ -2309,6 +2309,99 @@ test('合并👀的失回、重启和重复镜像沿原消息恢复，already_re
   assert.equal(calls.length, 4); assert.deepEqual(calls[0], calls[1]);
   assert.deepEqual(calls[0], { method: 'reactions.add', channel: f.dm, timestamp: '123.001', name: 'eyes' });
 });
+test('回复成功送达且轮次结束才把原消息的💬换成✅，重复镜像不重发', async t => {
+  const f = await reactionFixture(t), id = f.store.data.reactionInputs[f.requestId].inboxId, reactions = [];
+  f.plugin.kick = () => {}; f.plugin.stopped = false;
+  f.io.call = async (method, input) => { reactions.push({ method, ...input }); return {}; };
+  await f.plugin.feedback.receive(id);
+  const state = { participationDecision: 'reply', participationRequestIds: [f.requestId], acceptedRequestIds: [f.requestId],
+    inputRevision: 1, controlRevision: 0, pendingInputCount: 0, status: 'running', activeTurnId: f.requestId,
+    messages: [f.input, { ...f.message, text: '你好，我在。', actions: [] }], approvals: [] };
+  f.gateway.command = async type => type === 'conversation.state' ? state : {};
+  await f.plugin.mirror(f.key, state); await settleReactions(f.plugin);
+  assert.equal(f.store.data.feedback[id].desired, 'reply');
+  assert.equal(reactions.some(c => c.name === 'white_check_mark'), false);
+  state.status = 'waiting-for-user'; state.activeTurnId = null;
+  let entered, release; const began = new Promise(r => { entered = r; }), held = new Promise(r => { release = r; });
+  const post = f.io.update;
+  // 稳定结束后的最终文本变更，必须等 Slack 确认更新，不能先标完成。
+  state.messages[1].text = '你好，我在。你想聊哪个问题？';
+  f.io.update = async (...args) => { entered(); await held; return post(...args); }; t.after(() => release());
+  const delivery = f.plugin.mirror(f.key, state); await began;
+  assert.equal(f.store.data.feedback[id].desired, 'reply');
+  release(); await delivery; await settleReactions(f.plugin);
+  assert.equal(f.store.data.feedback[id].desired, 'completed');
+  assert.equal(f.store.data.feedback[id].applied.white_check_mark, true);
+  assert.equal(f.store.data.feedback[id].applied.speech_balloon, false);
+  const count = reactions.length; await f.plugin.mirror(f.key, state); await settleReactions(f.plugin);
+  assert.equal(reactions.length, count);
+});
+test('发送失败、未结束、未消费补充、历史正文和纯表情都不能标回复完成', async t => {
+  for (const mode of ['send-failure', 'active', 'pending', 'partial', 'history', 'reaction-only']) {
+    const f = await reactionFixture(t), id = f.store.data.reactionInputs[f.requestId].inboxId;
+    f.plugin.kick = () => {}; f.plugin.stopped = false; f.io.call = async () => ({});
+    await f.plugin.feedback.receive(id);
+    const reply = { ...f.message, text: '这是当前回答', actions: [] };
+    const state = { participationDecision: 'reply', participationRequestIds: [f.requestId], acceptedRequestIds: [f.requestId],
+      inputRevision: 1, controlRevision: 0, pendingInputCount: mode === 'pending' ? 1 : 0,
+      status: 'waiting-for-user', activeTurnId: mode === 'active' ? f.requestId : null,
+      messages: mode === 'history' ? [reply, f.input] : [f.input, mode === 'reaction-only' ? f.message : reply], approvals: [] };
+    f.gateway.command = async type => type === 'conversation.state' ? state : {};
+    if (mode === 'partial') reply.partial = true;
+    if (mode === 'send-failure') {
+      f.io.post = async () => { throw TypeError('synthetic failed delivery'); };
+      await assert.rejects(f.plugin.mirror(f.key, state));
+    } else await f.plugin.mirror(f.key, state);
+    await settleReactions(f.plugin);
+    assert.notEqual(f.store.data.feedback[id].desired, 'completed', mode);
+    assert.notEqual(f.store.data.feedback[id].applied.white_check_mark, true, mode);
+  }
+});
+test('同轮补充后的正式回答同时完成原问题和补充，不借补充前的旧正文', async t => {
+  const f = await reactionFixture(t), firstId = f.store.data.reactionInputs[f.requestId].inboxId;
+  f.plugin.kick = () => {}; f.plugin.stopped = false; f.io.call = async () => ({});
+  await f.plugin.feedback.receive(firstId);
+  const secondEvent = event({ ts: '123.002', thread_ts: '123.001', text: '补充：请回答最新问题。' });
+  const secondId = envelopeId('events_api', { team_id: teamId, event: secondEvent }), secondRequest = 'new-supplement';
+  await f.store.receive(secondId, { type: 'events_api', body: { team_id: teamId, event: secondEvent } });
+  await f.store.update(state => {
+    state.threads[f.key].ownRequests.push(secondRequest);
+    state.reactionInputs[secondRequest] = { ...state.reactionInputs[f.requestId], timestamp: secondEvent.ts,
+      eventHash: digest({ ...secondEvent, type: 'message' }), inboxId: secondId };
+  });
+  await f.plugin.feedback.receive(secondId);
+  const supplement = { ...f.input, requestId: secondRequest, text: secondEvent.text };
+  const firstReply = { ...f.message, id: 'earlier-body', text: '补充前的旧回答', actions: [] };
+  const finalReply = { ...f.message, id: 'latest-body', text: '这是纳入补充后的正式回答', actions: [] };
+  const state = { participationDecision: 'reply', participationRequestIds: [secondRequest], acceptedRequestIds: [f.requestId, secondRequest],
+    inputRevision: 2, consumedInputRevision: 2, controlRevision: 0, pendingInputCount: 0, status: 'waiting-for-user', activeTurnId: null,
+    messages: [f.input, firstReply, supplement], approvals: [] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.notEqual(f.store.data.feedback[secondId].desired, 'completed');
+  state.messages.push(finalReply);
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  for (const id of [firstId, secondId]) assert.equal(f.store.data.feedback[id].desired, 'completed');
+  assert.equal(f.sent.filter(item => item.text?.includes(finalReply.text)).length, 1);
+});
+test('只有当前请求的绑定确认卡成功送达才完成，旧卡片不借给新输入', async t => {
+  const f = await reactionFixture(t), id = f.store.data.reactionInputs[f.requestId].inboxId;
+  f.plugin.kick = () => {}; f.plugin.stopped = false; f.io.call = async () => ({});
+  await f.plugin.feedback.receive(id);
+  const proposal = { id: 'current-binding', kind: 'binding-proposal', version: 'v1', pending: true,
+    node: { id: 'login', title: '登录' }, pathText: '项目：目标\n└─ 登录：认证' };
+  const reply = { ...f.message, actions: [proposal] };
+  const state = { participationDecision: 'reply', participationRequestIds: [f.requestId], acceptedRequestIds: [f.requestId],
+    inputRevision: 1, controlRevision: 0, pendingInputCount: 0, status: 'waiting-for-user', activeTurnId: null,
+    messages: [reply, f.input], approvals: [proposal] };
+  f.gateway.command = async () => state;
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.notEqual(f.store.data.feedback[id].desired, 'completed', '历史卡片不能完成当前输入');
+  state.messages = [f.input, reply];
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.equal(f.store.data.feedback[id].desired, 'completed');
+  assert.equal(f.sent.filter(item => JSON.stringify(item.blocks).includes('approve_binding')).length, 1);
+});
 test('a submit ACK racing an older mirror snapshot resets its next poll atomically', async t => {
   for (const mode of ['message', 'answer']) {
     const f = await fixture(t), key = threadKey(teamId, channel, '120.001');
