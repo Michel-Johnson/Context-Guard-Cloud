@@ -196,6 +196,12 @@ export function validateIntegrationCommand(config, input) {
       fail('INVALID_ARGUMENT', 'Batch inputs retain distinct IDs and the gateway-assigned operator');
     }
   }
+  if (Object.hasOwn(input.payload || {}, 'participation')) {
+    if (input.type !== 'conversation.submit' || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', '接话参考只接受原始 Slack 批次');
+    const participation = relevanceInput(input.payload.participation);
+    if (!participation.routing || !participation.inputs || JSON.stringify(participation.inputs) !== JSON.stringify(input.payload.inputs.map(({ id, text }) => ({ id, text }))) ||
+        participation.text !== input.payload.inputs.map(entry => entry.text).join('\n\n')) fail('INVALID_ARGUMENT', '接话参考必须匹配原始输入');
+  }
   return { command: { ...input, payload: input.payload ?? {} }, actor };
 }
 

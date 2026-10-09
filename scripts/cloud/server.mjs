@@ -1300,8 +1300,8 @@ export async function startCloudServer({
     await requireManualConversation(project, conversationId);
     if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
     if (type === 'conversation.submit') {
-      const { history, slackChannelId: _deliveryChannel, ...input } = payload;
-      return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...(history !== undefined ? { history } : {}) });
+      const { history, participation, slackChannelId: _deliveryChannel, ...input } = payload;
+      return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) });
     }
     if (type === 'conversation.interrupt') {
       if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');
