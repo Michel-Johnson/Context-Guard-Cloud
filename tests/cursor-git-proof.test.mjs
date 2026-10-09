@@ -116,3 +116,91 @@ test('Exact-SHA check facts refuse wrong issuer/revision, absent or running/skip
     const f = checksFixture(); change(f); await assert.rejects(f.verifier.checks(f.input), { code: 'SOURCE_UNVERIFIED' });
   });
 });
+
+function trustedFixture(change) {
+  const check = { id: 71, name: 'Formal tests', app: { id: 15368 }, head_sha: sourceSha, check_suite: { id: 81 }, status: 'completed', conclusion: 'success' };
+  const run = { id: 91, check_suite_id: 81, head_sha: sourceSha, head_branch: branch, event: 'push', path: '.github/workflows/ci.yml',
+    status: 'completed', conclusion: 'success', run_attempt: 1, repository: { full_name: 'example/repo' }, head_repository: { full_name: 'example/repo' } };
+  const data = { check, run, file: { type: 'file', path: run.path, sha: 'd'.repeat(40), size: 100 },
+    job: { id: 101, name: check.name, run_id: run.id, head_sha: sourceSha, status: 'completed', conclusion: 'success', run_attempt: 1,
+      check_run_url: 'https://api.github.com/repos/example/repo/check-runs/71', steps: [{ name: 'Run formal tests', status: 'completed', conclusion: 'success' }] } };
+  const input = { sourceSha, branch, requiredChecks: [{ name: check.name, appId: 15368, workflowPath: run.path, workflowBlobSha: data.file.sha, testStep: 'Run formal tests' }] };
+  change?.(data, input);
+  const calls = [], verifier = new CursorGitProof({ repository: 'example/repo', fetch: async (url, options) => {
+    calls.push({ url, options }); assert.equal(options.method || 'GET', 'GET'); assert.equal(options.redirect, 'error');
+    const value = url.includes('/check-runs?') ? { total_count: 1, check_runs: [data.check] }
+      : url.includes('/actions/runs?') ? { total_count: 1, workflow_runs: [data.run] }
+        : url.includes('/contents/') ? data.file : url.includes('/jobs?') ? { total_count: 1, jobs: [data.job] } : data.run;
+    return new Response(JSON.stringify(value));
+  } });
+  return { input, data, calls, verifier };
+}
+test('Trusted CI facts pin exact push source, workflow blob, suite, current job and actual test step without inventing a verdict', async () => {
+  const f = trustedFixture(), facts = await f.verifier.trustedChecks(f.input);
+  assert.equal(facts.length, 1); assert.equal(facts[0].checkRunId, 71); assert.equal(facts[0].jobId, 101);
+  assert.equal(facts[0].workflowBlobSha, 'd'.repeat(40)); assert.equal(facts[0].testConclusion, 'success');
+  assert.equal('verdict' in facts[0], false); assert.equal('todoId' in facts[0], false); assert.equal(f.calls.length, 5);
+});
+test('Trusted CI rejects renamed/spoofed workflows, source drift, fake job binding, absent tests and ambiguous policies', async t => {
+  const cases = {
+    sha: (d) => { d.check.head_sha = baseSha; }, suite: d => { d.run.check_suite_id = 82; },
+    repo: d => { d.run.head_repository.full_name = 'foreign/repo'; }, event: d => { d.run.event = 'pull_request'; },
+    branch: d => { d.run.head_branch = 'another-branch'; }, running: d => { d.run.status = 'in_progress'; },
+    workflow: d => { d.run.path = '.github/workflows/spoof.yml'; }, blob: d => { d.file.sha = baseSha; },
+    kind: d => { d.file.type = 'dir'; }, job: d => { d.job.check_run_url = 'https://api.github.com/repos/other/repo/check-runs/71'; },
+    source: d => { d.job.head_sha = baseSha; }, attempt: d => { d.job.run_attempt = 2; },
+    step: d => { d.job.steps = []; }, duplicateStep: d => { d.job.steps.push({ ...d.job.steps[0] }); },
+    neutral: d => { d.check.conclusion = 'neutral'; },
+    app: (d, input) => { input.requiredChecks[0].appId = 999; },
+    path: (d, input) => { input.requiredChecks[0].workflowPath = '../ci.yml'; },
+    duplicated: (d, input) => { input.requiredChecks.push({ ...input.requiredChecks[0] }); },
+  };
+  for (const [name, change] of Object.entries(cases)) await t.test(name, async () => {
+    const f = trustedFixture(change); await assert.rejects(f.verifier.trustedChecks(f.input), { code: 'SOURCE_UNVERIFIED' });
+  });
+});
+test('Trusted CI retains real test failure and skip as machine facts, never silently treats them as passing', async () => {
+  for (const outcome of ['failure', 'skipped']) {
+    const f = trustedFixture(data => { data.run.conclusion = 'failure'; data.job.conclusion = data.check.conclusion = 'failure'; data.job.steps[0].conclusion = outcome; });
+    const [fact] = await f.verifier.trustedChecks(f.input);
+    assert.equal(fact.conclusion, 'failure'); assert.equal(fact.testConclusion, outcome); assert.equal(fact.runConclusion, 'failure');
+  }
+});
+test('Trusted CI retains every same-branch context including failures, filtering PR provenance before outcomes', async () => {
+  const f = trustedFixture(), contexts = ['success', 'failure', 'pull_request'].map((outcome, index) => {
+    const check = { ...f.data.check, id: 71 + index, check_suite: { id: 81 + index }, conclusion: outcome === 'failure' ? 'failure' : 'success' };
+    const run = { ...f.data.run, id: 91 + index, check_suite_id: 81 + index, conclusion: check.conclusion,
+      ...(outcome === 'pull_request' ? { event: 'pull_request', status: 'in_progress', conclusion: null } : {}) };
+    const job = { ...f.data.job, id: 101 + index, run_id: run.id, conclusion: check.conclusion,
+      check_run_url: `https://api.github.com/repos/example/repo/check-runs/${check.id}`,
+      steps: [{ ...f.data.job.steps[0], conclusion: check.conclusion }] };
+    return { check, run, job };
+  });
+  const calls = [];
+  f.verifier.request = async (url, options) => {
+    assert.equal(options.method || 'GET', 'GET'); calls.push(url);
+    const route = new URL(url), suite = Number(route.searchParams.get('check_suite_id'));
+    const selected = contexts.find(context => context.run.check_suite_id === suite || route.pathname.endsWith('/runs/' + context.run.id) || route.pathname.endsWith('/runs/' + context.run.id + '/jobs'));
+    const value = url.includes('/check-runs?') ? { total_count: contexts.length, check_runs: contexts.map(context => context.check) }
+      : url.includes('/contents/') ? f.data.file
+        : url.includes('/actions/runs?') ? { total_count: 1, workflow_runs: [selected.run] }
+          : url.includes('/jobs?') ? { total_count: 1, jobs: [selected.job] } : selected.run;
+    return new Response(JSON.stringify(value));
+  };
+  const facts = await f.verifier.trustedChecks(f.input);
+  assert.deepEqual(facts.map(fact => fact.conclusion), ['success', 'failure']);
+  assert.deepEqual(facts.map(fact => fact.workflowRunId), [91, 92]);
+  assert.equal(calls.some(url => /\/runs\/93\/jobs\?/.test(url)), false, 'PR provenance is not selected by whether its result is green');
+});
+test('Trusted CI detects a rerun after job observation and rejects partial run/job/check pages', async () => {
+  for (const kind of ['rerun', 'repository', 'jobs', 'runs', 'checks']) {
+    const f = trustedFixture(), original = f.verifier.request;
+    f.verifier.request = async (url, options) => {
+      if (kind === 'rerun' && /\/actions\/runs\/91$/.test(url)) return new Response(JSON.stringify({ ...f.data.run, run_attempt: 2 }));
+      if (kind === 'repository' && /\/actions\/runs\/91$/.test(url)) return new Response(JSON.stringify({ ...f.data.run, head_repository: { full_name: 'foreign/repo' } }));
+      if (kind === 'jobs' && url.includes('/jobs?') || kind === 'runs' && url.includes('/actions/runs?') || kind === 'checks' && url.includes('/check-runs?')) return new Response('{}', { headers: { Link: '<https://api.github.com/next>; rel="next"' } });
+      return original(url, options);
+    };
+    await assert.rejects(f.verifier.trustedChecks(f.input), { code: 'SOURCE_UNVERIFIED' });
+  }
+});

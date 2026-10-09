@@ -568,7 +568,7 @@ export async function startCloudServer({
     if (!roles) return null;
     const coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
     const { repository, store } = interfaceProject(project);
-    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId', 'githubTokenFile'].includes(key)) ||
+    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId', 'githubTokenFile', 'ciPolicy'].includes(key)) ||
         !coordinator.sessionTemplates?.includes(roles.templateSessionId) || coordinator.bindings?.[roles.templateSessionId] !== cursorTemplateWorktree(roles.templateSessionId) ||
         config.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase() || !allowedOrigin) protocolFail('FORBIDDEN', 'Configure the hosted Cursor template explicitly for this repository Coordinator');
     if (!cursorRoleServices.has(project.id)) {
@@ -579,6 +579,7 @@ export async function startCloudServer({
           repositoryId: repository.repositoryId, templateSessionId: roles.templateSessionId, repositoryUrl: config.repositoryUrl,
           startingRef: config.startingRef, model: config.model, store, provider: transport.provider,
           gitProof: cursorGitProofFactory({ repository: repository.slug, tokenFile: roles.githubTokenFile }),
+          ...(roles.ciPolicy ? { ciPolicy: roles.ciPolicy } : {}),
           endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
           allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
           authorizeSource: async ({ state, task }) => {

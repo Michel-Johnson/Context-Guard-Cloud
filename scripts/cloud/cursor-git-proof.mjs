@@ -8,6 +8,16 @@ const relative = value => typeof value === 'string' && value.length > 0 && value
   value.replace(/\/$/, '').split('/').every(part => part && part !== '.' && part !== '..') &&
   !value.split('/').includes('.codex');
 const repositorySlug = url => typeof url === 'string' && /^(?:https:\/\/)?github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?$/i.exec(url)?.[1];
+const label = value => typeof value === 'string' && !!value.trim() && value.length <= 200 && !/[\x00-\x1f]/.test(value);
+const positive = value => Number.isSafeInteger(value) && value > 0;
+
+export function cursorTrustedChecks(checks) {
+  const fields = ['name', 'appId', 'workflowPath', 'workflowBlobSha', 'testStep'];
+  if (!Array.isArray(checks) || !checks.length || checks.length > 20 || checks.some(check => !check || Object.keys(check).some(key => !fields.includes(key)) ||
+      !label(check.name) || check.appId !== 15368 || !/^\.github\/workflows\/[\w.-]+\.ya?ml$/.test(check.workflowPath || '') ||
+      !sha.test(check.workflowBlobSha || '') || !label(check.testStep)) || new Set(checks.map(check => check.name)).size !== checks.length) fail('Pin GitHub Actions jobs, workflow blob versions and actual test steps explicitly');
+  return structuredClone(checks);
+}
 
 export function cursorApprovedPaths(paths) {
   if (!Array.isArray(paths) || !paths.length || paths.length > 100 || !paths.every(relative)) fail('Use bounded relative paths from the reviewed Plan');
@@ -78,6 +88,66 @@ export class CursorGitProof {
             !Number.isSafeInteger(check.id) || check.id <= 0)) fail('Required check is absent, unfinished, skipped or from another source/issuer');
         return matching.map(check => ({ name: required.name, appId: required.appId, sourceSha, checkRunId: check.id, conclusion: check.conclusion }));
       });
+    });
+  }
+
+  async trustedChecks({ sourceSha, branch, requiredChecks }) {
+    if (!sha.test(sourceSha || '') || !relative(branch)) fail('Use an exact source and its verified branch');
+    requiredChecks = cursorTrustedChecks(requiredChecks);
+    return this.withReader(async get => {
+      const list = await get(`commits/${sourceSha}/check-runs?filter=latest&per_page=100`);
+      if (!Array.isArray(list.check_runs) || list.total_count !== list.check_runs.length || list.total_count >= 100) fail('The complete source check list is unavailable');
+      const suites = new Map(), workflows = new Map(), facts = [];
+      for (const policy of requiredChecks) {
+        const matching = list.check_runs.filter(check => check.name === policy.name && check.app?.id === policy.appId);
+        let selected = 0;
+        for (const check of matching) {
+          if (!positive(check.id) || !positive(check.check_suite?.id) || check.head_sha !== sourceSha) fail('The check identity or source is unverified');
+          const suite = check.check_suite.id;
+          if (!suites.has(suite)) {
+            const runs = await get(`actions/runs?check_suite_id=${suite}&head_sha=${sourceSha}&per_page=100`);
+            if (runs.total_count !== 1 || !Array.isArray(runs.workflow_runs) || runs.workflow_runs.length !== 1) fail('A unique workflow run for the check suite is unavailable');
+            const run = runs.workflow_runs[0];
+            if (!positive(run.id) || run.check_suite_id !== suite || run.head_sha !== sourceSha ||
+                run.repository?.full_name?.toLowerCase() !== this.repository.toLowerCase() || run.head_repository?.full_name?.toLowerCase() !== this.repository.toLowerCase()) fail('The workflow source or repository is unverified');
+            suites.set(suite, { run });
+          }
+          const context = suites.get(suite), run = context.run;
+          // Provenance is selected BEFORE results: a PR merge checkout or a
+          // different branch is not this exact-source push execution. Keep ALL
+          // matching contexts in the selected provenance, including failures.
+          if (run.event !== 'push' || run.head_branch !== branch) continue;
+          selected++;
+          if (!positive(run.run_attempt) || run.status !== 'completed' || check.status !== 'completed' ||
+              !['success', 'failure', 'cancelled', 'timed_out', 'action_required'].includes(run.conclusion) ||
+              !['success', 'failure', 'cancelled', 'timed_out', 'action_required'].includes(check.conclusion) ||
+              ![policy.workflowPath, policy.workflowPath + '@' + branch, policy.workflowPath + '@refs/heads/' + branch].includes(run.path)) fail('Use the completed pinned workflow for the source branch');
+          if (!workflows.has(policy.workflowPath)) {
+            const file = await get(`contents/${policy.workflowPath.split('/').map(encodeURIComponent).join('/')}?ref=${sourceSha}`);
+            if (file.type !== 'file' || file.path !== policy.workflowPath || !positive(file.size) || file.size > 1024 * 1024 || !sha.test(file.sha || '')) fail('The source workflow file is unavailable');
+            workflows.set(policy.workflowPath, file.sha);
+          }
+          if (workflows.get(policy.workflowPath) !== policy.workflowBlobSha) fail('The workflow changed from the explicitly trusted version');
+          context.jobs ||= await get(`actions/runs/${run.id}/jobs?filter=latest&per_page=100`);
+          if (!Array.isArray(context.jobs.jobs) || context.jobs.total_count !== context.jobs.jobs.length || context.jobs.total_count >= 100) fail('The complete current-attempt job list is unavailable');
+          const jobs = context.jobs.jobs.filter(job => job.name === policy.name && job.check_run_url?.toLowerCase() ===
+            `https://api.github.com/repos/${this.repository}/check-runs/${check.id}`.toLowerCase());
+          const job = jobs[0];
+          if (jobs.length !== 1 || !positive(job.id) || job.run_id !== run.id || job.head_sha !== sourceSha || job.status !== 'completed' ||
+              job.conclusion !== check.conclusion || job.run_attempt !== undefined && job.run_attempt !== run.run_attempt || !Array.isArray(job.steps)) fail('The check is not the exact workflow job and source');
+          const steps = job.steps.filter(step => step.name === policy.testStep), step = steps[0];
+          if (steps.length !== 1 || step.status !== 'completed' || !['success', 'failure', 'cancelled', 'skipped'].includes(step.conclusion)) fail('The declared test step was not observed');
+          const latest = await get(`actions/runs/${run.id}`);
+          for (const field of ['id', 'check_suite_id', 'head_sha', 'head_branch', 'event', 'path', 'run_attempt', 'status', 'conclusion']) if (latest[field] !== run[field]) fail('The workflow changed during verification');
+          if (latest.repository?.full_name?.toLowerCase() !== this.repository.toLowerCase() ||
+              latest.head_repository?.full_name?.toLowerCase() !== this.repository.toLowerCase()) fail('The workflow repository changed during verification');
+          facts.push({ name: policy.name, appId: policy.appId, sourceSha, checkRunId: check.id, workflowRunId: run.id,
+            jobId: job.id, runAttempt: run.run_attempt, workflowPath: policy.workflowPath, workflowBlobSha: policy.workflowBlobSha,
+            conclusion: check.conclusion, runConclusion: run.conclusion, testConclusion: step.conclusion });
+        }
+        if (!selected) fail('No declared exact-source push execution was verified');
+      }
+      return facts;
     });
   }
 

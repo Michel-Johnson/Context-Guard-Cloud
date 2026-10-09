@@ -14,10 +14,13 @@ import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 const digest = value => createHash('sha256').update(value).digest('hex');
 const templateId = '11111111-1111-4111-8111-111111111111';
 const sourceSha = 'a'.repeat(40), taskId = 'http-task';
+const handoffSha = 'b'.repeat(40);
+const ciPolicy = { checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv: ['node', '--test', '--test-reporter=tap', 'tests/fixture.mjs'],
+  name: 'Formal tests', appId: 15368, workflowPath: '.github/workflows/ci.yml', workflowBlobSha: 'd'.repeat(40), testStep: 'Run formal tests' }] };
 
 // Real loopback HTTP, Coordinator tools, scheduler, ProtocolStore and MCP.
 // Both vendor models are controlled dependencies: this is not native acceptance.
-async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false } = {}) {
+async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false, trustedCi = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-role-http-'));
   let cloud;
   t.after(async () => { await cloud?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -27,7 +30,7 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
   await fs.writeFile(providerFile, JSON.stringify({ baseUrl: 'https://model.invalid', model: 'synthetic', token: 'synthetic-only' }));
   await fs.writeFile(cursorConfigFile, JSON.stringify({ projects: { 'context-guard': {
     apiKeyFile, repositoryUrl: mismatchedRepository ? 'https://github.com/other/repo' : 'https://github.com/example/repo',
-    startingRef: sourceSha, roles: { templateSessionId: templateId },
+    startingRef: sourceSha, roles: { templateSessionId: templateId, ...(trustedCi ? { ciPolicy } : {}) },
   } } }), { mode: 0o600 });
   const config = { enabled, providerFile, bindings: { [templateId]: cursorTemplateWorktree(templateId) },
     sessionTemplates: [templateId], maxConcurrentTasks: 1 };
@@ -50,6 +53,23 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
     getRun: async (agentId, runId) => { const run = runs.get(agentId); assert.equal(run.id, runId);
       return { ...run, git: { branches: [{ repoUrl: 'https://github.com/example/repo', branch: 'cursor/http-task' }] } }; },
     getAgent: async agentId => ({ id: agentId, latestRunId: runs.get(agentId)?.id }),
+    readRunEvents: async (agentId, runId) => {
+      // Only read this isolated server's one reserved Tester. The tool stream
+      // is a controlled vendor boundary, not an actual Cursor execution.
+      const testers = path.join(directory, 'cursor-roles', digest('context-guard'), 'testers');
+      const files = await fs.readdir(testers); assert.equal(files.length, 1);
+      const actor = JSON.parse(await fs.readFile(path.join(testers, files[0]), 'utf8'));
+      assert.equal(actor.nativeAgentId, agentId); assert.equal(actor.invocations.at(-1).runId, runId);
+      return { agentId, runId, complete: true, events: [...actor.commands.map((spec, index) => ({ event: 'tool_call', data: {
+        callId: 'http-command-' + index, name: 'run_terminal_cmd', status: 'completed', args: { command: spec.command },
+        result: { isBackground: false, success: { command: spec.command, stdout: 'CG_CURSOR_PROOF ' + JSON.stringify({
+          format: 1, nonce: spec.nonce, sourceSha: handoffSha, argv: spec.argv,
+          before: { sha: handoffSha, clean: true }, after: { sha: handoffSha, clean: true },
+          exitCode: 0, signal: null, spawnError: null,
+          stdout: '# tests 1\n# pass 1\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n', stderr: '',
+        }) + '\n' } },
+      } })), { event: 'result', data: { runId, status: 'FINISHED' } }] };
+    },
   };
   cloud = await startCloudServer({ dataDir: directory, port: 0, publicOrigin: 'https://roles.example', browserToken: 'synthetic-human', memoryConfig, cursorConfigFile,
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
@@ -59,7 +79,18 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       assert.equal(options.method || 'GET', 'GET'); assert.equal(options.redirect, 'error');
       assert.ok(url.startsWith('https://api.github.com/repos/example/repo/'));
       gitCalls.push(url);
-      const value = url.includes('/branches/') ? { name: 'cursor/http-task', commit: { sha: 'b'.repeat(40) } }
+      const check = { id: 71, name: 'Formal tests', app: { id: 15368 }, head_sha: handoffSha, check_suite: { id: 81 }, status: 'completed', conclusion: 'success' };
+      const run = { id: 91, check_suite_id: 81, head_sha: handoffSha, head_branch: 'cursor/http-task', event: 'push',
+        path: '.github/workflows/ci.yml', run_attempt: 1, status: 'completed', conclusion: 'success',
+        repository: { full_name: 'example/repo' }, head_repository: { full_name: 'example/repo' } };
+      const job = { id: 101, name: check.name, run_id: run.id, head_sha: handoffSha, run_attempt: 1, status: 'completed', conclusion: 'success',
+        check_run_url: 'https://api.github.com/repos/example/repo/check-runs/71', steps: [{ name: 'Run formal tests', status: 'completed', conclusion: 'success' }] };
+      const value = url.includes('/check-runs?') ? { total_count: 1, check_runs: [check] }
+        : url.includes('/actions/runs?') ? { total_count: 1, workflow_runs: [run] }
+          : url.includes('/contents/') ? { type: 'file', path: run.path, sha: 'd'.repeat(40), size: 100 }
+            : url.includes('/jobs?') ? { total_count: 1, jobs: [job] }
+              : url.endsWith('/actions/runs/91') ? run
+                : url.includes('/branches/') ? { name: 'cursor/http-task', commit: { sha: 'b'.repeat(40) } }
         : url.includes('/compare/') ? { base_commit: { sha: sourceSha }, merge_base_commit: { sha: sourceSha }, status: 'ahead', behind_by: 0,
           total_commits: 1, commits: [{ sha: 'b'.repeat(40) }], files: [{ filename: 'src/fixture.mjs' }] }
           : { sha: 'b'.repeat(40), parents: [{ sha: sourceSha }], files: [{ filename: 'src/fixture.mjs' }] };
@@ -137,8 +168,8 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
     url: cloud.url };
 }
 
-test('Cloud Coordinator public approval and MCP verify the original handoff before independent CI routing with controlled native and Git providers', async t => {
-  const f = await fixture(t), proposal = await f.prepare();
+test('Public Coordinator approval, handoff and independent MCP CI reach the original task with controlled native and Git providers', async t => {
+  const f = await fixture(t, { trustedCi: true }), proposal = await f.prepare();
   assert.equal(f.nativeCalls.length, 0, 'A prepared requirement never calls Cursor');
   await f.approve(proposal);
   await f.poll(state => state.projectTasks?.some(task => task.stage === 'dispatched') && f.nativeCalls.length === 1);
@@ -203,8 +234,26 @@ test('Cloud Coordinator public approval and MCP verify the original handoff befo
   const ciContext = await f.context(ciAuthorization);
   assert.equal(ciContext.phase, 'ci'); assert.equal(ciContext.stage, 'testing'); assert.deepEqual(ciContext.session, current.session);
   assert.notEqual(ciContext.actor.id, current.actor.id); assert.equal(ciContext.sourceSha, 'b'.repeat(40));
+  assert.deepEqual(ciContext.testPolicy.checks.map(({ todoId, testId, argv, machineStatus }) => ({ todoId, testId, argv, machineStatus })),
+    [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv: ciPolicy.checks[0].argv, machineStatus: 'passed' }]);
+  assert.match(ciContext.testPolicy.checks[0].command, /CG_CURSOR_PROOF/);
   assert.equal((await f.store.taskRecord(f.human, context.session, taskId)).stage, 'testing', 'An independent FINISHED Run is not a CI verdict');
+  const ciEvidence = await f.call(ciAuthorization, 'context_guard_exchange', { id: 'ci-owned-evidence', type: 'object.put', payload: {
+    kind: 'evidence', ref: ciContext.writePrefix + 'evidence', baseVersion: '', content: { sourceSha: handoffSha, synthetic: true },
+  } });
+  assert.equal(ciEvidence.isError, undefined);
+  const ciResult = await f.call(ciAuthorization, 'context_guard_exchange', { id: 'original-http-ci', type: 'ci.result', payload: {
+    taskId, sourceSha: handoffSha, verdict: 'passed', checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', status: 'passed', evidenceRef: ciEvidence.structuredContent.data.ref }],
+  } });
+  assert.equal(ciResult.isError, undefined); assert.equal(ciResult.structuredContent.data.state, 'proof-pending');
+  await f.poll(async () => (await f.store.taskRecord(f.human, current.session, taskId)).stage === 'awaiting-merge');
+  const completedCi = await f.store.taskRecord(f.human, current.session, taskId);
+  assert.equal(completedCi.ci.verdict, 'passed'); assert.equal(completedCi.acceptanceReview, undefined);
+  assert.equal(f.nativeCalls.length, 3, 'Verification does not start a replacement model');
+  assert.equal(f.gitCalls.filter(url => url.includes('/check-runs?')).length, 2, 'Exact-source workflow facts are read before and after the independent Run');
   const state = await f.store.transaction(value => value, { readOnly: true });
+  assert.equal(Object.values(state.cursorRoleCiResults).length, 1);
+  assert.equal(Object.values(state.queues).flatMap(queue => queue.items).filter(item => item.message.type === 'ci.result').length, 1);
   assert.equal(Object.values(state.bindings).every(binding => binding.deviceId === 'cloud-cursor:context-guard'), true);
   assert.equal((await f.store.projectTasks(f.human))[0].reviewIssuer.role, 'human');
   const legacy = await f.request('/api/workbench/projects/context-guard/api/cursor-chat');

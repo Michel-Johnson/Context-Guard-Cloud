@@ -12,7 +12,7 @@ import { hash } from '../scripts/shared/io.mjs';
 const templateId = '11111111-1111-4111-8111-111111111111', sourceSha = 'a'.repeat(40), handoffSha = 'b'.repeat(40);
 // ProtocolStore, approvals, bindings, durable intents and role channel are real.
 // The native provider is a controlled dependency, not real Cursor execution.
-async function fixture(t, { gitProof } = {}) {
+async function fixture(t, { gitProof, ciPolicy } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-factory-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = new ProtocolStore(path.join(directory, 'protocol')), calls = [], runs = new Map();
@@ -26,13 +26,14 @@ async function fixture(t, { gitProof } = {}) {
       if (uncertain === 'followUp') throw Object.assign(new Error('Synthetic lost confirmation'), { code: 'CURSOR_TRANSPORT_ERROR', deliveryUncertain: true }); return run; },
     getRun: async (agentId, runId) => { const run = runs.get(agentId); assert.equal(run.id, runId); return run; },
     getAgent: async agentId => ({ id: agentId, latestRunId: runs.get(agentId)?.id }),
+    readRunEvents: async () => { throw Object.assign(new Error('Native stream fixture is not configured'), { code: 'SOURCE_UNVERIFIED' }); },
     cancel: async (agentId, runId) => { calls.push({ method: 'cancel', agentId, runId });
       if (uncertain === 'cancel') throw Object.assign(new Error('Synthetic lost cancel acknowledgement'), { code: 'CURSOR_TRANSPORT_ERROR', deliveryUncertain: true });
       runs.get(agentId).status = 'CANCELLED'; return {}; },
   };
   const options = { directory: path.join(directory, 'roles'), projectId: 'project', repositoryId: '123', templateSessionId: templateId,
     repositoryUrl: 'https://github.com/example/repo', startingRef: sourceSha, endpoint: 'https://cloud.example/api/role-mcp', store, provider,
-    authorizeSource: async () => allowed, ...(gitProof ? { gitProof } : {}) };
+    authorizeSource: async () => allowed, ...(gitProof ? { gitProof } : {}), ...(ciPolicy ? { ciPolicy } : {}) };
   const factory = new CursorRoleFactory(options);
   const human = { repositoryId: '123', deviceId: 'browser', agentId: 'human', role: 'human' };
   const coordinator = { ...human, role: 'coordinator', agentId: 'coordinator', bindings: { [templateId]: cursorTemplateWorktree(templateId) }, creationTemplates: [templateId] };
@@ -270,8 +271,8 @@ test('A definitely rejected hosted launch remains an explicit failure, not a suc
   assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
 });
 
-async function handoffFixture(t, verify) {
-  const inspected = [], f = await fixture(t, { gitProof: { verify: async input => {
+async function handoffFixture(t, verify, { ciPolicy, trustedChecks } = {}) {
+  const inspected = [], f = await fixture(t, { ciPolicy, gitProof: { ...(trustedChecks ? { trustedChecks } : {}), verify: async input => {
     inspected.push(input);
     return verify ? verify(input, f) : { repository: 'example/repo', branch: 'cursor/task', baseSha: sourceSha, sourceSha: handoffSha, files: ['src/fixture.mjs'] };
   } } });
@@ -310,6 +311,164 @@ test('Original Cursor handoff is deferred, verified and applied through the same
   assert.equal(Object.values(state.cursorRoleHandoffs).length, 1);
   const queue = Object.values(state.queues).flatMap(queue => queue.items);
   assert.equal(queue.filter(item => item.message.type === 'task.report' && item.message.payload.stage === 'handoff').length, 1);
+});
+
+const ciPolicy = { checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv: ['node', '--test', '--test-reporter=tap', 'tests/fixture.mjs'],
+  name: 'Formal tests', appId: 15368, workflowPath: '.github/workflows/ci.yml', workflowBlobSha: 'd'.repeat(40), testStep: 'Run formal tests' }] };
+async function ciFixture(t, { nativeFailed = false, machineFailed = false, unavailable = false } = {}) {
+  const machine = [{ name: 'Formal tests', sourceSha: handoffSha, conclusion: machineFailed ? 'failure' : 'success',
+    runConclusion: machineFailed ? 'failure' : 'success', testConclusion: machineFailed ? 'failure' : 'success' }], workflowCalls = [];
+  const f = await handoffFixture(t, null, { ciPolicy, trustedChecks: async input => {
+    workflowCalls.push(input);
+    if (unavailable) throw Object.assign(new Error('Synthetic workflow pending'), { code: 'SOURCE_UNVERIFIED' });
+    return machine;
+  } });
+  await f.factory.channel.exchange(f.invocation.token, f.input); await f.factory.pump(f.reserved.session, 'task');
+  await f.send(f.coordinator, f.reserved.session, 'ci.request', { taskId: 'task', sourceSha: handoffSha, ciTodoRef: f.todo.ref, unitTestRefs: [f.evidence.ref] },
+    { workflow: { verifyCiReceiver: (state, _p, session) => f.factory.hasCiReceiver(state, session) } });
+  const file = f.factory.ciFile(f.reserved.session, 'task', handoffSha);
+  const typedObservation = async (agentId, runId) => {
+    const actor = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.equal(actor.nativeAgentId, agentId); assert.equal(actor.invocations.at(-1).runId, runId);
+    const commands = actor.commands.map((spec, index) => ({ event: 'tool_call', data: {
+      callId: 'actual-command-' + index, name: 'run_terminal_cmd', status: 'completed', args: { command: spec.command },
+      result: { isBackground: false, success: { command: spec.command, stdout: 'CG_CURSOR_PROOF ' + JSON.stringify({
+        format: 1, nonce: spec.nonce, sourceSha: handoffSha, argv: spec.argv, before: { sha: handoffSha, clean: true }, after: { sha: handoffSha, clean: true },
+        exitCode: nativeFailed ? 1 : 0, signal: null, spawnError: null,
+        stdout: `# tests 1\n# pass ${nativeFailed ? 0 : 1}\n# fail ${nativeFailed ? 1 : 0}\n# cancelled 0\n# skipped 0\n# todo 0\n`, stderr: '',
+      }) + '\n' } },
+    } }));
+    return { agentId, runId, complete: true, events: [...commands, { event: 'result', data: { runId, status: 'FINISHED' } }] };
+  };
+  f.provider.readRunEvents = typedObservation;
+  return Object.assign(f, { machine, workflowCalls, file, typedObservation });
+}
+async function ciProposal(f, { verdict = 'passed', status = 'passed', reproduction = false } = {}) {
+  const invocation = await f.factory.pump(f.reserved.session, 'task'), context = await f.factory.channel.context(invocation.token);
+  const put = async name => (await f.factory.channel.exchange(invocation.token, { id: 'ci-' + name, type: 'object.put',
+    payload: { kind: 'evidence', ref: context.writePrefix + name, baseVersion: '', content: { sourceSha: handoffSha, observation: 'Controlled provider evidence, not a real vendor test' } } })).data;
+  const evidence = await put('evidence'), reproductionRef = reproduction ? (await put('reproduction')).ref : undefined;
+  const input = { id: 'original-ci-result', type: 'ci.result', payload: { taskId: 'task', sourceSha: handoffSha, verdict,
+    checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', status, evidenceRef: evidence.ref, ...(reproductionRef ? { reproductionRef } : {}) }] } };
+  return { invocation, context, input, evidence };
+}
+test('Independent Cursor CI original proposal reaches the original task only with native observation AND declared exact-source workflow facts', async t => {
+  const f = await ciFixture(t), p = await ciProposal(f);
+  assert.notEqual(p.invocation.scope.nativeAgentId, f.invocation.scope.nativeAgentId);
+  assert.notEqual(p.context.actor.id, f.reserved.session.id); assert.equal(p.context.testPolicy.checks[0].machineStatus, 'passed');
+  assert.match(p.context.testPolicy.checks[0].command, /CG_CURSOR_PROOF/);
+  f.runs.get(p.invocation.scope.nativeAgentId).status = 'RUNNING';
+  assert.equal((await f.factory.channel.exchange(p.invocation.token, p.input)).data.state, 'proof-pending');
+  assert.deepEqual(await f.factory.pump(f.reserved.session, 'task'), { state: 'proof-pending' });
+  assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'testing');
+  f.runs.get(p.invocation.scope.nativeAgentId).status = 'FINISHED';
+  const reopened = new CursorRoleFactory(f.options); await reopened.pump(f.reserved.session, 'task');
+  const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  assert.equal(task.stage, 'awaiting-merge'); assert.equal(task.ci.verdict, 'passed'); assert.equal(task.acceptanceReview, undefined);
+  const state = await f.store.transaction(value => value, { readOnly: true });
+  assert.equal(Object.values(state.cursorRoleCiResults).length, 1); assert.equal(f.calls.length, 3);
+  assert.equal(f.workflowCalls.length, 2); assert.equal(f.workflowCalls.every(call => call.sourceSha === handoffSha && call.branch === 'cursor/task'), true);
+  await reopened.pump(f.reserved.session, 'task'); assert.equal(f.calls.length, 3); assert.equal(f.workflowCalls.length, 2);
+});
+test('CI cannot invent numbered coverage, reuse another message ID or replace the saved native proposal', async t => {
+  const f = await ciFixture(t), p = await ciProposal(f);
+  await assert.rejects(f.factory.channel.exchange(p.invocation.token, { ...p.input, id: 'ci-evidence' }), { code: 'ID_REUSED' });
+  await assert.rejects(f.factory.channel.exchange(p.invocation.token, { ...p.input, payload: { ...p.input.payload,
+    checks: [{ ...p.input.payload.checks[0], testId: 'invented-test' }] } }), { code: 'SOURCE_UNVERIFIED' });
+  await f.factory.channel.exchange(p.invocation.token, p.input);
+  await assert.rejects(f.factory.channel.exchange(p.invocation.token, { ...p.input, id: 'replacement-ci' }), { code: 'ID_REUSED' });
+  await f.factory.pump(f.reserved.session, 'task'); assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).ci.verdict, 'passed');
+});
+test('Actual failed native or workflow tests cannot be promoted by FINISHED or a passing CI proposal', async t => {
+  for (const failure of ['native', 'workflow']) await t.test(failure, async child => {
+    const f = await ciFixture(child, { nativeFailed: failure === 'native', machineFailed: failure === 'workflow' }), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'testing'); assert.equal(f.calls.length, 3);
+  });
+});
+test('A truthful failed independent CI preserves owned reproduction evidence and original task failure', async t => {
+  const f = await ciFixture(t, { nativeFailed: true, machineFailed: true }), p = await ciProposal(f, { verdict: 'failed', status: 'failed', reproduction: true });
+  await f.factory.channel.exchange(p.invocation.token, p.input); await f.factory.pump(f.reserved.session, 'task');
+  const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  assert.equal(task.stage, 'ci-failed'); assert.equal(task.ci.verdict, 'failed'); assert.equal(f.calls.length, 3);
+});
+test('Pending workflow facts do not launch CI, and a policy change cannot reauthorize an existing role', async t => {
+  const f = await ciFixture(t, { unavailable: true });
+  for (let i = 0; i < 2; i++) await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+  assert.equal(f.calls.length, 2); assert.equal(f.workflowCalls.length, 1);
+  const reopened = new CursorRoleFactory({ ...f.options, ciPolicy: { checks: [{ ...ciPolicy.checks[0], testStep: 'Different test step' }] } });
+  await assert.rejects(reopened.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  assert.equal(f.calls.length, 2);
+});
+test('A missing or malformed original CI TODO cannot launch an independent native Run', async t => {
+  for (const mode of ['missing', 'kind', 'coverage']) await t.test(mode, async child => {
+    const f = await ciFixture(child);
+    await f.store.transaction(state => {
+      const key = hash(canonical(['123', f.reserved.session.id, f.reserved.session.generation, f.todo.ref]));
+      const todo = state.objects[key];
+      if (mode === 'missing') delete state.objects[key];
+      else if (mode === 'kind') todo.versions[todo.latest].kind = 'evidence';
+      else todo.versions[todo.latest].content.items[0].id = 'unconfigured-todo';
+    });
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+    assert.equal(f.calls.length, 2); assert.equal(f.workflowCalls.length, 0);
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'testing');
+  });
+});
+test('CI evidence or host identity drift during observer reads cannot commit a CI verdict', async t => {
+  for (const drift of ['evidence', 'run']) await t.test(drift, async child => {
+    const f = await ciFixture(child), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    f.provider.readRunEvents = async (...args) => {
+      const observed = await f.typedObservation(...args);
+      if (drift === 'run') f.provider.getAgent = async agentId => ({ id: agentId, latestRunId: 'external-run' });
+      else await f.factory.channel.exchange(p.invocation.token, { id: 'new-ci-evidence', type: 'object.put', payload: { kind: 'evidence', ref: p.evidence.ref,
+        baseVersion: p.evidence.version, content: { changed: true } } });
+      return observed;
+    };
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'testing'); assert.equal(f.calls.length, 3);
+  });
+});
+test('Concurrent CI verifiers and a lost acknowledgement commit only the original result once', async t => {
+  for (const mode of ['concurrent', 'lost-ack']) await t.test(mode, async child => {
+    const f = await ciFixture(child), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    if (mode === 'lost-ack') {
+      const exchange = f.factory.channel.exchange.bind(f.factory.channel);
+      f.factory.channel.exchange = async (...args) => { const reply = await exchange(...args);
+        if (args[1].type === 'ci.result') throw Object.assign(new Error('Synthetic lost CI reply after commit'), { code: 'ACK_UNKNOWN' });
+        return reply;
+      };
+      await f.factory.pump(f.reserved.session, 'task');
+      await new CursorRoleFactory(f.options).pump(f.reserved.session, 'task');
+    } else await Promise.all([f.factory.pump(f.reserved.session, 'task'), new CursorRoleFactory(f.options).pump(f.reserved.session, 'task')]);
+    const state = await f.store.transaction(value => value, { readOnly: true });
+    assert.equal(Object.values(state.cursorRoleCiResults).length, 1);
+    assert.equal(Object.values(state.queues).flatMap(queue => queue.items).filter(item => item.message.type === 'ci.result').length, 1);
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).ci.verdict, 'passed'); assert.equal(f.calls.length, 3);
+  });
+});
+test('Revoked native CI capability or human approval cannot accept a saved passing proposal', async t => {
+  for (const mode of ['capability', 'approval']) await t.test(mode, async child => {
+    const f = await ciFixture(child), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    if (mode === 'capability') await f.factory.channel.revoke(p.invocation.token);
+    else await f.store.transaction(state => { Object.values(state.projectTasks)[0].review.decision = 'rejected'; });
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: mode === 'capability' ? 'ROLE_EXPIRED' : 'CURSOR_ROLE_CONFLICT' });
+    assert.equal((await f.store.taskRecord(f.human, f.reserved.session, 'task')).stage, 'testing'); assert.equal(f.calls.length, 3);
+  });
+});
+test('Private CI policy rejects command injection, missing trusted workflow identity, duplicate IDs and oversized contexts before native calls', async t => {
+  const f = await fixture(t), cases = [
+    { checks: [] }, { checks: [{ ...ciPolicy.checks[0], argv: ['node', 'test\nother-command'] }] },
+    { checks: [{ ...ciPolicy.checks[0], appId: 999 }] }, { checks: [{ ...ciPolicy.checks[0], workflowBlobSha: '' }] },
+    { checks: [ciPolicy.checks[0], ciPolicy.checks[0]] },
+    { checks: [{ ...ciPolicy.checks[0], argv: Array.from({ length: 10 }, () => 'x'.repeat(1000)) }] },
+  ];
+  for (const policy of cases) assert.throws(() => new CursorRoleFactory({ ...f.options, ciPolicy: policy }), { code: 'SOURCE_UNVERIFIED' });
+  assert.equal(f.calls.length, 0);
 });
 
 test('Deferred Cursor handoff rejects another request, malformed or foreign references without replacing its saved proposal', async t => {
