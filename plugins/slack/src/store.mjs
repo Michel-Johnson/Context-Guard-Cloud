@@ -23,7 +23,8 @@ export class Store {
   async update(operation) {
     const run = this.tail.then(async () => {
       const next = structuredClone(this.data), result = await operation(next);
-      await this.#publish(next);
+      // A replay may inspect an existing durable receipt without changing it.
+      if (!isDeepStrictEqual(this.data, next)) await this.#publish(next);
       return result;
     });
     this.tail = run.catch(() => {});
