@@ -1,6 +1,6 @@
 import { hash } from '../shared/io.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
-import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
+import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
@@ -398,7 +398,7 @@ function reactionOnlyContinuation(state, turnId, input) {
     for (let offset = 0; offset < calls.length; offset++) {
       const call = calls[offset], reply = results.content[offset];
       const operationId = `coordinator:${hash(`${turnId}:${call.id}`)}`, receipt = state.toolReceipts[operationId];
-      if (call.name !== 'react_to_user' || !receipt || receipt.isError ||
+      if (businessToolName(call.name) !== 'react_to_user' || !receipt || receipt.isError ||
           receipt.fingerprint !== hash(JSON.stringify({ name: call.name, input: call.input })) ||
           receipt.result?.kind !== 'slack-reaction' || receipt.result.status !== 'intent' ||
           receipt.result.actionId !== operationId || receipt.result.emoji !== call.input?.emoji ||
@@ -426,7 +426,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const projectTools = ['list_projects', 'switch_project'];
   const executableTools = sourceTools.filter(tool => (!['react_to_user', 'select_text_model', ...projectTools].includes(tool.name) || trustedSlackInput) &&
     (!projectTools.includes(tool.name) || /^D[A-Z0-9]{1,31}$/.test(slackActor?.channelId || '')));
-  const modelTools = tools.filter(tool => !projectTools.includes(tool.name) || executableTools.includes(tool));
+  const availableModelTools = tools.filter(tool => !projectTools.includes(tool.name) || executableTools.includes(tool));
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
   if (state.activeTurnId && state.performance?.turnId !== state.activeTurnId) state.performance = {
@@ -438,6 +438,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
+    const modelTools = needsGate ? mergedParticipationTools(availableModelTools) : availableModelTools;
     const reactionOnlyCompletion = !!alreadyAllowed && reactionOnlyContinuation(state, turnId, participationInput);
     const reactionAssistant = reactionOnlyCompletion ? state.messages.at(-2) : null;
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
@@ -456,7 +457,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       await publishDecision();
       if (text && measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
       await onText?.(text);
-    }, { continuation: !!alreadyAllowed, reactionOnlyCompletion }) : null;
+    }, { continuation: !!alreadyAllowed, reactionOnlyCompletion,
+      replyToolNames: needsGate ? modelTools.map(tool => tool.name) : [] }) : null;
     const publishDecision = async () => {
       if (gate?.decision && (state.slackParticipation?.requestId !== gateKey || state.slackParticipation.decision !== gate.decision)) {
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
@@ -471,7 +473,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         if (!gate && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
         if (gate) { await gate.consume(text); await publishDecision(); } else await onText?.(text);
       } : gate ? async text => { await gate.consume(text); await publishDecision(); } : onText, onToolStart: async name => {
-        gate?.toolStart(); await publishDecision(); await onToolStart?.(name);
+        gate?.toolStart();
+        if (gate && gate.decision !== 'reply') return;
+        await publishDecision(); await onToolStart?.(name);
       } });
       if (signal?.aborted) {
         // An adapter may finish despite cancellation. Preserve only visible text;
@@ -532,6 +536,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     await save(state);
   }
   const next = state.pending, toolAssistant = state.messages.at(-1);
+  const mergedReplyAllowed = trustedSlackInput && state.slackParticipation?.decision === 'reply' &&
+    (state.activeRequestIds || [state.activeInput.id]).includes(state.slackParticipation.requestId);
+  const toolName = call => mergedReplyAllowed ? businessToolName(call.name) : call.name;
   let changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
   if ((changed.steered || changed.interrupted) && toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   if (next.stop === 'end_turn') {
@@ -545,14 +552,15 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     changed = checkpoint ? await checkpoint() : changed;
     const operationId = `coordinator:${hash(`${turnId}:${call.id}`)}`;
     const fingerprint = hash(JSON.stringify({ name: call.name, input: call.input }));
+    const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
     if (!receipt) {
       if (changed.steered || changed.interrupted) receipt = { fingerprint, ...failedTool(changed.interrupted ? 'TURN_INTERRUPTED' : 'INPUT_SUPERSEDED') };
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
-      else if (!executableTools.some(tool => tool.name === call.name)) receipt = { fingerprint,
+      else if (!executableTools.some(tool => tool.name === name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
-      else if (call.name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
+      else if (name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
         item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id).length >= 2) {
         receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
       }
@@ -562,12 +570,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         try {
           // Model settings use the integration's identifier alphabet, while
           // the original native tool receipt keeps its unchanged identity.
-          const result = await execute(call.name, call.input, { operationId: call.name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
-            ...(call.name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
+          const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
+            ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
-            ...(['select_text_model', ...projectTools].includes(call.name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
-              ...(projectTools.includes(call.name) ? { requestId: state.activeInput.id } : {}) } : {}) });
-          receipt = { fingerprint, result: call.name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
+            ...(['select_text_model', ...projectTools].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
+              ...(projectTools.includes(name) ? { requestId: state.activeInput.id } : {}) } : {}) });
+          receipt = { fingerprint, result: name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
             ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result };
         }
         catch (error) {
@@ -576,7 +584,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           receipt = { fingerprint, ...failedTool(error.code, error.toolHint) };
         } finally {
           if (state.performance) state.performance.tools = [...state.performance.tools,
-            { name: call.name, durationMs: Date.now() - started, ...(errorCode ? { errorCode } : {}) }].slice(-120);
+            { name, durationMs: Date.now() - started, ...(errorCode ? { errorCode } : {}) }].slice(-120);
         }
       }
       state.toolReceipts[operationId] = receipt;
@@ -586,7 +594,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (!receipt.isError && receipt.result?.kind === 'map-read' && receipt.result.node?.id) visible.push({
       kind: 'node-read', actionId: receipt.result.actionId, node: { id: receipt.result.node.id, title: receipt.result.node.title || '' },
     });
-    else if (!receipt.isError && call.name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
+    else if (!receipt.isError && name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
     else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'binding-proposal', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
     if (!receipt.isError && ['conversation-mounted', 'project-switch'].includes(receipt.result?.kind)) transferred = true;
     responses.push(toolReply(call, receipt));
@@ -601,12 +609,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const presentationOnly = completePresentations && !failed && responses.length > 0 && visible.length === responses.length &&
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
-      ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
+      ['show_nodes', 'open_node', 'tour_nodes'].includes(toolName(call)) && call.input?.replyComplete === true);
   // 纯社交回应必须由模型明确标记，无正文、无本轮业务工具且所有意图回执成功。
   // 默认表情意图仍不能结束应有的文字答复；平台送达继续由私有队列核验。
   const reactionOnly = trustedSlackInput && !failed && responses.length > 0 && visible.length === responses.length &&
     !next.content.some(block => block.type === 'text' && block.text?.trim()) &&
-    next.content.filter(block => block.type === 'tool_use').every(call => call.name === 'react_to_user' && call.input?.replyComplete === true) &&
+    next.content.filter(block => block.type === 'tool_use').every(call => toolName(call) === 'react_to_user' && call.input?.replyComplete === true) &&
     !state.messages.some(message => message.role === 'assistant' && message.requestId === state.activeInput.id &&
       message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
   changed = checkpoint ? await checkpoint() : changed;

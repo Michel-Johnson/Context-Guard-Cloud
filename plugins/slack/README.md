@@ -8,6 +8,8 @@
 
 复制 `.env.example` 的字段到 **checkout 外**的私有 EnvironmentFile，文件权限设为 0600；配置 bot token、app token、独立插件网关 token、Cloud origin 和独立状态目录。不要把凭据填入仓库模板。先启用 Cloud 的可选 loopback 网关，再执行 `npm start`。
 
+已有网关若显式配置 `actions` 白名单，绑定确认需要 `binding.review`，需求说明确认需要 `brief.review`。升级时逐项核对；不要因此扩大用户、项目范围或删除白名单。Socket 已连接不代表确认按钮可用，部署后须真实点击并回读保存结果。
+
 仓库根目录的 `deploy/context-guard-slack.service` 是 system service，沿用 `context-guard` 账号：源码位于 `/opt/context-guard-cloud/repository/plugins/slack`，独立 Node 22 runtime 位于 `/opt/context-guard-slack/runtime/bin/node`；私有配置位于 `/etc/context-guard-slack.env`，状态位于 `/var/lib/context-guard-slack`，均在 checkout 外。先安装并验证该 Node runtime；模板不下载运行时。运行时路径不同可调整 unit，但 Cloud 与 Slack 必须保留一个明确源码根目录。两个服务独立启动与停止；业务状态和凭据独立备份，源码仅通过 Git/release SHA 回退，不复制源码备份。
 
 从 Cloud 仓库根目录安装模板：
@@ -49,7 +51,9 @@ Coordinator 可在已进入回复的轮次，用 👍、❤️、😄、👏、�
 
 ## 可靠性与边界
 
-普通消息采用合并策略：同一次 Coordinator 模型调用先决定是否接话，再直接回答或调用允许的工具。简单答复不另调用分类模型；工具需要的续轮照常保留。内部接话标识不进入正文、历史或 Slack；标识缺失、静默时夹带正文或工具均拒绝执行。每个新批次重新判断，历史与引用不授予权限。
+普通消息采用合并策略：同一次 Coordinator 模型调用先决定是否接话，再直接回答或调用允许的工具。简单答复不另调用分类模型；工具需要的续轮照常保留。直接调用工具时，模型选择本轮 `reply_` 开头的工具明确声明接话；参数格式不变，宿主在完整响应校验后调用原业务工具。缺少声明、未知工具或静默时夹带正文、工具均拒绝执行。每个新批次重新判断，历史与引用不授予权限。
+
+内部标识和工具别名不展示为用户正文。原生工具名、输入及回执在内部历史中保持原值；别名不能扩大工具、操作者或项目权限，也不代替人工审批。
 
 每轮模型请求附带简短的服务器格式提醒，避免历史正文让模型省略接话标识；不修改原始输入或提交指纹。格式失败且没有未决工具、待处理补充或停止要求时，新消息可以继续同一对话，旧失败和回执仍保留。HTTP 409 的忙碌响应按原编号退避重试，不误判成永久失败；其他身份、权限和冲突错误仍须处理。
 
