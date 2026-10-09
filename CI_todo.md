@@ -3,7 +3,7 @@
 ## COORDINATOR-BADCASE-20261010 · 修复计划的真实验收缺口
 
 - 正式受控验证在 `merged-participation-independent`、`coordinator-binding`、`slack-cloud`、`integration-gateway`、Slack 插件和 Cloud 浏览器测试中；覆盖格式恢复、非法 SSE 参数、回执复用、旧事项审批、过期/跨用户按钮。受控平台 IO 不算真实 Slack。
-- [ ] 冻结修订的真实 Map 三段十轮：新待办、新 Bug、旧事项；记录原输出、首次失败、恢复、按钮与保存回读。历史短流程和执行中改过源码的结果不套用到最终候选。
+- [x] GLM-5.3 真实 Map 三段十轮：新待办、新 Bug、旧事项；正式入口 `tests/coordinator-dialogue-live-browser.mjs`。冻结产品修订 `e831c31` 的记录前后源码 hash 一致，30/30 流程通过；4 次格式违规自动纠正，原输出与逐轮诊断保留。后续仅调整读取测试替身，产品文件仍与验收 hash 一致。不是 Chrome Slack、人工体验或安装后验收。
 - [ ] Chrome 中真实 Slack 三段十轮、原生选择/绑定按钮与 ✅ 送达。当前仅有正式机器人，尚无候选版独立测试入口，不拿线上旧版代替验收。
 - [ ] 人工检查每段最多60字、单个核心问题、挂载时机和事实准确性；首个有意义回复以两秒为目标，不能用表情或“正在处理”计时。
 - [ ] Skill 最终固定包的精确锁安装与线上真实入口复验，不以临时候选包替代发布产物验收。
