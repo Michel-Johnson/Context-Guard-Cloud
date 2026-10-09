@@ -531,9 +531,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     state.pending = next;
     await save(state);
   }
-  const next = state.pending;
+  const next = state.pending, toolAssistant = state.messages.at(-1);
   let changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
-  if (changed.steered || changed.interrupted) state.messages.at(-1).superseded = true;
+  if ((changed.steered || changed.interrupted) && toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   if (next.stop === 'end_turn') {
     state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user'; state.pending = null;
     await save(state);
@@ -609,8 +609,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
-    const response = state.messages.at(-2);
-    if (response?.role === 'assistant') response.superseded = true;
+    if (toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
     transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
