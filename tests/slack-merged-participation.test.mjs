@@ -141,15 +141,31 @@ test('合并接话的纯交流表情可正常结束，保留原生工具对和�
   assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'heart']);
 });
 
-test('读业务工具之后的空结束仍失败，不能用交流表情冒充完整答复', async t => {
+test('明确标记纯交流表情完成后，保存工具对和回执，不另生成占位正文', async t => {
   const f = await fixture(t, async ({ onText, onToolStart }, count) => {
+    assert.equal(count, 1, '明确完整纯交流回应不另生成占位答复');
+    await onText('[CG_REPLY]'); await onToolStart('react_to_user');
+    return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
+      { type: 'tool_use', id: 'social-complete', name: 'react_to_user', input: { emoji: 'wave', replyComplete: true } }] };
+  });
+  await f.send('只用原生挥手表情打个招呼，不需要正文。');
+  const state = await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.reactions.some(item => item.name === 'wave'));
+  assert.equal(state.participationDecision, 'reply'); assert.equal(f.modelCalls.length, 1); assert.deepEqual(f.posts, []);
+  const binding = Object.values(f.store.data.threads)[0];
+  const saved = JSON.parse(await fs.readFile(path.join(f.directory, 'coordinators', projectId, 'chats', binding.conversationId, 'conversation.json'), 'utf8'));
+  assert.equal(saved.messages.at(-1).content[0].type, 'tool_result');
+  assert.equal(Object.values(saved.toolReceipts).filter(item => item.result?.kind === 'slack-reaction').length, 1);
+});
+
+test('读业务工具之后的空结束仍失败，不能用交流表情冒充完整答复', async t => {
+  const f = await fixture(t, async ({ onText, onToolStart, system }, count) => {
     if (count === 1) {
       await onText('[CG_REPLY]'); await onToolStart('read_map');
       return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]' },
         { type: 'tool_use', id: 'required-read', name: 'read_map', input: { nodeId: 'T0' } }] };
     }
     if (count === 2) return { stop: 'tool_use', content: [
-      { type: 'tool_use', id: 'not-complete', name: 'react_to_user', input: { emoji: 'bulb' } }] };
+      { type: 'tool_use', id: 'not-complete', name: 'react_to_user', input: { emoji: 'bulb', replyComplete: true } }] };
     return { stop: 'end_turn', content: [] };
   });
   await f.send('读取测试模块并说明它是什么。');
