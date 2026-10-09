@@ -6,6 +6,8 @@
 - [x] Root 在原run入口的短submit锁下读取当前轮次，优先应用对应、未恢复的耐久停止，再处理错误恢复/step limit。保持原输入、错误、历史及工具回执，清理仅活动/流显示；没有新重试、旁路授权、直接平台写入或数据迁移。重启仍读取同一journal，显式原轮次恢复才继续。
 - [x] Root 唯一四目标开发者验证 actual `15f64a` exit0，Node22.18.0，4/4、0失败/跳过/取消，1384.6267ms；service `31fae769a07914389e01e5f3b6ec4ca306efcb28d6492150859bf2faacfa2bb1`、steer test `8c27f1b9b6208bedde3e71db2159b93a933d45a61a52bbf63a037bb1b0db1a43` 前后冻结一致，日志SHA256 `847e5a5863e20384de91c5bddb0b60fddbfd62f735bbd898074bb359fcf44938`。同进程/重启/step-limit、显式恢复精确复用已确认工具、迟到stop不取消后来工作及旧失败保护通过，没有重跑原PE/诊断目标。
 - [x] 静态闭环发现server恢复入口也会跳过不可自动重试的error：仅增加已有未恢复停止的启动条件，不扩大错误自动重试。追加一个真实隔离HTTP/server-close/restart目标。首 `1b43ec` exit1为fixture误以为初始input-journal已存在；原首次错误保存，仅改合成fixture为与inputJournal缺省一致的零补充状态。最小返工 `5c0c2a` exit0、1/1，4839.2324ms：旧accepted-but-unapplied停止转interrupted/controlRevision1、零新增model/工具/Main修改，原历史/指纹/回执/错误保留。该追加修改未套作此前PE测试文件hash的通过，最终Required核新整合修订，不伪称独立Tester。
+- [x] PR52首准确head416cf8a的Required run37957311485真实失败：Node22和18唯一同项 history journal 断言通过后的hookFailed/ENOTEMPTY；清理注册先删fixture、后关闭服务，且只等待首runner而未收拢后续kick。原失败日志保存，不重跑求绿或跳过测试。仅该正式fixture改为同一teardown先release/close(stop=true)再移除自有临时目录，正文等待service.close收拢全部owned runner；不增加重试、放宽断言或修改业务。
+- [x] 上述唯一失败目标最小返工 actual `617732` exit0、1/1，485.3448ms。此前成功的PE/停止/HTTP目标未重复；后续新PR修订Required按完整冻结树重新核验，不复用416cf8a失败门禁。
 - [ ] 开发完成后唯一四目标：新增同进程/重启/step-limit停止合同与旧实时停止、工具收拢及失败输入保护；不重复PE或诊断目标。准确Required/发布后观察原已保存停止自行收敛，再使用原生resume恢复同原任务；不能用新任务或改ID替代。
 
 ## SLACK-VISIBLE-FIRST-LINE-01 · 内部头与用户首行分离（2026-10-09）
