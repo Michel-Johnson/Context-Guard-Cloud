@@ -26,7 +26,7 @@ const participationTransient = error => {
 // A read action is retained by Cloud for provenance/focus, but has no Slack UI.
 // Preserve actual text, questions, attachments and other presentation actions.
 const hasSlackContent = message => !!(message.text || message.questions?.length || message.attachments?.length ||
-  message.actions?.some(action => action && !['map-read', 'node-read', 'slack-reaction'].includes(action.kind)));
+  message.actions?.some(action => action && !['map-read', 'node-read', 'slack-reaction', 'binding-proposal', 'conversation-mounted'].includes(action.kind)));
 const isMessage = event => ['message', 'app_mention'].includes(event?.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share');
 const indirectMessage = (event, botUserId) => isMessage(event) && event.user !== botUserId &&
   event.channel_type !== 'im' && !event.channel?.startsWith('D') && !explicitlyAddressed(event, botUserId);
