@@ -34,6 +34,10 @@
   ],
   "helpers": [
     {
+      "path": "tests/helpers/openclaw-map.mjs",
+      "usedBy": "tests/map-relations-independent.test.mjs"
+    },
+    {
       "path": "tests/helpers/skill.mjs",
       "usedBy": "tests/interface-events.test.mjs"
     }
@@ -44,6 +48,9 @@
     }
   ],
   "productFiles": [
+    "tests/map-translations.test.mjs",
+    "tests/map-relations-independent.test.mjs",
+    "tests/helpers/openclaw-map.mjs",
     "tests/cursor-provider.test.mjs",
     "tests/cursor-sessions.test.mjs",
     "tests/cursor-workbench.test.mjs",

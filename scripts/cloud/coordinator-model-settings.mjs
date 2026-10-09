@@ -56,7 +56,7 @@ export class CoordinatorModelSettings {
   async selection(overrides = null) {
     const state = await this.read();
     const option = this.options.find(item => item.id === state.selectedId);
-    return { providerId: option.id, model: overrides ? this.factory({ ...option.config, ...overrides }) : option.model };
+    return { providerId: option.id, version: this.public(state).version, model: overrides ? this.factory({ ...option.config, ...overrides }) : option.model };
   }
   async selectForTurn(input) {
     const receipt = await this.select(input), current = await this.state();
