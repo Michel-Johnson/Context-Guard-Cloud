@@ -23,7 +23,9 @@ sudo systemctl show context-guard-slack.service -p WorkingDirectory -p ExecStart
 
 ## 使用
 
-Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员只需首次关联 Map 与已核实的本人 Slack 账号；新增私有项目仅在本人私聊可选，不自动公开到频道。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.6.0.md)。
+Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员只需首次关联 Map 与已核实的本人 Slack 账号；新增私有项目仅在本人私聊可选，不自动公开到频道。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.7.0.md)。
+
+Cursor 执行默认关闭。管理员须配置已注册仓库、准确 Cursor 模板及可批准执行的 Slack 用户，并显式开放 `conversation.cursor`。授权用户在原线程启用后，仍逐项确认 brief；Plan 和独立测试回到同一线程，不要求另开 Cursor 聊天或粘贴执行提示。仅有 Map 的项目不能继承此权限。启用或排队不代表原生执行成功，真实任务与部署验收另行完成。
 
 私聊中可以直接问“有哪些项目”或说“切换到某项目”，不用进入 Home。Coordinator 查询当前授权目录，只显示项目名称；同名时先澄清。插件成功保存后才确认切换，目标使用独立对话，原项目记录保留；在原线程继续回复也会进入目标项目。公共频道不开放此切换工具，也不因此新增权限。
 

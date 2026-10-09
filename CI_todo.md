@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## CURSOR-SLACK-ENTRY-01 · 原对话执行入口（2026-10-10）
+
+- [x] 原 Slack/manual 对话增加默认关闭的 `conversation.cursor`：显式仓库/模板/真人授权、空闲模式 CAS、原 ProjectTask/准确 brief 人审/既有 Plan 与独立 CI 回传；不另开聊天、转换旧批准或恢复通用派发。固定 core 2.3.0/UI 1.4.1 不变。
+- [x] 保留首次完整回归失败：804 项、801 通过、1 失败、2 既有跳过、exit1，183444.84175ms。模式保护误拦普通 shutdown 的持久步骤；分离 retired/stopping，既有正式 shutdown/restart Oracle 未改。另真实 HTTP 固定交错复现旧 registry 快照晚回复污染缓存；模式代次及持久授权校验拒绝旧初始化，锁外只收拢自有实例。
+- [x] 修复后冻结源码完整回归：807 项、805 通过、0 失败/取消、2 既有跳过、实际 exit0，205680.772625ms；日志 `temp/cursor-slack-entry-full-fixed-20261010.log`。独立最小正式组合14/14、exit0，29194.769667ms，六项 hash 前后一致；日志 `temp/cursor-slack-epoch-independent-c38a9f5-20261010.log`。这些结果绑定同步 Main52 前、夹具预置修改前字节，不冒充后续修订通过。
+- [ ] 独立日志中的后台 JSON 读取告警保留；新测试改在启动 Cloud 前预置唯一合成手动事项，避免测试运行时半写文件。正常同步 Main52 后仍须按最终字节验证，不能把夹具调整当作生产故障修复。
+- [ ] 正常 PR/Required/部署及原生 Cursor、真实 Slack/原 Coordinator 三路径任务验收仍未完成。受控模型、Git 与 Slack IO 不代表真实任务调用；原历史台账保留，不将本入口通过迁移为所有细节完成。
+
 ## CURSOR-MAIN-INTEGRATION-02 · 当前 Slack 基线同步（2026-10-09）
 
 - [x] 正常合并 main `a5ec3faf66ccd4bc77edaa2747e7624ab5d5974e`，保留双方验证记录及候选 Cloud 1.10.0；固定 core 2.3.0/UI 1.4.1 不变，不修改共享生成物。

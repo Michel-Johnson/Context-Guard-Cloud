@@ -10,6 +10,9 @@ import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/
 import { cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
 import { CursorGitProof } from '../scripts/cloud/cursor-git-proof.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
+import { INTEGRATION_COMMANDS } from '../scripts/cloud/integration-gateway.mjs';
+import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
+import { Store, threadKey } from '../plugins/slack/src/store.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const templateId = '11111111-1111-4111-8111-111111111111';
@@ -20,10 +23,12 @@ const ciPolicy = { checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv:
 
 // Real loopback HTTP, Coordinator tools, scheduler, ProtocolStore and MCP.
 // Both vendor models are controlled dependencies: this is not native acceptance.
-async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false, trustedCi = false } = {}) {
+async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false, trustedCi = false, slack = false, cursorExecution = true, enableAction = true, holdModel = false, manualItem = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-role-http-'));
   let cloud;
-  t.after(async () => { await cloud?.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  let releaseModel; const heldModel = new Promise(resolve => { releaseModel = resolve; });
+  let enteredModel = false;
+  t.after(async () => { releaseModel(); await cloud?.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const apiKeyFile = path.join(directory, 'key'), cursorConfigFile = path.join(directory, 'cursor.json');
   const providerFile = path.join(directory, 'model.json');
   await fs.writeFile(apiKeyFile, 'synthetic-only', { mode: 0o600 });
@@ -41,7 +46,8 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
   const memoryFile = path.join(memoryConfig.dataDir, digest('context-guard'), 'memory.json');
   await fs.mkdir(path.dirname(memoryFile), { recursive: true });
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'main-1', memory: { records: {}, map: {
-    v: 1, bootstrap: 'ready', root: { id: 'T0', title: 'Synthetic project', kind: 'module', state: 'dirty', owns: [], children: [] },
+    v: 1, bootstrap: 'ready', root: { id: 'T0', title: 'Synthetic project', kind: 'module', state: 'dirty', owns: [], children: [],
+      ...(manualItem ? { todos: [{ id: 'TD1', title: 'Synthetic manual item', status: 'pending' }] } : {}) },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
   const commands = [{ name: 'prepare_task', input: { taskId, text: 'Implement one isolated fixture', acceptance: 'Formal assertion passes', nodeIds: ['T0'], mainVersion: 'main-1' } }];
   const nativeCalls = [], gitCalls = [], runs = new Map(); let count = 0;
@@ -71,7 +77,10 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       } })), { event: 'result', data: { runId, status: 'FINISHED' } }] };
     },
   };
+  const integrationConfig = slack ? { host: '127.0.0.1', port: 0, token: 'synthetic-slack-integration-credential', teamId: 'TTEST', projectIds: ['context-guard'],
+    ...(enableAction ? { actions: [...INTEGRATION_COMMANDS] } : {}), ...(cursorExecution ? { cursorExecution: { 'context-guard': { templateSessionId: templateId, userIds: ['UTEST'] } } } : {}) } : undefined;
   cloud = await startCloudServer({ dataDir: directory, port: 0, publicOrigin: 'https://roles.example', browserToken: 'synthetic-human', memoryConfig, cursorConfigFile,
+    ...(integrationConfig ? { integrationConfig } : {}),
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
     protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },
     cursorProviderFactory: () => provider,
@@ -96,14 +105,16 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
           : { sha: 'b'.repeat(40), parents: [{ sha: sourceSha }], files: [{ filename: 'src/fixture.mjs' }] };
       return new Response(JSON.stringify(value));
     } }),
-    coordinatorModelFactory: () => ({ next: async () => { const command = commands.shift(); return command
+    coordinatorModelFactory: () => ({ next: async () => { enteredModel = true; if (holdModel) await heldModel; const command = commands.shift(); return command
       ? { stop: 'tool_use', content: [{ type: 'tool_use', id: 'model-' + ++count, ...command }] }
       : { stop: 'end_turn', content: [{ type: 'text', text: 'Synthetic Coordinator response' }] }; } }),
   });
   const store = new ProtocolStore(path.join(directory, 'interface-v2', digest('123')));
   const human = { repositoryId: '123', deviceId: 'browser', agentId: 'human', role: 'human' };
   const endpoint = '/api/workbench/projects/context-guard/api/coordinator';
+  let slackConversationId;
   const request = async (route, input, headers = { Authorization: 'Bearer synthetic-human' }) => {
+    if (slackConversationId && route.startsWith(endpoint)) route += `${route.includes('?') ? '&' : '?'}conversation=${encodeURIComponent(slackConversationId)}`;
     const response = await fetch(cloud.url + route, { method: input ? 'POST' : 'GET', headers: { ...headers,
       ...(input ? { 'Content-Type': 'application/json' } : {}) }, ...(input ? { body: JSON.stringify(input) } : {}) });
     return { status: response.status, body: await response.json() };
@@ -111,7 +122,8 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
   const post = async (route, input) => {
     const deadline = Date.now() + 15000;
     for (;;) {
-      const result = await request(route, input);
+      const result = slackConversationId && route === endpoint
+        ? await gateway('conversation.submit', input, { conversationId: slackConversationId, id: input.id }) : await request(route, input);
       // Inbox notifications may start a turn between observing waiting and
       // POST. BUSY is a definite non-acceptance; reuse this exact request ID.
       // Accepted/unknown results are never retried or replaced.
@@ -120,7 +132,7 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
         const state = await request(endpoint); assert.equal(state.status, 200);
         await new Promise(resolve => setTimeout(resolve, 20)); continue;
       }
-      assert.equal(result.status, route === endpoint ? 202 : 200, JSON.stringify(result.body)); return result.body;
+      assert.equal(result.status, route === endpoint && !slackConversationId ? 202 : 200, JSON.stringify(result.body)); return slackConversationId && route === endpoint ? result.body.data : result.body;
     }
   };
   const poll = async predicate => {
@@ -130,10 +142,21 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       assert.ok(Date.now() < deadline, 'Coordinator state did not advance before its deadline');
       await new Promise(resolve => setTimeout(resolve, 30)); }
   };
-  const prepare = async () => { await post(endpoint, { id: 'requirement', text: 'Synthetic requirement' });
+  const prepare = async () => {
+    if (slack) {
+      const created = await gateway('conversation.create'); assert.equal(created.status, 200);
+      slackConversationId = created.body.data.conversationId;
+      const enabled = await gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId: slackConversationId });
+      assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
+    }
+    await post(endpoint, { id: 'requirement', text: 'Synthetic requirement' });
     const state = await poll(value => value.approvals?.some(item => item.projectTask) && value.status === 'waiting-for-user');
     return state.approvals.find(item => item.projectTask); };
-  const approve = proposal => post(endpoint + '/approval', { id: 'human-approve', proposalId: proposal.id, decision: 'approved', reason: 'Synthetic explicit human approval' });
+  const approve = async proposal => {
+    if (!slackConversationId) return post(endpoint + '/approval', { id: 'human-approve', proposalId: proposal.id, decision: 'approved', reason: 'Synthetic explicit human approval' });
+    const result = await gateway('brief.review', { proposalId: proposal.id, version: proposal.brief.version, decision: 'approved', reason: 'Synthetic explicit human approval' }, { conversationId: slackConversationId, id: 'human-approve' });
+    assert.equal(result.status, 200, JSON.stringify(result.body)); return result.body.data;
+  };
   const mcpRoute = '/api/workbench/projects/context-guard/api/cursor-role-mcp';
   const mcp = async (authorization, method, params, extra = {}) => {
     // Model the backend of a TLS reverse proxy, retaining its public Host.
@@ -164,12 +187,209 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   };
-  return { directory, store, human, nativeCalls, gitCalls, commands, config, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
-    url: cloud.url };
+  const gateway = async (type, payload = {}, { conversationId, userId = 'UTEST', id = 'slack-' + type.replaceAll('.', '-') } = {}) => {
+    const response = await fetch(cloud.integrationUrl + '/v1/command', { method: 'POST', headers: { Authorization: 'Bearer synthetic-slack-integration-credential', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, teamId: 'TTEST', userId, projectId: 'context-guard', ...(conversationId ? { conversationId } : {}), type, payload }) });
+    return { status: response.status, body: await response.json() };
+  };
+  return { directory, store, human, nativeCalls, gitCalls, commands, config, integrationConfig, gateway, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
+    releaseModel, modelEntered: () => enteredModel,
+    url: cloud.url, integrationUrl: cloud.integrationUrl };
 }
 
-test('Public Coordinator approval, handoff and independent MCP CI reach the original task with controlled native and Git providers', async t => {
-  const f = await fixture(t, { trustedCi: true }), proposal = await f.prepare();
+test('Slack Cursor opt-in preserves the original conversation and original human-approved task', async t => {
+  const f = await fixture(t, { slack: true, mixed: true });
+  const created = await f.gateway('conversation.create'); assert.equal(created.status, 200, JSON.stringify(created.body));
+  const conversationId = created.body.data.conversationId;
+  const before = await f.gateway('conversation.state', {}, { conversationId });
+  assert.equal(before.body.data.executionMode, 'manual'); assert.equal(f.nativeCalls.length, 0);
+  const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId });
+  assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
+  assert.equal(enabled.body.data.conversationId, conversationId); assert.equal(enabled.body.data.executionMode, 'automatic');
+  assert.equal(f.nativeCalls.length, 0, 'Enabling the host is not brief approval or a paid model request');
+  const submitted = await f.gateway('conversation.submit', { text: 'Prepare a Cursor task in this same conversation' }, { conversationId });
+  assert.equal(submitted.status, 200, JSON.stringify(submitted.body));
+  let state;
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const response = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(response.status, 200, JSON.stringify(response.body));
+    state = response.body.data;
+    if (state.status === 'waiting-for-user' && state.approvals.some(value => value.projectTask)) break;
+    assert.ok(Date.now() < deadline, 'Original Slack conversation never received its brief'); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const proposal = state.approvals.find(value => value.projectTask);
+  assert.equal(f.nativeCalls.length, 0); assert.equal((await f.store.projectTasks(f.human))[0].conversationId, conversationId);
+  const wrong = await f.gateway('brief.review', { proposalId: proposal.id, version: 'stale', decision: 'approved' }, { conversationId, id: 'wrong-brief' });
+  assert.equal(wrong.status, 409); assert.equal(f.nativeCalls.length, 0);
+  const approved = await f.gateway('brief.review', { proposalId: proposal.id, version: proposal.brief.version, decision: 'approved', reason: 'Synthetic human confirmation' }, { conversationId });
+  assert.equal(approved.status, 200, JSON.stringify(approved.body));
+  await f.poll(() => f.nativeCalls.length === 1);
+  const task = (await f.store.projectTasks(f.human))[0];
+  assert.equal(task.conversationId, conversationId); assert.equal(task.templateSessionId, templateId);
+  assert.equal(task.reviewIssuer.agentId, 'slack:TTEST:UTEST'); assert.equal(task.reviewIssuer.role, 'human');
+  assert.equal(f.nativeCalls[0].input.mode, 'plan');
+  const original = await f.gateway('conversation.state', {}, { conversationId });
+  assert.equal(original.status, 200); assert.equal(original.body.data.projectTasks[0].taskId, taskId);
+  assert.equal(original.body.data.approvals.find(value => value.id === proposal.id).pending, false);
+});
+
+test('Slack Cursor enable is closed by default and rejects other operators or repository mismatches', async t => {
+  for (const options of [{ enableAction: false }, { cursorExecution: false }, { mismatchedRepository: true }, { userId: 'UOTHER' }]) await t.test(JSON.stringify(options), async t => {
+    const f = await fixture(t, { slack: true, ...options }), created = await f.gateway('conversation.create');
+    assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
+    const result = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId, ...(options.userId ? { userId: options.userId } : {}) });
+    assert.equal(result.status, 403, JSON.stringify(result.body)); assert.equal(result.body.error.code, 'FORBIDDEN');
+    assert.equal((await f.gateway('conversation.state', {}, { conversationId })).body.data.executionMode, 'manual');
+    assert.equal(f.nativeCalls.length, 0); assert.deepEqual(await f.store.projectTasks(f.human), []);
+  });
+});
+
+test('Slack Cursor grant replay, state and events revalidate the current operator configuration', async t => {
+  const f = await fixture(t, { slack: true }), created = await f.gateway('conversation.create');
+  const conversationId = created.body.data.conversationId, options = { conversationId, id: 'stable-enable' };
+  const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, options); assert.equal(enabled.status, 200);
+  assert.deepEqual((await f.gateway('conversation.cursor', { expectedMode: 'manual' }, options)).body, enabled.body);
+  const bound = await f.gateway('conversation.bind', { conversationId }, { id: 'bind-enabled' });
+  assert.equal(bound.status, 200); assert.equal(bound.body.data.executionMode, 'automatic', 'Binding cannot silently remove Cursor authority');
+  f.integrationConfig.cursorExecution['context-guard'].userIds = ['UOTHER'];
+  assert.equal((await f.gateway('conversation.cursor', { expectedMode: 'manual' }, options)).status, 403, 'A cached enable receipt cannot survive revocation');
+  assert.equal((await f.gateway('conversation.state', {}, { conversationId })).status, 403);
+  assert.equal((await f.gateway('conversation.submit', { text: 'Do not run' }, { conversationId })).status, 403);
+  const events = await fetch(f.integrationUrl + '/v1/events?' + new URLSearchParams({ teamId: 'TTEST', userId: 'UTEST', projectId: 'context-guard', conversationId }),
+    { headers: { Authorization: 'Bearer synthetic-slack-integration-credential' } });
+  assert.equal(events.status, 403); await events.body.cancel();
+  assert.equal(f.nativeCalls.length, 0); assert.equal(f.modelEntered(), false);
+});
+
+test('Slack Cursor controls reuse the original thread, exact brief approval and result cards through real HTTP', async t => {
+  const f = await fixture(t, { slack: true }), created = await f.gateway('conversation.create');
+  const conversationId = created.body.data.conversationId, store = await new Store(path.join(f.directory, 'slack-plugin')).open();
+  const key = threadKey('TTEST', 'CTEST', '1.0'), posts = [];
+  await store.bind(key, { projectId: 'context-guard', conversationId, channel: 'CTEST', threadTs: '1.0', userId: 'UTEST', ownRequests: [] });
+  const plugin = new SlackPlugin({ store, teamId: 'TTEST', cloudOrigin: 'https://roles.example', botUserId: 'UBOT',
+    gateway: { command: async (type, input) => {
+      const response = await f.gateway(type, input.payload, { conversationId: input.conversationId, userId: input.userId, id: input.id });
+      assert.equal(response.status, 200, JSON.stringify(response.body)); return response.body.data;
+    } }, io: { post: async input => { posts.push(input); return String(posts.length + 10); }, update: async (channel, ts, text, blocks) => { posts.push({ channel, ts, text, blocks, update: true }); } },
+    logger: { warn(){}, error(){} } });
+  t.after(() => plugin.stop());
+  await plugin.mirror(key);
+  const enable = posts.flatMap(item => item.blocks || []).flatMap(block => block.elements || []).find(value => value.action_id === 'enable_cursor');
+  assert.ok(enable); assert.match(enable.text.text, /当前对话/); assert.equal(f.nativeCalls.length, 0);
+  await plugin.process('cursor-button', { type: 'interactive', body: { user: { id: 'UTEST' }, actions: [{ action_id: 'enable_cursor', value: enable.value }] } });
+  assert.equal(store.data.threads[key].conversationId, conversationId); assert.equal(f.nativeCalls.length, 0);
+  const submitted = await f.gateway('conversation.submit', { text: 'Prepare the original task' }, { conversationId }); assert.equal(submitted.status, 200);
+  const deadline = Date.now() + 5000; let state;
+  for (;;) {
+    state = (await f.gateway('conversation.state', {}, { conversationId })).body.data;
+    if (state.status === 'waiting-for-user' && !state.activeTurnId && state.approvals.some(item => item.projectTask)) break;
+    assert.ok(Date.now() < deadline); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  await plugin.mirror(key);
+  const approve = posts.flatMap(item => item.blocks || []).flatMap(block => block.elements || []).find(value => value.action_id === 'approve_brief');
+  assert.ok(approve); assert.equal(approve.text.text, '确认并交给 Cursor');
+  assert.equal(JSON.parse(approve.value).version, state.approvals.find(item => item.projectTask).brief.version);
+  await plugin.process('approve-original-brief', { type: 'interactive', body: { user: { id: 'UTEST' }, actions: [{ action_id: 'approve_brief', value: approve.value }] } });
+  await f.poll(() => f.nativeCalls.length === 1); await plugin.mirror(key);
+  assert.ok(posts.some(item => item.text?.includes('已进入 Cursor 执行队列')));
+  assert.equal(posts.some(item => JSON.stringify(item.blocks || []).includes('export_prompt')), false);
+  assert.equal(posts.filter(item => !item.update).every(item => item.channel === 'CTEST' && item.threadTs === '1.0'), true);
+  assert.equal(store.data.threads[key].conversationId, conversationId);
+});
+
+test('Slack Cursor mode change rejects a live original model turn and preserves its receipt', async t => {
+  const f = await fixture(t, { slack: true, holdModel: true }), created = await f.gateway('conversation.create');
+  const conversationId = created.body.data.conversationId;
+  assert.equal((await f.gateway('conversation.submit', { text: 'Original pending input' }, { conversationId })).status, 200);
+  const deadline = Date.now() + 3000;
+  while (!f.modelEntered()) { assert.ok(Date.now() < deadline); await new Promise(resolve => setTimeout(resolve, 10)); }
+  const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId });
+  assert.equal(enabled.status, 409); assert.equal(enabled.body.error.code, 'COORDINATOR_BUSY');
+  const state = (await f.gateway('conversation.state', {}, { conversationId })).body.data;
+  assert.equal(state.executionMode, 'manual'); assert.equal(state.status, 'running');
+  assert.ok(state.messages.some(value => value.role === 'user' && value.text.includes('Original pending input')));
+  assert.equal(f.nativeCalls.length, 0); f.releaseModel();
+});
+
+test('Slack Cursor mode change rejects an old registry read arriving after cache retirement', async t => {
+  const f = await fixture(t, { slack: true }), created = await f.gateway('conversation.create');
+  assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
+  const registryFile = path.join(f.directory, 'coordinators', 'context-guard', 'conversations.json');
+  const originalRead = fs.readFile;
+  let captured = false, releaseRead;
+  const heldRead = new Promise(resolve => { releaseRead = resolve; });
+  // Hold only this test's first real registry snapshot, after the file has
+  // been read. The original HTTP request now carries the old manual revision.
+  fs.readFile = async function(file, ...args) {
+    const value = await originalRead.call(this, file, ...args);
+    if (file === registryFile && !captured) { captured = true; await heldRead; }
+    return value;
+  };
+  t.after(() => { releaseRead(); fs.readFile = originalRead; });
+  const late = f.request(f.endpoint + '?conversation=' + encodeURIComponent(conversationId));
+  try {
+    const deadline = Date.now() + 3000;
+    while (!captured) { assert.ok(Date.now() < deadline, 'The original registry read was not reached'); await new Promise(resolve => setTimeout(resolve, 10)); }
+    const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId });
+    assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
+  } finally { releaseRead(); }
+  const stale = await late;
+  assert.equal(stale.status, 409, JSON.stringify(stale.body));
+  assert.equal(stale.body.error.code, 'COORDINATOR_BUSY');
+  fs.readFile = originalRead;
+  const state = await f.gateway('conversation.state', {}, { conversationId });
+  assert.equal(state.status, 200); assert.equal(state.body.data.executionMode, 'automatic');
+  assert.equal((await f.gateway('conversation.submit', { text: 'Use the current Cursor host' }, { conversationId })).status, 200);
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    const current = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(current.status, 200);
+    if (current.body.data.status === 'waiting-for-user' && current.body.data.approvals.some(item => item.projectTask)) break;
+    assert.notEqual(current.body.data.status, 'error', JSON.stringify(current.body.data.error));
+    assert.ok(Date.now() < deadline, 'A stale initializer poisoned the current service'); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(f.nativeCalls.length, 0, 'Changing hosts never approves the new brief');
+});
+
+test('Slack Cursor pending manual approval cannot become execution authority after enabling', async t => {
+  const f = await fixture(t, { slack: true, manualItem: true });
+  // Manual preparation requires a real existing item or an independently
+  // confirmed node binding. Seed it before starting Cloud, not by a partial
+  // write racing its background reader; keep the original business gate.
+  Object.assign(f.commands[0].input, { itemId: 'TD1', nodeId: 'T0', kind: 'todo' });
+  const created = await f.gateway('conversation.create');
+  assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
+  assert.equal((await f.gateway('conversation.submit', { text: 'Prepare the original manual brief' }, { conversationId })).status, 200);
+  const deadline = Date.now() + 5000; let proposal;
+  for (;;) {
+    const response = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(response.status, 200);
+    proposal = response.body.data.approvals.find(item => item.manual && item.pending);
+    if (proposal && response.body.data.status === 'waiting-for-user' && !response.body.data.activeTurnId) break;
+    assert.ok(Date.now() < deadline, 'The original manual brief was not prepared'); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId });
+  assert.equal(enabled.status, 409); assert.equal(enabled.body.error.code, 'CONFLICT');
+  const state = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(state.status, 200);
+  assert.equal(state.body.data.executionMode, 'manual');
+  assert.equal(state.body.data.approvals.find(item => item.id === proposal.id).pending, true);
+  assert.equal(f.nativeCalls.length, 0); assert.deepEqual(await f.store.projectTasks(f.human), []);
+});
+
+test('Slack Cursor concurrent enable operations preserve one grant and the original conversation', async t => {
+  const f = await fixture(t, { slack: true }), created = await f.gateway('conversation.create');
+  assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
+  const results = await Promise.all(['enable-first', 'enable-second'].map(id => f.gateway('conversation.cursor', { expectedMode: 'manual' }, { conversationId, id })));
+  assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+  const winner = results.find(result => result.status === 200);
+  assert.equal(winner.body.data.conversationId, conversationId);
+  const state = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(state.status, 200);
+  assert.equal(state.body.data.executionMode, 'automatic'); assert.equal(f.nativeCalls.length, 0);
+  const registry = JSON.parse(await fs.readFile(path.join(f.directory, 'coordinators', 'context-guard', 'conversations.json'), 'utf8'));
+  assert.equal(Object.keys(registry.chats).length, 1);
+  assert.ok(['enable-first', 'enable-second'].includes(registry.chats[conversationId].cursorExecution.operationId));
+});
+
+for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reaches independent CI without a second conversation' : 'Public Coordinator approval, handoff and independent MCP CI reach the original task with controlled native and Git providers', async t => {
+  const f = await fixture(t, { trustedCi: true, slack }), proposal = await f.prepare();
   assert.equal(f.nativeCalls.length, 0, 'A prepared requirement never calls Cursor');
   await f.approve(proposal);
   await f.poll(state => state.projectTasks?.some(task => task.stage === 'dispatched') && f.nativeCalls.length === 1);

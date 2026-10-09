@@ -457,6 +457,7 @@ export class SlackPlugin {
       else if (action.action_id === 'approve_brief') await this.review(id, userId, value, 'approved', '用户在 Slack 中确认 brief');
       else if (action.action_id === 'approve_binding') await this.reviewBinding(id, userId, value, 'approved');
       else if (action.action_id === 'reject_binding') await this.reviewBinding(id, userId, value, 'rejected');
+      else if (action.action_id === 'enable_cursor') await this.enableCursor(id, userId, value);
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
@@ -1208,14 +1209,24 @@ export class SlackPlugin {
   async review(id, userId, value, decision, reason) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const result = await this.command('brief.review', binding, userId, operationId(id, 'review'), { proposalId: value.proposalId, decision, reason, version: value.version });
-    const confirmed = 'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
+    const automatic = result.executionMode === 'automatic';
+    const confirmed = automatic ? 'brief 已确认，已进入 Cursor 执行队列。Plan 和结果会回到这个线程；排队不代表执行完成。' :
+      'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
     await this.io.post({ id: operationId(id, 'review-result'), channel: binding.channel, threadTs: binding.threadTs, text: decision === 'approved' ? confirmed : 'brief 已退回。直接在这个线程告诉我你想怎么修改。',
-      ...(decision === 'approved' ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
+      ...(decision === 'approved' && !automatic ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     if (decision === 'approved' && result.itemId && result.nodeId) await this.store.update(state => {
       const thread = state.threads[value.key]; thread.watchedItems ||= {};
       thread.watchedItems[result.itemId] ||= { nodeId: result.nodeId, kind: result.kind || 'todo', status: null }; thread.nextItemPoll = 0;
     });
+    return result;
+  }
+  async enableCursor(id, userId, value) {
+    const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
+    const result = await this.command('conversation.cursor', binding, userId, operationId(id, 'enable-cursor'), { expectedMode: 'manual' });
+    await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
+    await this.io.post({ id: operationId(id, 'cursor-enabled'), channel: binding.channel, threadTs: binding.threadTs,
+      text: '已启用当前对话的 Cursor 执行能力。请继续说明任务；每份 brief 仍需确认，启用本身没有派发任务。' });
     return result;
   }
   async reviewBinding(id, userId, value, decision) {
@@ -1466,19 +1477,31 @@ export class SlackPlugin {
         await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
         continue;
       }
-      if (approval.manual !== true) continue;
+      if (approval.manual !== true && !(approval.projectTask && approval.executionProvider === 'cursor')) continue;
       const id = `approval:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
       if (prior?.hash === hash) continue;
       if (approval.pending === false && !prior) continue;
       const resolved = approval.pending === false;
       const text = approval.stale ? '主节点已改绑，这份需求说明已过期，请重新整理。' :
         resolved ? `brief 已${approval.decision === 'approved' ? '确认' : '退回'}` : 'Coordinator：等待人工确认 brief';
-      const blocks = resolved ? [section(text), ...(approval.decision === 'approved' ? [{ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key, proposalId: approval.id }) }] }] : [])] : approvalBlocks(approval, key);
+      const blocks = resolved ? [section(text), ...(approval.decision === 'approved' && approval.manual === true ? [{ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key, proposalId: approval.id }) }] }] : [])] : approvalBlocks(approval, key);
       const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${id}`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
       await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
       if (resolved && approval.decision === 'approved' && approval.itemId && approval.nodeId) await this.store.update(data => {
         const thread = data.threads[key]; thread.watchedItems ||= {}; thread.watchedItems[approval.itemId] ||= { nodeId: approval.nodeId, kind: approval.kind || 'todo', status: null };
       });
+    }
+    if (state.cursorAvailable || this.store.data.threads[key].mirrored['cursor-execution']) {
+      const active = state.executionProvider === 'cursor', text = active ? '已启用当前对话的 Cursor 执行能力，任务仍须确认 brief。' :
+        state.cursorAvailable ? '可以在当前对话启用 Cursor。启用不批准任务，也不会另开聊天。' : '当前对话未获得 Cursor 执行权限，请联系项目管理员。';
+      const blocks = [section(text), ...(!active && state.cursorAvailable ? [{ type: 'actions', elements: [{ type: 'button', action_id: 'enable_cursor',
+        text: { type: 'plain_text', text: '在当前对话启用 Cursor' }, value: JSON.stringify({ key }) }] }] : [])];
+      const content = digest(blocks), prior = this.store.data.threads[key].mirrored['cursor-execution'];
+      if (prior?.hash !== content) {
+        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
+          await this.io.post({ id: operationId(`${key}:cursor-execution`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
+        await this.store.update(data => { data.threads[key].mirrored['cursor-execution'] = { ts, hash: content }; });
+      }
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
     const ownsFeedback = state.participationRequestIds?.some(id => this.feedback.valid(this.store.data.reactionInputs?.[id]?.inboxId));

@@ -152,7 +152,7 @@ export function messageBlocks(message, key, context) {
 export function approvalBlocks(approval, key) {
   const version = approval.version || approval.brief?.version;
   return [...plainSections(`待确认 brief\n${approval.title || approval.text || approval.brief?.text || approval.brief?.summary || '请查看工作台中的 brief'}\n${approval.pathText ? `主节点路径：\n${approval.pathText}\n` : ''}${Array.isArray(approval.acceptance) ? approval.acceptance.join('\n') : approval.acceptance || ''}`),
-    { type: 'actions', elements: [button('确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
+    { type: 'actions', elements: [button(approval.projectTask && approval.executionProvider === 'cursor' ? '确认并交给 Cursor' : '确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
 }
 
 export function bindingBlocks(proposal, key) {

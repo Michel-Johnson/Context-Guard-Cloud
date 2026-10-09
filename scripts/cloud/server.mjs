@@ -621,6 +621,8 @@ export async function startCloudServer({
           endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
           allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
           authorizeSource: async ({ state, task }) => {
+            const original = Object.values(state.projectTasks || {}).find(item => item.repositoryId === repository.repositoryId && item.taskId === task.id && item.sessionId === task.session.id);
+            if (original?.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation);
             const template = state.bindings[digest(JSON.stringify([repository.repositoryId, roles.templateSessionId]))];
             if (!template || template.deviceId !== 'cloud-cursor:' + project.id || template.worktreeId !== coordinator.bindings[roles.templateSessionId]) return false;
             const memory = await readMemoryProject(configuredMemory, project.id), document = memory.main?.memory?.map;
@@ -712,8 +714,36 @@ export async function startCloudServer({
 
   const projectById = id => registry.projects.find(project => project.id === id);
   const coordinators = new Map();
+  const cursorTransitions = new Set();
+  const cursorModeEpochs = new Map();
   let integrationGateway = null;
   const conversationsFor = project => new CoordinatorConversations(path.join(dataDir, 'coordinators', project.id));
+  const cursorExecutionScope = (project, actor) => {
+    const grant = integrations?.cursorExecution?.[project.id], roles = cursorConfiguration?.projects?.[project.id]?.roles;
+    const host = cursorConfiguration?.projects?.[project.id], coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
+    if (isMapProject(project) || actor?.kind !== 'human' || actor.integration !== 'slack' || actor.teamId !== integrations?.teamId ||
+        actor.sessionId !== `slack:${actor.teamId}:${actor.userId}` || !integrations?.actions.includes('conversation.cursor') ||
+        !grant?.userIds.includes(actor.userId) || grant.templateSessionId !== roles?.templateSessionId || !coordinator?.enabled ||
+        !coordinator.sessionTemplates?.includes(grant.templateSessionId) || coordinator.bindings?.[grant.templateSessionId] !== cursorTemplateWorktree(grant.templateSessionId)) {
+      protocolFail('FORBIDDEN', 'Cursor execution requires an explicit repository, template and Slack operator grant');
+    }
+    const { repository } = interfaceProject(project);
+    if (!/^[a-f0-9]{40}$/.test(host.startingRef || '') || host.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase()) protocolFail('FORBIDDEN', 'Cursor repository and fixed source commit must match this project');
+    return { projectId: project.id, repositoryId: repository.repositoryId, templateSessionId: grant.templateSessionId, actor: structuredClone(actor),
+      configurationHash: digest(JSON.stringify([grant, repository.repositoryId, repository.slug, host.repositoryUrl, host.startingRef])) };
+  };
+  const requireCursorGrant = async (project, conversation, actor = null, delegation = null) => {
+    const grant = conversation.cursorExecution;
+    if (!grant || conversation.executionMode !== 'automatic') protocolFail('FORBIDDEN', 'This conversation has no Cursor execution grant');
+    const current = cursorExecutionScope(project, grant.actor);
+    if (actor) cursorExecutionScope(project, actor);
+    if (grant.configurationHash !== current.configurationHash || grant.projectId !== current.projectId || grant.repositoryId !== current.repositoryId ||
+        grant.templateSessionId !== current.templateSessionId || delegation &&
+        (delegation.grantId !== grant.operationId || delegation.templateSessionId !== grant.templateSessionId || delegation.configurationHash !== grant.configurationHash)) {
+      protocolFail('FORBIDDEN', 'The original Cursor execution grant changed');
+    }
+    return grant;
+  };
   const normalizedSessions = item => (Array.isArray(item?.sessions) ? item.sessions : [])
     .map(value => String(value || '').trim()).filter(Boolean);
   const mapItem = async (project, nodeId, kind, itemId) => {
@@ -765,6 +795,11 @@ export async function startCloudServer({
     nodeIds: configuredMemory.projects[project.id].coordinator.nodeIds || null,
   });
   const coordinatorFor = async (project, conversationId = 'legacy') => {
+    const key = `${project.id}:${conversationId}`, epoch = cursorModeEpochs.get(key) || 0;
+    const assertCurrentEpoch = () => {
+      if (cursorTransitions.has(key) || (cursorModeEpochs.get(key) || 0) !== epoch) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
+    };
+    assertCurrentEpoch();
     const config = coordinatorConfigFor(project);
     if (!config?.enabled) throw new MapError('COORDINATOR_DISABLED', 'Coordinator is not enabled for this project', 404);
     const conversations = conversationsFor(project);
@@ -776,11 +811,23 @@ export async function startCloudServer({
       await conversations.ensureSession(sessionId, binding.name || 'Session 对话');
     }
     const conversation = await conversations.get(conversationId);
+    // A getter can carry an old registry snapshot across retirement. Reject
+    // it before it can occupy or overwrite the new mode's cache slot.
+    assertCurrentEpoch();
+    const modeRevision = value => JSON.stringify([value.executionMode || 'automatic', value.cursorExecution || null]);
+    const revision = modeRevision(conversation);
+    const assertCurrentMode = async () => {
+      assertCurrentEpoch();
+      const current = await conversations.get(conversationId);
+      assertCurrentEpoch();
+      if (modeRevision(current) !== revision) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode changed', 409);
+    };
     const manual = conversation.executionMode === 'manual';
     if (isMapProject(project) && !manual) protocolFail('FORBIDDEN', 'Map 项目只支持人工对话，不创建执行 Session');
-    const key = `${project.id}:${conversationId}`;
     if (!coordinators.has(key)) {
       const creating = (async () => {
+        let ownedService;
+        try {
         if (!path.isAbsolute(config.providerFile || '') || !config.bindings || typeof config.bindings !== 'object') throw new MapError('INVALID_COORDINATOR_CONFIG', 'Configure provider and explicit Session bindings', 503);
         // A Map-only project has no repository or execution Session. Its
         // isolated workflow store is empty; manual briefs use Map CAS instead.
@@ -829,6 +876,10 @@ export async function startCloudServer({
         const execute = createCoordinatorExecutor({
           authorizeTool: async (name, input, { caller }) => {
             const liveConversation = await conversations.get(conversationId);
+            // A live counted tool makes retireIdle reject the transition.
+            // Do not abort that step merely because an enable attempt is busy.
+            if (service.retired || (liveConversation.executionMode === 'manual') !== manual) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode changed', 409);
+            if (liveConversation.cursorExecution) await requireCursorGrant(project, liveConversation);
             Object.assign(conversation, liveConversation);
             for (const field of ['nodeId', 'kind', 'itemId', 'bindingApproval']) if (!Object.hasOwn(liveConversation, field)) delete conversation[field];
             if (!tools.some(tool => tool.name === name)) protocolFail('FORBIDDEN', 'Tool is not enabled for this conversation');
@@ -1011,7 +1062,10 @@ export async function startCloudServer({
               if (!requirements.itemId && (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId)) {
                 protocolFail('APPROVAL_REQUIRED', '新需求先提出主节点绑定建议，等人类确认后再整理 brief；相关模块按需读取，不加入绑定。');
               }
-              return bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor }));
+              return bindingsFor(project).withStableFocus(conversationId, live => {
+                if (live.executionMode !== 'manual') protocolFail('CONFLICT', 'Conversation execution mode changed');
+                return manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor });
+              });
             }
             const requirements = conversation?.itemId
               ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind }
@@ -1032,7 +1086,9 @@ export async function startCloudServer({
                 if (routedNodes.length > 3) protocolFail('INVALID_ARGUMENT', 'Map TODO/Bug routing exceeds three nodes');
                 requirements.nodeIds = routedNodes;
               }
-              const ownerId = await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
+              if (conversation.cursorExecution && (await store.projectTasks(human)).some(task => task.itemId === requirements.itemId && task.nodeId === requirements.nodeId && task.kind === requirements.kind &&
+                  task.conversationId !== conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'This item already belongs to another active execution');
+              const ownerId = conversation.cursorExecution ? conversationId : await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
               if (conversationId !== ownerId) {
                 if (!await readJSON(conversations.conversationFile(ownerId), null)) {
                   await conversations.continueIn(conversationId, ownerId);
@@ -1047,6 +1103,10 @@ export async function startCloudServer({
               }
             }
             if (JSON.stringify(requirements).length > 2000) protocolFail('INVALID_ARGUMENT', 'Keep requirements within 2000 characters');
+            if (conversation.cursorExecution) {
+              const grant = await requireCursorGrant(project, await conversations.get(conversationId));
+              requirements.cursorDelegation = { grantId: grant.operationId, templateSessionId: grant.templateSessionId, configurationHash: grant.configurationHash };
+            }
             const task = await store.prepareProjectTask(principal, requirements, operationId, conversationId);
             return { ...task, projectTask: true, requiresHumanApproval: true };
           },
@@ -1140,7 +1200,8 @@ export async function startCloudServer({
         const fileWriteNote = config.fileWrite === true
           ? '\n项目允许 write_file 写入一个仓库相对路径的 UTF-8 文本文件。用户明确要求新建或替换单个文件时使用它，一次一个路径；不提交、不推送、不修改 Main。文件已存在时传入当前内容的 expectedSha。多文件修改和代码开发仍使用 brief。'
           : '';
-        const system = coordinatorRolePrompt(await fs.readFile(path.join(root, 'scripts/shared/roles/Coordinator.md'), 'utf8'), { manual }) + (!itemScoped ? '' :
+        const system = coordinatorRolePrompt(await fs.readFile(path.join(root, 'scripts/shared/roles/Coordinator.md'), 'utf8'), { manual }) +
+          (conversation.cursorExecution ? '\n当前对话已由真人启用受限 Cursor Cloud 执行能力，启用不是任务批准。\n新 brief 经人确认后，系统固定 Cursor 模板派发；不要请人另开 Session 或粘贴提示。\nPlan、交接和独立 CI 结果回到原对话，仍走原审核协议；不根据本轮结束判断任务完成。\n' : '') + (!itemScoped ? '' :
           '\n本对话仅负责下方「当前事项」；先读取其所在节点的最新原文，不处理其他事项。') + fileWriteNote;
         const directory = conversations.conversationDirectory(conversationId);
         const visionProvider = integrations?.visionProviderFile ? await readJson(integrations.visionProviderFile) : null;
@@ -1152,7 +1213,8 @@ export async function startCloudServer({
           const pending = (await bindingsFor(project).approvals(conversationId)).find(item => item.pending);
           return { ...context, bindingRef: pending ? { id: pending.id, version: pending.version } : null };
         };
-        const service = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
+        await assertCurrentMode();
+        const service = ownedService = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
           ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true } : {}),
@@ -1211,13 +1273,24 @@ export async function startCloudServer({
         // idle conversation creates a transient in-memory `running` state, so
         // its first user submission can incorrectly fail with COORDINATOR_BUSY.
         const restored = await service.state();
+        await assertCurrentMode();
+        assertCurrentEpoch();
         if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored))) service.kick();
         return service;
+        } catch (cause) {
+          // Drain only this initializer's instance, outside workflow locks.
+          // A late initializer must never close or delete its replacement.
+          if (ownedService) { await ownedService.inbox?.close(); await ownedService.close({ stop: true }); }
+          throw cause;
+        }
       })();
       coordinators.set(key, creating);
       creating.catch(() => { if (coordinators.get(key) === creating) coordinators.delete(key); });
     }
-    return coordinators.get(key);
+    const service = await coordinators.get(key);
+    await assertCurrentMode();
+    assertCurrentEpoch();
+    return service;
   };
   const notifyManualReviews = async (project, conversationId, service) => {
     let state = await service.state();
@@ -1273,6 +1346,17 @@ export async function startCloudServer({
       state.acceptances = [];
       state.projectTasks = [];
       state.sessionTemplates = [];
+    } else if (conversation.cursorExecution) {
+      await requireCursorGrant(project, conversation);
+      const { store, principal } = interfaceProject(project);
+      const tasks = (await store.projectTasks(principal)).filter(task => task.conversationId === conversationId);
+      state.executionMode = 'automatic'; state.executionProvider = 'cursor'; state.projectTasks = tasks;
+      state.approvals = [...state.approvals.filter(proposal => !proposal.manual), ...await manualBriefsFor(project).approvals(conversationId)];
+      state.approvals = state.approvals.map(proposal => {
+        const task = proposal.projectTask && tasks.find(item => item.taskId === proposal.taskId);
+        return task ? { ...proposal, executionProvider: 'cursor', pending: task.stage === 'brief' && task.brief.version === proposal.brief.version,
+          ...(task.review ? { decision: task.review.decision } : {}) } : proposal;
+      });
     }
     const bindingApprovals = await bindingsFor(project).approvals(conversationId);
     const bindingIds = new Set(bindingApprovals.map(proposal => proposal.id));
@@ -1302,9 +1386,10 @@ export async function startCloudServer({
     return service.submit(input, options);
   };
   const reviewManualBrief = async (project, conversationId, input, actor) => {
-    const conversation = await conversationsFor(project).get(conversationId);
-    if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'This conversation does not use manual execution');
-    const result = await bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor }));
+    const result = await bindingsFor(project).withStableFocus(conversationId, conversation => {
+      if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'This conversation does not use manual execution');
+      return manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor });
+    });
     const notification = await notifyManualReviews(project, conversationId, await coordinatorFor(project, conversationId));
     return { ...result, notification };
   };
@@ -1318,15 +1403,29 @@ export async function startCloudServer({
     if (!project || !configuredMemory?.projects?.[id]) protocolFail('NOT_FOUND', 'Project is unavailable');
     return project;
   };
-  const authorizeIntegrationProject = async (id, actor) => {
-    if (mapProjects.allowed(actor)) { await mapProjects.get(id); return; }
-    if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+  const authorizeIntegrationProject = async (id, actor, input) => {
+    if (mapProjects.allowed(actor)) await mapProjects.get(id);
+    else if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+    if (input?.type === 'conversation.cursor') cursorExecutionScope(await integrationProject(id), actor);
+    const conversationId = input?.conversationId || (input?.type === 'conversation.bind' && input.payload?.conversationId);
+    if (conversationId) {
+      const project = await integrationProject(id), conversation = await conversationsFor(project).get(conversationId);
+      if (conversation.cursorExecution) await requireCursorGrant(project, conversation, actor);
+    }
   };
-  const requireManualConversation = async (project, id) => {
+  const requireIntegrationConversation = async (project, id, actor) => {
     if (typeof id !== 'string') protocolFail('INVALID_ARGUMENT', 'Select a linked conversation');
     const conversation = await conversationsFor(project).get(id);
-    if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'Bind this conversation explicitly before plugin access');
+    if (conversation.executionMode !== 'manual') await requireCursorGrant(project, conversation, actor);
     return conversation;
+  };
+  const integrationPublicState = async (project, id, actor) => {
+    const state = await coordinatorPublicState(project, id);
+    if (state.executionMode === 'manual') {
+      try { cursorExecutionScope(project, actor); state.cursorAvailable = true; }
+      catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.cursorAvailable = false; }
+    }
+    return state;
   };
   const integrationCommand = async (request, { actor, operationId, recoveryCheck }) => {
     const { type, payload = {}, projectId, conversationId } = request;
@@ -1352,7 +1451,7 @@ export async function startCloudServer({
     if (type === 'models.select') return (await modelSettingsFor(project)).select({ id: operationId, ...payload });
     if (type === 'conversation.relevance') {
       const input = relevanceInput(payload);
-      if (conversationId) await requireManualConversation(project, conversationId);
+      if (conversationId) await requireIntegrationConversation(project, conversationId, actor);
       const config = coordinatorConfigFor(project);
       if (!config?.enabled || !path.isAbsolute(config.providerFile || '')) protocolFail('COORDINATOR_DISABLED', 'Coordinator is unavailable for relevance checks');
       const memory = await readMemoryProject(configuredMemory, projectId);
@@ -1372,10 +1471,34 @@ export async function startCloudServer({
       await coordinatorFor(project, id); return { conversationId: id,
         ...(isMapProject(project) ? { mapNodeId: project.mapNodeId } : {}) };
     }
+    if (type === 'conversation.cursor') {
+      if (Object.keys(payload).some(key => key !== 'expectedMode') || payload.expectedMode !== 'manual') protocolFail('INVALID_ARGUMENT', 'Confirm the current manual mode explicitly');
+      const grant = cursorExecutionScope(project, actor), conversations = conversationsFor(project), before = await conversations.get(conversationId);
+      if (before.cursorExecution?.operationId === operationId) return conversations.enableCursor(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+      const service = await coordinatorFor(project, conversationId), key = `${project.id}:${conversationId}`;
+      if (cursorTransitions.has(key)) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
+      cursorTransitions.add(key);
+      cursorModeEpochs.set(key, (cursorModeEpochs.get(key) || 0) + 1);
+      try {
+        return await service.retireIdle(() => bindingsFor(project).withStableFocus(conversationId, async () => {
+          if ((await manualBriefsFor(project).approvals(conversationId)).some(proposal => proposal.pending && !proposal.stale) ||
+              (await bindingsFor(project).approvals(conversationId)).some(proposal => proposal.pending)) protocolFail('CONFLICT', 'Resolve pending human approvals before enabling Cursor');
+          const { store, principal } = interfaceProject(project);
+          if ((await store.projectTasks(principal)).some(task => task.conversationId === conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'Resolve the original execution before changing its host');
+          cursorExecutionScope(project, actor);
+          return conversations.enableCursor(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+        }));
+      } finally {
+        // Never drain a runner while holding its submit/binding/registry locks.
+        if (service.retired) { coordinators.delete(key); await service.inbox.close(); await service.close({ stop: true }); }
+        cursorTransitions.delete(key);
+      }
+    }
     if (type === 'conversation.bind') {
       if (isMapProject(project)) protocolFail('FORBIDDEN', 'Map 项目不能关联仓库执行对话');
       const id = payload.conversationId;
       const conversation = await conversationsFor(project).get(id);
+      if (conversation.cursorExecution) { await requireCursorGrant(project, conversation, actor); return { conversationId: id, executionMode: 'automatic' }; }
       const service = await coordinatorFor(project, id), state = await service.state();
       if (state.activeTurnId || state.status === 'running') protocolFail('COORDINATOR_BUSY', 'Wait for the current turn before binding');
       const { store, principal } = interfaceProject(project);
@@ -1422,8 +1545,8 @@ export async function startCloudServer({
       }
       return commitMainMemoryMap(configuredMemory, projectId, { operationId, baseVersion: payload.baseVersion, operations }, actor);
     }
-    await requireManualConversation(project, conversationId);
-    if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
+    const integrationConversation = await requireIntegrationConversation(project, conversationId, actor);
+    if (type === 'conversation.state') return integrationPublicState(project, conversationId, actor);
     if (type === 'conversation.submit') {
       const { history, participation, recovery, slackChannelId: _deliveryChannel, ...input } = payload;
       const recoveryOptions = recovery ? { operatorRecovery: recovery.operationId, recoveryGuard: async (state, journal) => {
@@ -1436,7 +1559,19 @@ export async function startCloudServer({
       if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');
       return (await coordinatorFor(project, conversationId)).interrupt({ ...payload, id: operationId }, { source: 'slack', actor });
     }
-    if (type === 'brief.review') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
+    if (type === 'brief.review') {
+      if (integrationConversation.executionMode === 'manual') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
+      if (Object.keys(payload).some(key => !['proposalId', 'version', 'decision', 'reason'].includes(key)) || typeof payload.version !== 'string' ||
+          !['approved', 'rejected'].includes(payload.decision) || payload.reason !== undefined && (typeof payload.reason !== 'string' || payload.reason.length > 1000)) protocolFail('INVALID_ARGUMENT', 'Review the exact original brief version');
+      const service = await coordinatorFor(project, conversationId), proposal = (await service.state()).approvals.find(value => value.id === payload.proposalId && value.projectTask);
+      if (!proposal || proposal.brief.version !== payload.version) protocolFail('CONFLICT', 'The original conversation brief changed');
+      const { store, principal } = interfaceProject(project), task = (await store.projectTasks(principal)).find(item => item.taskId === proposal.taskId && item.conversationId === conversationId);
+      if (!task?.cursorDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
+      await requireCursorGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation);
+      const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
+      kickTaskScheduler(project);
+      return { executionMode: 'automatic', taskId: result.taskId, stage: result.stage };
+    }
     if (type === 'binding.review') {
       const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
       return { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) };
@@ -1460,6 +1595,7 @@ export async function startCloudServer({
         if (stopping) break;
         try {
         let hosted;
+        if (task.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(task.conversationId), null, task.cursorDelegation);
         if (task.stage === 'dispatched') {
           const binding = await store.registeredBinding(human, task.sessionId);
           if (binding?.deviceId === 'cloud-cursor:' + project.id) hosted = await cursorRolesFor(project);
@@ -1469,7 +1605,8 @@ export async function startCloudServer({
           continue;
         }
         if (task.stage === 'queued') {
-            const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id]);
+            const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id] &&
+              (!task.cursorDelegation || id === task.cursorDelegation.templateSessionId && id === hostedTemplateId));
             const templateSessionId = templates.find(id => {
               if (hostedTemplateId === id) return true;
               const presence = interfacePresence.get(presenceKey(principal.repositoryId, id));
@@ -3035,10 +3172,10 @@ export async function startCloudServer({
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
     authorizeProject: authorizeIntegrationProject,
     logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
-    state: async scope => {
+    state: async (scope, { actor }) => {
       const project = await integrationProject(scope.projectId);
-      await requireManualConversation(project, scope.conversationId);
-      return coordinatorPublicState(project, scope.conversationId);
+      await requireIntegrationConversation(project, scope.conversationId, actor);
+      return integrationPublicState(project, scope.conversationId, actor);
     } });
   const heartbeat = setInterval(() => {
     for (const client of workbenchClients) if (!client.res.destroyed) client.res.write(': heartbeat\n\n');

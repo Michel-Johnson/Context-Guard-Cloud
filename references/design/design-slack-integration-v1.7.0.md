@@ -1,6 +1,6 @@
 # Slack 插件网关
 
-设计版本：v1.6.0。新增默认关闭的旧参与失败单次 operator 恢复合同；交流完成、即时状态、原绑定、工具续轮和底层文件格式不变。
+设计版本：v1.7.0。新增默认关闭的原对话 Cursor 执行入口；人工模式、交流完成、旧参与恢复和底层文件格式不变。实现与实际部署分别验收。
 
 读者：Cloud 管理员和插件开发者。Slack 与 Cloud 共用独立的 `Context-Guard-Cloud` 仓库和一个发布 SHA，但作为两个服务运行；安装和使用见 [插件 README](https://github.com/Michel-Johnson/Context-Guard-Cloud/blob/main/plugins/slack/README.md)。网关默认关闭，只监听本机，不配置公网代理。Slack SDK 只安装在插件包中，不随 Skill 安装。
 
@@ -19,7 +19,7 @@
 }
 ```
 
-`actions` 可指定下一节动作子集；不填时允许全部列出的动作。不新增用户角色体系，真实 Slack 用户 ID 持久写入操作回执。插件凭据是服务信任边界，不能下发给用户或执行 Agent。
+`actions` 可指定下一节动作子集；不填时允许普通动作，不含 `recovery.preflight` 或 `conversation.cursor`。不新增用户角色体系，真实 Slack 用户 ID 持久写入操作回执。插件凭据是服务信任边界，不能下发给用户或执行 Agent。
 
 视觉供应商 JSON 使用现有 `baseUrl/model/token` 格式，模型必须配置为 `glm-5.3-flash`；可配置 `protocol: "openai"`（baseUrl 为 API 根路径）或默认 Anthropic 协议。凭据仅放该私有文件。图片轮次缺少有效视觉配置时明确失败，不改用文本模型；文字轮次沿用项目原供应商。正式开放前必须真实验证模型可用性。
 
@@ -40,7 +40,36 @@
 
 总览的直接子节点作为项目入口；已有 `cloudProjectId` 保留原项目和历史绑定，其余入口按节点身份区分。同名不合并，改名不换身份；删除或移出项目入口后旧选择失效，不能改接到别的项目。Map 分支是唯一数据来源，不创建第二份 Map 或开发项目登记。
 
-新入口自动使用指定项目的已配置模型目录，但不继承仓库、文件写入、执行 Session 或派发权限。只建立人工 Coordinator 对话；读写限于所选分支，确认 brief 通过原 Map 版本校验保存事项和执行提示，不自动派发。底层文件格式不变。
+新入口自动使用指定项目的已配置模型目录，但不继承仓库、文件写入、执行 Session 或派发权限。只建立人工 Coordinator 对话；读写限于所选分支，确认 brief 通过原 Map 版本校验保存事项和执行提示，不自动派发。底层文件格式不变。下节 Cursor 能力只向另行配置的已注册仓库开放，不能用 Map 读取授权替代。
+
+## 原对话 Cursor 执行
+
+仅本次明确授权的 Cursor Executor/独立 Tester 接入使用此能力，不恢复通用自动派发系统。管理员在原私有集成配置的已审核 `actions` 中增加 `conversation.cursor`，并明确配置仓库项目、既有 Cursor Cloud 模板与 Slack 真人：
+
+```json
+{
+  "cursorExecution": {
+    "<已注册且已在 projectIds 开放的项目>": {
+      "templateSessionId": "<与 Cursor roles 一致的模板 ID>",
+      "userIds": ["<已核实的 Slack 用户 ID>"]
+    }
+  }
+}
+```
+
+保留现有动作白名单，不用示例覆盖现场配置。项目还须有准确 GitHub 数字身份、仓库 URL、固定源码提交、已启用 Coordinator、正确模板绑定和现有 Cursor `roles` 配置。仅有 Map 或来源错配时拒绝；厂商密钥仍保留原私有 provider 文件，不进入 Slack、提示词、Git 或模式回执。
+
+新对话仍默认 `manual`。已授权用户可在原线程点击「在当前对话启用 Cursor」，调用 `conversation.cursor`，payload 只有 `expectedMode:"manual"`。此操作原子保存原 chat 的自动执行模式和不可变授权回执，不创建另一个聊天、执行 Session 或厂商模型请求。
+
+转换只允许真正空闲的独立 chat。未结束模型轮、未决工具、压缩、待纳入输入、未决节点/brief 审批或活任务必须先处理。锁序固定 submit→binding→conversation；锁内退休旧实例并提交模式，锁外收拢与重建，旧迟到 submit 和工具调用不能恢复旧权限。无法安全转换的历史状态明确拒绝，不删除记录。
+
+缓存初始化在读取前记录原对话的模式代次，读取后、启动恢复和返回前核对代次与持久模式/授权。迟到的旧快照明确返回 `COORDINATOR_BUSY`，不能覆盖新缓存；失效初始化仅收拢自己创建的实例。模式退休与普通关闭区分，普通关闭仍完成当前持久工具步骤；失败的忙碌转换不打断在途工具。
+
+旧人工 brief、事项和批准完整保留，不转为自动派发批准。之后的新 brief 仍由人确认准确版本，使用原 `reviewProjectTask`、调度、Plan、交接和独立 CI 协议；任务归原 chat，已有事项关联不引导用户另开对话。另一个活任务占用的事项拒绝重复开发。
+
+后端把原授权摘要和准确模板固定在原 ProjectTask 的指纹中，模型不能声明宿主或操作者。调度只选择该 Cursor 模板，不因其他 Claude 在线而回退。审批、旧运输回执重放、状态/SSE、原生启动和回传均重查原授权；撤销或配置漂移保持失败，不补造成功。
+
+自动执行卡使用「确认并交给 Cursor」；确认后只说进入队列，不导出粘贴提示，也不把 `FINISHED` 当作任务完成。Plan、交接和独立测试回传原 Coordinator 与 Slack 线程。原生 Cursor、真实 Slack、部署与三路径任务验收另行记录，HTTP/受控厂商通过不代替它们。
 
 仅有 Map、尚未关联仓库的项目，导出提示明确标注“需求交接”，不声称已经支持该项目的 CLI/API 单文件读取或 Session 同步。用户确定实际仓库后，仍需按 Skill 原有流程确认项目与 Session 绑定。
 
@@ -78,13 +107,14 @@ Home 和原问题都提供实时搜索菜单；打开或输入时读取当前目
 | --- | --- |
 | `project.list` / `project.read` | 开放项目目录 / Main Map、版本和公开 Session 状态 |
 | `conversation.create` / `conversation.bind` | 创建人工执行对话 / 关联无活动自动执行工作的对话；关联后项目及执行模式不变 |
+| `conversation.cursor` | 显式可选；`expectedMode:"manual"`；经当前仓库/模板/真人授权，将空闲原 chat 启用为 Cursor 自动执行，不批准 brief、不调用厂商模型 |
 | `conversation.state` / `conversation.submit` | 公共消息、问题、审批及状态 / 提交文本、附件、问题答案或原 ID 重试 |
 | `conversation.interrupt` | `expectedTurnId`；新操作 ID 停止指定轮次，重复操作返回原回执，不改停后来轮次 |
 | `models.state` | 空 payload；读取当前项目默认文字模型、已配置模型安全目录和设置版本，不探测供应商健康 |
 | `models.select` | `providerId`、`baseVersion`；真实用户确认已配置模型，以原操作 ID 复用浏览器模型设置的 CAS 与持久回执 |
 | `conversation.relevance` | `text`（最多 10000 字符）、`context`（最多 6 条 `{speaker,text}`，每条文本 800 字符）、`files`（最多 6 个 `{name,mimeType}`）；可不带对话 ID。返回 `{respond,reason,mainVersion}`，网关按原 ID 保存判断回执；不创建对话、不写 Map、不调用业务工具 |
 | `map.write` | `baseVersion`、`operations`；复用 Main 事务校验，新 TODO/Bug 显式标记人工执行 |
-| `brief.review` | `proposalId`、`version`、`decision`、`reason`；指定版本确认或拒绝；确认不调用派发器 |
+| `brief.review` | `proposalId`、`version`、`decision`、`reason`；人工模式只保存事项/提示；经显式授权的 Cursor 自动模式签原对话的准确 brief，再由原调度派发 |
 | `prompt.read` | `proposalId`；读取已批准 brief 的完整执行提示 |
 | `attachment.upload` / `attachment.read` | filename、MIME、base64 / 项目隔离的附件引用及原文；不接受任意磁盘路径 |
 
