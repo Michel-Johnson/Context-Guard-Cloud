@@ -39,7 +39,7 @@ test('Main version and task changes update only the trailing context, not the st
   assert.doesNotMatch(a.staticText, /v1|pending|当前事项/);
   assert.match(b.dynamicText, /Main 版本：v2/);
   assert.match(b.dynamicText, /状态：done/);
-  assert.match(b.dynamicText, /模块记忆/);
+  assert.match(b.staticText, /模块记忆/); assert.doesNotMatch(b.dynamicText, /模块记忆/);
   assert.equal(coordinatorPrefix('role', a, tools), coordinatorPrefix('role', b, tools));
   const overview = snapshot(); overview.memory.map.root.children[0].todos[0].desc = '旧用途资料';
   const first = buildCoordinatorContext(overview);
@@ -72,6 +72,57 @@ test('Missing Map produces stable unavailable context and preserves its version 
   const a = buildCoordinatorContext({ version: 'a' }), b = buildCoordinatorContext({ version: 'b' });
   assert.equal(a.staticVersion, b.staticVersion);
   assert.match(a.dynamicText, /暂不可用/); assert.equal(b.version, 'b');
+});
+
+test('完整祖先正文不漏读，权限或容量不足明确标明来源节点', () => {
+  const doc = snapshot();
+  doc.memory.map.root.children[0].children.push({ id: 'N3', title: 'Testing', memoryDocument: '测试约束正文', children: [] });
+  const current = { id: 'main', nodeId: 'N3', kind: 'bug' };
+  const context = buildCoordinatorContext(doc, { conversation: current });
+  for(const text of ['项目概览','模块记忆','测试约束正文'])assert.equal(context.text.split(text).length - 1, 1);
+  assert.doesNotMatch(context.text, /不可见记忆/);
+  assert.deepEqual(context.memoryPath.map(node=>node.status), ['loaded','loaded','loaded']);
+  const restricted = buildCoordinatorContext(doc, { conversation: current, nodeIds: ['N3'] });
+  assert.doesNotMatch(restricted.text, /模块记忆/); assert.match(restricted.text, /权限不足/);
+  const bounded = buildCoordinatorContext(doc, { conversation: current, maxMemoryChars: 5 });
+  assert.doesNotMatch(bounded.text, /测试约束正文/); assert.match(bounded.text, /超过上下文容量/);
+  const emptyCapacity = buildCoordinatorContext(doc, { conversation: current, maxMemoryChars: 0 });
+  assert.doesNotMatch(emptyCapacity.text, /项目概览|模块记忆|测试约束正文/);
+  assert.deepEqual(emptyCapacity.memoryPath.map(node => node.status), ['capacity', 'capacity', 'capacity']);
+  const unboundCapacity = buildCoordinatorContext(doc, { maxMemoryChars: 0 });
+  assert.doesNotMatch(unboundCapacity.text, /项目概览/); assert.match(unboundCapacity.text, /项目记忆超过上下文容量/);
+  const deleted = buildCoordinatorContext(doc, { conversation: { ...current, nodeId: 'deleted' } });
+  assert.match(deleted.text, /当前绑定节点已不存在/); assert.doesNotMatch(deleted.text, /模块记忆|测试约束正文/);
+});
+
+test('连续三轮祖先正文各出现一次；更新与改绑替换固定背景，失败重试仍用原快照', async t => {
+  let current = snapshot(), focus = item, fail = false;
+  const { service, calls } = await setup(t, { maxModelRetries: 0,
+    context: async () => buildCoordinatorContext(current, { conversation: focus }),
+    model: { next: async request => {
+      calls.push(structuredClone({ system: request.system, messages: request.messages }));
+      if (fail) { fail = false; throw Object.assign(new Error('synthetic'), { code: 'MODEL_UNAVAILABLE' }); }
+      return structuredClone(answer);
+    } } });
+  for (let index = 0; index < 3; index++) {
+    await service.submit({ id: 'round-' + index, text: '继续讨论' }); await service.running;
+    const input = JSON.stringify(calls[index]);
+    for (const body of ['项目概览', '模块记忆']) assert.equal(input.split(body).length - 1, 1);
+    assert.equal(calls[index].system, calls[0].system);
+  }
+  current.memory.map.root.children[0].memoryDocument = '新版登录约束'; current.version = 'updated';
+  await service.submit({ id: 'update', text: '现在呢' }); await service.running;
+  assert.match(calls.at(-1).system, /新版登录约束/); assert.doesNotMatch(JSON.stringify(calls.at(-1)), /模块记忆/);
+  assert.match(calls.at(-1).messages.at(-1).content, /来源版本：updated/);
+  focus = { id: 'item-2', nodeId: 'N2' }; fail = true;
+  await service.submit({ id: 'rebind-retry', text: '换个模块继续' }); await service.running;
+  const accepted = structuredClone(calls.at(-1));
+  assert.match(accepted.system, /不可见记忆/); assert.doesNotMatch(accepted.system, /新版登录约束/);
+  current.memory.map.root.children[1].memoryDocument = '又一版约束'; current.version = 'latest';
+  await service.submit({ id: 'rebind-retry', text: '换个模块继续', retry: true }); await service.running;
+  assert.deepEqual(calls.at(-1), accepted);
+  await service.submit({ id: 'next-fresh', text: '读取最新约束' }); await service.running;
+  assert.match(calls.at(-1).system, /又一版约束/); assert.doesNotMatch(calls.at(-1).system, /不可见记忆/);
 });
 
 test('Fresh turns append Main snapshots and delivery metadata without rewriting earlier native history', async t => {

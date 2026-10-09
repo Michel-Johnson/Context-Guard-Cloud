@@ -198,7 +198,7 @@ test('Manual role is selected explicitly without changing legacy execution instr
   for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史摘要不是当前事实或授权']) {
     assert.ok(manual.includes(invariant), `Manual role preserves ${invariant}`);
   }
-  assert.ok(manual.length < automatic.length / 2, 'Profile excludes unrelated lifecycle text rather than appending overrides');
+  assert.doesNotMatch(manual, /自动发起中断恢复|审核 Plan/, '人工讨论提示词不包含执行调度规则');
   const windows = document.replace(/\n/g, '\r\n');
   assert.equal(coordinatorRolePrompt(windows, { manual: true }).replace(/\r\n/g, '\n'), manual);
   assert.equal(coordinatorRolePrompt('custom legacy guide'), 'custom legacy guide');
@@ -253,16 +253,17 @@ test('Manual native brief explains the complete existing-item identity rather th
   assert.match(fields.itemId.description || '', /existing.*exact.*item ID/i);
   assert.match(fields.itemId.description || '', /nodeId.*kind/i);
   assert.match(fields.nodeId.description || '', /existing.*owning Main node/i);
-  assert.match(fields.kind.description || '', /bug.*requires.*itemId/i);
+  assert.match(fields.kind.description || '', /修改已有 Bug 须提供 itemId 和 nodeId/);
+  assert.match(fields.kind.description || '', /新 Bug 不必提供 itemId/);
   assert.deepEqual(coordinatorTools, before, 'Automatic tools remain unchanged');
 });
 test('Manual memory tool describes read-before-write and scoped full-document replacement without changing the schema', () => {
   const before = structuredClone(coordinatorTools);
   const tools = filterManualTools(coordinatorTools);
   const tool = tools.find(x => x.name === 'edit_map'), original = before.find(x => x.name === 'edit_map');
-  assert.match(tool.description, /Create, update, move or delete.*TODO\/Bug/);
-  assert.match(tool.description, /For a memory update on an existing node/);
-  assert.match(tool.description, /read_map.*target.*before.*edit/i);
+  assert.match(tool.description, /更新、移动或删除已存在的 Main 节点及 TODO\/Bug/);
+  assert.match(tool.description, /新节点必须先用 propose_mount 取得人类确认/);
+  assert.match(tool.description, /修改记忆前先用 read_map 读取目标原文，保留无关内容/);
   const memory = tool.input_schema.properties.actions.items.properties.memoryDocument;
   assert.match(memory.description || '', /only.*requested.*sections/i);
   assert.match(memory.description || '', /preserve.*other.*sections/i);
@@ -938,12 +939,70 @@ async function manualFixture(t) {
     return receipt;
   };
   const options = { directory, projectId, readMain, commitMain }, service = new CoordinatorManualBriefs(options);
-  return { service, options, readMain, get commits() { return commits; }, interrupt() { throwAfterCommit = true; },
+  return { service, options, readMain, readReceipt: async request => receipts.get(request.operationId) || null,
+    get commits() { return commits; }, interrupt() { throwAfterCommit = true; },
     change() { document.root.memoryDocument = 'Updated project memory'; version = hash(JSON.stringify(document)); } };
 }
 const brief = version => ({ text: 'Correct token renewal', acceptance: 'Expired tokens are refreshed once', nodeIds: ['LOGIN'], mainVersion: version });
 const review = (proposal, decision = 'approved') => ({ proposalId: proposal.id, version: proposal.version, decision, reason: 'Human reviewed this exact brief' });
 const context = (operationId = 'review-first') => ({ operationId, conversationId: 'chat-fixture', actor });
+
+test('新 TODO 和 Bug 只在已确认主节点形成 brief，审批后各存一份正确类型的事项', async t => {
+  for (const kind of ['todo', 'bug']) {
+    const f = await manualFixture(t);
+    const binding = { nodeId: 'LOGIN', kind, bindingApproval: 'human-approved-' + kind };
+    const service = new CoordinatorManualBriefs({ ...f.options, readBinding: async () => binding });
+    const before = await f.readMain();
+    const proposal = await service.prepare({ ...brief(before.version), kind }, context('new-' + kind));
+    assert.equal(proposal.kind, kind); assert.equal(f.commits, 0);
+    assert.equal(proposal.pathText, 'Fixture：尚未填写描述\n└─ Login：Token renewal');
+    const result = await service.review(review(proposal), context('approve-new-' + kind));
+    const node = (await f.readMain()).document.root.children[0];
+    const item = node[kind === 'bug' ? 'bugs' : 'todos'].find(item => item.id === result.itemId);
+    assert.equal(item.status, kind === 'bug' ? 'open' : 'pending');
+    assert.equal(item.executionMode, 'manual'); assert.equal(f.commits, 1);
+    assert.equal(node[kind === 'bug' ? 'todos' : 'bugs'].some(item => item.id === result.itemId), false);
+    await service.review(review(proposal), context('approve-new-' + kind)); assert.equal(f.commits, 1);
+  }
+});
+
+test('未确认、跨主节点和多节点 brief 被拒绝；改绑使旧 brief 审批失效且 Main 不变', async t => {
+  const f = await manualFixture(t); let binding = { nodeId: 'LOGIN', kind: 'todo' };
+  const service = new CoordinatorManualBriefs({ ...f.options, readBinding: async () => binding });
+  const original = await f.readMain(), input = brief(original.version);
+  await assert.rejects(service.prepare(input, context('unbound')), { code: 'APPROVAL_REQUIRED' });
+  binding.bindingApproval = 'confirmed-login';
+  await assert.rejects(service.prepare({ ...input, nodeIds: ['T0'] }, context('other-node')), { code: 'APPROVAL_REQUIRED' });
+  await assert.rejects(service.prepare({ ...input, nodeIds: ['LOGIN', 'T0'] }, context('multiple-nodes')), { code: 'INVALID_ARGUMENT' });
+  const proposal = await service.prepare(input, context('before-rebind'));
+  binding = { nodeId: 'T0', kind: 'todo', bindingApproval: 'confirmed-project' };
+  await assert.rejects(service.review(review(proposal), context('stale-confirm')), { code: 'VERSION_CONFLICT' });
+  assert.deepEqual(await f.readMain(), original); assert.equal(f.commits, 0);
+});
+
+test('提交前失败后改绑不得把旧 intent 写入原节点；已提交失回只恢复原回执', async t => {
+  for (const committed of [false, true]) {
+    const f = await manualFixture(t); let binding = { nodeId: 'LOGIN', kind: 'todo', bindingApproval: 'first-focus' }, failed = false;
+    const service = new CoordinatorManualBriefs({ ...f.options, readBinding: async () => binding, readCommitReceipt: f.readReceipt,
+      commitMain: async (...args) => {
+        if (committed) { f.interrupt(); return f.options.commitMain(...args); }
+        if (!failed) { failed = true; throw Object.assign(new Error('before-commit'), { code: 'TEMPORARY_UNAVAILABLE' }); }
+        return f.options.commitMain(...args);
+      } });
+    const proposal = await service.prepare(brief((await f.readMain()).version), context('prepare-intent'));
+    await assert.rejects(service.review(review(proposal), context('intent-review')));
+    binding = { nodeId: 'T0', kind: 'todo', bindingApproval: 'new-focus' };
+    const restarted = new CoordinatorManualBriefs({ ...f.options, readBinding: async () => binding, readCommitReceipt: f.readReceipt });
+    if (committed) {
+      assert.equal((await restarted.review(review(proposal), context('intent-review'))).decision, 'approved');
+      assert.equal(f.commits, 1);
+    } else {
+      await assert.rejects(restarted.review(review(proposal), context('intent-review')), { code: 'VERSION_CONFLICT' });
+      assert.equal(f.commits, 0);
+    }
+    assert.equal((await f.readMain()).document.root.children[0].todos.length, committed ? 1 : 0);
+  }
+});
 
 test('Manual Bug intent without item identity is rejected instead of silently proposing a new TODO', async t => {
   const fixture = await manualFixture(t), { service } = fixture;
@@ -1045,5 +1104,5 @@ test('Manual rejection does not mutate Main and manual tools cannot dispatch or 
   const result = await fixture.service.review(review(proposal, 'rejected'), context());
   assert.equal(result.decision, 'rejected'); assert.equal(result.prompt, undefined); assert.equal(fixture.commits, 0);
   const tools = filterManualTools(['dispatch_task', 'request_ci', 'prepare_task', 'read_map', 'complete_task'].map(name => ({ name, description: 'old' })));
-  assert.deepEqual(tools.map(tool => tool.name), ['prepare_task', 'read_map']); assert.match(tools[0].description, /manual/);
+  assert.deepEqual(tools.map(tool => tool.name), ['prepare_task', 'read_map']); assert.match(tools[0].description, /不自动派发/);
 });

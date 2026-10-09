@@ -48,7 +48,7 @@ export const coordinatorTools = [
       title: string, purpose: string, memoryDocument: { type: 'string', maxLength: 12000 }, kind: { enum: ['module', 'work', 'node', 'todo', 'bug'] }, state: { enum: ['dirty', 'untested', 'success'] }, owns: strings,
     }, required: ['op'], additionalProperties: false } },
   }),
-  definition('mount_conversation', 'Attach the Coordinator to a Main node. Does not write Main and does not create an execution Session; that Session is created after the brief is approved.', {
+  definition('mount_conversation', '提出唯一主节点的绑定或改绑建议，返回完整路径供人类确认。此工具不会直接绑定；用户同意后由宿主保存。相关模块仅按需读取，绑定不代表批准开发。', {
     mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'] }, title: string, description: string,
   }),
   definition('ask_user', 'Ask one clarification; not for brief approval or final acceptance.', { question: string, options: { type: 'array', items: { ...string, maxLength: 120 }, minItems: 2, maxItems: 6, uniqueItems: true }, nodeIds }, ['question']),
@@ -123,7 +123,11 @@ export function createCoordinatorExecutor(ctx) {
         ...(input.nodeIds ? { nodes: await ctx.resolveNodes(input.nodeIds) } : {}), approval: 'not-granted' };
     }
     if (name === 'edit_map') return ctx.editMap(input, operationId);
-    if (name === 'mount_conversation') return ctx.mountConversation(input, operationId);
+    if (name === 'mount_conversation') {
+      if (!['human', 'slack'].includes(options.source)) throw Object.assign(new Error('绑定建议需要当前人类输入'), { code: 'TOOL_FORBIDDEN' });
+      return ctx.mountConversation(input, operationId, { ...options,
+        actor: options.actor || { kind: 'human', sessionId: 'browser-human' } });
+    }
     if (name === 'write_file') return ctx.writeFile(input, operationId);
     if (name === 'propose_mount') {
       const parent = await ctx.readMap(input.parentId);

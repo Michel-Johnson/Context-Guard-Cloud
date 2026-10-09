@@ -797,10 +797,11 @@ test('Cloud mount confirmation is browser-only, commits a versioned batch atomic
   };
   server = await startCloudServer(options);
   const input = { id: 'human-mount', proposalIds: ['a', 'b'], decision: 'approved', reason: 'Confirmed both responsibilities' };
-  const send = (body, token = 'test-browser') => fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator/mount-review`, {
-    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  const send = (body, token = 'test-browser', human = token === 'test-browser') => fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator/mount-review`, {
+    method: 'POST', headers: { ...(human ? { Cookie: 'cg_workbench=test-browser', Origin: server.url } : { Authorization: `Bearer ${token}` }), 'Content-Type': 'application/json' }, body: JSON.stringify(body),
   });
   assert.equal((await send(input, 'synthetic-agent')).status, 401);
+  assert.equal((await send(input, 'test-browser', false)).status, 401, 'Bearer 凭据不代表人类确认');
   assert.notEqual((await send({ ...input, role: 'human' })).status, 200);
   assert.equal((await send({ ...input, id: 'stale-review', proposalIds: ['stale'] })).status, 409);
   assert.equal((await readMemoryView(memoryConfig, projectId)).main.memory.map.root.children.length, 0);
@@ -1091,7 +1092,11 @@ test('Coordinator context carries the full static directory and only the mounted
   assert.match(context.text, /节点导航：\n- Root \[T0\]：Whole project\n  - Reader \[N1\]：Public reading\n    - Article \[N2\]：Article page\n  - Admin \[N3\]：Private admin/);
   assert.doesNotMatch(context.text, /staticDirectory|parentId|children/);
   assert.match(context.text, /## 当前事项\n- 类型：TODO\n- 事项 ID：TD1\n- 所在节点：Article \[N2\]\n- 标题：Improve article\n- 要求：Make the published article readable\n- 状态：pending/);
-  assert.match(context.text, /## 当前节点及祖先记忆\n- Root \[T0\]\n  - 记忆：root memory\n- Reader \[N1\]\n  - 记忆：reader memory\n- Article \[N2\]\n  - 记忆：article memory/);
+  assert.match(context.text, /## 当前节点及祖先记忆/);
+  for (const [title, id, memory] of [['Root', 'T0', 'root memory'], ['Reader', 'N1', 'reader memory'], ['Article', 'N2', 'article memory']]) {
+    assert.ok(context.text.includes(`- ${title} [${id}]\n  - 记忆：${memory}\n  - 尚未建立记忆正文。`));
+    assert.equal(context.text.split(memory).length - 1, 1);
+  }
   assert.doesNotMatch(context.text, /private unrelated memory|"conversation"|"currentTask"/);
   snapshot.memory.map.root.children[0].children[0].todos[0].status = 'processing';
   const refreshed = buildCoordinatorContext(snapshot, { conversation });
@@ -1186,7 +1191,7 @@ test('Main overview purpose excerpts preserve raw titles and technical facts wit
   assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘录|按键焦点资料/);
 });
 
-test('Coordinator loads project memory before dialogue and one relevant node document on focus', () => {
+test('Coordinator 对话先读项目记忆，绑定后读取祖先正文并标明当前节点缺失正文', () => {
   const snapshot = { version: 'main-memory-1', memory: { map: { root: {
     id: 'T0', title: '实验博客', purpose: '验证博客', memoryDocument: '# 实验博客 · 项目记忆\n\n## 目标\n\n实验不得发布生产。',
     memories: [{ text: '旧项目流水' }], children: [
@@ -1200,7 +1205,10 @@ test('Coordinator loads project memory before dialogue and one relevant node doc
   assert.match(project.text, /实验不得发布生产/);
   assert.doesNotMatch(project.text, /旧项目流水|键盘可跳转正文|不公开私有数据/);
   const focused = buildCoordinatorContext(snapshot, { conversation: { id: 'item-1', nodeId: 'N2' } });
-  assert.match(focused.text, /## 当前节点记忆 \[N1\]\n# 阅读 · 节点记忆/);
+  assert.match(focused.staticText, /### 阅读 的记忆正文 \[N1\]\n# 阅读 · 节点记忆/);
+  assert.match(focused.dynamicText, /正文已加载；来源版本：main-memory-1/);
+  assert.match(focused.text, /- 列表 \[N2\]\n  - 尚未建立记忆正文。/);
+  assert.equal(focused.text.split('实验不得发布生产。').length - 1, 1);
   assert.match(focused.text, /键盘可跳转正文/);
   assert.doesNotMatch(focused.text, /旧项目流水|旧阅读流水|不公开私有数据/);
 });
@@ -2151,7 +2159,7 @@ test('Coordinator Map actions compile structural and destructive Main changes', 
   assert.throws(() => coordinatorStructureOperations([{ op: 'update', id: 'N1', todos: [] }], 'turn:records'), { code: 'FORBIDDEN' });
 });
 
-test('Cloud Coordinator edits Main and mounts a durable item through configured tools', async t => {
+test('Cloud Coordinator 编辑 Main，提出绑定建议并等人类确认后保存归属', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-coordinator-map-tools-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -2185,16 +2193,19 @@ test('Cloud Coordinator edits Main and mounts a durable item through configured 
       } }] };
     } }),
   });
+  const browserLogin = await fetch(`${server.url}/auth?token=test-browser`, { redirect: 'manual' });
+  assert.equal(browserLogin.status, 302);
+  const browserHeaders = { Cookie: browserLogin.headers.get('set-cookie').split(';')[0], Origin: server.url, 'Content-Type': 'application/json' };
   const call = async (method, body) => {
     const response = await fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator`, {
-      method, headers: { Authorization: 'Bearer test-browser', 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}),
+      method, headers: browserHeaders, ...(body ? { body: JSON.stringify(body) } : {}),
     });
     assert.ok(response.ok, await response.clone().text()); return response.json();
   };
   const submit = async body => {
     for (let i = 0; i < 100; i++) {
       const response = await fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator`, {
-        method: 'POST', headers: { Authorization: 'Bearer test-browser', 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        method: 'POST', headers: browserHeaders, body: JSON.stringify(body),
       });
       if (response.ok) return response.json();
       const result = await response.json();
@@ -2224,14 +2235,29 @@ test('Cloud Coordinator edits Main and mounts a durable item through configured 
   assert.equal(memory.main.version, mountedVersion);
   assert.deepEqual(memory.main.memory.map.root.todos, []);
   const mounted = state.messages.findLast(message => message.actions)?.actions[0];
-  assert.equal(mounted.kind, 'conversation-mounted');
+  assert.equal(mounted.kind, 'binding-proposal');
+  assert.equal(state.focus.nodeId, null, '模型建议不是人类确认');
+  assert.equal(mounted.pathText, 'Lab：尚未填写描述');
   assert.equal(mounted.item, undefined);
   assert.equal(mounted.executionSessionId, undefined);
   assert.equal(mounted.conversationId, 'legacy');
   assert.equal((await call('GET')).projectTasks.length, 0);
   assert.equal((await call('GET')).sessionCreations.length, 0);
+  const review = { id: 'human-binding-review', proposalId: mounted.id, version: mounted.version, decision: 'approved' };
+  const confirmation = await fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator/binding-review`, {
+    method: 'POST', headers: browserHeaders, body: JSON.stringify(review),
+  });
+  assert.equal(confirmation.status, 200, await confirmation.clone().text());
+  assert.equal((await confirmation.json()).decision, 'approved');
+  state = await wait();
+  assert.deepEqual(state.focus, { nodeId: 'T0', kind: 'todo' });
+  assert.equal((await readMemoryView(memoryConfig, projectId)).main.version, mountedVersion);
+  const duplicate = await fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator/binding-review`, {
+    method: 'POST', headers: browserHeaders, body: JSON.stringify(review),
+  });
+  assert.equal(duplicate.status, 200); assert.equal((await duplicate.json()).decision, 'approved');
   const continuedResponse = await fetch(`${server.url}/api/workbench/projects/${projectId}/api/coordinator?conversation=${mounted.conversationId}`, {
-    headers: { Authorization: 'Bearer test-browser' },
+    headers: browserHeaders,
   });
   assert.ok(continuedResponse.ok);
   assert.match(JSON.stringify((await continuedResponse.json()).messages), /挂载这个需求/);

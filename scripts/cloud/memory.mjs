@@ -417,6 +417,18 @@ function retainStoredDispatch(document, operations) {
     return op;
   });
 }
+export async function readMainMemoryReceipt(configuration, projectId, input, actor) {
+  validateOptions(configuration);
+  return withFileLock(projectMemoryLockFile(configuration.dataDir, projectId), async () => {
+    const state = await readMemoryProject(configuration, projectId);
+    const receipt = state.receipts[hash(`main-workbench:${input.operationId}`)];
+    if (!receipt) return null;
+    const fingerprint = hash(encode({ baseVersion: input.baseVersion ?? null, operations: input.operations, actor }));
+    if (receipt.fingerprint !== fingerprint) throw new MapError('ID_REUSED', '提交回执与原操作不一致', 409);
+    return receiptResult(state, receipt);
+  });
+}
+
 export async function commitMainMemoryMap(configuration, projectId, input, actor = { kind: 'human', sessionId: 'cloud-workbench' }, { preserveStoredDispatch = false } = {}) {
   validateOptions(configuration);
   if (!configuration.projects?.[projectId]) throw new MapError('NOT_FOUND', 'Memory project is not configured', 404);

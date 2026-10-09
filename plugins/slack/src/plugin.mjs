@@ -2,7 +2,7 @@ import { digest, threadKey } from './store.mjs';
 import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
-import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
+import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 // This narrow boundary repeats the Cloud enum deliberately; contract tests
@@ -430,6 +430,8 @@ export class SlackPlugin {
       else if (action.action_id === 'reject_brief') await this.review(id, userId, value, 'rejected', '用户要求继续讨论并修改 brief');
       else if (action.action_id === 'answer_question') await this.answer(id, userId, value);
       else if (action.action_id === 'approve_brief') await this.review(id, userId, value, 'approved', '用户在 Slack 中确认 brief');
+      else if (action.action_id === 'approve_binding') await this.reviewBinding(id, userId, value, 'approved');
+      else if (action.action_id === 'reject_binding') await this.reviewBinding(id, userId, value, 'rejected');
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
@@ -1180,6 +1182,15 @@ export class SlackPlugin {
     });
     return result;
   }
+  async reviewBinding(id, userId, value, decision) {
+    const binding = this.store.data.threads[value.key];
+    if (!binding) throw new Error('Unknown Slack thread');
+    const result = await this.command('binding.review', binding, userId, operationId(id, 'binding-review'),
+      { proposalId: value.proposalId, version: value.version, decision });
+    await this.io.post({ id: operationId(id, 'binding-result'), channel: binding.channel, threadTs: binding.threadTs, text: result.message });
+    await this.store.update(data => { data.threads[value.key].nextPoll = 0; });
+    return result;
+  }
   async exportPrompt(id, userId, value) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const prompt = await this.command('prompt.read', binding, userId, operationId(id, 'prompt'), { proposalId: value.proposalId });
@@ -1408,6 +1419,17 @@ export class SlackPlugin {
       }
     }
     for (const approval of state.approvals || []) {
+      if (approval.kind === 'binding-proposal') {
+        const id = `binding:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
+        if (prior?.hash === hash || approval.pending === false && !prior) continue;
+        const text = approval.pending ? 'Coordinator：请确认需求的主节点' :
+          approval.decision === 'approved' ? '已确认绑定到' + approval.node.title : approval.decision === 'superseded' ? '已有新的绑定建议' : '暂不绑定，继续讨论';
+        const blocks = approval.pending ? bindingBlocks(approval, key) : [section(text)];
+        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
+          await this.io.post({ id: operationId(`${key}:${id}`, 'binding-card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
+        await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
+        continue;
+      }
       if (approval.manual !== true) continue;
       const id = `approval:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
       if (prior?.hash === hash) continue;

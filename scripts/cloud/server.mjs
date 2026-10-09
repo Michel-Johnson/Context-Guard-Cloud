@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap as commitStoredMainMemoryMap, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap as commitStoredMainMemoryMap, readMainMemoryReceipt, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -24,6 +24,8 @@ import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, Coordinator
 import { coordinatorTools, coordinatorReferences, coordinatorReferenceFiles, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
+import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
+import { coordinatorNodePath } from '../shared/coordinator-path.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
@@ -496,6 +498,7 @@ export async function startCloudServer({
   }
   const integrationAttachments = integrations ? new IntegrationAttachmentStore({ directory: path.join(dataDir, 'integration-attachments'), maxBytes: 5 * 1024 * 1024 }) : null;
   const manualBriefStores = new Map();
+  const bindingStores = new Map();
   const modelSettings = new Map();
   const mapTranslations = new MapTranslations();
   const modelSettingsFor = project => {
@@ -520,9 +523,21 @@ export async function startCloudServer({
       directory: path.join(dataDir, 'manual-briefs', project.id), projectId: project.id,
       ...(isMapProject(project) ? { mapOnly: true } : {}),
       readMain: async () => { const { main } = await readMemoryProject(configuredMemory, project.id); return { version: main?.version, document: main?.memory?.map }; },
+      readBinding: conversationId => conversationsFor(project).get(conversationId),
+      readCommitReceipt: (input, actor) => mapProjectRefs.has(project.id)
+        ? readOverviewReceipt(input, actor, mapProjectRefs.get(project.id))
+        : readMainMemoryReceipt(configuredMemory, project.id, input, actor),
       commitMain: (input, actor) => commitMainMemoryMap(configuredMemory, project.id, input, actor),
     }));
     return manualBriefStores.get(project.id);
+  };
+  const bindingsFor = project => {
+    if (!bindingStores.has(project.id)) bindingStores.set(project.id, new CoordinatorBindings({
+      directory: path.join(dataDir, 'coordinators', project.id), conversations: conversationsFor(project),
+      nodeIds: coordinatorConfigFor(project)?.nodeIds || null,
+      readMain: async () => (await readMemoryProject(configuredMemory, project.id)).main,
+    }));
+    return bindingStores.get(project.id);
   };
   if (configuredMemory) await enforceMainHistoryRetention(configuredMemory);
   const memoryHandler = configuredMemory ? createMemoryHandler(configuredMemory, { authorizeDevice: async ({ credential, projectId, sessionId, scope, method }) => {
@@ -737,6 +752,9 @@ export async function startCloudServer({
         };
         const execute = createCoordinatorExecutor({
           authorizeTool: async (name, input, { caller }) => {
+            const liveConversation = await conversations.get(conversationId);
+            Object.assign(conversation, liveConversation);
+            for (const field of ['nodeId', 'kind', 'itemId', 'bindingApproval']) if (!Object.hasOwn(liveConversation, field)) delete conversation[field];
             if (!tools.some(tool => tool.name === name)) protocolFail('FORBIDDEN', 'Tool is not enabled for this conversation');
             if (caller && input.executionSessionId && !await callerBinding(caller, input.executionSessionId)) {
               protocolFail('FORBIDDEN', 'This Session is not assigned to the caller');
@@ -911,7 +929,10 @@ export async function startCloudServer({
                 protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
               }
               const requirements = focused ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind } : input;
-              return manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor });
+              if (!requirements.itemId && (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId)) {
+                protocolFail('APPROVAL_REQUIRED', '新需求先提出主节点绑定建议，等人类确认后再整理 brief；相关模块按需读取，不加入绑定。');
+              }
+              return bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor }));
             }
             const requirements = conversation?.itemId
               ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind }
@@ -956,7 +977,9 @@ export async function startCloudServer({
             return ids.map(id => {
               const entry = index.get(id), node = entry?.node;
               if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(id)) protocolFail('NOT_FOUND', 'Referenced Main node is unavailable');
-              return { id, title: node.title, purpose: node.purpose || '' };
+              return { id, title: node.title, purpose: node.purpose || '',
+                path: coordinatorNodePath(root, id, { nodeIds: config.nodeIds || null })
+                  .map(({ id, title, purpose }) => ({ id, title, purpose })) };
             });
           },
           readMap: async id => {
@@ -977,6 +1000,9 @@ export async function startCloudServer({
           },
           editMap: async (input, operationId) => {
             if (config.mapWrite !== true) protocolFail('FORBIDDEN', 'Coordinator Map writing is not enabled for this project');
+            if (manual && input.actions.some(action => action.op === 'create')) {
+              protocolFail('APPROVAL_REQUIRED', '创建新节点请使用 propose_mount，等人类确认后再创建。');
+            }
             const operations = coordinatorStructureOperations(input.actions, operationId);
             const result = await commitMainMemoryMap(configuredMemory, project.id, { operationId: `coordinator-map:${operationId}`,
               baseVersion: input.mainVersion, operations }, { kind: 'coordinator', sessionId: '', agentId: principal.agentId });
@@ -984,41 +1010,9 @@ export async function startCloudServer({
             return { kind: 'map-action', message: 'Map 已更新', version: result.version,
               nodes: [...new Set(result.nodeIds)].map(id => index.get(id)?.node).filter(Boolean).map(node => ({ id: node.id, title: node.title, purpose: node.purpose || '' })) };
           },
-          mountConversation: async (input, operationId) => {
-            if (!['todo', 'bug', 'idea'].includes(input.kind)) protocolFail('INVALID_ARGUMENT', 'Unsupported work item kind');
-            if (manual) {
-              if (config.mapWrite !== true) protocolFail('FORBIDDEN', 'Coordinator item mounting is not enabled for this project');
-              const file = path.join(dataDir, 'coordinators', project.id, 'manual-mounts', digest(operationId) + '.json');
-              return withFileLock(file + '.lock', async () => {
-                let intent = await readJSON(file, null);
-                const fingerprint = digest(JSON.stringify({ input, conversationId }));
-                if (intent && intent.fingerprint !== fingerprint) protocolFail('ID_REUSED', 'Mount ID belongs to another request');
-                if (!intent) {
-                  const snapshot = await readMemoryProject(configuredMemory, project.id);
-                  if (snapshot.main.version !== input.mainVersion) protocolFail('VERSION_CONFLICT', 'Main changed; read the node again');
-                  const node = entries(snapshot.main.memory.map.root).get(input.nodeId)?.node;
-                  if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(node.id)) protocolFail('NOT_FOUND', 'Node is unavailable');
-                  intent = { fingerprint, version: snapshot.main.version, node: { id: node.id, title: node.title }, kind: input.kind, title: input.title };
-                  await atomicWrite(file, json(intent));
-                }
-                await conversations.setFocus(conversationId, { nodeId: intent.node.id, kind: intent.kind, title: intent.title });
-                Object.assign(conversation, { nodeId: intent.node.id, kind: intent.kind });
-                delete conversation.itemId;
-                return { kind: 'map-action', actionId: operationId, version: intent.version, node: intent.node,
-                  message: '已挂载到节点；未写入 Main，也未创建执行 Session。' };
-              });
-            }
-            if (conversationId.startsWith('item-')) protocolFail('INVALID_ARGUMENT', 'This item is already mounted; prepare its project requirements');
+          mountConversation: async (input, operationId, { actor }) => {
             if (config.mapWrite !== true) protocolFail('FORBIDDEN', 'Coordinator item mounting is not enabled for this project');
-            const memory = await readMemoryProject(configuredMemory, project.id), snapshot = memory.main;
-            if (snapshot.version !== input.mainVersion) protocolFail('VERSION_CONFLICT', 'Main changed; read the target node again');
-            const node = entries(snapshot.memory.map.root).get(input.nodeId)?.node;
-            if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(input.nodeId)) protocolFail('NOT_FOUND', 'Mount target is unavailable');
-            await conversations.setFocus(conversationId, { nodeId: node.id, kind: input.kind, title: input.title });
-            Object.assign(conversation, { nodeId: node.id, kind: input.kind, title: input.title });
-            delete conversation.itemId;
-            return { kind: 'conversation-mounted', message: '已挂载到节点；未写入 Main，也未创建执行 Session。用户批准 brief 后，系统为该事项创建新的执行 Session 并派发。',
-              conversationId, node: { id: node.id, title: node.title }, version: snapshot.version };
+            return bindingsFor(project).propose(input, { operationId, conversationId, actor });
           },
           // Conversation ownership is a UI routing hint, not an authorization
           // boundary. Every Coordinator conversation uses the same project
@@ -1068,6 +1062,12 @@ export async function startCloudServer({
         const visionProvider = integrations?.visionProviderFile ? await readJson(integrations.visionProviderFile) : null;
         if (visionProvider && visionProvider.model !== 'glm-5.3-flash') throw new MapError('INVALID_VISION_PROVIDER', 'Slack image turns require glm-5.3-flash', 503);
         const settings = config.modelProviders ? await modelSettingsFor(project) : null;
+        const loadContext = async () => {
+          const snapshot = (await readMemoryProject(configuredMemory, project.id)).main;
+          const context = buildCoordinatorContext(snapshot, { conversation: await conversations.get(conversationId), nodeIds: config.nodeIds || null });
+          const pending = (await bindingsFor(project).approvals(conversationId)).find(item => item.pending);
+          return { ...context, bindingRef: pending ? { id: pending.id, version: pending.version } : null };
+        };
         const service = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
@@ -1075,8 +1075,19 @@ export async function startCloudServer({
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
           ...(integrations ? { onStateChange: () => integrationGateway?.notify({ projectId: project.id, conversationId }) } : {}),
-          context: async () => buildCoordinatorContext((await readMemoryProject(configuredMemory, project.id)).main,
-            { conversation, nodeIds: config.nodeIds || null }), simulated: config.simulated === true });
+          context: loadContext,
+          beforeAcceptHumanInput: async ({ inputs, context, source, actor }) => {
+            if (!context?.bindingRef || !['human', 'slack'].includes(source) || actor?.kind !== 'human') return context;
+            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text));
+            if (!confirmation) return context;
+            try {
+              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef });
+              return result ? await loadContext() : context;
+            } catch (error) {
+              if (!(error instanceof MapError)) throw error;
+              return { ...context, dynamicText: context.dynamicText + '\n绑定未生效：' + error.message };
+            }
+          }, simulated: config.simulated === true });
         const intake = conversationId === 'legacy' ? mapIntakeFor(project, { submit: async (request, options) => {
           const item = JSON.parse(request.text), id = await itemConversation(project, item);
           return (await coordinatorFor(project, id)).submit(request, options);
@@ -1146,8 +1157,24 @@ export async function startCloudServer({
     }
     return { pending: false };
   };
+  const notifyBindingReviews = async (project, conversationId, service) => {
+    for (const result of await bindingsFor(project).notifications(conversationId)) {
+      const id = 'binding-notice:' + result.proposalId + ':' + result.decision;
+      const state = await service.state();
+      if (state.acceptedRequestIds?.includes(id) || result.humanInputId && state.acceptedRequestIds?.includes(result.humanInputId)) {
+        await bindingsFor(project).acknowledge(result.proposalId, conversationId); continue;
+      }
+      if (state.activeTurnId || state.status === 'running') return { pending: true };
+      try {
+        await service.submit({ id, text: JSON.stringify({ type: 'human.binding-review', ...result }) }, { source: 'workflow' });
+        await bindingsFor(project).acknowledge(result.proposalId, conversationId);
+      } catch (error) { return { pending: true, error: { code: error.code || 'NOTIFICATION_FAILED' } }; }
+    }
+    return { pending: false };
+  };
   const coordinatorPublicState = async (project, conversationId) => {
     const service = await coordinatorFor(project, conversationId);
+    const bindingNotification = await notifyBindingReviews(project, conversationId, service);
     let state = await service.state();
     const conversation = await conversationsFor(project).get(conversationId);
     if (conversation.executionMode === 'manual') {
@@ -1162,7 +1189,10 @@ export async function startCloudServer({
       state.projectTasks = [];
       state.sessionTemplates = [];
     }
-    return { ...state, conversationId };
+    const bindingApprovals = await bindingsFor(project).approvals(conversationId);
+    const bindingIds = new Set(bindingApprovals.map(proposal => proposal.id));
+    return { ...state, approvals: [...state.approvals.filter(item => item.kind !== 'binding-proposal' && !bindingIds.has(item.id)), ...bindingApprovals],
+      focus: { nodeId: conversation.nodeId || null, kind: conversation.kind || null }, bindingNotification, conversationId };
   };
   const submitCoordinator = async (project, conversationId, input, options = {}) => {
     if (!input || Object.keys(input).some(key => !['id', 'text', 'inputs', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
@@ -1189,7 +1219,7 @@ export async function startCloudServer({
   const reviewManualBrief = async (project, conversationId, input, actor) => {
     const conversation = await conversationsFor(project).get(conversationId);
     if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'This conversation does not use manual execution');
-    const result = await manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor });
+    const result = await bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor }));
     const notification = await notifyManualReviews(project, conversationId, await coordinatorFor(project, conversationId));
     return { ...result, notification };
   };
@@ -1308,6 +1338,10 @@ export async function startCloudServer({
       return (await coordinatorFor(project, conversationId)).interrupt({ ...payload, id: operationId }, { source: 'slack', actor });
     }
     if (type === 'brief.review') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
+    if (type === 'binding.review') {
+      const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
+      return { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) };
+    }
     if (type === 'prompt.read') return manualBriefsFor(project).prompt(payload.proposalId, conversationId);
     protocolFail('INVALID_ARGUMENT', 'Unsupported integration operation');
   };
@@ -1615,12 +1649,22 @@ export async function startCloudServer({
     const document = snapshot.document || emptyProjectDocument(project);
     return { projectId: project.id, version: snapshot.version || versionOf(document), document };
   };
+  const overviewRequestDigest = (input, actor, project) => digest(JSON.stringify({ baseVersion: input.baseVersion, operations: input.operations,
+    ...(project ? { projectId: project.id, actor } : {}) }));
+  const readOverviewReceipt = (input, actor, project) => serial('overview', () => withFileLock(overviewFile + '.lock', async () => {
+    await recoverTransactions('overview');
+    const operationId = validateOperationId(input);
+    if (project) await mapProjects.get(project.id);
+    const previous = await readJson(operationFile('overview', operationId), null);
+    if (!previous) return null;
+    if (previous.requestDigest !== overviewRequestDigest(input, actor, project)) throw new MapError('ID_REUSED', 'operationId belongs to another request', 409);
+    return previous.result;
+  }));
   const commitOverview = async (input, actor = { kind: 'human', sessionId: 'cloud-workbench' }, project = null) => {
     const result = await serial('overview', () => withFileLock(overviewFile + '.lock', async () => {
       await recoverTransactions('overview');
       const operationId = validateOperationId(input), receiptPath = operationFile('overview', operationId);
-      const requestDigest = digest(JSON.stringify({ baseVersion: input.baseVersion, operations: input.operations,
-        ...(project ? { projectId: project.id, actor } : {}) }));
+      const requestDigest = overviewRequestDigest(input, actor, project);
       if (project) await mapProjects.get(project.id);
       const previous = await readJson(receiptPath, null);
       if (previous) { if (previous.requestDigest !== requestDigest) throw new MapError('ID_REUSED', 'operationId belongs to another request', 409); return previous.result; }
@@ -2428,7 +2472,9 @@ export async function startCloudServer({
         if (action === '/api/coordinator/conversations/new' && project && req.method === 'POST') {
           const input = await requestBody(req);
           if (!input || Object.keys(input).some(key => key !== 'id')) protocolFail('INVALID_ARGUMENT', 'Provide a stable conversation request');
-          const conversations = conversationsFor(project), id = await conversations.createChat(input.id);
+          const conversations = conversationsFor(project), id = await conversations.createChat(input.id, {
+            executionMode: browserToken && safeEqual(decodedCookieValue(req), browserToken) ? 'manual' : 'automatic',
+          });
           await coordinatorFor(project, id);
           return send(res, 201, { id });
         }
@@ -2446,7 +2492,7 @@ export async function startCloudServer({
               return send(res, 200, state);
             }
             await coordinator.refreshBindings();
-            const state = await coordinator.state();
+            const state = await coordinatorPublicState(project, conversationId);
             state.conversationId = conversationId;
             state.conversations = await conversationsFor(project).list();
             const memory = await readMemoryProject(configuredMemory, project.id);
@@ -2495,7 +2541,8 @@ export async function startCloudServer({
             }
             return send(res, 200, state);
           }
-          if (req.method === 'POST') return send(res, 202, await submitCoordinator(project, conversationId, await requestBody(req)));
+          if (req.method === 'POST') return send(res, 202, await submitCoordinator(project, conversationId, await requestBody(req),
+            browserToken && safeEqual(decodedCookieValue(req), browserToken) ? { source: 'human', actor: { kind: 'human', sessionId: 'browser-human' } } : {}));
         }
         if (action === '/api/coordinator/interrupt' && project && req.method === 'POST') {
           const input = await requestBody(req);
@@ -2503,6 +2550,7 @@ export async function startCloudServer({
           return send(res, 202, await (await coordinatorFor(project, conversationId)).interrupt(input));
         }
         if (action === '/api/coordinator/mount-review' && project && req.method === 'POST') {
+          requireHumanWorkbench(req);
           const coordinator = await coordinatorFor(project, conversationId), input = await requestBody(req);
           const result = await coordinator.reviewMount(input, (proposals, operationId) => commitMainMemoryMap(configuredMemory, project.id, {
             operationId, baseVersion: proposals[0].mainVersion,
@@ -2512,6 +2560,13 @@ export async function startCloudServer({
           }));
           void coordinator.inbox.pump();
           return send(res, 200, result);
+        }
+        if (action === '/api/coordinator/binding-review' && project && req.method === 'POST') {
+          requireHumanWorkbench(req);
+          const input = await requestBody(req);
+          const result = await bindingsFor(project).review(input, { conversationId,
+            actor: { kind: 'human', sessionId: 'browser-human' } });
+          return send(res, 200, { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) });
         }
         if (action === '/api/coordinator/approval' && project && req.method === 'POST') {
           const input = await requestBody(req), coordinator = await coordinatorFor(project, conversationId);

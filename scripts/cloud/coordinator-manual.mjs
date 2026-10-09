@@ -2,11 +2,12 @@ import path from 'node:path';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { entries, MapError } from '../shared/map-model.mjs';
 import { buildFilesystemV2 } from '../shared/filesystem-v2.mjs';
+import { coordinatorNodePath, coordinatorPathText } from '../shared/coordinator-path.mjs';
 
 export const MANUAL_DISABLED_TOOLS = Object.freeze(['dispatch_task', 'review_plan', 'request_ci', 'request_rework', 'resume_task', 'guide_task', 'complete_task']);
 export const filterManualTools = tools => tools.filter(tool => !MANUAL_DISABLED_TOOLS.includes(tool.name)).map(tool => {
   if (tool.name === 'edit_map') {
-    const result = { ...tool, description: 'Create, update, move or delete Main nodes and TODO/Bug records at the observed mainVersion. For a memory update on an existing node, use read_map on that target node before editing; navigation and read_reference do not supply its current contents.' };
+    const result = { ...tool, description: '更新、移动或删除已存在的 Main 节点及 TODO/Bug。新节点必须先用 propose_mount 取得人类确认，不通过本工具直接创建。修改记忆前先用 read_map 读取目标原文，保留无关内容。' };
     const actions = tool.input_schema?.properties?.actions, item = actions?.items, memory = item?.properties?.memoryDocument;
     if (memory) result.input_schema = { ...tool.input_schema, properties: { ...tool.input_schema.properties,
       actions: { ...actions, items: { ...item, properties: { ...item.properties,
@@ -16,7 +17,7 @@ export const filterManualTools = tools => tools.filter(tool => !MANUAL_DISABLED_
     return result;
   }
   if (tool.name !== 'prepare_task') return tool;
-  const result = { ...tool, description: 'Prepare a brief for human confirmation; confirmation creates or updates a Main TODO/Bug and a pasteable execution prompt. Execution is manual.' };
+  const result = { ...tool, description: '整理 brief 供人类确认。新需求须已取得主节点绑定确认，nodeIds 只填这个主节点；相关模块按需读取。确认 brief 后保存 Main TODO/Bug 和可粘贴执行提示，不自动派发。' };
   if (tool.input_schema?.properties) {
     const properties = { ...tool.input_schema.properties };
     for (const [field, description] of [
@@ -24,7 +25,7 @@ export const filterManualTools = tools => tools.filter(tool => !MANUAL_DISABLED_
       ['text', 'For a new TODO, the first line becomes the Main item title (up to 200 characters). Put the user-requested title there, followed by the complete requirements on subsequent lines. An existing TODO/Bug keeps its current title; do not claim this brief renames it.'],
       ['itemId', 'To reuse an existing TODO/Bug, copy its exact Main item ID here and also provide nodeId and kind. Omit for a new TODO in a project conversation. An item-focused conversation may inherit its trusted item only when itemId, nodeId and kind are all omitted; partial routing is rejected.'],
       ['nodeId', 'For an existing item, copy its owning Main node ID and include it in nodeIds. This is required with itemId.'],
-      ['kind', 'Existing item type: todo or bug. A bug brief requires itemId and nodeId; kind=bug alone must not create a TODO. New TODO briefs may omit this field.'],
+      ['kind', '事项类型：todo 或 bug。新事项使用人类已确认的主节点及类型；新 Bug 不必提供 itemId。修改已有 Bug 须提供 itemId 和 nodeId；kind=bug 不能创建 TODO。'],
     ]) if (properties[field]) properties[field] = { ...properties[field], description };
     result.input_schema = { ...tool.input_schema, properties };
   }
@@ -51,21 +52,22 @@ const allowedActor = actor => actor && actor.kind === 'human' && typeof actor.se
 const publicProposal = proposal => ({ id: proposal.id, version: proposal.version, brief: { ref: `manual-brief:${proposal.id}`, version: proposal.version },
   taskId: proposal.itemId, nodeId: proposal.nodeId, itemId: proposal.itemId, kind: proposal.kind, text: proposal.text, acceptance: proposal.acceptance,
   nodeIds: proposal.nodeIds, mainVersion: proposal.mainVersion, requiresHumanApproval: true, manual: true, pending: !proposal.review,
+  ...(proposal.pathText ? { pathText: proposal.pathText } : {}),
   ...(proposal.review ? { decision: proposal.review.decision, review: { ...proposal.review,
     result: Object.fromEntries(Object.entries(proposal.review.result).filter(([key]) => key !== 'prompt')) } } : {}) });
 
-export function manualBriefInput(input) {
+export function manualBriefInput(input, { allowNewBug = false } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
       typeof input.text !== 'string' || !input.text.trim() || input.text.length > 8000 ||
       typeof input.acceptance !== 'string' || !input.acceptance.trim() || input.acceptance.length > 4000 ||
       typeof input.mainVersion !== 'string' || !input.mainVersion || input.mainVersion.length > 128 ||
-      !Array.isArray(input.nodeIds) || !input.nodeIds.length || input.nodeIds.length > 20 || input.nodeIds.some(id => !identifier(id)) ||
+      !Array.isArray(input.nodeIds) || input.nodeIds.length !== 1 || input.nodeIds.some(id => !identifier(id)) ||
       new Set(input.nodeIds).size !== input.nodeIds.length || input.nodeId !== undefined && !identifier(input.nodeId) ||
       input.itemId !== undefined && !identifier(input.itemId) || input.kind !== undefined && !['todo', 'bug'].includes(input.kind)) fail('INVALID_ARGUMENT', 'Provide a brief, acceptance criteria, Main version and exact node IDs');
   if (input.itemId && (!input.nodeId || !input.kind)) fail('INVALID_ARGUMENT', 'An existing item requires its node and TODO/Bug kind');
-  if (input.kind === 'bug' && !input.itemId) fail('INVALID_ARGUMENT', 'A Bug brief requires the existing itemId and nodeId; taskId alone does not associate an item. Create a new Bug through edit_map before preparing its brief.');
+  if (input.kind === 'bug' && !input.itemId && !allowNewBug) fail('INVALID_ARGUMENT', '新 Bug 必须先确认主节点；修改已有 Bug 须提供 itemId 和 nodeId，taskId 不能代替事项身份。');
   return { text: input.text.trim(), acceptance: input.acceptance.trim(), mainVersion: input.mainVersion, nodeIds: [...input.nodeIds],
-    nodeId: input.nodeId || input.nodeIds[0], ...(input.itemId ? { itemId: input.itemId, kind: input.kind } : { kind: 'todo' }) };
+    nodeId: input.nodeId || input.nodeIds[0], ...(input.itemId ? { itemId: input.itemId, kind: input.kind } : { kind: input.kind || 'todo' }) };
 }
 
 export function manualExecutionPrompt({ projectId, proposal, document, version, mapOnly = false }) {
@@ -89,9 +91,9 @@ export function manualExecutionPrompt({ projectId, proposal, document, version, 
 // Proposals are conversational state, not a second Task system. Approval uses
 // the same Main CAS callback as the workbench and never creates an Agent Session.
 export class CoordinatorManualBriefs {
-  constructor({ directory, projectId, readMain, commitMain, mapOnly = false }) {
+  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null }) {
     if (!path.isAbsolute(directory || '') || !identifier(projectId) || typeof readMain !== 'function' || typeof commitMain !== 'function') throw new Error('Manual brief storage and Main services are required');
-    Object.assign(this, { projectId, readMain, commitMain, mapOnly });
+    Object.assign(this, { projectId, readMain, commitMain, mapOnly, readBinding, readCommitReceipt });
     this.file = path.join(directory, 'manual-briefs.json');
   }
   async state() { return readJSON(this.file, { proposals: {}, operations: {}, reviews: {} }); }
@@ -108,7 +110,11 @@ export class CoordinatorManualBriefs {
   }
   async prepare(input, { operationId, conversationId, actor } = {}) {
     if (!identifier(operationId) || !identifier(conversationId)) fail('INVALID_ARGUMENT', 'Provide stable proposal and conversation IDs');
-    const value = manualBriefInput(input);
+    const binding = this.readBinding ? await this.readBinding(conversationId) : null;
+    const value = manualBriefInput(input, { allowNewBug: !!binding?.bindingApproval });
+    if (!value.itemId && this.readBinding && (!binding?.bindingApproval || binding.nodeId !== value.nodeId || binding.kind !== value.kind)) {
+      fail('APPROVAL_REQUIRED', '先由人类确认本需求的唯一主节点和事项类型，再整理 brief。', 409);
+    }
     const fingerprint = hash(JSON.stringify({ value, conversationId }));
     const id = `manual-${hash(JSON.stringify([this.projectId, conversationId, operationId]))}`;
     return withFileLock(this.file + '.lock', async () => {
@@ -131,9 +137,11 @@ export class CoordinatorManualBriefs {
         identity = workItemIdentity(item);
       }
       const proposal = { id, fingerprint, projectId: this.projectId, conversationId, operationId, ...value,
-        itemId: value.itemId || `TD${hash(id).slice(0, 24)}`, itemIdentity: identity,
+        itemId: value.itemId || `${value.kind === 'bug' ? 'B' : 'TD'}${hash(id).slice(0, 24)}`, itemIdentity: identity,
+        ...(!value.itemId && binding ? { bindingApproval: binding.bindingApproval } : {}),
+        pathText: coordinatorPathText(coordinatorNodePath(document.root, value.nodeId)),
         createdAt: new Date().toISOString(), ...(actor ? { actor: structuredClone(actor) } : {}) };
-      proposal.version = hash(JSON.stringify({ ...value, itemId: proposal.itemId, itemIdentity: identity }));
+      proposal.version = hash(JSON.stringify({ ...value, itemId: proposal.itemId, itemIdentity: identity, bindingApproval: proposal.bindingApproval }));
       state.proposals[id] = proposal;
       await atomicWrite(this.file, encode(state));
       return publicProposal(proposal);
@@ -161,6 +169,12 @@ export class CoordinatorManualBriefs {
       let receipt, prompt;
       if (input.decision === 'approved') {
         if (!proposal.intent) {
+          if (proposal.bindingApproval) {
+            const binding = await this.readBinding?.(conversationId);
+            if (binding?.bindingApproval !== proposal.bindingApproval || binding.nodeId !== proposal.nodeId || binding.kind !== proposal.kind) {
+              fail('VERSION_CONFLICT', '主节点已改绑，这份 brief 已过期；请按当前归属重新整理。', 409);
+            }
+          }
           const snapshot = await this.readMain(), document = snapshotDocument(snapshot);
           if (snapshot.version !== proposal.mainVersion) fail('VERSION_CONFLICT', 'Main changed after the brief; refresh before confirming', 409);
           const node = entries(document.root).get(proposal.nodeId)?.node;
@@ -172,7 +186,7 @@ export class CoordinatorManualBriefs {
           const approval = { proposalId: proposal.id, version: proposal.version, mainVersion: proposal.mainVersion,
             text: proposal.text, acceptance: proposal.acceptance, actor: structuredClone(actor), approvedAt, executionMode: 'manual', ready: true };
           const item = proposal.itemIdentity ? { ...matches[0], approvedBrief: approval, executionMode: 'manual' } : { id: proposal.itemId,
-            title: proposal.text.split('\n')[0].slice(0, 200), description: proposal.text, status: 'pending', createdAt: approvedAt, approvedBrief: approval };
+            title: proposal.text.split('\n')[0].slice(0, 200), description: proposal.text, status: proposal.kind === 'bug' ? 'open' : 'pending', createdAt: approvedAt, approvedBrief: approval };
           item.executionMode = 'manual';
           const operations = [{ type: 'update', id: node.id, fields: { [field]: proposal.itemIdentity
             ? list.map(value => value.id === proposal.itemId ? item : value) : [...list, item] } }];
@@ -185,8 +199,16 @@ export class CoordinatorManualBriefs {
           await atomicWrite(this.file, encode(state));
         }
         const intent = proposal.intent;
+        const request = { operationId: intent.operationId, baseVersion: intent.baseVersion, operations: intent.operations };
+        receipt = this.readCommitReceipt ? await this.readCommitReceipt(request, intent.actor) : null;
+        if (!receipt && proposal.bindingApproval) {
+          const binding = await this.readBinding?.(conversationId);
+          if (binding?.bindingApproval !== proposal.bindingApproval || binding.nodeId !== proposal.nodeId || binding.kind !== proposal.kind) {
+            fail('VERSION_CONFLICT', '主节点已改绑，原操作未确认提交；保留回执记录，不向旧节点写入。', 409);
+          }
+        }
         try {
-          receipt = await this.commitMain({ operationId: intent.operationId, baseVersion: intent.baseVersion, operations: intent.operations }, intent.actor);
+          receipt ||= await this.commitMain(request, intent.actor);
         } catch (error) {
           if (error.code === 'VERSION_CONFLICT') { delete proposal.intent; await atomicWrite(this.file, encode(state)); }
           throw error;
