@@ -64,6 +64,7 @@ export function coordinatorCompactBoundary(messages, through = 0, { humanOnly = 
 }
 export const coordinatorCanAutoResume = (state, maxRetries = 2) => !!state?.activeTurnId &&
   state.status === 'error' && ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(state.error?.code) &&
+  !(state.operatorRecovery && !state.operatorRecovery.initialAccepted) &&
   (state.modelRetries || 0) < maxRetries;
 
 function questionsAt(state, index) {
@@ -512,6 +513,7 @@ export class CoordinatorService {
           if (item.answerTo) (state.answers ||= {})[item.answerTo] = { text: item.text, requestId: item.id };
         }
         state.consumedInputRevision = item.revision;
+        delete state.operatorRecovery; // A new ordinary input is not an old operator recovery attempt.
         state.activeContext = item.context;
         (state.activeRequestIds ||= [state.activeTurnId]).push(item.id);
         if (item.message.attachments?.some(value => IMAGE_TYPES.has(value.mimeType))) {
@@ -573,12 +575,12 @@ export class CoordinatorService {
     const fingerprint = metadata.length || actor || source === 'slack' ? hash(JSON.stringify({ text, answerTo, attachments: metadata, source, actor })) : hash(baseInput);
     return { id, text, answerTo, metadata, hasImages, fingerprint };
   }
-  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation } = {}) {
+  async submit({ id = randomUUID(), text = '', retry = false, answerTo, attachments = [], inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation, recoveryGuard, operatorRecovery } = {}) {
     if (inputs !== undefined) {
       if (text || retry || answerTo !== undefined || attachments.length) throw error('INVALID_INPUT', 'A batch cannot mix single-message controls');
-      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) });
+      return this.submitBatch({ id, inputs, followup, expectedTurnId }, { source, actor, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}), recoveryGuard, operatorRecovery });
     }
-    if (history !== undefined || participation !== undefined) throw error('INVALID_INPUT', 'Reference context is only accepted on verified Slack batches');
+    if (history !== undefined || participation !== undefined || recoveryGuard || operatorRecovery) throw error('INVALID_INPUT', 'Reference context is only accepted on verified Slack batches');
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (!['queue', 'steer'].includes(followup) || expectedTurnId !== undefined && (typeof expectedTurnId !== 'string' || !expectedTurnId || expectedTurnId.length > 128) ||
         typeof retry !== 'boolean') throw error('INVALID_INPUT', 'Provide valid follow-up controls');
@@ -729,7 +731,7 @@ export class CoordinatorService {
     this.kick();
     return { accepted: true, id, ...(followup === 'steer' ? { followup } : {}) };
   }
-  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation } = {}) {
+  async submitBatch({ id, inputs, followup = 'queue', expectedTurnId }, { source = 'human', actor, history, participation, recoveryGuard, operatorRecovery } = {}) {
     if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
     if (typeof id !== 'string' || !id || id.length > 128 || !Array.isArray(inputs) || !inputs.length || inputs.length > 100 ||
         inputs.some(input => !input || Object.keys(input).some(key => !['id', 'text', 'attachments', 'answerTo'].includes(key))) ||
@@ -744,6 +746,9 @@ export class CoordinatorService {
         actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`)) throw error('INVALID_INPUT', 'Reference history requires a gateway-bound Slack operator');
     history = validateSlackHistory(history);
     participation = validateMergedParticipation(participation, inputs, { source, actor });
+    if ((recoveryGuard || operatorRecovery) && (source !== 'slack' || typeof recoveryGuard !== 'function' || typeof operatorRecovery !== 'string' || !operatorRecovery || !participation)) {
+      throw error('INVALID_INPUT', 'Recovery admission is a private server-derived guard, not a client retry budget');
+    }
     const prepared = await Promise.all(inputs.map(input => this.prepareInput(input, { source, actor })));
     const fingerprint = hash(encode({ inputs: prepared.map(input => ({ id: input.id, fingerprint: input.fingerprint })), followup, expectedTurnId, source, actor,
       ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) }));
@@ -761,6 +766,7 @@ export class CoordinatorService {
           if (previous !== fingerprint) throw error('ID_REUSED', 'Conversation batch ID differs');
           return;
         }
+        if (recoveryGuard) await recoveryGuard(state, journal);
         if (state.requests[id] || journal.requests[id] || prepared.some(input => state.requests[input.id] || journal.requests[input.id])) {
           throw error('ID_REUSED', 'An original input already belongs to another accepted request');
         }
@@ -830,6 +836,7 @@ export class CoordinatorService {
           nextContext = await this.beforeAcceptHumanInput({ inputs: prepared, context: nextContext, source, actor });
           for (const message of messages) message.serverContext = { ...message.serverContext, ...coordinatorInputContext(nextContext, source) };
         }
+        if (recoveryGuard) await recoveryGuard(await this.readConversation(state), await this.inputJournal()); // Recheck persistence under the native acceptance lock.
         const version = hash(this.system);
         if (state.promptVersion && state.promptVersion !== version) (state.promptChanges ||= []).push({ from: state.promptVersion, to: version, requestId: first.id, at: new Date().toISOString() });
         state.promptVersion = version;
@@ -848,6 +855,8 @@ export class CoordinatorService {
         state.activeModelRoute = route; state.activeContext = nextContext;
         state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs };
         state.activeTurnId = first.id; state.steps = 0; state.modelRetries = 0;
+        if (operatorRecovery) state.operatorRecovery = { id: operatorRecovery, initialAttempted: false, initialAccepted: false };
+        else delete state.operatorRecovery;
         state.partialText = ''; delete state.partialOutputId; delete state.partialResponseIndex;
         state.status = 'running'; state.error = null; state.activity = null;
         await this.saveState(state);
@@ -1071,6 +1080,11 @@ export class CoordinatorService {
             this.modelAbort = generation;
             await this.ensureVisualSummary(state, save);
             await this.ensureDocumentSummary(state, save);
+            if (state.operatorRecovery && !state.operatorRecovery.initialAccepted) {
+              if (state.operatorRecovery.initialAttempted) throw error('RECOVERY_INITIAL_UNKNOWN', 'The original recovery model attempt is unresolved; no automatic second attempt is allowed');
+              state.operatorRecovery.initialAttempted = true;
+              await save(state);
+            }
             state = await coordinatorStep({ turnId: this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId, state, model,
               materializeMessages: value => this.materializeMessages(value, { currentImages: value.activeModelRoute?.kind === 'vision' }),
               system: prefix.system, promptVersion: hash(this.system), tools: prefix.tools, save, execute: (...args) => {
@@ -1078,6 +1092,9 @@ export class CoordinatorService {
                 return this.execute(...args);
               },
               completePresentations: this.completePresentations,
+              onModelAccepted: value => {
+                if (value.operatorRecovery && !value.operatorRecovery.initialAccepted) value.operatorRecovery.initialAccepted = true;
+              },
               checkpoint: () => this.inputSignals(state), signal: this.turnAbort.signal,
               onText: async text => { if (generation.signal.aborted || this.turnAbort !== generation) return;
                 state.streaming = { turnId: state.activeTurnId, messageIndex: state.messages.length, text };
@@ -1112,7 +1129,8 @@ export class CoordinatorService {
               if (this.steerSettleMs) await new Promise(resolve => setTimeout(resolve, this.steerSettleMs));
               continue;
             }
-            if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause.code) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending) {
+            if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause.code) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
+                !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
               state.modelRetries = (state.modelRetries || 0) + 1;
               state.steps--; state.streaming = null; state.activity = null;
               state.activeTiming.modelRetryAt = new Date().toISOString();

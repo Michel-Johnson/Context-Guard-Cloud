@@ -4,9 +4,10 @@ import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { MapError } from '../shared/map-model.mjs';
+import { recoveryScope } from './slack-recovery.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind',
-  'conversation.state', 'conversation.submit', 'conversation.interrupt', 'conversation.relevance', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
@@ -153,7 +154,8 @@ export function validateIntegrationConfig(config) {
       map.userIds.some(id => typeof id !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(id)) || new Set(map.userIds).size !== map.userIds.length)) {
     fail('INVALID_INTEGRATION_CONFIG', 'Map 项目需要默认模型项目和明确授权的 Slack 用户');
   }
-  return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790, actions: config.actions ?? [...INTEGRATION_COMMANDS] };
+  return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790,
+    actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => type !== 'recovery.preflight') };
 }
 
 export function integrationActor(config, { teamId, userId }) {
@@ -173,6 +175,26 @@ export function validateIntegrationCommand(config, input) {
   if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
+  if (input.type === 'recovery.preflight') {
+    const scope = recoveryScope(input.payload, actor, input.projectId);
+    relevanceInput(scope.participation);
+    if (input.conversationId !== undefined) fail('INVALID_ARGUMENT', 'Recovery derives its one original conversation');
+    actor.channelId = scope.channelId;
+  }
+  if (Object.hasOwn(input.payload || {}, 'recovery')) {
+    const recovery = input.payload.recovery;
+    if (input.type !== 'conversation.submit' || !config.actions.includes('recovery.preflight') || !object(recovery) ||
+        Object.keys(recovery).some(key => !['operationId', 'scope'].includes(key)) || !identifier(recovery.operationId)) {
+      fail('FORBIDDEN', 'Only the explicit recovery capability may supply its fixed recovery descriptor', 403);
+    }
+    const scope = recoveryScope(recovery.scope, actor, input.projectId);
+    if (input.id !== scope.submitId || input.conversationId !== scope.conversationId || input.payload.followup !== 'steer' ||
+        Object.keys(input.payload).some(key => !['inputs', 'participation', 'followup', 'slackChannelId', 'recovery'].includes(key)) ||
+        input.payload.slackChannelId !== scope.channelId || JSON.stringify(input.payload.inputs) !== JSON.stringify(scope.participation.inputs) ||
+        JSON.stringify(input.payload.participation) !== JSON.stringify(scope.participation)) {
+      fail('RECOVERY_SCOPE_MISMATCH', 'Recovery retains the exact original batch, target and immutable transport projection', 409);
+    }
+  }
   if (Object.hasOwn(input.payload || {}, 'slackChannelId')) {
     if (input.type !== 'conversation.submit' || !/^[DCG][A-Z0-9]{1,31}$/.test(input.payload.slackChannelId || '')) fail('INVALID_ARGUMENT', 'Provide the current Slack delivery channel');
     actor.channelId = input.payload.slackChannelId;
@@ -240,6 +262,8 @@ export async function startIntegrationGateway({ config, command, state, authoriz
     // return old private results through an otherwise valid transport ID.
     if (input.projectId) await authorizeProject?.(input.projectId, actor);
     if (readOnly.has(input.type)) return command(input, { actor, operationId: input.id });
+    const recovery = input.type === 'recovery.preflight' ? recoveryScope(input.payload, actor, input.projectId)
+      : input.type === 'conversation.submit' && input.payload.recovery ? recoveryScope(input.payload.recovery.scope, actor, input.projectId) : null;
     const fingerprint = hash(JSON.stringify({ input, actor }));
     const key = hash(JSON.stringify([actor.teamId, input.id]));
     if (inflight.has(key)) {
@@ -248,7 +272,22 @@ export async function startIntegrationGateway({ config, command, state, authoriz
       return pending.promise;
     }
     const file = path.join(stateDir, 'receipts', key + '.json');
-    const promise = withFileLock(file + '.lock', async () => {
+    const recoveryCheck = async () => {
+      const created = await readJSON(path.join(stateDir, 'receipts', hash(JSON.stringify([actor.teamId, recovery.createId])) + '.json'), null);
+      if (created && (created.projectId !== input.projectId || created.actor?.userId !== actor.userId || created.data?.conversationId !== recovery.conversationId)) {
+        fail('RECOVERY_SCOPE_MISMATCH', 'The original conversation receipt belongs to another scope', 409);
+      }
+      for (const id of recovery.businessIds) {
+        const targetKey = hash(JSON.stringify([actor.teamId, id]));
+        if (id !== input.id && inflight.has(targetKey) || await readJSON(path.join(stateDir, 'receipts', targetKey + '.json'), null)) {
+          fail('UNKNOWN_BUSINESS_EFFECT', 'The original scope has an in-flight or accepted business operation', 409);
+        }
+      }
+    };
+    if (recovery) for (const id of recovery.businessIds) if (id !== input.id && inflight.has(hash(JSON.stringify([actor.teamId, id])))) {
+      fail('UNKNOWN_BUSINESS_EFFECT', 'An original business operation is still in flight', 409);
+    }
+    const perform = async () => {
       const previous = await readJSON(file, null);
       if (previous) {
         if (previous.fingerprint !== fingerprint) fail('ID_REUSED', 'Operation ID belongs to another request', 409);
@@ -257,12 +296,19 @@ export async function startIntegrationGateway({ config, command, state, authoriz
       // The callback must also use this ID for durable business operations so a
       // crash between commit and saving the transport receipt is safe to retry.
       const startedAt = Date.now();
-      const data = await command(input, { actor, operationId: input.id });
+      const data = await command(input, { actor, operationId: input.id, ...(recovery ? { recoveryCheck } : {}) });
+      if (input.type === 'recovery.preflight') return data; // No business receipt or state is created by inspection.
       await atomicWrite(file, encode({ fingerprint, actor, type: input.type, projectId: input.projectId,
         conversationId: input.conversationId, data, at: new Date().toISOString(),
         ...(input.type === 'conversation.relevance' ? { durationMs: Date.now() - startedAt } : {}) }));
       return data;
-    });
+    };
+    // One narrow lock set, not a generic lock manager. Recheck and original
+    // acceptance share every known legacy/current receipt lock; the callback
+    // additionally checks under the conversation's native submit lock.
+    const files = recovery ? [...new Set([file, ...[recovery.createId, ...recovery.businessIds].map(id => path.join(stateDir, 'receipts', hash(JSON.stringify([actor.teamId, id])) + '.json'))])].sort() : [file];
+    const locked = index => index === files.length ? perform() : withFileLock(files[index] + '.lock', () => locked(index + 1));
+    const promise = locked(0);
     inflight.set(key, { promise, fingerprint });
     try { return await promise; } finally { inflight.delete(key); }
   };
