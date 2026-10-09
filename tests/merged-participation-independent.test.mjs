@@ -34,6 +34,51 @@ async function submit(service, text, options = {}) {
 }
 const streamed = snapshots => snapshots.map(state => state.streaming?.text || '').filter(Boolean);
 
+for (const name of ['ask_user', 'mount_conversation', 'show_model_menu']) test(`接话别名 ${name} 执行后等待人类，不追加模型总结`, async t => {
+  let calls = 0;
+  const input = name === 'ask_user' ? { question: '绑定到主页模块，可以吗？', options: ['可以', '暂不绑定'] } : {};
+  const native = { type: 'tool_use', id: 'wait', name: `reply_${name}`, input };
+  const f = await fixture(t, async () => {
+    calls++;
+    return calls === 1 ? { stop: 'tool_use', content: [native] } : answer('不应出现的额外总结。');
+  }, { tools: [{ name }], execute: async (actual, args) => {
+    assert.equal(actual, name); assert.deepEqual(args, input); return { saved: true };
+  } });
+  await submit(f.service, '先展示确认，不继续处理。'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(calls, 1);
+  assert.deepEqual((await f.service.readConversation()).messages.find(message => message.role === 'assistant').content, [native]);
+  if (name === 'ask_user') {
+    const question = state.messages.at(-1).questions[0];
+    assert.equal(state.messages.at(-1).text, input.question); assert.deepEqual(question.options, input.options);
+    assert.ok(f.snapshots.some(snapshot => snapshot.activity?.kind === 'preparing-question'));
+    await f.service.submit({ id: 'answer', text: '可以', answerTo: question.id }); await f.service.close();
+    const restored = await f.service.state();
+    assert.deepEqual(restored.messages.flatMap(message => message.questions || []).find(item => item.id === question.id).answer,
+      { text: '可以', requestId: 'answer' });
+    assert.equal(calls, 2); assert.equal(restored.approvals.length, 0, '提问答复不是事项批准');
+  }
+});
+
+test('接话别名纯表情完成后只执行一轮，原生工具对及精确回执保留', async t => {
+  let calls = 0;
+  const native = { type: 'tool_use', id: 'social-complete', name: 'reply_react_to_user', input: { emoji: 'wave', replyComplete: true } };
+  const f = await fixture(t, async () => {
+    calls++;
+    return calls === 1 ? { stop: 'tool_use', content: [native] } : answer('不应出现的占位正文。');
+  }, { tools: [{ name: 'react_to_user' }], execute: async (name, input, { operationId }) => {
+    assert.equal(name, 'react_to_user'); assert.deepEqual(input, native.input);
+    return { kind: 'slack-reaction', actionId: operationId, emoji: 'wave', status: 'intent' };
+  } });
+  await submit(f.service, '只挥手，不需要正文。'); await f.service.close();
+  assert.equal(calls, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  const raw = await f.service.readConversation();
+  assert.deepEqual(raw.messages.at(-2).content, [native]); assert.equal(raw.messages.at(-1).content[0].tool_use_id, native.id);
+  const receipt = Object.values(raw.toolReceipts)[0];
+  assert.equal(receipt.result.requestId, 'original'); assert.deepEqual(receipt.result.actor, actor);
+  assert.ok(receipt.result.actionId.startsWith('coordinator:')); assert.deepEqual(streamed(f.snapshots), []);
+});
+
 test('普通网页来源不能借用接话工具别名获得执行权限', async t => {
   let calls = 0;
   const f = await fixture(t, async ({ tools }) => {

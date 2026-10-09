@@ -510,7 +510,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     }
     const inputTokens = coordinatorInputTokens(next.usage);
     if (inputTokens !== null) state.lastInputTokens = inputTokens;
-    if (next.content.some(block => block.type === 'tool_use' && block.name === 'ask_user')) await onToolStart?.('ask_user');
+    if (next.content.some(block => block.type === 'tool_use' &&
+      (gate?.decision === 'reply' ? businessToolName(block.name) : block.name) === 'ask_user')) await onToolStart?.('ask_user');
     if (gate?.decision === 'silent') {
       const changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
       state.pending = null;
@@ -616,14 +617,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     !next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call => toolName(call) === 'react_to_user' && call.input?.replyComplete === true) &&
     !state.messages.some(message => message.role === 'assistant' && message.requestId === state.activeInput.id &&
-      message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
+      message.content?.some(block => block.type === 'tool_use' && toolName(block) !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
     if (toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
     transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
-      (block.name === 'ask_user' || block.name === 'mount_conversation' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
+      (toolName(block) === 'ask_user' || toolName(block) === 'mount_conversation' || toolName(block) === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;
 }
