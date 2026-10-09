@@ -1,10 +1,23 @@
 # Cloud 验证台账
 
+## CURSOR-MAIN-INTEGRATION-02 · 当前 Slack 基线同步（2026-10-09）
+
+- [x] 正常合并 main `a5ec3faf66ccd4bc77edaa2747e7624ab5d5974e`，保留双方验证记录及候选 Cloud 1.10.0；固定 core 2.3.0/UI 1.4.1 不变，不修改共享生成物。
+- [x] 此合并工作树完整 `npm test` 实际退出 0：794 项、792 通过、0 失败/取消、2 既有跳过，164858.609542ms。日志 `temp/cursor-slack-main-integration-20261009.log`；供应商和 Slack 外部传输仍为受控依赖，不是线上 Cursor 任务验收。
+- [ ] 原 Slack/manual 入口的 Cursor 派发与原任务结果回传仍未接线；当前回归及独立 automatic 仓库角色测试不代表此入口已完成。生产部署与三条路径真实任务验收仍未通过。
+
 ## CURSOR-MAIN-INTEGRATION-01 · 接入分支同步（2026-10-09）
 
 - [x] 正常同步 main `e23d493`，仅 root 版本冲突保留候选 1.10.0，主分支 Slack/绑定/交流权限与正式测试保留。固定依赖沿 main 的公开 core 2.3.0/UI 1.4.1，不消费相邻 Skill 未发布的候选。
 - 保留旧依赖实际失败：普通安装显示 up-to-date，但磁盘仍为 UI 1.4.0，生成器正确拒绝；该环境的 782 项/780 通过/2 跳过/退出 0 不算当前固定消费通过。原依赖完整保留后，从锁文件新安装公开包；安装版本与 URL、61 生成物及摘要均匹配，没有手改共享生成物。
 - [x] 准确固定依赖组合完整 `npm test`：782 项、780 通过、0 失败、2 既有跳过，实际退出 0、171758.771791ms。独立当前 CI/绑定/Slack 4/4、退出 0，冻结前后 hash 一致；61 文件与安装包逐字节 parity。当前公开 UI 仍有旧独立 Cursor 入口，退役要等待 Skill 候选 UI 1.4.2 正常发布后消费，不宣称原生接线或三路径任务通过。
+
+## SLACK-MODEL-CALLBACK-DIAG-01 · 流回调失败的私有定位边界（2026-10-09）
+
+- [x] Coordinator 批准三文件窄范围：SSE 的 onText/onToolStart 真实回调失败不再附默认 STREAM_INVALID，仅以白名单 failureOrigin=callback 与 callbackBoundary 区分边界；原错误码、阶段、严格解析/gate、停止/补充/超时、预算/权限/重试不变。不能据此宣称原124语义评估中的12项无效响应根因或修复已获证实，原失败与未复现单例均保留。
+- [x] Executor 开发完成：复用 safeTermination/safeModelDiagnostic 进入既有私有 performance；不保存异常正文、流文本、思考、工具名/参数或凭据，不增加公开诊断或业务执行。正式边界用例保 getter/伪造值拒绝、真正流校验失败、原取消分类及零业务工具/零正式 assistant。
+- [x] Executor：基线 `5e2cd0dbd018811aa715f5631d101ecda38f790a`，开发完成后唯一四目标窄验证 actual `f80a8a` exit0，4/4通过、0失败/跳过/取消，330.7523ms。日志 `temp/slack-model-callback-diag-executor-20261009.log`；仅上述回调/真正校验/恶意metadata/超时目标，不全量、不生产/付费模型、不重跑求绿。正式源/test冻结与准确命令见同名前缀私有交接；后续命名或参与PE整合需按新字节交独立Tester，不将本4项称语义修复。
+- [x] 独立 Tester：准确 model `32d8eea53bdb173d8126c9912ddbf87604b99da159c442960a881f0cf9c84462` / cloud test `69b6c6bad29fa36b315901ccf0d3d2ca44f2dbec574de730d740e78bfbdcf857` 前后一致；唯一四目标 actual `6ad675` exit0，4/4，252.01ms。回调来源、安全投影与原解析/取消合同通过，日志 SHA256 `f8a6f48166140a4457c1d10dee78f7c06e46f913ea88845741a76cc127d3afbd`。定位能力通过不等于供应商响应、真实语义或线上打断验收通过。
 
 ## SLACK-MERGED-EMOJI-03 · 纯表情完成的批次与耐久边界（2026-10-09）
 
@@ -1752,3 +1765,38 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] Coordinator 审核后仅抽取封闭元数据 writer 并修改限额用例，取消人为生命周期事件；其余 7 目标源码不变。唯一返工批次 Node18.20.8 / actual chunk6ac49a 退出 0：定向 4 项通过、4 项名称筛选跳过、0 fail/cancel，4325.6503ms；正常退出、原 7/1 退出码、敏感内容不进入产物及限额均验证。首次三项治理各退出 0，发现 42 个自动文件；9 文件前后哈希一致。helper fe78f2c22c7429ff408ecf6b35acb0c3fac6b4a39b634a7b38a9478ace3b3d83，test bae66e6e92514ef0250e82ba5e77f0a864859e7fd4442aefc44b81412ce3062b；stdout cb8152b3b568d342e187aa38a04dd2063b38a018540acd88b645fccdbc73308f，result e3f2608eb3f94a0427d9ccf7e211d15b440eca3c66d5b8b93317195976d163d3。未重复 32 秒保活用例、不以 4 项代替最终独立 8 项或 Linux CI。
 - [x] 独立 Tester：准确提交 `aaf5d2d53a5a90a6178c30a1be4a2e2df3c07a5e`，固定官方 Node18.20.8 最终完整8项目标 actual `e359a2` exit0，8/8、0失败/跳过/取消、36013.8346ms，包含本修订真实32秒保活 worker 的30秒快照。ND-01..08 全部通过，35冻结文件与59生成物前后一致，原并发/15分钟/Required/权限/pins不变；只关闭诊断自身fd与unref timer，不关闭业务资源，原退出7/1保持、秘密和任意对象不入产物、限额/来源/写入失败明确incomplete。日志 SHA256 `11ebc19bdceb7891dcdeebb6bcb4c1725bed5b21843b6485cdf47014290a926f`，报告 `temp/slack-main456-independent-technical-aaf-20261009.md`。Windows独立通过不冒充Ubuntu超时根因已修。
 - [ ] 下一次必要代码 CI 的实际 Ubuntu 证据。保留 b198a4f 的 run 37884367488 / job 113671043498 首次 15 分钟失败；Windows Slack 36 项及 Legacy 2 项通过不能证明该 Linux 根因已修复，最后已输出用例不是卡点证明。
+
+## SLACK-C4-RECOVERY-01 · 原参与失败的正式单次恢复（2026-10-09）
+
+- [x] Coordinator 代码层审核：只支持已核完整历史新建路径，原 attention/三次计数/错误/全部业务 ID 不变；采用现进程 root-owned capsule，不造产品节点/Main 审批、不启生产权限或假 Slack 事件。Cloud 精确回执锁与原 submit 锁内最终复核，未知效果 fail closed。
+- [x] Executor 开发：默认关闭的受保护 operator 入口、两阶段 proof/apply、独立一次 epoch、精确运输失 ACK 重放；初始尝试不自动复试，完整原生响应与 accepted 同一次 save，原始工具回执及后续业务轮保留。历史 writer 真缺 conversationId 支持，own-key null/undefined/已有绑定拒绝；当前真实 C4 待读，不宣称恢复。
+- [ ] Executor 首次唯一14目标：Node24.19.0 actual `ad4a90` exit1，12通过/2失败、0跳过/取消，1695.0144ms。日志 `temp/slack-c4-recovery-executor-20261009.log` SHA256 `a66278c9bb852c989324ca6c1f7ca42f0cc0a5e5ad40f122ae82723ad7164aed`。失败分别为新 steer 夹具误要求更换原 activeInput 锚点，以及新 HTTP 夹具未配置必需的隔离 protocol repository 映射；已提交最小 fixture 修正 Plan，未自行重跑/弱化门禁。其余12与首次字节绑定，不充作最终候选全部通过；Windows拒绝capsule通过不证明Linux真实安装/OS权限。
+- [x] 经 Coordinator 审核仅修两处正式 fixture，未改产品：保原 activeInput 锚点并核新参与批次/原回执/预算flag去除；HTTP补唯一合成 repository mapping。唯一2目标返工 Node24.19.0 actual `ccf0c8` exit0，2/2、0失败/跳过/取消，1849.0377ms。日志 `temp/slack-c4-recovery-fixture-fix-executor-20261009.log` SHA256 `0c6c06b69231f9ec20dc059718b094d3b15f69341e5f0069d0a928c9a24727ca`。正式 cloud test新hash `be1f4876e1010c1ab05856e886ec72b502d36ee2849e3b22d0b771c1084183f3`；16产品/测试清单/版本文件与返工前冻结一致，其余12旧证据不套新整组。候选Cloud1.9.2/Slack0.6.2及设计v1.6.0未上线，最终23文件hash/命令交接 `temp/slack-c4-recovery-executor-handoff-20261009.md`；独立Tester需按最终字节一次14目标。
+- [x] Main46 整合后的独立 Tester：准确基线 `8de9c834f36ab8cb59d43ab4dac70ebafd760ca8` 加26冻结工作树文件，候选Cloud1.9.3/Slack0.6.3；唯一14正式目标 actual `3d7952` exit0，14/14、0失败/跳过/取消，5118.2687ms。31项前后snapshot一致，Core2.3.0/UI1.4.1实际tar SRI/安装字节及全部61生成物一致；REC-09核完整纯reply_read原别名/指纹、同次保存及正常续轮，原身份/回执/停止/lane与初轮预算保护不削弱。日志 `temp/slack-c4-recovery-main46-independent-20261009.log` SHA256 `a5940f0a87208a76eb712f78fcd3277466708fb21d3dd0a830ef8d724141e0af`，报告 `temp/slack-c4-recovery-main46-independent-20261009.md` SHA256 `cee36c8420bbe7d6e50be6db86e1e39f6943359f70843022d8ad050411c8122d`。旧12/2和两fixture2/2原证据保留，不拼作新修订结果；Linux真正0750/0640安装CLI、生产原C4负效果证明/恢复/native送达仍未验证。
+- [ ] Delivery：正常 PR/Required/Main、精确部署及生产配置另行审核；原 C4 正式 proof、恢复审计、原批次完整终态及原线程 native 回执后才可闭合。禁止清旧计数、重新伪造人类输入或只凭 accepted/health/新请求成功宣称完成。
+## SLACK-C4-RECOVERY-01 · Main48 卡片回执与自然交流兼容收口（2026-10-09）
+
+- [x] Coordinator 批准最小范围：复用现有 `hasSlackContent`，正文/问题/附件要求正式 `{ts}` 回执，binding卡要求自身卡片回执，mounted-only不要求空贴文。依据真实adapter的静态纠偏，任何单独project-switch动作走专用announced ACK，无不存在的raw槽；不支持的混合switch actions保未完成，不新增发送或恢复数据。另恢复已确认的自然表情策略，保Main48系统completed对勾与“不是任务完成/批准”，enum/目标/权限不变。
+- [x] Executor 开发完成后唯一3目标：Node24.19.0 actual `7d6ce1` exit0，3/3、0失败/跳过/取消，470.8871ms；REC-05扩真实回执/卡pending→ACK/正文与卡双向缺ACK/mounted-only/switch专用结果/混合fail-closed/问题附件/reaction sent，保原三次attention/ID/错误。另核Main47空binding原正文保留与既有自然交流枚举/target-free schema。日志 `temp/slack-c4-recovery-main48-compat-executor-20261009.log` SHA256 `f5e5d835dc1a7752ecaf4f3f1042a48c5361cd0e0e4215a5eedffed45acf74cb`；8产品/正式测试/文档hash前后一致。没有14/全量/模型/生产/配置/Git重跑，旧首次失败及14+2/14旧源证据原样保留。
+- [ ] 独立Tester同准确候选一次这3受影响目标；候选由Root声明Cloud1.9.5/Slack0.6.5，HEAD `abbc1a9` + MERGE_HEAD `336414c` 未提交整合。私有交接 `temp/slack-c4-recovery-main48-compat-executor-handoff-20261009.md` 含准确命令/产品diff边界/8hash/四版本hash；Linux正式operator与真实C4、原生用户体验仍须分别验收，不能由模块通过代替。
+- [x] 独立Tester同准确候选唯一3目标：actual `81feb2` exit0，3/3、0失败/跳过/取消，520.9318ms；12冻结hash及HEAD/MERGE_HEAD前后一致，静态无阻断发现。REC-05、Main47纯绑定回执、enum/target-free自然交流三个正式目标通过；日志 SHA256 `afc8dcefea501be1d0ca64ba98a5249740596738e014c01c209f4f6cf4aec25d`，报告 `temp/slack-c4-recovery-main48-compat-independent-20261009.md` SHA256 `f2cd9c0b1c89371a150b9fd4ce86abbda70c84cfb2d0dc34b05d163693ab132e`。不复跑旧14或全量；Linux真实安装、生产C4/native仍未验证。
+
+## COORDINATOR-OVERVIEW-NAMING-02 · 用途主资料与内部定位分离（2026-10-09）
+
+- [x] Coordinator 源码及独立报告审核通过；候选 Cloud1.9.6，Slack0.6.5、固定 Core2.3.0/UI1.4.1 与生成物不变。版本仅改根 package/lock 三处，不追加模块或全量重测；验收文档原位对齐现合同，不放宽标准。
+- [ ] Delivery：正常 PR/Required/Main 后按准确发布 SHA 部署，再以普通真人 TODO 查询验用途短名。生成流及自然参与的独立失败继续保留，不能将本四项测试或一个回复当成全部计划通过。
+
+- [x] Coordinator 批准的四文件窄范围：现有用途摘要升为普通未完成概览主行，原题、事项 ID、节点 ID 和记录状态独立标为内部定位资料；没有独立用途时使用既有原标题投影。沿原 desc/description/text 选择与160字符/Unicode/多行边界，原题120字符限制保持，长题明确提示截断；不改 Map/Main、角色/PE、工具或生成物，不增加模型调用。
+- [x] 唯一授权生产只读 actual `4b79b3` exit0，精确 source `f20492d4a8192dc0a980142d5c03a0d3e8a9eceb`；原两条确认项各匹配一次且已有独立用途。生产描述未复制到源码、正式测试或公开台账，未修改生产数据、配置或源码。
+- [x] Executor 开发后唯一四目标模块批次：Node24.19.0 actual `a74077` exit0，4/4通过、0失败/跳过/取消，391.1713ms；范围过滤/20条边界，用途主资料与原事实/缺失回退/截断，动态版本与稳定前缀隔离，已接受重试与新输入快照隔离。基线 `f20492d4a8192dc0a980142d5c03a0d3e8a9eceb` 加本四文件工作树；源/两测试前后哈希一致，context `4707a6f43a1137dca574a3be787e2e036220c49bedd241086def556318593d1f`，cloud test `ab01727ca95f315c9e915aa9d43e921f7313095f89443c5433e7c3daa4508d1b`，cache test `7eb0eecbdbd812a3ff5e278995edb33a1c0475ee6daf3984ff1b28196a404395`。日志 `temp/coordinator-overview-naming-executor-20261009.log` SHA256 `0a9dc946e7534b1d1052943c2c4efc85468dcc06b97161a6946ddb77535b5d1d`；命令 `node --test --test-name-pattern "^(Main overview is fresh|Main overview purpose|Main version and task changes update only)" tests/cloud-coordinator.test.mjs tests/coordinator-cache-prefix.test.mjs`。未全量/真实模型/Slack发言/部署，不以旧 PURPOSE-01 结果冒充本修订通过。
+- [x] 独立 Tester 核对准确源/测试字节并验证四目标：基线 f20492d 加冻结工作树，Node24.19.0 唯一批次 actual `cdf784` exit0，4/4、0失败/跳过/取消，1131.521ms；context4707a6f/cloudtestab01727/cache7eb0eec/原CI10fff123四项前后hash一致。用途主资料/原标题身份不变、scope/20/160边界、dynamic/static及原retry快照通过。日志 `temp/coordinator-overview-naming-independent-20261009.log` SHA256 `dcae5d4e034f36a2c0d286bddb065d9862bec9e53aee4750fc9e93bea37c175d`，报告 `temp/coordinator-overview-naming-independent-20261009.md` SHA256 `ef2fb245567d2e6615628ed2e75bee062ac8da8f3de342561c5d58512bcd6d7e`。另仅静态核验收文档912755dc原位对齐当前merged/reply_及pure两合同，40/50/95%/2%/100%/1.5s与身份权限未改，无新增suite。Required、合并、上线及真实模型短名称验收由 Coordinator 后续收口；合成通过不等于真实模型会正确改写概览名称，当前未提交或部署。
+
+## SLACK-RECEIVER-FACTS-PE-02 · 原位收口参与前提与当前概览命名（2026-10-09）
+
+- [x] Coordinator 批准的 Cloud-owned 原位替换：动作须明确/隐式邀请，可信历史 speaker 与 routing.coordinatorUserId 匹配产物归属，更正接续不同于孤立通知，引用无外层邀请不触发；不硬排除 @其他 Bot。coordinator-prefix 原状态规则明确当前概览名称按本轮用途、内部资料用于定位、旧答复不是当前清单或名称。删除重复句和例子抵销，不加白名单/分类器/模型轮次，不改 Main、context、历史、权限或共享角色。
+- [x] 首批静态组合预算不增长：同一共享角色 + delivery + merged 为4672→4616字符、10980→10762 UTF-8字节，角色 SHA256 `58c95ae2c5db616e6f5c1503635743fd4d154b7274ab771eb3f0917d0449fd63` 原样；context SHA256 `4707a6f43a1137dca574a3be787e2e036220c49bedd241086def556318593d1f` 原样。业务日期/版本及原标题均保留，不实现推测性标题隐藏。
+- [x] Executor 开发后唯一四目标合同批次：Node24.19.0 actual `477367` exit0，4/4、0失败/跳过/取消，5643.1878ms；基线 `5e2cd0dbd018811aa715f5631d101ecda38f790a` 加本轮与并行诊断工作树。真实隔离服务请求携带新规则、只调用原主模型且重复事件不再调用；格式提醒不修改可信身份/历史/附件；新资料只进动态上下文，旧接受快照和重试原样。命令 `node --test --test-name-pattern "^(Slack 合并简单答复：|合并接话格式提醒只改本次请求副本|Main version and task changes update only|Main overview purpose enters fresh inputs)" tests/slack-merged-participation.test.mjs tests/coordinator-cache-prefix.test.mjs`；日志 `temp/slack-receiver-facts-pe02-executor-20261009.log` SHA256 `b47fa18d0d7d3546905a596ee9813ffdb64edc298d3497900c2c6c0f397ebf3c`。
+- 首批四文件前后冻结一致：merged `87eb6c59d4a73594b8e4ef65136b0a6f27a195f6928a46f700fff474b1eebca9`；prefix `c9fe3aa3f565c5a948bb30ef362b387539c3245d012cdcbc65852f3bb98d2f05`；Slack merged test `a9c5b8ab4570a92cee4914ebca54800ebf6a57683021f9953e8a981d20c13a9f`；cache test `ad80153d25e43aca65fe80b9bc611ea51d3174244a346599dd65618ae390b1f0`。未修改 cloud-coordinator 的诊断专用段，未重复诊断目标或全量。
+- [x] 后续只读消费者审查发现两个既有格式合同依赖原表达。Coordinator 批准仅恢复 prefix 的「本轮答复发往 Slack：使用纯文本」「段间留一个空行」「代码可用独立围栏代码块」，旧测试不改，不削权限。最终 prefix SHA256 `4846f2d4d22edef0f903b396c9c03670876d47598b040061446243c9b5546ffe`；其余三文件原样。最终静态组合为4637字符/10813字节，仍小于原4672/10980；Executor 未重跑，首批477367只对应上列旧prefix字节，不能套为最终通过。
+- [x] 用户要求停止调用 subagent 后 Root 接手：最终准确字节唯一六目标开发者验证 actual `402540` exit0，Node22.18.0，6/6、0失败/跳过/取消，2075.1538ms；UTC15:33:32.812→15:33:35.017，七源/test前后hash一致。原四合同与两个既有格式合同均通过，日志 `temp/slack-recipient-final-development-20261009.log` SHA256 `fdc0022aa4b6cd4a7fbf881f65c50ab3460cc32dec6ca60aae10e915b169dac4`。这不是独立Tester或真实语义结果；不再重复诊断四目标或本六目标。本轮Required对最终PR修订独立执行，真实语义及线上短名另外记录，不将开发测试称全计划完成。
+- [ ] 独立 Tester 同最终准确字节一次四合同＋两个既有格式目标：原四目标另加 `Slack reply policy is supplied as system instructions without changing native tools or other sources`、`Public manual conversation uses lean role and unchanged native schemas without weakening normal execution`（分别在 cloud-coordinator / slack-cloud）；不重测未改诊断目标。Required、正常合并和单次1.9.7发布由 Coordinator 收口。合同通过不证明模型语义判断或真实短名效果；原124为failed/seen，标签、首次错误和真实NAMING-02失败保留。未重新调用该集、真实模型或Slack，不改默认模型，不提交/部署。

@@ -9,6 +9,7 @@ import { coordinatorPrefix, coordinatorInputContext } from '../scripts/cloud/coo
 import { CoordinatorService, CoordinatorConversations } from '../scripts/cloud/coordinator-service.mjs';
 import { coordinatorModelMessages, coordinatorStep } from '../scripts/cloud/coordinator-model.mjs';
 import { hash } from '../scripts/shared/io.mjs';
+import { MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 
 const tools = [{ name: 'read_map', input_schema: { type: 'object', properties: {} } }];
 const answer = { stop: 'end_turn', content: [{ type: 'text', text: '收到' }],
@@ -31,7 +32,7 @@ async function setup(t, options = {}) {
   return { directory, service, calls };
 }
 
-test('Main version and task changes update only the trailing context, not the stable project prefix', () => {
+test('Main version and task changes update only the trailing context, not the stable project prefix', async () => {
   const a = buildCoordinatorContext(snapshot(), { conversation: item });
   const b = buildCoordinatorContext(snapshot('v2', 'done'), { conversation: item });
   assert.equal(a.staticText, b.staticText);
@@ -42,12 +43,23 @@ test('Main version and task changes update only the trailing context, not the st
   assert.match(b.staticText, /模块记忆/); assert.doesNotMatch(b.dynamicText, /模块记忆/);
   assert.equal(coordinatorPrefix('role', a, tools), coordinatorPrefix('role', b, tools));
   const overview = snapshot(); overview.memory.map.root.children[0].todos[0].desc = '旧用途资料';
+  overview.memory.map.root.children[0].todos[0].title = '协议 v3.4.5，期限 2027-04-12';
+  const original = structuredClone(overview);
   const first = buildCoordinatorContext(overview);
+  assert.deepEqual(overview, original, 'Naming instructions never remove Main facts');
+  assert.match(first.dynamicText, /原标题：协议 v3\.4\.5，期限 2027-04-12/);
   overview.memory.map.root.children[0].todos[0].desc = '新用途资料';
   const second = buildCoordinatorContext(overview);
-  assert.match(first.dynamicText, /用途摘录：旧用途资料/); assert.match(second.dynamicText, /用途摘录：新用途资料/);
+  assert.match(first.dynamicText, /用途摘要：旧用途资料/); assert.match(second.dynamicText, /用途摘要：新用途资料/);
   assert.equal(first.staticText, second.staticText); assert.equal(first.staticVersion, second.staticVersion);
   assert.equal(coordinatorPrefix('role', first, tools), coordinatorPrefix('role', second, tools));
+  const role = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
+  const envelope = coordinatorPrefix(role, { format: 2, staticText: '' }, []).system + MERGED_PARTICIPATION_POLICY;
+  // Pre-change delivery + unchanged project directory policy + merged policy:
+  // 1112 characters / 2890 UTF-8 bytes. The shared role is not edited here.
+  assert.ok(envelope.length <= role.length + 1112, 'Combined static context cannot grow');
+  assert.ok(Buffer.byteLength(envelope) <= Buffer.byteLength(role) + 2890, 'The byte budget also cannot grow');
+  assert.match(envelope, /旧答复不作为当前清单或名称/);
 });
 
 test('Memory, navigation, roles and permitted tool profiles invalidate their own content versions', () => {
@@ -170,7 +182,9 @@ test('Main overview purpose enters fresh inputs but cannot rewrite accepted retr
   await service.submit({ id: 'overview-first', text: '有哪些待办' }); await service.running;
   const accepted = JSON.parse(await fs.readFile(service.file, 'utf8')).messages[0];
   assert.equal(accepted.content, '有哪些待办');
-  assert.match(calls[0].messages[0].content, /用途摘录：旧用途资料 v1.2，期限 2027-02-03/);
+  assert.match(calls[0].messages[0].content, /用途摘要：旧用途资料 v1.2，期限 2027-02-03/);
+  assert.match(calls[0].system, /当前概览名称按本轮用途概括/);
+  assert.doesNotMatch(calls[0].system, /旧用途资料 v1\.2|期限 2027-02-03/, 'Per-turn facts remain outside the static policy');
   current = snapshot('v2'); current.memory.map.root.children[0].todos[0].description = '新用途资料 v2.3，期限 2027-06-07';
   await service.submit({ id: 'overview-first', text: '有哪些待办', retry: true }); await service.running;
   assert.deepEqual(calls[1], calls[0], 'Retry uses the original accepted data, not latest item purposes');
@@ -178,7 +192,7 @@ test('Main overview purpose enters fresh inputs but cannot rewrite accepted retr
   await service.submit({ id: 'overview-second', text: '现在呢' }); await service.running;
   assert.equal(calls.length, 3, 'No new model rewriting or formatting round is introduced');
   assert.equal(calls[2].system, calls[0].system); assert.deepEqual(calls[2].tools, calls[0].tools);
-  assert.match(calls[2].messages.at(-1).content, /用途摘录：新用途资料 v2.3，期限 2027-06-07/);
+  assert.match(calls[2].messages.at(-1).content, /用途摘要：新用途资料 v2.3，期限 2027-06-07/);
   const after = JSON.parse(await fs.readFile(service.file, 'utf8')).messages;
   assert.deepEqual(after.slice(0, before.length), before); assert.deepEqual(after[0], accepted);
   assert.equal(after.filter(message => message.role === 'user').length, 2);

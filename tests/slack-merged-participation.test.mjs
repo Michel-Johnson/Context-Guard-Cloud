@@ -8,7 +8,7 @@ import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
-import { validateMergedParticipation, mergedParticipationMessages } from '../scripts/cloud/merged-participation.mjs';
+import { validateMergedParticipation, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store } from '../plugins/slack/src/store.mjs';
@@ -73,7 +73,11 @@ async function fixture(t, next) {
       await plugin.tick();
       const binding = Object.values(store.data.threads)[0];
       if (binding) last = await command('conversation.state', { id: `state-${Date.now()}`, userId, projectId, conversationId: binding.conversationId });
-      const desired = last?.status === 'error' ? 'failed' : last?.participationDecision;
+      const lastInput = last?.messages?.findLastIndex(message => message.role === 'user' && last.participationRequestIds?.includes(message.requestId)) ?? -1;
+      const completed = lastInput >= 0 && !last?.activeTurnId && ['waiting-for-user', 'idle'].includes(last?.status) && !last.pendingInputCount &&
+        last.messages.slice(lastInput + 1).some(message => message.role === 'assistant' && !message.partial &&
+          (message.text?.trim() || message.questions?.length || message.attachments?.length));
+      const desired = last?.status === 'error' ? 'failed' : completed && last.participationDecision === 'reply' ? 'completed' : last?.participationDecision;
       const expectedFeedback = (last?.participationRequestIds || []).map(id => store.data.reactionInputs?.[id]?.inboxId)
         .filter(Boolean).map(id => plugin.store.data.feedback?.[id]).filter(Boolean);
       const feedbackReady = !Object.hasOwn(slackStatusEmojis, desired || '') || expectedFeedback.every(item =>
@@ -99,26 +103,35 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
   assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
   assert.equal(f.modelCalls[0].tools.length > 0, true);
   assert.match(f.modelCalls[0].system, /Slack 合并接话协议/);
+  assert.ok(f.modelCalls[0].system.includes(MERGED_PARTICIPATION_POLICY), 'The actual request carries the current policy, not a second classifier');
+  assert.match(f.modelCalls[0].system, /明确或隐式请Coordinator参与/);
+  assert.match(f.modelCalls[0].system, /可信历史 speaker 匹配 routing\.coordinatorUserId/);
+  assert.match(f.modelCalls[0].system, /更正、补充是接续/);
+  assert.match(f.modelCalls[0].system, /没有外层邀请只是资料/);
+  assert.match(f.modelCalls[0].system, /当前概览名称按本轮用途概括/);
   const submitted = f.commands.find(command => command.type === 'conversation.submit');
   assert.deepEqual(submitted.payload.participation.inputs, submitted.payload.inputs.map(({ id, text }) => ({ id, text })));
   assert.equal(state.messages.find(message => message.role === 'user').actor.sessionId, `slack:${teamId}:${userId}`);
   assert.ok(f.posts.some(post => post.text.includes('已确认。')));
   assert.doesNotMatch(JSON.stringify(f.posts), /CG_REPLY|CG_SILENT/);
-  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'speech_balloon']);
+  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'speech_balloon', 'white_check_mark']);
   assert.deepEqual(await f.main(), before);
   await f.send('请确认收到。');
   await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId);
   assert.equal(f.modelCalls.length, 1);
-  assert.equal(f.reactions.length, 2);
+  assert.equal(f.reactions.length, 3);
 });
 
 test('合并接话格式提醒只改本次请求副本，原文、附件和历史保持不变', () => {
   for (const content of ['请确认。', [{ type: 'text', text: '查看附件' }, { type: 'image', source: { type: 'base64', data: 'synthetic' } }]]) {
-    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content }];
+    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content,
+      serverContext: { participation: { context: [{ speaker: botUserId, text: '合成 Coordinator 产物' },
+        { speaker: 'UOTHER', text: '合成他人产物' }], routing: { coordinatorUserId: botUserId } } } }];
     const original = structuredClone(messages), request = mergedParticipationMessages(messages);
     assert.deepEqual(messages, original);
     assert.match(JSON.stringify(request.at(-1).content), /服务器本轮输出格式/);
     assert.deepEqual(request[0], original[0]);
+    assert.deepEqual(request[1].serverContext, original[1].serverContext, 'Trusted speaker/routing data is not rewritten into a decision');
     if (Array.isArray(content)) assert.deepEqual(request[1].content.slice(0, -1), content);
   }
 });
@@ -187,7 +200,7 @@ test('慢模型尚未给出任何标识时已出现👀，确认后才切换状�
   assert.ok(feedback.firstAttemptAt - feedback.savedAt < 1000);
   assert.equal(feedback.desired, 'received'); release();
   await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.posts.length > 0);
-  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon']);
+  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'white_check_mark']);
 });
 
 test('接话后真实读工具及交流表情与正文并存，多次模型调用不重置状态', async t => {
@@ -209,8 +222,8 @@ test('接话后真实读工具及交流表情与正文并存，多次模型调�
   await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.posts.some(post => post.text.includes('💡')) &&
     f.reactions.some(reaction => reaction.name === 'bulb'));
   assert.equal(f.modelCalls.length, 3);
-  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'bulb']);
-  assert.equal(Object.values(f.store.data.feedback)[0].revision, 1);
+  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'bulb', 'white_check_mark']);
+  assert.equal(Object.values(f.store.data.feedback)[0].revision, 2);
   assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
 });
 
@@ -227,7 +240,7 @@ test('单条原消息至多两个交流表情，工具回执明确拒绝超额�
   await f.send('确认理解，并说明下一步。');
   await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.posts.some(post => post.text.includes('核对')) &&
     f.reactions.some(reaction => reaction.name === 'heart'));
-  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'thumbsup', 'heart']);
+  assert.deepEqual(f.reactions.map(reaction => reaction.name), ['eyes', 'speech_balloon', 'thumbsup', 'heart', 'white_check_mark']);
   assert.equal(f.modelCalls.length, 2);
 });
 
@@ -246,8 +259,8 @@ test('消息接收即发送👀，控制头确认后切换💬，不等待完整
   release(); await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId);
   f.plugin.store = await new Store(path.join(f.directory, 'slack')).open();
   for (const key of Object.keys(f.plugin.store.data.threads)) { await f.plugin.mirror(key); await f.plugin.mirror(key); }
-  assert.equal(f.reactions.length, 2);
-  assert.equal(Object.values(f.plugin.store.data.feedback).filter(item => item.applied.speech_balloon && !item.applied.eyes).length, 1);
+  assert.equal(f.reactions.length, 3);
+  assert.equal(Object.values(f.plugin.store.data.feedback).filter(item => item.applied.white_check_mark && !item.applied.speech_balloon && !item.applied.eyes).length, 1);
 });
 
 test('无控制头的失败轮次不锁死线程，新消息接续且保留原失败、输入指纹和回执', async t => {
@@ -272,7 +285,7 @@ test('无控制头的失败轮次不锁死线程，新消息接续且保留原�
   assert.deepEqual(saved.toolReceipts, original.toolReceipts);
   assert.equal(f.modelCalls.length, 2);
   assert.equal(Object.values(f.store.data.inbox).every(entry => entry.status === 'done'), true);
-  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning', 'eyes', 'speech_balloon']);
+  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning', 'eyes', 'speech_balloon', 'white_check_mark']);
   assert.deepEqual(await f.main(), before);
 });
 
@@ -288,7 +301,7 @@ test('Slack 合并静默：保存原输入，👀切换🙈，无正文或业务
   assert.deepEqual(await f.main(), before);
 });
 
-test('失败后的显式恢复提高控制代次，旧失败快照不能覆盖恢复后的💬', async t => {
+test('失败后的显式恢复提高控制代次，旧失败快照不能覆盖恢复后已送达的✅', async t => {
   const f = await fixture(t, async ({ onText }, count) => {
     const text = count === 1 ? '没有控制头' : '[CG_REPLY]\n恢复成功。'; await onText(text); return result(text);
   });
@@ -300,7 +313,7 @@ test('失败后的显式恢复提高控制代次，旧失败快照不能覆盖�
   const before = f.reactions.length;
   for (const key of Object.keys(f.store.data.threads)) await f.plugin.queueReadReactions(key, failed);
   await Promise.all([...f.plugin.reactions]);
-  assert.equal(f.reactions.length, before); assert.equal(Object.values(f.store.data.feedback)[0].desired, 'reply');
+  assert.equal(f.reactions.length, before); assert.equal(Object.values(f.store.data.feedback)[0].desired, 'completed');
 });
 
 test('Slack 合并工具答复：同轮决定后调用真实 read_map，续轮不重复决策', async t => {
