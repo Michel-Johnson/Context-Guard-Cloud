@@ -158,3 +158,29 @@ test('Gateway events Abort closes a live SSE connection without another state or
   await Promise.race([f.disconnected, new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Aborted HTTP stream remained open')), 2000); timeout.unref(); })]);
   assert.equal(f.requests.length, 1, 'Cancellation does not reconnect or create a conversation');
 });
+
+test('事件消费暂停时中断，恢复迭代不能再读取或等待下一个事件', { timeout: 10000 }, async t => {
+  const f = await fixture(t, (_req, res) => { sse(res); res.write(frame(state({ sequence: 1 }))); });
+  const controller = new AbortController(), iterator = f.events(controller.signal);
+  assert.equal((await iterator.next()).value.sequence, 1);
+  controller.abort();
+  await assert.rejects(iterator.next(), { name: 'AbortError' });
+  assert.equal(f.requests.length, 1);
+});
+
+test('读取和取消不响应时仍及时中断，释放锁但不重连或丢失取消错误', { timeout: 3000 }, async () => {
+  let cancelCalls = 0;
+  const body = new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(frame(state({ sequence: 1 })))); },
+    cancel() { cancelCalls++; return new Promise(() => {}); },
+  });
+  const gateway = new Gateway({ url: 'http://127.0.0.1:1234', token, teamId,
+    fetchImpl: async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }) });
+  const controller = new AbortController(), iterator = gateway.events({ ...scope, signal: controller.signal });
+  assert.equal((await iterator.next()).value.sequence, 1);
+  const waiting = iterator.next();
+  controller.abort();
+  await assert.rejects(waiting, { name: 'AbortError' });
+  assert.equal(cancelCalls, 1);
+  assert.equal(body.locked, false);
+});
