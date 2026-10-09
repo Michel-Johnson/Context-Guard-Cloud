@@ -65,7 +65,21 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       ...(input ? { 'Content-Type': 'application/json' } : {}) }, ...(input ? { body: JSON.stringify(input) } : {}) });
     return { status: response.status, body: await response.json() };
   };
-  const post = async (route, input) => { const result = await request(route, input); assert.equal(result.status, route === endpoint ? 202 : 200, JSON.stringify(result.body)); return result.body; };
+  const post = async (route, input) => {
+    const deadline = Date.now() + 15000;
+    for (;;) {
+      const result = await request(route, input);
+      // Inbox notifications may start a turn between observing waiting and
+      // POST. BUSY is a definite non-acceptance; reuse this exact request ID.
+      // Accepted/unknown results are never retried or replaced.
+      if (route === endpoint && result.status === 409 && result.body.error?.code === 'COORDINATOR_BUSY') {
+        assert.ok(Date.now() < deadline, 'Coordinator did not release its active turn');
+        const state = await request(endpoint); assert.equal(state.status, 200);
+        await new Promise(resolve => setTimeout(resolve, 20)); continue;
+      }
+      assert.equal(result.status, route === endpoint ? 202 : 200, JSON.stringify(result.body)); return result.body;
+    }
+  };
   const poll = async predicate => {
     const deadline = Date.now() + 15000;
     for (;;) { const result = await request(endpoint); assert.equal(result.status, 200, JSON.stringify(result.body));

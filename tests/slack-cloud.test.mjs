@@ -262,6 +262,10 @@ test('真实 Cloud 项目工具沿原目录授权交接，对话和 Main 隔离�
 });
 
 test('隔离端到端：Slack 自然切换经真实 HTTP 和原生工具交接，后续原线程回复只读新项目上下文', async t => {
+  let plugin;
+  // Register before fixture teardown so failures also stop the consumer while
+  // its Cloud gateway and files still exist. Hooks execute in registration order.
+  t.after(() => plugin?.stop());
   const f = await fixture(t, { projectSelection: true }), dm = 'DTESTDM', posts = [], calls = [];
   const oldFile = legacyProjectMemoryFile(f.memoryConfig.dataDir, projectId), newFile = legacyProjectMemoryFile(f.memoryConfig.dataDir, otherProjectId);
   const oldMemory = await readJSON(oldFile), newMemory = await readJSON(newFile);
@@ -272,13 +276,13 @@ test('隔离端到端：Slack 自然切换经真实 HTTP 和原生工具交接�
   await store.update(s => { s.preferences[userId] = projectId; });
   const gateway = new Gateway({ url: f.cloud.integrationUrl, token: integrationCredential, teamId });
   const original = gateway.command.bind(gateway); gateway.command = async (type, args) => { calls.push({ type, ...args }); return original(type, args); };
-  const plugin = new SlackPlugin({ store, gateway, teamId, cloudOrigin: f.cloud.url, botUserId: 'UBOTTEST', collectMs: 0, maxCollectMs: 0,
+  plugin = new SlackPlugin({ store, gateway, teamId, cloudOrigin: f.cloud.url, botUserId: 'UBOTTEST', collectMs: 0, maxCollectMs: 0,
     logger: { warn(){}, error(){} }, io: {
       post: async input => { posts.push(input); return `${1000 + posts.length}.001`; }, update: async (...args) => { posts.push({ update: args }); },
       call: async (method, input) => method === 'conversations.info' ? { channel: { id: dm, user: userId } } :
         method === 'users.info' ? { user: { id: input.user, is_bot: false } } : { messages: [] },
     } });
-  t.after(() => plugin.stop()); plugin.stopped = false;
+  plugin.stopped = false;
   const send = async (ts, text, thread_ts) => plugin.receive({ type: 'events_api', body: { team_id: teamId, event: {
     type: 'message', user: userId, channel: dm, channel_type: 'im', ts, text, ...(thread_ts ? { thread_ts } : {}) } }, ack: async () => {} });
   await send('100.001', '切换到另一个项目');

@@ -125,5 +125,75 @@ export class CursorCloudProvider {
     if (result?.id !== agentId) fail('CURSOR_AGENT_MISMATCH', 'Cursor returned another Agent');
     return result;
   }
+  async readRunEvents(agentId, runId, { signal, onEvent } = {}) {
+    const route = `/v1/agents/${id(agentId)}/runs/${id(runId)}/stream`;
+    if (onEvent !== undefined && typeof onEvent !== 'function') fail('INVALID_CURSOR_OPTIONS', 'Use a trusted stream observer');
+    const controller = new AbortController(), abort = () => controller.abort();
+    if (signal?.aborted) abort();
+    signal?.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(abort, this.timeoutMs);
+    let reader, bytes = 0, line = '', data = [], event = '', skipLf = false, complete = false;
+    const events = [], decoder = new TextDecoder('utf-8', { fatal: true });
+    const frame = async () => {
+      if (!data.length) { event = ''; return; }
+      let value;
+      try { value = JSON.parse(data.join('\n')); } catch { fail('CURSOR_PROTOCOL_ERROR', 'Cursor stream returned invalid JSON'); }
+      const kind = event || 'message'; data = []; event = '';
+      if (!value || typeof value !== 'object' || Array.isArray(value)) fail('CURSOR_PROTOCOL_ERROR', 'Cursor stream returned an invalid event');
+      if (['status', 'result'].includes(kind) && value.runId !== runId) fail('CURSOR_RUN_MISMATCH', 'Cursor stream returned another Run');
+      if (['status', 'tool_call', 'result', 'error', 'done'].includes(kind)) {
+        if (events.length >= 20000) fail('CURSOR_OUTPUT_LIMIT', 'Cursor stream has too many events');
+        const item = { event: kind, data: value }; events.push(item);
+        if (onEvent) await onEvent(item);
+      }
+      if (kind === 'done') complete = true;
+    };
+    const finishLine = async () => {
+      if (!line) await frame();
+      else if (!line.startsWith(':')) {
+        const index = line.indexOf(':'), field = index < 0 ? line : line.slice(0, index);
+        let value = index < 0 ? '' : line.slice(index + 1);
+        if (value.startsWith(' ')) value = value.slice(1);
+        if (field === 'data') data.push(value);
+        else if (field === 'event') event = value;
+      }
+      line = '';
+    };
+    try {
+      const response = await fetch(this.origin + route, { redirect: 'error', signal: controller.signal,
+        headers: { Authorization: this.authorization, Accept: 'text/event-stream' } });
+      if (!response.ok) {
+        response.body?.cancel().catch(() => {});
+        fail(response.status === 410 ? 'CURSOR_STREAM_EXPIRED' : response.status === 409 ? 'CURSOR_CONFLICT'
+          : [401, 403].includes(response.status) ? 'CURSOR_AUTH_REQUIRED' : response.status === 404 ? 'CURSOR_NOT_FOUND'
+            : response.status === 429 ? 'CURSOR_RATE_LIMITED' : 'CURSOR_HTTP_ERROR', `Cursor stream returned HTTP ${response.status}`);
+      }
+      if (!/^text\/event-stream(?:\s*;|$)/i.test(response.headers.get('content-type') || '')) fail('CURSOR_PROTOCOL_ERROR', 'Cursor stream requires event-stream content');
+      reader = response.body?.getReader();
+      if (!reader) fail('CURSOR_PROTOCOL_ERROR', 'Cursor stream returned an empty body');
+      while (!complete) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        bytes += chunk.value.length;
+        if (bytes > 8 * 1024 * 1024) fail('CURSOR_OUTPUT_LIMIT', 'Cursor stream exceeds the limit');
+        const text = decoder.decode(chunk.value, { stream: true });
+        for (const character of text) {
+          if (skipLf) { skipLf = false; if (character === '\n') continue; }
+          if (character === '\r' || character === '\n') { await finishLine(); skipLf = character === '\r'; }
+          else line += character;
+          if (complete) break;
+        }
+      }
+      if (!complete) fail('CURSOR_STREAM_INCOMPLETE', 'Cursor stream ended without its done event');
+      if (controller.signal.aborted) fail('CURSOR_TIMEOUT', 'Cursor stream observation was interrupted');
+      return { agentId, runId, complete: true, events };
+    } catch (cause) {
+      if (typeof cause.code === 'string' && cause.code.startsWith('CURSOR_')) throw cause;
+      fail(controller.signal.aborted ? 'CURSOR_TIMEOUT' : 'CURSOR_TRANSPORT_ERROR', 'Cursor stream observation did not confirm complete output');
+    } finally {
+      clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort();
+      if (reader) { reader.cancel().catch(() => {}); reader.releaseLock(); }
+    }
+  }
   cancel(agentId, runId) { return this.request(`/v1/agents/${id(agentId)}/runs/${id(runId)}/cancel`, { method: 'POST', body: {} }); }
 }

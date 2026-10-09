@@ -48,6 +48,9 @@
     }
   ],
   "productFiles": [
+    "tests/cursor-git-proof.test.mjs",
+    "tests/cursor-stream.test.mjs",
+    "tests/cursor-native-proof.test.mjs",
     "tests/cursor-role-http.test.mjs",
     "tests/cursor-role-factory.test.mjs",
     "tests/cursor-role-channel.test.mjs",
