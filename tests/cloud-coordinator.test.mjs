@@ -14,6 +14,7 @@ import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, coo
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
+import { SLACK_INTERACTION_POLICY, slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
 
 const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
 function reactionState(source = 'slack', actor = reactionActor) {
@@ -58,6 +59,13 @@ test('Slack reaction enum and target-free schema reject approval-like emoji and 
   assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
     'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
   assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
+  assert.match(tool.description, /不只在用户要求时使用/); assert.match(tool.description, /无需解释的社交确认可纯表情/);
+  assert.doesNotMatch(tool.description, /默认用简短文字|问候和社交确认也应简短文字回应|用户明确要表情或确有必要.*才使用/);
+  assert.match(SLACK_INTERACTION_POLICY, /更主动、自然地使用 react_to_user/);
+  assert.match(SLACK_INTERACTION_POLICY, /不只在用户索要表情时使用/);
+  assert.match(SLACK_INTERACTION_POLICY, /简单社交确认无需解释时可以只用交流表情/);
+  assert.doesNotMatch(SLACK_INTERACTION_POLICY, /默认用简短文字回应|只有用户明确要表情|问候.*必须/);
+  assert.match(SLACK_INTERACTION_POLICY, /对勾不代表任务完成或人类批准/); assert.equal(slackStatusEmojis.completed, 'white_check_mark');
   assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
   assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
   assert.equal(tool.input_schema.properties.replyComplete.type, 'boolean');

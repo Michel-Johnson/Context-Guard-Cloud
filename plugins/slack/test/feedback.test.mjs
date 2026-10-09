@@ -63,7 +63,7 @@ test('原消息与👀意图一次持久提交，崩溃重启而无 Slack 重投
   f.plugin.store = reopened; f.plugin.stopped = false;
   await f.settle(); assert.deepEqual(f.calls.map(c => c.name), ['eyes']);
 });
-for (const [desired, emoji] of [['silent', 'see_no_evil'], ['reply', 'speech_balloon'], ['failed', 'warning'], ['stopped', 'stop_sign']]) {
+for (const [desired, emoji] of [['silent', 'see_no_evil'], ['reply', 'speech_balloon'], ['completed', 'white_check_mark'], ['failed', 'warning'], ['stopped', 'stop_sign']]) {
   test(`状态 ${desired} 先确认 ${emoji} 再移除仅本机器人 👀`, async t => {
     const f = await fixture(t), id = await f.receive(); await f.settle();
     await f.plugin.feedback.decide(id, desired, { inputRevision: 1, controlRevision: 0, requestId: 'original' }); await f.settle();
@@ -74,6 +74,30 @@ for (const [desired, emoji] of [['silent', 'see_no_evil'], ['reply', 'speech_bal
     assert.equal(f.calls.some(c => c.user !== undefined), false, '移除 API 不指定其他反应者');
   });
 }
+test('回复完成后换成对勾，旧接话快照和新消息的全局版本不能重置旧原消息', async t => {
+  const f = await fixture(t), id = await f.receive(); await f.settle();
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 }); await f.settle();
+  await f.plugin.feedback.decide(id, 'completed', { inputRevision: 1 }); await f.settle();
+  assert.deepEqual([...f.present], [`${channel}:100.001:white_check_mark`]);
+  assert.deepEqual(f.calls.slice(-2).map(c => [c.method, c.name]), [['reactions.add', 'white_check_mark'], ['reactions.remove', 'speech_balloon']]);
+  const count = f.calls.length;
+  for (const desired of ['received', 'reply', 'silent', 'failed', 'stopped']) {
+    await f.plugin.feedback.decide(id, desired, { inputRevision: 2, controlRevision: 0 });
+  }
+  await f.receive(); await f.settle();
+  assert.equal(f.calls.length, count); assert.equal(f.store.data.feedback[id].desired, 'completed');
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 2, controlRevision: 1 }); await f.settle();
+  assert.deepEqual([...f.present], [`${channel}:100.001:speech_balloon`]);
+});
+test('失败或停止不能被同代次的迟到完成快照标成对勾', async t => {
+  for (const terminal of ['failed', 'stopped']) {
+    const f = await fixture(t), id = await f.receive(); await f.settle();
+    await f.plugin.feedback.decide(id, terminal, { inputRevision: 1 }); await f.settle();
+    await f.plugin.feedback.decide(id, 'completed', { inputRevision: 1 }); await f.settle();
+    assert.equal(f.store.data.feedback[id].desired, terminal);
+    assert.equal(f.calls.some(c => c.name === 'white_check_mark'), false);
+  }
+});
 test('同一增量或迟到眼睛不能覆盖更新的决定，未知结果始终恢复原目标', async t => {
   const f = await fixture(t); let release, entered;
   const held = new Promise(r => { release = r; }), started = new Promise(r => { entered = r; });
@@ -165,3 +189,101 @@ test('状态与交流表情命名空间分离，原白名单和新增选项均�
   assert.ok(['thumbsup', 'heart', 'handshake', 'bulb', 'fire', 'joy', 'rocket'].every(name => slackReactionEmojis.includes(name)));
   assert.ok(Object.values(slackStatusEmojis).every(name => !slackReactionEmojis.includes(name)));
 });
+
+async function restartFeedback(t, f) {
+  await f.plugin.stop();
+  const store = await new Store(f.directory).open();
+  const plugin = new SlackPlugin({ store, io: f.io, gateway: f.plugin.gateway,
+    teamId: team, botUserId: bot, cloudOrigin: 'https://example.invalid', logger: { warn() {}, error() {} } });
+  plugin.kick = () => {}; plugin.stopped = false;
+  t.after(() => plugin.stop());
+  return { plugin, store, settle: async () => {
+    plugin.feedback.drain(); await Promise.all([...plugin.reactions]); await store.tail;
+  } };
+}
+
+test('完成对勾添加失回后重启确认原操作，再移除本机器人接话状态', async t => {
+  const f = await fixture(t), id = await f.receive(); await f.settle();
+  await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 }); await f.settle();
+  const otherReaction = `${channel}:100.001:speech_balloon:UOTHER`;
+  f.present.add(otherReaction);
+  const call = f.io.call, attempts = []; let lose = true;
+  f.io.call = async (method, input) => {
+    attempts.push({ method, ...input });
+    const result = await call(method, input);
+    if (lose && method === 'reactions.add' && input.name === 'white_check_mark') {
+      lose = false; throw TypeError('synthetic completed add acknowledgement lost');
+    }
+    return result;
+  };
+  await f.plugin.feedback.decide(id, 'completed', { inputRevision: 1 }); await f.settle();
+  const pending = structuredClone(f.store.data.feedback[id].pending);
+  assert.equal(pending.status, 'unknown'); assert.equal(pending.method, 'add');
+  assert.equal(pending.emoji, 'white_check_mark'); assert.equal(pending.attempts, 1);
+  assert.equal(f.store.data.feedback[id].applied.speech_balloon, true);
+  assert.deepEqual(attempts, [{ method: 'reactions.add', channel, timestamp: '100.001', name: 'white_check_mark' }]);
+  assert.ok(f.present.has(`${channel}:100.001:speech_balloon`));
+  assert.ok(f.present.has(`${channel}:100.001:white_check_mark`));
+
+  const resumed = await restartFeedback(t, f);
+  assert.deepEqual(resumed.store.data.feedback[id].pending, pending);
+  await resumed.store.update(state => { state.feedback[id].pending.next = 0; });
+  await resumed.settle();
+  assert.deepEqual(attempts, [attempts[0], attempts[0],
+    { method: 'reactions.remove', channel, timestamp: '100.001', name: 'speech_balloon' }]);
+  const record = resumed.store.data.feedback[id];
+  assert.equal(record.desired, 'completed'); assert.equal(record.pending, null);
+  assert.equal(record.applied.white_check_mark, true); assert.equal(record.applied.speech_balloon, false);
+  assert.deepEqual(record.receipts.slice(-2).map(receipt => [receipt.method, receipt.emoji, receipt.attempts]),
+    [['add', 'white_check_mark', 2], ['remove', 'speech_balloon', 1]]);
+  assert.deepEqual([...f.present].sort(), [otherReaction, `${channel}:100.001:white_check_mark`].sort());
+  assert.ok(attempts.every(operation => operation.user === undefined));
+  await resumed.settle(); assert.equal(attempts.length, 3, '重复恢复不重发已确认状态');
+});
+
+for (const failure of ['lost-ack', 'rate-limited']) {
+  test(`完成后移除接话状态 ${failure}，重启只恢复原目标且保留他人反应`, async t => {
+    const f = await fixture(t), id = await f.receive(); await f.settle();
+    await f.plugin.feedback.decide(id, 'reply', { inputRevision: 1 }); await f.settle();
+    const otherReactions = [`${channel}:100.001:speech_balloon:UOTHER`, `${channel}:100.001:heart:UOTHER`];
+    for (const reaction of otherReactions) f.present.add(reaction);
+    const call = f.io.call, attempts = []; let first = true;
+    f.io.call = async (method, input) => {
+      attempts.push({ method, ...input });
+      if (first && method === 'reactions.remove' && input.name === 'speech_balloon') {
+        first = false;
+        if (failure === 'rate-limited') throw Object.assign(Error('synthetic remove limited'), {
+          code: 'slack_webapi_rate_limited_error', retryAfter: 7 });
+        await call(method, input); throw TypeError('synthetic completed remove acknowledgement lost');
+      }
+      return call(method, input);
+    };
+    await f.plugin.feedback.decide(id, 'completed', { inputRevision: 1 }); await f.settle();
+    const pending = structuredClone(f.store.data.feedback[id].pending);
+    assert.equal(pending.status, 'unknown'); assert.equal(pending.method, 'remove');
+    assert.equal(pending.emoji, 'speech_balloon'); assert.equal(pending.attempts, 1);
+    assert.equal(f.store.data.feedback[id].applied.white_check_mark, true);
+    assert.equal(f.store.data.feedback[id].applied.speech_balloon, true, '未知移除不伪造确认');
+    assert.equal(f.present.has(`${channel}:100.001:speech_balloon`), failure === 'rate-limited');
+    if (failure === 'rate-limited') assert.ok(pending.next - pending.startedAt >= 7000);
+    assert.deepEqual(attempts, [
+      { method: 'reactions.add', channel, timestamp: '100.001', name: 'white_check_mark' },
+      { method: 'reactions.remove', channel, timestamp: '100.001', name: 'speech_balloon' },
+    ]);
+
+    const resumed = await restartFeedback(t, f);
+    assert.deepEqual(resumed.store.data.feedback[id].pending, pending);
+    await resumed.settle(); assert.equal(attempts.length, 2, '退避期内重启不绕过原截止时间');
+    await resumed.store.update(state => { state.feedback[id].pending.next = 0; });
+    await resumed.settle();
+    assert.deepEqual(attempts[2], attempts[1], '失回或限流都只重放同频道、时间戳、表情的移除操作');
+    const record = resumed.store.data.feedback[id];
+    assert.equal(record.desired, 'completed'); assert.equal(record.pending, null);
+    assert.equal(record.applied.white_check_mark, true); assert.equal(record.applied.speech_balloon, false);
+    assert.deepEqual(record.receipts.slice(-2).map(receipt => [receipt.method, receipt.emoji, receipt.attempts]),
+      [['add', 'white_check_mark', 1], ['remove', 'speech_balloon', 2]]);
+    assert.deepEqual([...f.present].sort(), [...otherReactions, `${channel}:100.001:white_check_mark`].sort());
+    assert.ok(attempts.every(operation => operation.user === undefined));
+    await resumed.settle(); assert.equal(attempts.length, 3, '已确认移除不再重放');
+  });
+}

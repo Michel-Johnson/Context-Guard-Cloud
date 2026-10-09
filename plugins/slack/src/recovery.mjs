@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { digest, threadKey } from './store.mjs';
+import { hasSlackContent } from './plugin.mjs';
 import { recoveryScope, RECOVERY_ERRORS } from '../../../scripts/cloud/slack-recovery.mjs';
 
 const fail = (code, message) => { throw Object.assign(new Error(message), { code }); };
@@ -211,11 +212,21 @@ export class SlackRecoveryControl {
           state.participationRequestIds.length === audit.inputIds.length &&
           ['reply', 'silent'].includes(state.participationDecision)) {
         const messages = state.messages.filter(message => message.role === 'assistant' && audit.inputIds.includes(message.requestId) && !message.partial);
-        const textDone = messages.filter(message => message.text || message.questions?.length || message.attachments?.length ||
-          message.actions?.some(action => !['map-read', 'node-read', 'slack-reaction'].includes(action.kind))).every(message => binding.mirrored[message.id]);
+        const deliveryDone = messages.every(message => {
+          const actions = message.actions || [];
+          // The switch adapter replaces this message with its dedicated result
+          // and never creates a raw-body slot. Unsupported mixed actions stay
+          // unconfirmed; a switch ACK cannot stand in for another presentation.
+          const switches = actions.filter(action => action?.kind === 'project-switch');
+          if (switches.length) return actions.length === 1 && typeof switches[0].actionId === 'string' && !!switches[0].actionId &&
+            this.plugin.store.data.projectSwitches?.[`project-switch-${digest([audit.key, switches[0].actionId])}`]?.announced === true;
+          if (hasSlackContent(message) && !binding.mirrored[message.id]?.ts) return false;
+          return actions.every(action => action?.kind === 'binding-proposal' ? typeof action.id === 'string' && !!action.id &&
+            !!binding.mirrored[`binding:${action.id}`]?.ts : true);
+        });
         const actions = messages.flatMap(message => (message.actions || []).filter(action => action.kind === 'slack-reaction'));
         const reactionsDone = actions.every(action => this.plugin.store.data.reactionOutbox?.[`reaction-${digest([audit.key, action.actionId])}`]?.status === 'sent');
-        if (state.participationDecision === 'silent' || messages.length && textDone && reactionsDone) status = 'completed';
+        if (state.participationDecision === 'silent' || messages.length && deliveryDone && reactionsDone) status = 'completed';
       }
       if (status) await this.plugin.store.update(value => Object.assign(value.recoveries[operationId], { status, completedAt: Date.now() }));
     }
