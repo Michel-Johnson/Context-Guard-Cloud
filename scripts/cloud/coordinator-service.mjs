@@ -649,6 +649,9 @@ export class CoordinatorService {
             state.partialText = '';
             delete state.partialOutputId;
             delete state.partialResponseIndex;
+          }
+          if (state.status === 'interrupted' || state.status === 'error' && source === 'slack') {
+            // 显式恢复是新的控制代次，旧失败快照不能覆盖恢复后的状态。
             journal.controlRevision = (journal.controlRevision || 0) + 1;
             await atomicWrite(this.inputFile, encode(journal));
             state.controlRevision = journal.controlRevision;

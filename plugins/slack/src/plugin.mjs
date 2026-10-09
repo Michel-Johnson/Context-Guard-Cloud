@@ -2,12 +2,11 @@ import { digest, threadKey } from './store.mjs';
 import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
+import { SlackFeedback } from './feedback.mjs';
+import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
-// This narrow boundary repeats the Cloud enum deliberately; contract tests
-// keep it aligned without importing the whole Cloud tool catalogue.
-const slackReactionEmojis = ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray'];
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
 const reactionEventHash = event => digest({ ...event, type: 'message' });
@@ -60,6 +59,7 @@ export class SlackPlugin {
     this.userIdentities = new Map();
     this.identityTasks = new Set();
     this.eventStreams = new Map(); this.eventRetry = new Map(); this.eventTasks = new Set(); this.kickRequested = false;
+    this.feedback = new SlackFeedback(this);
   }
   async receive({ type, body, envelope_id, ack }) {
     const team = body.team_id || body.team?.id || body.event?.team;
@@ -74,7 +74,10 @@ export class SlackPlugin {
     }
     const id = envelopeId(type, body, envelope_id);
     if (Object.keys(this.store.data.inbox).length > 50000 && !this.store.data.inbox[id]) throw new Error('Slack journal capacity exceeded');
-    const fresh = await this.store.receive(id, safeEnvelope(type, body), { collectMs: this.collectMs, maxCollectMs: this.maxCollectMs });
+    const envelope = safeEnvelope(type, body);
+    const fresh = await this.store.receive(id, envelope, { collectMs: this.collectMs, maxCollectMs: this.maxCollectMs,
+      feedback: this.feedback.target(envelope) });
+    this.feedback.drain();
     await ack(type === 'slash_commands' ? { text: '已收到，正在处理。' } : undefined);
     // Modal trigger IDs expire quickly. Do not place them behind model polling
     // or attachment downloads; the journal is still durable before execution.
@@ -144,17 +147,24 @@ export class SlackPlugin {
     return ready;
   }
   async queueReadReactions(key, state) {
-    if (state.participationDecision !== 'reply' || !Array.isArray(state.participationRequestIds) || state.participationRequestIds.length > 20) return [];
+    if (!Array.isArray(state.participationRequestIds) || state.participationRequestIds.length > 20) return [];
     const ready = [], messages = state.messages || [];
+    const desired = state.status === 'error' ? 'failed' : state.status === 'interrupted' ? 'stopped' : state.participationDecision;
+    if (!['reply', 'silent', 'failed', 'stopped'].includes(desired)) return ready;
+    const binding = this.store.data.threads[key];
     for (const requestId of new Set(state.participationRequestIds)) {
       if (!state.acceptedRequestIds?.includes(requestId)) continue;
       const source = messages.find(message => message.role === 'user' && message.requestId === requestId);
-      if (!source) continue;
-      // 系统已读反馈复用原消息校验与耐久发送，不开放模型的表情白名单。
-      ready.push(...await this.queueReactions(key, { role: 'assistant', source: source.source,
-        actor: source.actor, requestId, actions: [{ kind: 'slack-reaction', actionId: requestId,
-          emoji: 'eyes', status: 'intent', requestId, actor: source.actor }] }, messages, { read: true }));
+      const input = this.store.data.reactionInputs?.[requestId], actor = source?.actor;
+      if (!binding || source?.source !== 'slack' || actor?.kind !== 'human' || actor.integration !== 'slack' || actor.teamId !== this.teamId ||
+          actor.sessionId !== `slack:${this.teamId}:${actor.userId}` || !binding.ownRequests?.includes(requestId) ||
+          !input || input.key !== key || input.projectId !== binding.projectId || input.conversationId !== binding.conversationId ||
+          input.userId !== actor.userId || input.channel !== binding.channel || !this.feedback.valid(input.inboxId) ||
+          this.store.data.feedback[input.inboxId].timestamp !== input.timestamp || this.store.data.feedback[input.inboxId].userId !== actor.userId ||
+          this.store.data.feedback[input.inboxId].eventHash !== input.eventHash) continue;
+      await this.feedback.decide(input.inboxId, desired, { requestId, inputRevision: state.inputRevision, controlRevision: state.controlRevision });
     }
+    this.feedback.drain();
     return ready;
   }
   drainReactions(ready = new Set()) {
@@ -221,6 +231,7 @@ export class SlackPlugin {
       `${event.channel}:${event.thread_ts || batch?.rootTs || event.ts}`;
   }
   async tick() {
+    this.feedback.drain();
     this.drainReactions();
     const occupied = new Set(this.messageLanes.keys());
     const pending = Object.entries(this.store.data.inbox).filter(([id, item]) => {
@@ -366,6 +377,17 @@ export class SlackPlugin {
         }
       });
       this.logger.warn('Slack operation failed', { id: digest(id).slice(0, 12), code: error.code || 'PLUGIN_ERROR' });
+      for (const member of members) {
+        const feedback = this.store.data.feedback?.[member];
+        if (this.store.data.inbox[member]?.status === 'attention' && this.feedback.valid(member)) {
+          await this.feedback.decide(member, 'failed', { inputRevision: Math.max(0, feedback.inputRevision), controlRevision: Math.max(0, feedback.controlRevision) });
+        }
+      }
+      this.feedback.drain();
+      if (this.store.data.inbox[id]?.status === 'attention' && this.feedback.valid(id) && !error.silent) {
+        await this.io.post({ id: operationId(id, 'intake-failed'), channel: event.channel, threadTs: event.thread_ts || event.ts,
+          text: 'Coordinator 暂时无法处理这条消息，请稍后重试。原消息仍保留。' }).catch(() => {});
+      }
       if (!transient && !error.silent && !mergedFailure) await this.reportError(id, entry.envelope.body, error).catch(() => {});
     }
   }
@@ -1158,7 +1180,8 @@ export class SlackPlugin {
     if (!binding || binding.projectId !== target.projectId || binding.conversationId !== target.conversationId) throw Object.assign(new Error('对话关联已改变，恢复请求未转交给其他对话'), { code: 'CONFLICT' });
     // Cloud restores the original input and trusted actor. A new transport ID
     // cannot be mistaken for the original successful submit receipt.
-    await this.command('conversation.submit', binding, userId, operationId(id, 'resume'), { retry: true, expectedTurnId: target.expectedTurnId });
+    await this.command('conversation.submit', binding, userId, operationId(id, 'resume'), { retry: true, expectedTurnId: target.expectedTurnId,
+      slackChannelId: binding.channel });
     await this.store.update(data => { data.threads[target.key].awaitingReplyId = target.expectedTurnId; data.threads[target.key].nextPoll = 0; });
   }
   async answer(id, userId, value) {
@@ -1422,7 +1445,9 @@ export class SlackPlugin {
       });
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
-    if (state.status === 'error' && !['pending', 'silent'].includes(state.participationDecision)) await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs, text: `Coordinator 当前失败：${state.error?.code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。` });
+    const ownsFeedback = state.participationRequestIds?.some(id => this.feedback.valid(this.store.data.reactionInputs?.[id]?.inboxId));
+    if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs,
+      text: ownsFeedback ? 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。' : `Coordinator 当前失败：${state.error?.code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。` });
     const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer);
     await this.store.update(data => {
       const thread = data.threads[key];

@@ -36,10 +36,15 @@ export class Store {
     this.tail = run.catch(() => {});
     return run;
   }
-  async receive(id, envelope, { collectMs = 800, maxCollectMs = 2000 } = {}) {
+  async receive(id, envelope, { collectMs = 800, maxCollectMs = 2000, feedback = null } = {}) {
     return this.update(state => {
       if (state.inbox[id]) return false;
       state.inbox[id] = { envelope, status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+      if (feedback) {
+        // 接收原消息与其反馈意图共用同一 fsync/原子替换，不留下崩溃窗口。
+        (state.feedback ||= {})[id] = { ...feedback, desired: 'received', revision: 0, inputRevision: -1, controlRevision: -1,
+          receivedAt: state.inbox[id].at, savedAt: Date.now(), applied: {}, receipts: [], pending: null };
+      }
       const event = envelope.type === 'events_api' && envelope.body?.event;
       if (event && ['message', 'app_mention'].includes(event.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share')) {
         const now = Date.now(), direct = event.channel_type === 'im' || event.channel?.startsWith('D');

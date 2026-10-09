@@ -55,9 +55,11 @@ test('Slack reaction tools reject untrusted source and actor even when a model g
 test('Slack reaction enum and target-free schema reject approval-like emoji and arbitrary destinations', async () => {
   const execute = createCoordinatorExecutor({});
   const tool = coordinatorTools.find(item => item.name === 'react_to_user');
-  assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray']);
-  assert.match(tool.description, /already accepted Coordinator reply turn/); assert.match(tool.description, /more readily/);
-  assert.match(tool.description, /accompany text or be the only reply/); assert.match(tool.description, /Do not react to every message, spam, bypass participation/);
+  assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
+    'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
+  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
+  assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
+  assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
   for (const emoji of tool.input_schema.properties.emoji.enum) assert.equal((await execute('react_to_user', { emoji }, { operationId: `enum:${emoji}` })).emoji, emoji);
   for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'eyes' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
     await assert.rejects(execute('react_to_user', input, { operationId: 'original' }), { code: 'INVALID_ARGUMENT' });

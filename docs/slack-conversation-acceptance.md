@@ -1,5 +1,22 @@
 # Slack conversation acceptance
 
+## 即时状态与交流表情验收
+
+本节以用户已确认的新要求覆盖下文历史验收中的“静默零表情”约束：代码先反馈所有获准接收的人类新消息，接话判断仍由模型完成，不扩大受众、工具或项目权限。
+
+| 场景 | 必须看到的结果 |
+| --- | --- |
+| 模型/上下文延迟十秒 | 原消息先有 👀；持久接收后一秒内发起表情请求，不等模型 |
+| 明确静默 | 👀 切换 🙈；无正文、无业务或交流工具；不把模型失败计为静默 |
+| 正常接话与多次工具续轮 | 👀 切换 💬；保留必要正文，多次模型调用不重置状态，不单独分类 |
+| 自然交流 | 支持正文+reaction、正文 emoji、纯社交 reaction；新增七种合法表情，状态命名空间独立 |
+| 同一消息多个交流动作 | 至多两个；超额工具错误明确，必要正文不丢；不要为凑数调用 |
+| 补充、重放、失回、重启与乱序 | 逐条原消息反馈、原目标恢复；旧 pending / 相同版本冲突不能回滚状态 |
+| 限流、删除旧状态失败或永久拒绝 | Retry-After 与原预算有效；未知不冒充送达，只删除自身状态，不阻塞正文 |
+| 模型异常或主动停止 | 明确失败或停止状态，不假装 🙈；原输入与已完成工具回执保留 |
+
+确定性闭环使用真实插件、HTTP 网关与持久化，模型和 Slack IO 替身单独标明。独立 Tester 验证准确提交；实际工作区需真实人类消息和平台回读。比较同模型、参数和场景的交流表情使用率、语义合适性、判断正确性、P50/P95 与失败率，次数不是越高越好。
+
 Coordinator participates when the current human explicitly or indirectly needs
 its help. A native mention of another Bot is evidence, not an exclusion rule.
 Project relevance alone does not require a reply. Quoted history, code and file
