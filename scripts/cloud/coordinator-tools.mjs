@@ -49,7 +49,7 @@ export const coordinatorTools = [
   definition('edit_map', 'Create, update, move or delete Main nodes and TODO/Bug records; update project or node memoryDocument at mainVersion.', {
     mainVersion: string, actions: { type: 'array', minItems: 1, maxItems: 30, items: { type: 'object', properties: {
       op: { enum: ['create', 'update', 'move', 'delete'] }, id: string, parentId: string, nodeId: string, order: { type: 'integer', minimum: 0 },
-      title: string, purpose: string, memoryDocument: { type: 'string', maxLength: 12000 }, kind: { enum: ['module', 'work', 'node', 'todo', 'bug'] }, state: { enum: ['dirty', 'untested', 'success'] }, owns: strings,
+      title: string, purpose: string, memoryDocument: { type: 'string', maxLength: 12000 }, kind: { enum: ['module', 'work', 'node', 'todo', 'bug'], description: '结构节点类型用 module 或 work。node 仅表示操作已有节点，不改变其类型；todo/bug 仅用于删除事项，不用于结构节点的创建或更新。' }, state: { enum: ['dirty', 'untested', 'success'] }, owns: strings,
     }, required: ['op'], additionalProperties: false } },
   }),
   definition('mount_conversation', '提出唯一主节点的绑定或改绑建议，返回完整路径供人类确认。此工具不会直接绑定；用户同意后由宿主保存。相关模块仅按需读取，绑定不代表批准开发。', {

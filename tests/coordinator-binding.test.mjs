@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { CoordinatorBindings } from '../scripts/cloud/coordinator-binding.mjs';
+import { CoordinatorBindings, bindingReplyDecision } from '../scripts/cloud/coordinator-binding.mjs';
 import { CoordinatorConversations, CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
 import { buildCoordinatorContext } from '../scripts/cloud/coordinator-context.mjs';
 
@@ -76,6 +76,24 @@ test('自然语言确认仅作用于当前人的待确认建议，引用或普�
   assert.equal(result.decision, 'approved'); assert.equal((await f.conversations.get(f.conversationId)).nodeId, 'TESTING');
 });
 
+test('Slack 固定署名不阻止整句确认，也不授予身份或让引用变成确认', async t => {
+  const suffix = ' *Sent using* <@U0C681J4XMW>', text = '同意绑定' + suffix;
+  assert.equal(bindingReplyDecision(text), null);
+  assert.equal(bindingReplyDecision(text, { slackAttribution: true }), 'approved');
+  assert.equal(bindingReplyDecision('暂不绑定' + suffix, { slackAttribution: true }), 'rejected');
+  for (const body of ['旧消息：“同意绑定”', '解释一下同意绑定', '同意绑定，但先别执行', '同意绑定 *Sent using* @未知']) {
+    assert.equal(bindingReplyDecision(body + suffix, { slackAttribution: true }), null);
+  }
+  const f = await fixture(t); await f.propose('slack-footer');
+  assert.equal(await f.bindings.naturalReview(text, { id: 'browser-text', ...f.context }), null);
+  assert.equal(await f.bindings.naturalReview(text, { id: 'foreign-text', ...f.context,
+    actor: { kind: 'human', sessionId: 'another-human' }, slackAttribution: true }), null);
+  assert.equal((await f.conversations.get(f.conversationId)).nodeId, undefined);
+  const result = await f.bindings.naturalReview(text, { id: 'slack-text', ...f.context, slackAttribution: true });
+  assert.equal(result.decision, 'approved');
+  assert.equal((await f.conversations.get(f.conversationId)).nodeId, 'TESTING');
+});
+
 test('已提交的绑定回执在重启后等待通知，确认通知后不再重复', async t => {
   const f = await fixture(t), proposal = await f.propose('notification');
   const result = await f.bindings.review(f.review(proposal), f.context);
@@ -101,8 +119,9 @@ async function dialogueFixture(t, options = {}) {
     context, beforeAcceptHumanInput: async ({ inputs, context: original, source, actor }) => {
       accepted.push({ ids: inputs.map(input => input.id), source, actor });
       if (!original.bindingRef || !['human', 'slack'].includes(source) || actor?.kind !== 'human') return original;
-      const last = [...inputs].reverse().find(input => /^(同意绑定|暂不绑定)$/.test(input.text));
-      if (last) await f.bindings.naturalReview(last.text, { id: last.id, ...f.context, actor, reference: original.bindingRef });
+      const slackAttribution = source === 'slack';
+      const last = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution }));
+      if (last) await f.bindings.naturalReview(last.text, { id: last.id, ...f.context, actor, reference: original.bindingRef, slackAttribution });
       return context();
     }, model: { next: async request => { calls.push(structuredClone({ system: request.system, messages: request.messages }));
       return { stop: 'end_turn', content: [{ type: 'text', text: '继续讨论' }] }; } }, ...options });
@@ -128,11 +147,12 @@ test('Slack 批量消息按最后一个明确决定确认，重复批次不重�
   const f = await dialogueFixture(t), slackActor = { kind: 'human', integration: 'slack', teamId: 'TTEST', userId: 'UTEST', sessionId: 'slack:TTEST:UTEST' };
   await f.bindings.propose({ mainVersion: 'v1', nodeId: 'TESTING', kind: 'bug', title: '回归缺陷' }, {
     operationId: 'slack-proposal', conversationId: f.conversationId, actor: slackActor });
-  const input = { id: 'slack-batch', inputs: [{ id: 'earlier', text: '暂不绑定' }, { id: 'latest', text: '同意绑定' }] };
+  const input = { id: 'slack-batch', inputs: [{ id: 'earlier', text: '暂不绑定 *Sent using* <@U0C681J4XMW>' }, { id: 'latest', text: '同意绑定 *Sent using* <@U0C681J4XMW>' }] };
   await f.service.submit(input, { source: 'slack', actor: slackActor }); await f.service.running;
   assert.equal((await f.conversations.get(f.conversationId)).nodeId, 'TESTING');
   assert.deepEqual(f.accepted[0].ids, ['earlier', 'latest']);
   assert.match(f.calls[0].system, /测试约束正文/);
+  assert.match(JSON.stringify(f.calls[0].messages), /Sent using/, '原始消息留在聊天记录，署名不充当身份凭据');
   await f.service.submit(input, { source: 'slack', actor: slackActor }); await f.service.running;
   assert.equal(f.accepted.length, 1); assert.equal(f.calls.length, 1);
 });

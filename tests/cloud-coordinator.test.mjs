@@ -2157,6 +2157,16 @@ test('Coordinator Map actions compile structural and destructive Main changes', 
   const memoryDocument = '# Lab · 项目记忆\n\n## 目标\n\n验证工作流。';
   assert.deepEqual(coordinatorStructureOperations([{ op: 'update', id: 'T0', memoryDocument }], 'turn:memory'),
     [{ type: 'update', id: 'T0', fields: { memoryDocument } }]);
+  assert.deepEqual(coordinatorStructureOperations([{ op: 'update', id: 'T0', kind: 'node', memoryDocument }], 'turn:memory-routing'),
+    [{ type: 'update', id: 'T0', fields: { memoryDocument } }]);
+  assert.equal(coordinatorStructureOperations([{ op: 'create', parentId: 'T0', title: '模块', kind: 'node' }], 'turn:node-routing')[0].node.kind, 'module');
+  assert.deepEqual(coordinatorStructureOperations([{ op: 'update', id: 'N1', kind: 'work' }], 'turn:change-kind'),
+    [{ type: 'update', id: 'N1', fields: { kind: 'work' } }]);
+  for (const kind of ['todo', 'bug']) {
+    assert.throws(() => coordinatorStructureOperations([{ op: 'update', id: 'N1', kind, memoryDocument }], 'turn:invalid-update'), { code: 'INVALID_ARGUMENT' });
+    assert.throws(() => coordinatorStructureOperations([{ op: 'create', parentId: 'T0', title: '事项', kind }], 'turn:invalid-create'), { code: 'INVALID_ARGUMENT' });
+  }
+  assert.throws(() => coordinatorStructureOperations([{ op: 'update', id: 'N1', kind: 'node' }], 'turn:empty-update'), { code: 'INVALID_ARGUMENT' });
   assert.throws(() => coordinatorStructureOperations([{ op: 'update', id: 'T0', memoryDocument: 'x'.repeat(12001) }], 'turn:large-memory'),
     { code: 'INVALID_ARGUMENT' });
   assert.throws(() => coordinatorStructureOperations([{ op: 'delete', id: 'TD1', kind: 'memory' }], 'turn:invalid-kind'), { code: 'INVALID_ARGUMENT' });
@@ -2180,6 +2190,7 @@ test('Cloud Coordinator 编辑 Main，提出绑定建议并等人类确认后保
     id: 'T0', title: 'Lab', kind: 'module', state: 'dirty', purpose: '', memories: [], ideas: [], todos: [], bugs: [], dormant: [], files: [], owns: [], children: [], proposal: 'accepted',
   } }, records: {} } }, sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
   let phase = 'edit', step = 0, latestVersion = 'v1', childId = '';
+  const routingMemory = '# Lab · 项目记忆\n\n## 进展\n\n只验证人工确认，不自动派发。';
   server = await startCloudServer({ dataDir: directory, port: 0, browserToken: 'test-browser', memoryConfig,
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/lab' }] },
@@ -2188,6 +2199,9 @@ test('Cloud Coordinator 编辑 Main，提出绑定建议并等人类确认后保
       if (step % 2 === 0) return { stop: 'end_turn', content: [{ type: 'text', text: '完成' }] };
       if (phase === 'edit') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'edit', name: 'edit_map', input: {
         mainVersion: latestVersion, actions: [{ op: 'create', parentId: 'T0', title: '阅读', purpose: '读者体验', owns: ['frontend/'] }],
+      } }] };
+      if (phase === 'memory') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'memory', name: 'edit_map', input: {
+        mainVersion: latestVersion, actions: [{ op: 'update', id: 'T0', kind: 'node', memoryDocument: routingMemory }],
       } }] };
       if (phase === 'mount') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'mount', name: 'mount_conversation', input: {
         mainVersion: latestVersion, nodeId: 'T0', kind: 'todo', title: '提升阅读体验', description: '页面更快且更清楚',
@@ -2233,6 +2247,12 @@ test('Cloud Coordinator 编辑 Main，提出绑定建议并等人类确认后保
   assert.equal(memory.main.memory.map.root.children[0].title, '阅读');
   assert.equal(memory.main.memory.map.root.children[0].origin, 'coordinator');
   assert.equal(state.messages.find(message => message.actions)?.actions[0].kind, 'map-action');
+  latestVersion = memory.main.version; phase = 'memory';
+  await submit({ id: 'memory-routing-turn', text: '只更新记忆正文，不修改节点类型' });
+  state = await wait(); memory = await readMemoryView(memoryConfig, projectId);
+  assert.equal(memory.main.memory.map.root.memoryDocument, routingMemory);
+  assert.equal(memory.main.memory.map.root.kind, 'module');
+  assert.equal(memory.main.memory.map.root.children[0].title, '阅读');
   latestVersion = memory.main.version; phase = 'mount';
   const mountedVersion = latestVersion;
   await submit({ id: 'mount-turn', text: '挂载这个需求' }); state = await wait(); memory = await readMemoryView(memoryConfig, projectId);
