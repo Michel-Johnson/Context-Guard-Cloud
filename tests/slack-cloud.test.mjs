@@ -941,9 +941,9 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
   if (scope === 'session') bindingsBefore['123'] = (await readJSON(path.join(f.directory, 'interface-v2', hash('123'), 'protocol-v2.json'), {})).bindings;
   const mounted = await f.browser(id, { human: true, body: { id: 'mount-focus', text: 'mount-focus-node' } });
   assert.equal(mounted.status, 202, JSON.stringify(mounted.body));
-  let final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  let final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId && state.acceptedRequestIds.includes('mount-focus'));
   const action = final.messages.flatMap(message => message.actions || []).find(value => value.kind === 'binding-proposal');
-  assert.equal(action?.node.id, 'N1');
+  assert.equal(action?.node.id, 'N1', JSON.stringify(final));
   assert.equal(final.conversations.find(value => value.id === id).nodeId, undefined);
   const reviewed = await f.browser(id, { human: true, suffix: '/binding-review', body: {
     id: 'confirm-focus', proposalId: action.id, version: action.version, decision: 'approved' } });
