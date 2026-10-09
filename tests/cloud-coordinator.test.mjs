@@ -60,8 +60,10 @@ test('Slack reaction enum and target-free schema reject approval-like emoji and 
   assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
   assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
   assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
+  assert.equal(tool.input_schema.properties.replyComplete.type, 'boolean');
+  assert.deepEqual(tool.input_schema.required, ['emoji']);
   for (const emoji of tool.input_schema.properties.emoji.enum) assert.equal((await execute('react_to_user', { emoji }, { operationId: `enum:${emoji}` })).emoji, emoji);
-  for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'eyes' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
+  for (const input of [{ emoji: 'white_check_mark' }, { emoji: 'eyes' }, { emoji: 'heart', replyComplete: 'true' }, { emoji: 'heart', channel: 'OTHER' }, { emoji: 'heart', requestId: 'old' }, { emoji: 'heart', timestamp: '1.0' }])
     await assert.rejects(execute('react_to_user', input, { operationId: 'original' }), { code: 'INVALID_ARGUMENT' });
 });
 test('Slack reaction native receipt retains original actor and input across a pending-step restart', async () => {
