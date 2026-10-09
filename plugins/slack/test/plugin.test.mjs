@@ -1759,6 +1759,7 @@ test('merged submit transient HTTP parse network and provider failures recover w
     () => new Response(JSON.stringify({ ok: false, error: { code: 'MODEL_UNAVAILABLE' } }), { status: 503 }),
     () => new Response('{broken JSON', { status: 200 }),
     () => new Response(JSON.stringify({ ok: 'invalid', data: {} }), { status: 200 }),
+    ...['BUSY', 'COORDINATOR_BUSY'].map(code => () => new Response(JSON.stringify({ ok: false, error: { code } }), { status: 409 })),
   ];
   for (const [index, failure] of failures.entries()) {
     const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
@@ -1789,6 +1790,8 @@ test('participation authorization contract version and identity failures never r
     () => new Response('<sign in required>', { status: 401 }),
     () => new Response('{broken', { status: 403 }),
     ...['INVALID_ARGUMENT', 'VERSION_MISMATCH', 'IDENTITY_MISMATCH', 'MODEL_ROUTE_CHANGED'].map(code => () => new Response(JSON.stringify({ ok: false, error: { code } }), { status: 503 })),
+    () => new Response(JSON.stringify({ ok: false, error: { code: 'CONFLICT' } }), { status: 409 }),
+    () => new Response(JSON.stringify({ ok: false, error: { code: 'COORDINATOR_BUSY' } }), { status: 401 }),
   ];
   for (const [index, failure] of failures.entries()) {
     const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
@@ -2126,6 +2129,44 @@ test('read reactions are bounded and stop waits for in-flight reactions without 
   f.plugin.readReaction(event({ ts: '21.001' }));
   await Promise.resolve(); assert.equal(stopped, false); assert.equal(calls, 8);
   release(); await stop; assert.equal(f.plugin.reactions.size, 0);
+});
+test('合并👀只绑定当前已接话原消息，静默、未决定、他人和改写原文均拒绝', async t => {
+  const f = await projectSwitchFixture(t);
+  const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
+    acceptedRequestIds: [f.input.requestId], messages: [f.input] };
+  f.plugin.stopped = false;
+  for (const decision of ['pending', 'silent']) assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationDecision: decision }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, participationRequestIds: ['new-pending-input'] }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot, acceptedRequestIds: [] }), []);
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, { ...snapshot,
+    messages: [{ ...f.input, actor: { ...f.actor, userId: 'UOTHER', sessionId: `slack:${teamId}:UOTHER` } }] }), []);
+  await f.store.update(state => { state.inbox['switch-inbox'].envelope.body.event.text = '改写原文'; });
+  assert.deepEqual(await f.plugin.queueReadReactions(f.key, snapshot), []);
+  assert.deepEqual(f.store.data.reactionOutbox || {}, {});
+});
+test('合并👀的失回、重启和重复镜像沿原消息恢复，already_reacted确认后不再发送', async t => {
+  const f = await projectSwitchFixture(t), calls = [];
+  const snapshot = { participationDecision: 'reply', participationRequestIds: [f.input.requestId],
+    acceptedRequestIds: [f.input.requestId], messages: [f.input] };
+  f.io.call = async (method, input) => {
+    assert.equal(method, 'reactions.add'); calls.push(input);
+    if (calls.length === 1) throw new TypeError('Synthetic lost ACK');
+    throw Object.assign(new Error('Already reacted'), { code: 'slack_webapi_platform_error', data: { error: 'already_reacted' } });
+  };
+  f.plugin.stopped = false;
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  const [id, record] = Object.entries(f.store.data.reactionOutbox)[0];
+  assert.equal(record.status, 'unknown');
+  f.plugin.store = await new Store(f.directory).open();
+  await f.plugin.store.update(state => { state.reactionOutbox[id].next = 0; });
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  assert.equal(f.plugin.store.data.reactionOutbox[id].status, 'sent');
+  f.plugin.drainReactions(new Set(await f.plugin.queueReadReactions(f.key, snapshot)));
+  await Promise.all([...f.plugin.reactions]);
+  assert.equal(calls.length, 2); assert.deepEqual(calls[0], calls[1]);
+  assert.deepEqual(calls[0], { channel: f.dm, timestamp: '123.001', name: 'eyes' });
 });
 test('a submit ACK racing an older mirror snapshot resets its next poll atomically', async t => {
   for (const mode of ['message', 'answer']) {

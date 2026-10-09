@@ -69,9 +69,14 @@ test('Native Coordinator read_map projection produces no empty Slack reply befor
 async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes = [], prepareInput, initialMap, mapProjects, modelSelection = false, projectSelection = false, integrationActions } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-slack-cloud-'));
   let cloud;
-  const held = new Set();
+  const held = new Set(), plugins = new Set();
   const releaseHeld = () => { for (const release of held) release(); held.clear(); };
-  t.after(async () => { releaseHeld(); await cloud?.close(); await fs.rm(directory, { recursive: true, force: true }); });
+  t.after(async () => {
+    releaseHeld();
+    // 先收拢插件的后台反应/原子写入，再停 Cloud，最后删除夹具目录。
+    for (const plugin of plugins) await plugin.stop();
+    await cloud?.close(); await fs.rm(directory, { recursive: true, force: true });
+  });
   const providerFile = path.join(directory, 'provider.json');
   await fs.writeFile(providerFile, JSON.stringify({ model: 'fixture-model', token: 'synthetic', baseUrl: 'https://fixture.invalid' }));
   const visionProviderFile = path.join(directory, 'vision-provider.json');
@@ -109,7 +114,8 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
           ? 'not a decision' : JSON.stringify({ target: addressed ? 'coordinator' : 'none', intent: addressed ? 'reply' : 'notice', reason: 'Controlled decision' }) }] };
       }
       const message = request.messages.at(-1), text = typeof message?.content === 'string'
-        ? message.content.split('[以下为原始输入]\n').at(-1) : '';
+        // 替身按原始人类输入路由；保留 modelCalls 中完整服务器格式提醒供断言。
+        ? message.content.split('[以下为原始输入]\n').at(-1).split('\n\n[服务器本轮输出格式；')[0] : '';
       if (projectSelection && ['列出项目', '切换到另一个项目'].includes(text)) return { stop: 'tool_use', content: [
         { type: 'tool_use', id: 'live-projects', name: 'list_projects', input: {} }] };
       if (projectSelection && Array.isArray(message?.content)) {
@@ -218,6 +224,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, childNodes 
     assert.fail(`${label} timed out: ${JSON.stringify(last?.body)}`);
   };
   return { directory, memoryConfig, options, modelCalls, gateway, browser, wait, get cloud() { return cloud; },
+    ownPlugin(plugin) { plugins.add(plugin); },
     main: () => readMemoryView(memoryConfig, projectId),
     async restart() { releaseHeld(); await cloud.close(); cloud = await startCloudServer(options); },
     async newConversation(id) {
@@ -284,7 +291,7 @@ test('隔离端到端：Slack 自然切换经真实 HTTP 和原生工具交接�
       call: async (method, input) => method === 'conversations.info' ? { channel: { id: dm, user: userId } } :
         method === 'users.info' ? { user: { id: input.user, is_bot: false } } : { messages: [] },
     } });
-  t.after(() => plugin.stop()); plugin.stopped = false;
+  f.ownPlugin(plugin); plugin.stopped = false;
   const send = async (ts, text, thread_ts) => plugin.receive({ type: 'events_api', body: { team_id: teamId, event: {
     type: 'message', user: userId, channel: dm, channel_type: 'im', ts, text, ...(thread_ts ? { thread_ts } : {}) } }, ack: async () => {} });
   await send('100.001', '切换到另一个项目');
@@ -403,7 +410,7 @@ test('隔离跨组件：网页新建项目→原 Slack 问题实时选项→同�
     io: { post: async input => { messages.push(input); return `${100 + messages.length}.001`; }, update: async (...input) => messages.push({ update: input }),
       call: async method => method === 'conversations.info' ? { channel: { user: userId } } :
         ['conversations.history', 'conversations.replies'].includes(method) ? { messages: [] } : {}, }, logger: { error(){}, warn(){} } });
-  t.after(() => plugin.stop());
+  f.ownPlugin(plugin);
   const event = { type: 'message', user: userId, channel: 'DPRIVATE', channel_type: 'im', ts: '100.000', text: '登录刷新 Bug，请分析。' };
   await plugin.chooseProject('original-question', event);
   const original = store.data.inbox['original-question'];
