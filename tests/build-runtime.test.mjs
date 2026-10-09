@@ -51,6 +51,24 @@ test('runtime builder materializes pinned core and UI with a repeatable manifest
   assert.equal(await fs.readFile(path.join(f.root, 'scripts/shared/example.mjs'), 'utf8'), 'export const example = 1;\n');
 });
 
+test('runtime builder migrates reference directories without changing runtime or user files', async t => {
+  const f = await fixture(t);
+  const core = path.join(f.root, 'node_modules/@michelj/context-guard-core');
+  await fs.mkdir(path.join(core, 'references'));
+  await fs.writeFile(path.join(core, 'references/map-read.md'), 'old guide');
+  assert.equal((await f.run()).code, 0);
+  await fs.writeFile(path.join(f.root, 'user-note.md'), 'preserve');
+  await fs.unlink(path.join(core, 'references/map-read.md'));
+  await fs.mkdir(path.join(core, 'skill-reference'));
+  await fs.writeFile(path.join(core, 'skill-reference/map-read.md'), 'new guide');
+  assert.equal((await f.run()).code, 0);
+  assert.equal(await fs.readFile(path.join(f.root, 'scripts/shared/skill-reference/map-read.md'), 'utf8'), 'new guide');
+  await assert.rejects(fs.access(path.join(f.root, 'scripts/shared/references/map-read.md')), { code: 'ENOENT' });
+  assert.equal(await fs.readFile(path.join(f.root, 'scripts/shared/example.mjs'), 'utf8'), 'export const example = 1;\n');
+  assert.equal(await fs.readFile(path.join(f.root, 'user-note.md'), 'utf8'), 'preserve');
+  assert.equal((await f.run()).code, 0);
+});
+
 test('runtime builder preserves existing source files instead of overwriting them', async t => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.root, 'scripts/shared/roles'), { recursive: true });

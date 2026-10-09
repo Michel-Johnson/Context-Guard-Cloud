@@ -93,21 +93,23 @@ test('Slack history freezes the first native input once across duplicate batches
 });
 
 test('Slack history journal marker prevents concurrent steered batches from injecting a second quoted snapshot', { timeout: 10000 }, async t => {
-  const root = await directory(t); let release, ready;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-history-')); let release, ready;
   const held = new Promise(resolve => { release = resolve; }), entered = new Promise(resolve => { ready = resolve; });
   let calls = 0;
   const service = new CoordinatorService({ directory: root, system: 'Test', tools: [], execute: async () => {}, model: { next: async () => {
     if (++calls === 1) { ready(); await held; }
     return { stop: 'end_turn', content: [{ type: 'text', text: 'Done' }] };
   } } });
-  t.after(async () => { release(); await service.close(); });
+  t.after(async () => {
+    release(); await service.close({ stop: true }); await fs.rm(root, { recursive: true, force: true });
+  });
   await service.submitBatch({ id: 'active-batch', inputs: [{ id: 'active-input', text: 'start' }] }, { source: 'slack', actor }); await entered;
   await service.submitBatch({ id: 'first-steer', inputs: [{ id: 'first-steer-input', text: 'current steer' }], followup: 'steer' }, { source: 'slack', actor, history });
   await service.submitBatch({ id: 'second-steer', inputs: [{ id: 'second-steer-input', text: 'another current steer' }], followup: 'steer' }, { source: 'slack', actor, history: [{ ...history[0], text: 'do not attach again' }] });
   const journal = await service.inputJournal();
   assert.equal(journal.historyAccepted, true); assert.deepEqual(journal.requests['first-steer-input'].message.serverContext.history, history);
   assert.equal(Object.hasOwn(journal.requests['second-steer-input'].message.serverContext, 'history'), false);
-  release(); await service.running;
+  release(); await service.close();
 });
 
 async function pluginFixture(t) {

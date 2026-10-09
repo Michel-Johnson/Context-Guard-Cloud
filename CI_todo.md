@@ -6,8 +6,29 @@
 - [ ] 冻结修订的真实 Map 三段十轮：新待办、新 Bug、旧事项；记录原输出、首次失败、恢复、按钮与保存回读。历史短流程和执行中改过源码的结果不套用到最终候选。
 - [ ] Chrome 中真实 Slack 三段十轮、原生选择/绑定按钮与 ✅ 送达。当前仅有正式机器人，尚无候选版独立测试入口，不拿线上旧版代替验收。
 - [ ] 人工检查每段最多60字、单个核心问题、挂载时机和事实准确性；首个有意义回复以两秒为目标，不能用表情或“正在处理”计时。
-- [ ] Skill 固定包公开发布后的精确锁安装、Required、合入部署及线上版本/真实入口复验。没有通过验收前保持 Draft。
+- [ ] Skill 最终固定包的精确锁安装与线上真实入口复验，不以临时候选包替代发布产物验收。
 - DeepSeek 真实测试已出现 `MODEL_HTTP_402`；保留原失败，不盲重试、不静默换线上模型、不代用户充值。其他已配置模型的隔离测试单独标注名称。
+
+## REFERENCE-DOCS-01 · 合并指南的兼容入口
+
+- [ ] Skill 新 core 发布后固定消费准确版本，从该构建验证旧 `read_reference` 标识 `map-mount.md`、`plan-review.md`、`test-check.md` 分别读到合并指南，角色相对链接与章节定位正确。源码的目录迁移与工具读取已有正式回归；旧固定包及合成迁移测试不代替新版共享包消费验收，不修改生成物绕过固定包。本次不部署。
+
+## SLACK-FAILED-TURN-STOP-01 · 失败轮次的耐久停止（2026-10-10）
+
+- [x] 真正原生停止的接收和执行分离缺陷已确认：原1.9.7同一真人/轮次回执与interrupt journal均已保存，journalControlRevision=1，conversation仍error/controlRevision=0，无追加模型或工具。代码run在处理journal前因不可自动恢复错误提前返回，停止请求未应用；不将该接收回执称执行完成。
+- [x] Root 在原run入口的短submit锁下读取当前轮次，优先应用对应、未恢复的耐久停止，再处理错误恢复/step limit。保持原输入、错误、历史及工具回执，清理仅活动/流显示；没有新重试、旁路授权、直接平台写入或数据迁移。重启仍读取同一journal，显式原轮次恢复才继续。
+- [x] Root 唯一四目标开发者验证 actual `15f64a` exit0，Node22.18.0，4/4、0失败/跳过/取消，1384.6267ms；service `31fae769a07914389e01e5f3b6ec4ca306efcb28d6492150859bf2faacfa2bb1`、steer test `8c27f1b9b6208bedde3e71db2159b93a933d45a61a52bbf63a037bb1b0db1a43` 前后冻结一致，日志SHA256 `847e5a5863e20384de91c5bddb0b60fddbfd62f735bbd898074bb359fcf44938`。同进程/重启/step-limit、显式恢复精确复用已确认工具、迟到stop不取消后来工作及旧失败保护通过，没有重跑原PE/诊断目标。
+- [x] 静态闭环发现server恢复入口也会跳过不可自动重试的error：仅增加已有未恢复停止的启动条件，不扩大错误自动重试。追加一个真实隔离HTTP/server-close/restart目标。首 `1b43ec` exit1为fixture误以为初始input-journal已存在；原首次错误保存，仅改合成fixture为与inputJournal缺省一致的零补充状态。最小返工 `5c0c2a` exit0、1/1，4839.2324ms：旧accepted-but-unapplied停止转interrupted/controlRevision1、零新增model/工具/Main修改，原历史/指纹/回执/错误保留。该追加修改未套作此前PE测试文件hash的通过，最终Required核新整合修订，不伪称独立Tester。
+- [x] PR52首准确head416cf8a的Required run37957311485真实失败：Node22和18唯一同项 history journal 断言通过后的hookFailed/ENOTEMPTY；清理注册先删fixture、后关闭服务，且只等待首runner而未收拢后续kick。原失败日志保存，不重跑求绿或跳过测试。仅该正式fixture改为同一teardown先release/close(stop=true)再移除自有临时目录，正文等待service.close收拢全部owned runner；不增加重试、放宽断言或修改业务。
+- [x] 上述唯一失败目标最小返工 actual `617732` exit0、1/1，485.3448ms。此前成功的PE/停止/HTTP目标未重复；后续新PR修订Required按完整冻结树重新核验，不复用416cf8a失败门禁。
+- [ ] 开发完成后唯一四目标：新增同进程/重启/step-limit停止合同与旧实时停止、工具收拢及失败输入保护；不重复PE或诊断目标。准确Required/发布后观察原已保存停止自行收敛，再使用原生resume恢复同原任务；不能用新任务或改ID替代。
+
+## SLACK-VISIBLE-FIRST-LINE-01 · 内部头与用户首行分离（2026-10-09）
+
+- [x] Root 直接开发：已上线1.9.7真实真人请求在onText回调被拒，零正文/工具；private边界指向接话格式校验，不冒称供应商SSE解析或Slack断线。原错误与输入保持；用户指定首行与内部头的具体冲突仍是待复验原因，不保存供应商原文、不将推断写成已复现根因。
+- [x] 最小原位修正：原两条规则区分内部CG_REPLY和用户可见首行；更正接续保留未更改的原要求，直接完成综合答复。不放宽gate/原生解析/授权，不猜接话、不加模型调用/自动重试，不删历史、错误或Map事实。删除同段重复表达抵销静态长度。
+- [x] Root 唯一三个正式目标 actual `057a7d` exit0，Node22.18.0，3/3、0失败/跳过/取消，4756.1902ms；merged `4dd177a0d3dcc89ae908be75d7a66190742a355f2d268c2ea72fdae701b14ed9` / test `05d4d8af57eae29689a54ded5230c7c166f99d5979b29e9d2ae41e3e8ad2d21b` 前后一致，prefix/cache test不变。含项目目录固定规则的完整组合为4980→4955字符、11734→11597字节；原4672等小计不含该固定段，不能混用。此前私有脚本d6e592误把小计当完整绝对上限，正式测试尚未运行就拒绝；仅修脚本口径，源码不改，首次失败保留。日志 `temp/slack-visible-first-line-budget-corrected-20261009.log`；仍是开发者验证，不冒称独立语义评估。
+- [ ] 开发后仅受影响的实际请求/原资料保留/静态预算目标；不重复此前回调四目标或全量。准确PR Required、正常合并、单次发布及原任务恢复后真实结果分别记录，不能由合成测试称模型效果已通过。
 
 ## SLACK-MODEL-CALLBACK-DIAG-01 · 流回调失败的私有定位边界（2026-10-09）
 
@@ -1761,3 +1782,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 后续只读消费者审查发现两个既有格式合同依赖原表达。Coordinator 批准仅恢复 prefix 的「本轮答复发往 Slack：使用纯文本」「段间留一个空行」「代码可用独立围栏代码块」，旧测试不改，不削权限。最终 prefix SHA256 `4846f2d4d22edef0f903b396c9c03670876d47598b040061446243c9b5546ffe`；其余三文件原样。最终静态组合为4637字符/10813字节，仍小于原4672/10980；Executor 未重跑，首批477367只对应上列旧prefix字节，不能套为最终通过。
 - [x] 用户要求停止调用 subagent 后 Root 接手：最终准确字节唯一六目标开发者验证 actual `402540` exit0，Node22.18.0，6/6、0失败/跳过/取消，2075.1538ms；UTC15:33:32.812→15:33:35.017，七源/test前后hash一致。原四合同与两个既有格式合同均通过，日志 `temp/slack-recipient-final-development-20261009.log` SHA256 `fdc0022aa4b6cd4a7fbf881f65c50ab3460cc32dec6ca60aae10e915b169dac4`。这不是独立Tester或真实语义结果；不再重复诊断四目标或本六目标。本轮Required对最终PR修订独立执行，真实语义及线上短名另外记录，不将开发测试称全计划完成。
 - [ ] 独立 Tester 同最终准确字节一次四合同＋两个既有格式目标：原四目标另加 `Slack reply policy is supplied as system instructions without changing native tools or other sources`、`Public manual conversation uses lean role and unchanged native schemas without weakening normal execution`（分别在 cloud-coordinator / slack-cloud）；不重测未改诊断目标。Required、正常合并和单次1.9.7发布由 Coordinator 收口。合同通过不证明模型语义判断或真实短名效果；原124为failed/seen，标签、首次错误和真实NAMING-02失败保留。未重新调用该集、真实模型或Slack，不改默认模型，不提交/部署。
+
+## SLACK-CHANNEL-DIRECTORY-01 · 当前频道查询被错误引导私聊（2026-10-10）
+
+- [x] 已观察 Bad Case：真实频道输入的来源、操作者、频道和项目开放范围核对正常；旧代码同时在模型目录与执行层将查询和切换限定为私聊，并由固定提示引导新开私聊。未删除原错误历史或伪造新的用户请求。
+- [x] 本轮直接开发：只读查询向已验证频道/群组开放，在模型读取前过滤原开放范围之外的项目；私聊保留完整授权目录，切换仍仅私聊。复用原目录、动作授权及回执，不新增供应商、监听范围、权限配置或第二份目录。固定提示更短，分别描述查询和切换。
+- [x] 开发者集中模块验证：基线 `edaca217` 加本轮修改，Node22.18.0 首批 actual `94fedf` exit1，12项中11通过/1失败，0跳过/取消；新增目录夹具尝试从公开 commit 设置禁止的 cloudProjectId，保留首次失败。仅改该夹具为更新服务生成的原项目入口，原过滤/数量/改名/重启/重放断言不变；唯一原目标 actual `c8b0c2` exit0，1/1、0失败/跳过/取消，1436.0743ms。产品代码从首批起未改；不把两次称为一次12/12。首次日志 SHA256 `96c1800fe922b8023096cfc46c78ed066c62e5d3236bcdd6f5357d37236f168e`，原失败目标复验日志 SHA256 `34085b9b9b4ce426d5a1c73aefb40206db818822b0e756663372c7476f50c6cc`。覆盖频道/群组/私聊真实隔离 HTTP、私有名称/简介/数量不泄露、同名总数、实时改名/重启、原请求重放、动作撤销、来源伪造拒绝及原私聊交接隔离。付费模型与 Slack 传输为替身，不作为真实聊天验收。
+- [ ] 独立 Tester TODO：按最终准确修订核验上述跨组件边界；本轮人类要求不调用 subagent，开发者和 Required CI 不冒充独立 Tester。
+- [ ] 交付：正常 PR/Required、Main CI、相同 SHA 部署与实际运行工具入口核验；不自动重放原失败消息或更改真实模型。

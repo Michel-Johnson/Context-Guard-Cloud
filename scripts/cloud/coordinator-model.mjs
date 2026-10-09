@@ -1,6 +1,7 @@
 import { hash } from '../shared/io.mjs';
 import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
+import { canUseSlackProjectTool } from './coordinator-tools.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
@@ -458,7 +459,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     /^[TE][A-Z0-9]{1,31}$/.test(slackActor.teamId || '') && slackActor.sessionId === `slack:${slackActor.teamId}:${slackActor.userId}`;
   const projectTools = ['list_projects', 'switch_project'];
   const executableTools = sourceTools.filter(tool => (!['react_to_user', 'select_text_model', ...projectTools].includes(tool.name) || trustedSlackInput) &&
-    (!projectTools.includes(tool.name) || /^D[A-Z0-9]{1,31}$/.test(slackActor?.channelId || '')));
+    (!projectTools.includes(tool.name) || canUseSlackProjectTool(tool.name, state.activeInput)));
   const availableModelTools = tools.filter(tool => !projectTools.includes(tool.name) || executableTools.includes(tool));
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
