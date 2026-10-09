@@ -30,15 +30,22 @@ export class Store {
     this.tail = run.catch(() => {});
     return run;
   }
-  async updateThread(key, operation) {
+  updateThread(key, operation) {
+    return this.#updateRecord('threads', key, operation, durableThread);
+  }
+  updateFeedback(id, operation) {
+    return this.#updateRecord('feedback', id, operation);
+  }
+  async #updateRecord(collection, key, operation, durable = null) {
     const run = this.tail.then(async () => {
-      const previous = this.data.threads[key];
+      const previous = this.data[collection]?.[key];
       if (!previous) return;
-      const thread = structuredClone(previous), result = await operation(thread, this.data);
-      const next = { ...this.data, threads: { ...this.data.threads, [key]: thread } };
+      const record = structuredClone(previous), result = await operation(record, this.data);
+      if (isDeepStrictEqual(previous, record)) return result;
+      const next = { ...this.data, [collection]: { ...this.data[collection], [key]: record } };
       // Poll deadlines alone are volatile; restart can only advance a read.
       // Every identity, status, input, mirror or receipt change remains durable.
-      if (isDeepStrictEqual(durableThread(previous), durableThread(thread))) this.data = next;
+      if (durable && isDeepStrictEqual(durable(previous), durable(record))) this.data = next;
       else await this.#publish(next);
       return result;
     });

@@ -168,3 +168,62 @@ test('空闲更新只复制目标线程，保留其余记录和业务身份的�
   await store.updateThread('one', thread => { thread.mirrored.reply.hash = 'delivered'; });
   assert.equal((await new Store(store.directory).open()).data.threads.one.mirrored.reply.hash, 'delivered');
 });
+
+test('反馈更新只复制目标记录，无变化不换账本，回执变化仍耐久保存', async t => {
+  const store = await fixture(t);
+  await store.receive('one', { text: 'synthetic' }, { feedback: { channel: 'CTEST', timestamp: '1.1' } });
+  await store.receive('two', { text: 'other synthetic' }, { feedback: { channel: 'CTEST', timestamp: '1.2' } });
+  const originalState = store.data, inbox = store.data.inbox, other = store.data.feedback.two;
+  const clone = structuredClone, copies = [], rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(globalThis, 'structuredClone', value => {
+    assert.notEqual(value, store.data, '不复制整个账本'); copies.push(value); return clone(value);
+  });
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  assert.equal(await store.updateFeedback('one', item => { item.desired = 'received'; return 'unchanged'; }), 'unchanged');
+  assert.equal(store.data, originalState); assert.equal(writes, 0);
+  await store.updateFeedback('one', item => { item.pending = { status: 'unknown', attempts: 1 }; });
+  assert.equal(writes, 1); assert.equal(store.data.inbox, inbox); assert.equal(store.data.feedback.two, other);
+  assert.deepEqual(copies, [originalState.feedback.one, originalState.feedback.one]);
+  const restarted = await new Store(store.directory).open();
+  assert.equal(restarted.data.feedback.one.pending.status, 'unknown');
+  assert.equal(restarted.data.feedback.two.timestamp, '1.2');
+});
+
+test('反馈事务与新输入共用串行队列，读取最新记录，删除后不复活', async t => {
+  const store = await fixture(t);
+  await store.receive('one', {}, { feedback: { channel: 'CTEST', timestamp: '1.1' } });
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; }), gate = new Promise(resolve => { release = resolve; });
+  const preceding = store.update(async state => { entered(); await gate; state.feedback.one.inputRevision = 3; });
+  await ready;
+  const changed = store.updateFeedback('one', item => { assert.equal(item.inputRevision, 3); item.desired = 'reply'; });
+  const accepted = store.receive('two', {}, { feedback: { channel: 'CTEST', timestamp: '1.2' } });
+  release(); await Promise.all([preceding, changed, accepted]);
+  assert.equal(store.data.feedback.one.desired, 'reply');
+  assert.equal(store.data.inbox.two.status, 'pending'); assert.equal(store.data.feedback.two.desired, 'received');
+  assert.deepEqual((await new Store(store.directory).open()).data, store.data);
+  const removed = store.update(state => { delete state.feedback.one; });
+  const late = store.updateFeedback('one', () => assert.fail('已删除记录不能重新建立'));
+  await Promise.all([removed, late]);
+  assert.equal((await new Store(store.directory).open()).data.feedback.one, undefined);
+});
+
+test('反馈保存与回调失败均不发布内存状态，原串行队列仍可继续', async t => {
+  const store = await fixture(t);
+  await store.receive('one', {}, { feedback: { channel: 'CTEST', timestamp: '1.1' } });
+  const original = await fs.readFile(store.file), open = fs.open.bind(fs);
+  let rejectSync = true;
+  t.mock.method(fs, 'open', async (...args) => {
+    const handle = await open(...args), sync = handle.sync.bind(handle);
+    t.mock.method(handle, 'sync', async () => { if (rejectSync) throw Object.assign(Error('synthetic fsync failure'), { code: 'EIO' }); return sync(); });
+    return handle;
+  });
+  await assert.rejects(store.updateFeedback('one', item => { item.pending = { status: 'sending' }; }), { code: 'EIO' });
+  assert.equal(store.data.feedback.one.pending, null); assert.deepEqual(await fs.readFile(store.file), original);
+  await assert.rejects(store.updateFeedback('one', item => { item.channel = 'OTHER'; throw Error('synthetic callback failure'); }), /synthetic callback failure/);
+  assert.equal(store.data.feedback.one.channel, 'CTEST');
+  rejectSync = false;
+  await store.updateFeedback('one', item => { item.pending = { status: 'unknown' }; });
+  assert.equal((await new Store(store.directory).open()).data.feedback.one.pending.status, 'unknown');
+});
