@@ -94,6 +94,7 @@ export class SlackPlugin {
     if (this.active) await this.active;
     await Promise.allSettled([...this.processing.values(), ...this.reactions, ...this.eventTasks]);
     await Promise.allSettled([...this.identityTasks]);
+    await this.recovery?.close();
     await this.store.tail;
   }
   readReaction(event) {
@@ -282,6 +283,7 @@ export class SlackPlugin {
       if (this.stopped) return;
       await run(id, entry);
     }
+    this.recovery?.poll();
     const bindings = Object.entries(this.store.data.threads);
     if (this.stopped) return;
     for (const [key, stream] of this.eventStreams) {
@@ -766,13 +768,13 @@ export class SlackPlugin {
       throw error;
     }
   }
-  async ensureBinding(id, event, expectedProjectId = null) {
+  async ensureBinding(id, event, expectedProjectId = null, recovery = null) {
     const rootTs = event.thread_ts || event.ts;
     let key = this.routedThreadKey(event), existing = this.store.data.threads[key];
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
     const projectId = direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel];
     const directKey = digest([this.teamId, event.channel, event.user, projectId]);
-    if (direct && !event.thread_ts && !event.ts?.startsWith('command-')) {
+    if (!recovery && direct && !event.thread_ts && !event.ts?.startsWith('command-')) {
       const currentKey = this.store.data.directThreads?.[directKey];
       if (currentKey && this.store.data.threads[currentKey]) { key = currentKey; existing = this.store.data.threads[key]; }
     }
@@ -785,7 +787,7 @@ export class SlackPlugin {
       return [key, existing];
     }
     const explicit = explicitlyAddressed(event, this.botUserId);
-    if (!direct && !explicit && !this.store.data.inbox[id]?.participation && !this.store.data.inbox[id]?.relevance?.respond) return [];
+    if (!recovery && !direct && !explicit && !this.store.data.inbox[id]?.participation && !this.store.data.inbox[id]?.relevance?.respond) return [];
     if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Channel project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
     if (!projectId) {
       await this.chooseProject(id, event);
@@ -918,7 +920,7 @@ export class SlackPlugin {
     });
     return structuredClone(metadata);
   }
-  async message(id, event, expectedProjectId = null, events = [event]) {
+  async message(id, event, expectedProjectId = null, events = [event], recovery = null) {
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
     const explicit = explicitlyAddressed(event, this.botUserId);
     const synthetic = event.ts?.startsWith('command-');
@@ -927,7 +929,7 @@ export class SlackPlugin {
     if (text.length > 8000 && !synthetic) throw Object.assign(new Error('每批消息正文最多 8000 字符'), { code: 'RELEVANCE_INPUT_LIMIT', silent: !direct && !explicit });
     const inputIds = events.map(item => events.length === 1 ? operationId(id, 'submit') : operationId(envelopeId('events_api', { team_id: this.teamId, event: item }), 'submit'));
     const batchInputs = events.map((item, index) => ({ id: inputIds[index], text: String(item.text || '') }));
-    if (direct && !synthetic) {
+    if (!recovery && direct && !synthetic) {
       const currentKey = event.thread_ts ? this.routedThreadKey(event) :
         this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])];
       const observedSwitch = this.eventStreams.get(currentKey)?.latest?.messages?.some(message =>
@@ -937,7 +939,7 @@ export class SlackPlugin {
         record.action.sourceConversationId === this.store.data.threads[currentKey]?.conversationId);
       if (observedSwitch || pendingSwitch) await this.mirror(currentKey);
     }
-    if (!synthetic) {
+    if (!recovery && !synthetic) {
       const directKey = digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]]);
       const originalKey = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
       const existingKey = direct && !event.thread_ts ? this.store.data.directThreads?.[directKey] : this.routedThreadKey(event);
@@ -976,8 +978,9 @@ export class SlackPlugin {
       if (acceptedProject !== currentProject) throw Object.assign(new Error('Channel project changed before submission'), { code: 'CONFLICT', silent: true });
       expectedProjectId = acceptedProject;
     }
-    const [key, binding] = await this.ensureBinding(id, event, expectedProjectId);
+    const [key, binding] = await this.ensureBinding(id, event, expectedProjectId, recovery);
     if (!binding) return;
+    if (recovery && binding.conversationId !== recovery.conversationId) throw Object.assign(new Error('Recovery cannot borrow another conversation'), { code: 'PROOF_UNAVAILABLE' });
     const attachments = [], downloads = []; let imageBytes = 0;
     for (const [index, item] of events.entries()) for (const file of item.files || []) {
       const input = await this.io.download(file);
@@ -992,9 +995,9 @@ export class SlackPlugin {
       (batchInputs[index].attachments ||= []).push(reference);
     }
     if (!text.trim() && !attachments.length) return;
-    const history = synthetic || binding.projectSwitch ? undefined : await this.bindingHistory(id, event, key, binding);
+    const history = recovery || synthetic || binding.projectSwitch ? undefined : await this.bindingHistory(id, event, key, binding);
     const requestId = operationId(id, 'batch-submit');
-    let replyContext = this.store.data.inbox[id]?.replyContext;
+    let replyContext = recovery ? { answerTo: null } : this.store.data.inbox[id]?.replyContext;
     if (!replyContext) {
       let question;
       if (binding.pendingQuestionId) {
@@ -1025,9 +1028,17 @@ export class SlackPlugin {
       }
       item.nextPoll = 0;
     });
-    const participation = this.store.data.inbox[id]?.participation?.payload;
-    await this.command('conversation.submit', binding, event.user, requestId, { inputs: batchInputs, followup: 'steer', slackChannelId: event.channel,
-      ...(participation ? { participation } : {}), ...(history?.length ? { history } : {}) });
+    const participation = recovery?.descriptor.originalRequest.payload || this.store.data.inbox[id]?.participation?.payload;
+    const payload = { inputs: batchInputs, followup: 'steer', slackChannelId: event.channel,
+      ...(participation ? { participation } : {}), ...(history?.length ? { history } : {}),
+      ...(recovery ? { recovery: { operationId: recovery.operationId, scope: recovery.descriptor } } : {}) };
+    if (recovery) {
+      // Persist the exact original transport before sending. A lost ACK only
+      // replays these bytes, not a rebuilt message or a second operator epoch.
+      const transport = { id: requestId, userId: event.user, projectId: binding.projectId, conversationId: binding.conversationId, payload };
+      await this.store.update(state => { state.recoveries[recovery.operationId].transport = transport; });
+    }
+    await this.command('conversation.submit', binding, event.user, requestId, payload);
     await this.store.update(state => {
       state.threads[key].awaitingReplyId = inputIds.at(-1); state.threads[key].nextPoll = 0;
       if (history !== undefined) state.threads[key].historyAccepted = true;

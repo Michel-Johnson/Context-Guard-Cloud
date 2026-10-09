@@ -412,7 +412,7 @@ function reactionOnlyContinuation(state, turnId, input) {
 
 // Persist every assistant response and tool receipt through the caller. Stable
 // operation IDs let protocol-backed tools replay a lost response idempotently.
-export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, completePresentations = false, checkpoint = null, signal = null }) {
+export async function coordinatorStep({ turnId, state, model, system, promptVersion = hash(system), tools, save, execute, materializeMessages = null, onText = null, onToolStart = null, onModelAccepted = null, completePresentations = false, checkpoint = null, signal = null }) {
   if (state.promptVersion && state.promptVersion !== promptVersion) throw problem('PROMPT_CHANGED', 'Resume with the same Coordinator prompt version');
   state.promptVersion = promptVersion;
   state.messages ||= []; state.toolReceipts ||= {};
@@ -516,6 +516,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       const changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
       state.pending = null;
       state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' : 'waiting-for-user';
+      onModelAccepted?.(state);
       await save(state); return state;
     }
     if (reactionOnlyCompletion && next.stop === 'end_turn' && next.content.length === 0) {
@@ -534,6 +535,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       ...(metadata.id ? { requestId: metadata.id, id: `message-${hash(`${metadata.id}:assistant:${state.messages.length}`)}` } : {}),
       ...(metadata.source ? { source: metadata.source } : {}), ...(metadata.actor ? { actor: metadata.actor } : {}) });
     state.pending = next;
+    // The private acceptance marker shares the complete native response save,
+    // never a streaming/tool-start save or a later business tool checkpoint.
+    onModelAccepted?.(state);
     await save(state);
   }
   const next = state.pending, toolAssistant = state.messages.at(-1);

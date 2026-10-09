@@ -93,6 +93,8 @@
     "tests/quark-provider.test.mjs",
     "tests/slack-cloud.test.mjs",
     "tests/slack-history.test.mjs",
+    "tests/slack-recovery-cloud.test.mjs",
+    "tests/slack-recovery.test.mjs",
     "tests/session-publication-completion.test.mjs",
     "tests/test-manifest.json",
     "tests/workbench-cloud-sync.test.mjs",
