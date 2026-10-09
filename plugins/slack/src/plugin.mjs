@@ -6,6 +6,18 @@ import { SlackFeedback } from './feedback.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
+function modelFailureText(code, ownsFeedback, outgoing) {
+  const owned = 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。';
+  const legacy = `Coordinator 当前失败：${code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。`;
+  if (code !== 'MODEL_HTTP_402') return ownsFeedback ? owned : legacy;
+  const current = '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。';
+  if (!outgoing) return current;
+  // 升级不改旧通知或原未知发送；复用原编号与已经冻结的显示内容。
+  const text = [current, owned, legacy].find(value => outgoing.hash === digest({ text: value }));
+  if (!text) throw Object.assign(new Error('Original error notice cannot be verified'), { code: 'DELIVERY_UNCERTAIN' });
+  return text;
+}
+
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
@@ -1505,8 +1517,11 @@ export class SlackPlugin {
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
     const ownsFeedback = state.participationRequestIds?.some(id => this.feedback.valid(this.store.data.reactionInputs?.[id]?.inboxId));
-    if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs,
-      text: ownsFeedback ? 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。' : `Coordinator 当前失败：${state.error?.code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。` });
+    if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) {
+      const id = operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error');
+      await this.io.post({ id, channel: binding.channel, threadTs: binding.threadTs,
+        text: modelFailureText(state.error?.code, ownsFeedback, this.store.data.outgoing[id]) });
+    }
     // 模型结束不等于 Slack 送达。只用当前批次之后已发送的正式回答/卡片作证据，
     // 续写时回答仍归最初请求，不能仅匹配最后一条补充的 requestId。
     const batch = state.participationRequestIds || [], currentThread = this.store.data.threads[key];

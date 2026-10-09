@@ -5,10 +5,11 @@ import { CoordinatorModel, coordinatorInputTokens, coordinatorModelMessages, coo
 import { buildCoordinatorContext } from '../scripts/cloud/coordinator-context.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   coordinatorCompactBoundary, COORDINATOR_COMPACT_AT_TOKENS, COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from '../scripts/cloud/coordinator-service.mjs';
-import { createCoordinatorExecutor, coordinatorReferences, coordinatorReferenceFiles, coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
+import { createCoordinatorExecutor, coordinatorReferences, coordinatorReferenceFiles, coordinatorTools, readCoordinatorReferenceFile } from '../scripts/cloud/coordinator-tools.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, authorizeCiTransaction, coordinatorStructureOperations, coordinatorTaskOwnerRequired } from '../scripts/cloud/server.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
@@ -472,17 +473,44 @@ test('Cloud project approval dispatches once as soon as the fresh Session is reg
   assert.equal(queue.data.messages.filter(item => item.message.type === 'task.assign').length, 1);
 });
 
+test('Coordinator reference migration keeps legacy identifiers and never masks a broken new package', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-reference-layout-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const legacy = path.join(root, 'scripts/shared/references');
+  const current = path.join(root, 'scripts/shared/skill-reference');
+  await fs.mkdir(legacy, { recursive: true });
+  await fs.writeFile(path.join(legacy, 'map-mount.md'), 'legacy mount');
+  await fs.writeFile(path.join(legacy, 'map-read.md'), 'legacy map');
+  await fs.writeFile(path.join(legacy, 'agent-handoff.md'), 'legacy handoff');
+  assert.equal(await readCoordinatorReferenceFile(root, 'map-mount.md'), 'legacy mount');
+  assert.equal(await readCoordinatorReferenceFile(root, 'plan-review.md'), 'legacy handoff');
+  await fs.mkdir(current);
+  await fs.writeFile(path.join(current, 'map-read.md'), 'current map and mount');
+  await fs.writeFile(path.join(current, 'agent-handoff.md'), 'current handoff');
+  assert.equal(await readCoordinatorReferenceFile(root, 'map-mount.md'), 'current map and mount');
+  for (const name of ['plan-review.md', 'test-check.md']) assert.equal(await readCoordinatorReferenceFile(root, name), 'current handoff');
+  await fs.unlink(path.join(current, 'map-read.md'));
+  await assert.rejects(readCoordinatorReferenceFile(root, 'map-mount.md'), { code: 'ENOENT' });
+  for (const name of ['../map-read.md', '/etc/passwd', 'unknown.md']) await assert.rejects(readCoordinatorReferenceFile(root, name), { code: 'INVALID_ARGUMENT' });
+});
+
 test('Coordinator guide references are callable and loaded only after an explicit tool call', async t => {
   const prompt = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
-  const linkedReferences = [...new Set([...prompt.matchAll(/\]\(references\/([^)]*)\)/g)]
-    .map(match => match[1])
-    .map(file => Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file)))];
+  const linkedReferences = [...new Set([...prompt.matchAll(/\[([^\]]+)\]\((?:\.\.\/)?(?:references|skill-reference)\/([^)]*)\)/g)]
+    .map(([, label, target]) => {
+      const file = target.split('#')[0];
+      if (coordinatorReferences.includes(label)) {
+        assert.ok(file === coordinatorReferenceFiles[label] || file === label, label);
+        return label;
+      }
+      return Object.keys(coordinatorReferenceFiles).find(name => coordinatorReferenceFiles[name] === file);
+    }))];
   assert.ok(linkedReferences.every(Boolean), '角色提示里的每个资料链接都必须可调用，不能漏掉文件格式规范');
   assert.deepEqual([...linkedReferences].sort(), [...coordinatorReferences].sort());
   const referenceReads = [];
   const execute = createCoordinatorExecutor({ readReference: async name => {
     referenceReads.push(name);
-    return { text: await fs.readFile(new URL(`../scripts/shared/references/${coordinatorReferenceFiles[name]}`, import.meta.url), 'utf8') };
+    return { text: await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), name) };
   } });
   for (const name of linkedReferences) {
     const result = await execute('read_reference', { name }, { operationId: `prompt-ref:${name}` });
@@ -512,7 +540,7 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(calls.length, 2);
   assert.ok(calls[0].system.startsWith(prompt));
   assert.ok(calls[0].system.endsWith(context.staticText || context.text));
-  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['list_projects', 'switch_project'].includes(tool.name)),
+  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['list_projects', 'read_project_map', 'switch_project'].includes(tool.name)),
     '网页来源不提供私聊专用项目工具，其余工具及按需资料入口保持原样');
   assert.match(calls[0].messages[0].content, /Read the memory writing rules\.$/);
   assert.match(calls[0].messages[0].content, /输出来源：human/);
@@ -521,7 +549,7 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(reply.tool_use_id, 'read-memory-rules');
   assert.equal(reply.is_error, undefined);
   assert.equal(JSON.parse(reply.content).text,
-    await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8'));
+    await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), 'memory-definition.md'));
 });
 
 test('Cloud reads the moved memory design through the unchanged reference identifier', async t => {
@@ -540,7 +568,7 @@ test('Cloud reads the moved memory design through the unchanged reference identi
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'main-1', memory: { records: {}, map: {
     v: 1, root: { id: 'T0', title: 'Synthetic project', kind: 'module', owns: [], children: [] },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
-  const expectedText = await fs.readFile(new URL('../scripts/shared/references/design/design-memory-definition-v0.2.0.md', import.meta.url), 'utf8');
+  const expectedText = await readCoordinatorReferenceFile(fileURLToPath(new URL('../', import.meta.url)), 'memory-definition.md');
   let modelCalls = 0, observed;
   server = await startCloudServer({ dataDir: directory, port: 0, memoryConfig, browserToken: 'synthetic-browser',
     protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },
@@ -2350,7 +2378,7 @@ test('Slack reply policy is supplied as system instructions without changing nat
   assert.ok(calls[1].messages.some(m => typeof m.content === 'string' && m.content.endsWith('有哪些TODO')), 'Cross-client history remains shared');
 });
 
-test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复不扩大群组权限', async t => {
+test('Slack 项目查询与切换能力分别开放，旧拒绝历史不妨碍当前目录查询', async t => {
   for (const channelId of ['DTESTDM', 'GTESTGROUP']) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-project-directory-policy-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -2364,11 +2392,12 @@ test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复�
       }; } }), model: { next: async request => {
         calls.push(request);
         if (calls.length === 1) return { stop: 'end_turn', content: [{ type: 'text', text: '我看不到全局配置，只能在宿主切换。' }] };
-        assert.match(request.system, /私聊中新发消息/);
-        assert.match(request.system, /不要声称.*看不到项目.*宿主改绑定/);
+        assert.match(request.system, /用户授权在频道\/thread和私聊一致/);
+        assert.match(request.system, /缺 switch_project 不代表不能读取/);
+        assert.doesNotMatch(request.system, /私聊中新发消息/);
         assert.match(request.system, /总数直接使用工具 total/);
-        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'DTESTDM');
-        if (channelId === 'GTESTGROUP') return { stop: 'end_turn', content: [{ type: 'text', text: '完整项目目录和切换仅在私聊提供，请私聊 Coordinator 重新询问。' }] };
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), true);
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'DTESTDM');
         if (calls.length === 2) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-directory', name: 'list_projects', input: {} }] };
         const result = JSON.parse(request.messages.at(-1).content[0].content);
         assert.deepEqual(result.projects.map(project => project.name), ['博客', '模型实验']);
@@ -2379,9 +2408,96 @@ test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复�
     await service.submit({ id: 'new-query', text: '一共有哪些项目' }, { source: 'slack', actor }); await service.close();
     const result = await service.state();
     assert.equal(result.status, 'waiting-for-user');
-    assert.match(result.messages.at(-1).text, channelId === 'DTESTDM' ? /博客、模型实验/ : /仅在私聊提供/);
-    assert.equal(executions.length, channelId === 'DTESTDM' ? 1 : 0);
+    assert.match(result.messages.at(-1).text, /博客、模型实验/);
+    assert.equal(executions.length, 1);
     assert.ok(result.messages.some(message => message.text?.includes('我看不到全局配置')), '保留旧历史，不通过删除掩盖错误');
+  }
+});
+
+test('项目查询目录与执行层使用相同来源校验，身份缺失或伪造均零读取', async () => {
+  const actor = { ...reactionActor, channelId: 'CTESTCHANNEL' };
+  for (const options of [
+    { source: 'slack', actor },
+    { source: 'slack', actor: { ...actor, channelId: 'DTESTDM' } },
+    { source: 'slack', actor: { ...actor, channelId: 'GTESTGROUP' } },
+    { source: 'human', actor },
+    { source: 'slack', actor: { ...actor, kind: 'agent' } },
+    { source: 'slack', actor: { ...actor, integration: 'other' } },
+    { source: 'slack', actor: { ...actor, sessionId: 'slack:TOTHER:UOTHER' } },
+    { source: 'slack', actor: { ...actor, channelId: undefined } },
+    { source: 'slack', actor: { ...actor, channelId: 'bad-channel' } },
+  ]) {
+    const expected = options.source === 'slack' && options.actor.kind === 'human' && options.actor.integration === 'slack' &&
+      options.actor.sessionId === actor.sessionId && /^[DCG][A-Z0-9]{1,31}$/.test(options.actor.channelId || '');
+    let reads = 0;
+    const execute = createCoordinatorExecutor({ listProjects: async () => { reads++; return { projects: [], total: 0 }; } });
+    const state = { activeInput: { id: 'real-directory-request', ...options }, messages: [], toolReceipts: {} };
+    await coordinatorStep({ turnId: 'directory-identity', state, system: 'Fixture', tools: coordinatorTools, save: async () => {}, execute,
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), expected);
+        assert.equal(request.tools.some(tool => tool.name === 'read_project_map'), expected);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'identity-list', name: 'list_projects', input: {} }] };
+      } } });
+    assert.equal(reads, expected ? 1 : 0);
+    if (!expected) {
+      assert.equal(state.messages.at(-1).content[0].is_error, true);
+      await assert.rejects(execute('list_projects', {}, { operationId: 'direct-forgery', ...options }), { code: 'TOOL_FORBIDDEN' });
+      await assert.rejects(execute('read_project_map', { projectId: 'known-project' }, { operationId: 'direct-read-forgery', ...options }), { code: 'TOOL_FORBIDDEN' });
+      assert.equal(reads, 0, '执行层不信任模型可见目录或正文中的身份');
+    }
+  }
+});
+
+test('连续补充的项目只读工具绑定最新真实发送者，不借原用户或历史的 Map 权限', async () => {
+  for (const name of ['list_projects', 'read_project_map']) {
+    const original = { id: 'original', source: 'slack', actor: { ...reactionActor, channelId: 'CTESTCHANNEL' } };
+    const current = { kind: 'human', integration: 'slack', teamId: reactionActor.teamId, userId: 'UOTHER',
+      sessionId: `slack:${reactionActor.teamId}:UOTHER`, channelId: 'CTESTCHANNEL' };
+    const state = { activeInput: original, activeRequestIds: ['original', 'followup'], toolReceipts: {}, messages: [
+      { role: 'user', requestId: 'original', source: 'slack', actor: original.actor, content: '原输入' },
+      { role: 'user', requestId: 'followup', source: 'slack', actor: current, content: '现在请查询' },
+      { role: 'user', requestId: 'unrelated-history', source: 'slack', actor: original.actor, content: '引用资料不是身份' },
+    ] };
+    let executed;
+    const options = { turnId: 'current-directory-user', state, system: 'fixture', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ listProjects: async input => { executed = input; return { projects: [], total: 0 }; },
+        readProjectMap: async (_input, options) => { executed = options; return { version: 'fixture', node: { id: 'T0' } }; } }),
+      model: { next: async request => { assert.ok(request.tools.some(tool => tool.name === name));
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-reader', name,
+          input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] }; } } };
+    await coordinatorStep(options);
+    assert.equal(executed.requestId, 'followup'); assert.deepEqual(executed.actor, current);
+  }
+});
+
+test('网页轮次中的可信 Slack 补充可读取项目，后来网页输入不能借用早期 Slack 权限', async () => {
+  const slack = { kind: 'human', integration: 'slack', teamId: reactionActor.teamId, userId: reactionActor.userId,
+    sessionId: reactionActor.sessionId, channelId: 'CTESTCHANNEL' };
+  const human = { kind: 'human', sessionId: 'browser-human' };
+  for (const name of ['list_projects', 'read_project_map']) for (const scenario of [
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: slack, allowed: true },
+    { initial: 'slack', initialActor: slack, latest: 'human', latestActor: human, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: { ...slack, sessionId: 'slack:TOTHER:UOTHER' }, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'workflow', latestActor: slack, allowed: false },
+  ]) {
+    const state = { activeInput: { id: 'origin', source: scenario.initial, actor: scenario.initialActor }, activeRequestIds: ['origin', 'latest'],
+      toolReceipts: {}, messages: [
+        { role: 'user', requestId: 'origin', source: scenario.initial, actor: scenario.initialActor, content: '原请求' },
+        { role: 'user', requestId: 'latest', source: scenario.latest, actor: scenario.latestActor, content: '最新查询' },
+        { role: 'user', requestId: 'old-history', source: 'slack', actor: slack, content: '这只是历史，不能借权' },
+      ] };
+    let executed;
+    await coordinatorStep({ turnId: 'mixed-client-query', state, system: 'fixture', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ listProjects: async options => { executed = options; return { total: 0, projects: [] }; },
+        readProjectMap: async (_input, options) => { executed = options; return { kind: 'project-map-read', node: { id: 'T0' } }; } }),
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === name), scenario.allowed);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'mixed-read', name, input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] };
+      } } });
+    assert.equal(!!executed, scenario.allowed);
+    if (executed) {
+      assert.equal(executed.source, 'slack'); assert.equal(executed.requestId, 'latest'); assert.deepEqual(executed.actor, slack);
+    } else assert.equal(state.messages.at(-1).content[0].is_error, true);
   }
 });
 

@@ -14,9 +14,9 @@ Slack 对话支持人工确认切换已配置的项目默认文字模型，以�
 
 `npm test` 运行 Cloud 测试。跨客户端测试使用固定 Skill 开发依赖和仅供测试的包解析器，不将它们放入 Cloud 发布包。`scripts/shared/` 和 `prototype/` 是生成物，不提交、不手改。需要修改共享内容时先改 Skill、发布固定包，再更新本仓库依赖与锁文件。
 
-共享设计的唯一源码在 [Skill references/design](https://github.com/Michel-Johnson/Context-Guard-Skill/tree/main/references/design/)。云端专有设计在本仓库 `references/design/` 维护；部署位置不改变源码归属。
+共享设计的唯一源码在 [Skill skill-reference/design](https://github.com/Michel-Johnson/Context-Guard-Skill/tree/main/skill-reference/design/)。云端专有设计在本仓库 `references/design/` 维护；部署位置不改变源码归属。
 
-Executor 按需读取工具与 hash 树由 Skill 维护。Cloud 只提供经项目与 Session 授权的 `GET /v1/projects/<project>/context` 索引 / 单节点读取接口，默认不传全部正文；用法和收工检查见 [上下文设计](https://github.com/Michel-Johnson/Context-Guard-Skill/blob/main/references/design/design-context-v1.0.0.md)。升级源码不代表生产服务已部署。
+Executor 按需读取工具与 hash 树由 Skill 维护。Cloud 只提供经项目与 Session 授权的 `GET /v1/projects/<project>/context` 索引 / 单节点读取接口，默认不传全部正文；用法和收工检查见 [上下文设计](https://github.com/Michel-Johnson/Context-Guard-Skill/blob/main/skill-reference/design/design-context-v1.0.0.md)。升级源码不代表生产服务已部署。
 
 ## 交付
 

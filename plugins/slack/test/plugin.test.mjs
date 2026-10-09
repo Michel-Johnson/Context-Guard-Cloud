@@ -479,7 +479,7 @@ for (const scenario of ['其他用户', '公共频道', '伪造原文', '生成�
   });
 }
 
-test('项目工具只向已验证 Slack 私聊开放，交接终止旧项目的后续工具', async () => {
+test('项目查询向已验证 Slack 频道开放，切换仍限私聊且终止旧项目的后续工具', async () => {
   const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: 'D000001', sessionId: `slack:${teamId}:${user}` };
   for (const channelId of [undefined, channel, 'D000001']) {
     const acceptedActor = { ...actor, ...(channelId ? { channelId } : {}) }; if (!channelId) delete acceptedActor.channelId;
@@ -488,7 +488,8 @@ test('项目工具只向已验证 Slack 私聊开放，交接终止旧项目的�
     await coordinatorStep({ turnId: `switch-${channelId}`, state, system: 'rule', tools: coordinatorTools, save: async () => {},
       execute: createCoordinatorExecutor({ switchProject: async (input, options) => { calls.push(options); return { kind: 'project-switch', projectId: input.projectId }; } }),
       model: { next: async request => {
-        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'D000001');
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), !!channelId);
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'D000001');
         modelToolsHash = hash(JSON.stringify(request.tools));
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'switch_project', input: { projectId: 'blog' } },
           { type: 'tool_use', id: 'should-not-write', name: 'edit_map', input: { mainVersion: 'old', actions: [] } }] };
@@ -2794,6 +2795,62 @@ test('Failed stream preview stays in its original slot and failure marking survi
     assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
     assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
   }
+});
+
+test('模型402提示区分账户问题，重放与重启不重复发出或改写旧通知', async t => {
+  for (const legacy of [null,
+    'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。',
+    'Coordinator 当前失败：MODEL_HTTP_402。请在工作台查看并重试；不会显示假成功。']) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.402'), writes = [];
+    await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: ['quota-turn'] });
+    const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+    f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { apiCall: async (method, input) => {
+      if (method === 'chat.postMessage' || method === 'chat.update') writes.push({ method, input });
+      return { ts: '500.402' };
+    } } });
+    if (legacy) await f.plugin.io.post({ id, channel, threadTs: '123.402', text: legacy });
+    writes.length = 0;
+    const state = { status: 'error', activeTurnId: 'quota-turn', consumedInputRevision: 0, error: { code: 'MODEL_HTTP_402', message: 'private-token-sentinel' },
+      messages: [{ role: 'user', requestId: 'quota-turn', id: 'source', text: '读取目录' }], approvals: [] };
+    f.gateway.command = async () => state;
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+    if (legacy) assert.equal(writes.length, 0, '旧通知不现代化或再次发送');
+    else {
+      assert.equal(writes.length, 1); assert.equal(writes[0].method, 'chat.postMessage');
+      assert.match(writes[0].input.text, /账户可用额度/); assert.doesNotMatch(writes[0].input.text, /稍后重试|private-token-sentinel/);
+    }
+    f.plugin.store = await new Store(f.directory).open(); f.plugin.io.store = f.plugin.store;
+    await f.plugin.mirror(key);
+    assert.equal(writes.length, legacy ? 0 : 1, '重启仍复用原发送编号');
+  }
+});
+
+test('模型402已冻结的未知发送只核对原消息，不再次发送或改写内容', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.quota-lost-ack');
+  await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: [] });
+  const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+  const text = '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。';
+  await f.store.update(data => { data.outgoing[id] = { id, channel, threadTs: '123.402', status: 'unknown', hash: digest({ text }) }; });
+  const writes = [], reads = [];
+  f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { apiCall: async (method, input) => {
+    if (['chat.postMessage', 'chat.update'].includes(method)) { writes.push(method); assert.fail('未知旧发送不能重发或改文'); }
+    reads.push(method); return { messages: [{ user: bot, ts: 'saved.402', text, metadata: { event_type: 'context_guard', event_payload: { id } } }] };
+  } } });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'quota-turn', error: { code: 'MODEL_HTTP_402' }, messages: [], approvals: [] });
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.deepEqual(reads, ['conversations.replies']); assert.equal(writes.length, 0);
+  assert.equal(f.store.data.outgoing[id].status, 'sent'); assert.equal(f.store.data.outgoing[id].ts, 'saved.402');
+});
+
+test('模型402的原未知通知无法核实时保留账本，不用新提示覆盖未知内容', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.quota-unknown');
+  await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: [] });
+  const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+  const original = { id, channel, threadTs: '123.402', status: 'unknown', hash: 'unsupported-original-projection' };
+  await f.store.update(data => { data.outgoing[id] = original; });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'quota-turn', error: { code: 'MODEL_HTTP_402' }, messages: [], approvals: [] });
+  await assert.rejects(f.plugin.mirror(key), { code: 'DELIVERY_UNCERTAIN' });
+  assert.deepEqual(f.store.data.outgoing[id], original); assert.equal(f.sent.length, 0);
 });
 
 test('Failed stream marking never borrows another revision or turn when the exact failed slot is missing', async t => {
