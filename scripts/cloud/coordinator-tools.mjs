@@ -53,7 +53,8 @@ export const coordinatorTools = [
     }, required: ['op'], additionalProperties: false } },
   }),
   definition('mount_conversation', '提出唯一主节点的绑定或改绑建议，返回完整路径供人类确认。此工具不会直接绑定；用户同意后由宿主保存。相关模块仅按需读取，绑定不代表批准开发。', {
-    mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'] }, title: string, description: string,
+    mainVersion: string, nodeId: string, kind: { enum: ['todo', 'bug', 'idea'] }, title: string,
+    description: { ...string, description: '用一句话说明为什么这个节点是需求的主要归属，供人类确认。' },
   }),
   definition('ask_user', 'Ask one clarification; not for brief approval or final acceptance.', { question: string, options: { type: 'array', items: { ...string, maxLength: 120 }, minItems: 2, maxItems: 6, uniqueItems: true }, nodeIds }, ['question']),
   definition('write_file', 'Write exactly one UTF-8 text file at a repository-relative path. Does not commit, push, or change Main. When the file already exists, pass expectedSha as the SHA-256 of its current bytes.', {

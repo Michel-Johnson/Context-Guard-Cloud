@@ -20,10 +20,12 @@ import { hash } from '../../../scripts/shared/io.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
-  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归' };
+  const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');
   const text = blocks.filter(block => block.type === 'section').map(block => block.text.text).join('\n');
   assert.ok(text.includes(proposal.pathText)); assert.match(text, /同意绑定|暂不绑定/);
+  assert.match(text, /理由：该需求主要影响测试模块。/);
+  assert.doesNotMatch(JSON.stringify(bindingBlocks({ ...proposal, reason: undefined }, 'internal-thread')), /理由：|undefined/);
   assert.doesNotMatch(text, /internal-/); assert.ok(blocks.filter(block => block.type === 'section').every(block => block.text.type === 'plain_text'));
   assert.deepEqual(blocks.at(-1).elements.map(button => button.action_id), ['approve_binding', 'reject_binding']);
   assert.deepEqual(JSON.parse(blocks.at(-1).elements[0].value), { key: 'internal-thread', proposalId: proposal.id, version: proposal.version });

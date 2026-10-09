@@ -111,7 +111,7 @@ async function coordinatorControlAcceptance() {
           });
         }
         if (text === '记住登录节点') return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'browser-mount', name: 'mount_conversation',
-          input: { nodeId: 'N3', kind: 'todo', title: 'Login discussion', description: 'Keep login focus', mainVersion: 'control-main' } }] };
+          input: { nodeId: 'N3', kind: 'todo', title: 'Login discussion', description: '该需求主要影响登录回归。', mainVersion: 'control-main' } }] };
         return { stop: 'end_turn', content: [{ type: 'text', text: '已继续当前讨论。' }] };
       } }) });
     fixtureContext = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
@@ -214,6 +214,7 @@ async function coordinatorControlAcceptance() {
     state = await (await fixtureContext.request.get(stateUrl)).json();
     assert.equal(state.focus.nodeId, null, '模型提出建议不能直接绑定');
     assert.match(await panel.textContent(), /Controls：项目目标[\s\S]*Login：登录模块[\s\S]*Testing：登录回归/);
+    assert.match(await panel.textContent(), /理由：该需求主要影响登录回归。/);
     await panel.getByRole('button', { name: '确认绑定', exact: true }).click();
     await fixturePage.waitForFunction(() => document.querySelector('#coordinator-panel [data-conversation="main"]')?.textContent.includes('Login discussion'));
     state = await (await fixtureContext.request.get(stateUrl)).json();

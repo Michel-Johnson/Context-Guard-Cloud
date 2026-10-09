@@ -15,6 +15,7 @@ export const bindingReplyDecision = (text, { slackAttribution = false } = {}) =>
 };
 const visible = proposal => ({ id: proposal.id, kind: 'binding-proposal', version: proposal.version,
   conversationId: proposal.conversationId, node: proposal.node, path: proposal.path, pathText: proposal.pathText,
+  ...(typeof proposal.input.description === 'string' && proposal.input.description.trim() ? { reason: proposal.input.description.trim() } : {}),
   itemKind: proposal.input.kind, title: proposal.input.title, requiresHumanApproval: true,
   pending: !proposal.review, ...(proposal.review ? { decision: proposal.review.decision } : {}) });
 
