@@ -746,7 +746,7 @@ export class SlackPlugin {
       return [key, existing];
     }
     const explicit = explicitlyAddressed(event, this.botUserId);
-    if (!direct && !explicit && !this.store.data.inbox[id]?.participation) return [];
+    if (!direct && !explicit && !this.store.data.inbox[id]?.participation && !this.store.data.inbox[id]?.relevance?.respond) return [];
     if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Channel project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
     if (!projectId) {
       await this.chooseProject(id, event);
@@ -907,7 +907,18 @@ export class SlackPlugin {
       if (!projectId) { if (direct || explicit) await this.chooseProject(id, event); return; }
       if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Project changed after accepting this message batch'), { code: 'CONFLICT', silent: true });
       let participation = this.store.data.inbox[id]?.participation;
-      if (!participation) {
+      const legacy = !participation && this.store.data.inbox[id]?.relevance;
+      if (legacy) {
+        // 旧提交可能已接受但 ACK 丢失；不能给同一操作增添新字段。
+        // 只恢复已持久保存的原分类/批次，不再调用分类模型。
+        const request = this.store.data.inbox[id]?.relevanceRequest;
+        if (typeof legacy.respond !== 'boolean' || typeof legacy.mainVersion !== 'string' ||
+            legacy.projectId !== projectId || request?.projectId !== projectId || request.userId !== event.user ||
+            request.payload?.text !== text || JSON.stringify(request.payload?.inputs) !== JSON.stringify(batchInputs)) {
+          throw Object.assign(new Error('旧接话记录与原消息批次不一致'), { code: 'ID_REUSED', silent: true });
+        }
+        if (!legacy.respond) return;
+      } else if (!participation) {
         const context = direct && existing && (!event.thread_ts || existingKey !== originalKey)
           ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);
         const routing = await this.mentionRoute(id, { ...event, text });
@@ -922,8 +933,9 @@ export class SlackPlugin {
       }
       const currentBinding = this.store.data.threads[existingKey];
       const currentProject = currentBinding?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
-      if (participation.projectId !== currentProject) throw Object.assign(new Error('Channel project changed before submission'), { code: 'CONFLICT', silent: true });
-      expectedProjectId = participation.projectId;
+      const acceptedProject = legacy?.projectId || participation.projectId;
+      if (acceptedProject !== currentProject) throw Object.assign(new Error('Channel project changed before submission'), { code: 'CONFLICT', silent: true });
+      expectedProjectId = acceptedProject;
     }
     const [key, binding] = await this.ensureBinding(id, event, expectedProjectId);
     if (!binding) return;

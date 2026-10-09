@@ -1854,6 +1854,97 @@ test('restart after frozen participation capture reuses it and does not classify
   assert.deepEqual(reopened.data.inbox.restart.participation, f.store.data.inbox.restart.participation);
   assert.equal(f.calls.filter(call => call.type === 'conversation.create').length, 1);
 });
+
+async function seedLegacyParticipation(f, id, original, { respond = true, binding = false } = {}) {
+  const op = suffix => `slack-${digest(`${id}:${suffix}`)}`;
+  await f.store.update(state => { state.channels[original.channel] = 'lab'; });
+  await f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: original } });
+  const key = threadKey(teamId, original.channel, original.thread_ts || original.ts), inputs = [{ id: op('submit'), text: original.text }];
+  if (binding) await f.store.bind(key, { channel: original.channel, threadTs: original.thread_ts || original.ts,
+    projectId: 'lab', conversationId: 'chat-legacy-http', userId: user, ownRequests: [inputs[0].id] });
+  await f.store.update(state => {
+    const item = state.inbox[id];
+    item.relevance = { respond, reason: 'Persisted old classification', mainVersion: 'legacy-v1', projectId: 'lab' };
+    item.relevanceRequest = { id: op('relevance'), userId: user, projectId: 'lab',
+      ...(binding ? { conversationId: 'chat-legacy-http' } : {}), payload: { text: original.text, inputs, context: [],
+        routing: { coordinatorUserId: bot, mentionedUsers: [{ id: bot, isBot: true }], replyToCoordinator: false },
+        files: (original.files || []).map(file => ({ name: String(file.name || file.title || '').slice(0, 200), mimeType: String(file.mimetype || '').slice(0, 100) })) } };
+    item.replyContext = { answerTo: null };
+    if (item.batchId) state.messageBatches[item.batchId].frozen = true;
+  });
+  return { key, inputs, request: { id: op('batch-submit'), userId: user, projectId: 'lab', conversationId: 'chat-legacy-http',
+    payload: { inputs, followup: 'steer', slackChannelId: original.channel } } };
+}
+
+test('legacy accepted submit with lost ACK replays identical old payload after upgrade without another model or write', async t => {
+  const f = await fixture(t), id = 'legacy-lost-ack', original = event({ text: `<@${bot}> 请确认旧请求。` });
+  const legacy = await seedLegacyParticipation(f, id, original, { binding: true });
+  let models = 0, accepted = 0;
+  const service = new CoordinatorService({ directory: path.join(f.directory, 'legacy-coordinator'), system: 'Old accepted Coordinator',
+    tools: [], execute: async () => assert.fail('This old request needs no business write'),
+    model: { next: async () => { models++; return { stop: 'end_turn', content: [{ type: 'text', text: '旧请求已确认。' }] }; } } });
+  const server = await startIntegrationGateway({ config: { host: '127.0.0.1', port: 0, token: 'synthetic-upgrade-lost-ack-credential-123456', teamId, projectIds: ['lab'] },
+    stateDir: path.join(f.directory, 'legacy-gateway'), state: async () => ({ ...(await service.state()), conversationId: 'chat-legacy-http' }),
+    command: async (input, context) => {
+      if (input.type === 'conversation.relevance') assert.fail('Upgrade recovery cannot invoke a classifier');
+      if (input.type === 'project.list') return { projects: [{ id: 'lab', name: 'Lab' }] };
+      if (input.type === 'conversation.state') return { ...(await service.state()), conversationId: 'chat-legacy-http' };
+      if (input.type === 'conversation.submit') { accepted++; return service.submit({ ...input.payload, id: input.id }, { source: 'slack', actor: context.actor }); }
+      assert.fail(`Unexpected upgrade operation ${input.type}`);
+    } });
+  const gateway = new Gateway({ url: server.url, token: 'synthetic-upgrade-lost-ack-credential-123456', teamId });
+  let upgraded;
+  try {
+    // The old service committed and Gateway persisted its receipt. Its caller
+    // lost the reply before changing the durable old inbox from pending.
+    await gateway.command('conversation.submit', legacy.request); await service.close();
+    assert.equal(f.store.data.inbox[id].status, 'pending'); assert.equal(models, 1); assert.equal(accepted, 1);
+    const reopened = await new Store(f.directory).open(), submissions = [];
+    const command = gateway.command.bind(gateway);
+    gateway.command = async (type, input) => { if (type === 'conversation.submit') submissions.push(structuredClone(input)); return command(type, input); };
+    upgraded = new SlackPlugin({ store: reopened, gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot,
+      logger: { warn() {}, error() {} } });
+    await upgraded.runEntry(id, reopened.data.inbox[id]);
+    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].error, undefined);
+    assert.deepEqual(submissions, [legacy.request]); assert.equal(submissions[0].payload.participation, undefined);
+    assert.equal(models, 1); assert.equal(accepted, 1, 'The saved old Gateway receipt must replay before the business callback');
+    await upgraded.mirror(legacy.key);
+    assert.ok(f.sent.some(item => item.text?.includes('旧请求已确认。')));
+  } finally { await upgraded?.stop(); await server.close(); await service.close({ stop: true }); }
+});
+
+test('legacy cached silent pending input completes after upgrade without classification submission download or external message', async t => {
+  const f = await fixture(t), id = 'legacy-silent', original = event({ text: `<@${bot}> 仅存档，不用回复。`, files: [{ id: 'FOLD', name: 'old.png', mimetype: 'image/png' }] });
+  await seedLegacyParticipation(f, id, original, { respond: false });
+  f.io.download = async () => assert.fail('A cached old silent decision cannot download attachments');
+  f.gateway.command = async () => assert.fail('A cached old silent decision cannot call Gateway');
+  const reopened = await new Store(f.directory).open();
+  const upgraded = new SlackPlugin({ store: reopened, gateway: f.gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot,
+    logger: { warn() {}, error() {} } });
+  try {
+    await upgraded.runEntry(id, reopened.data.inbox[id]);
+    assert.equal(reopened.data.inbox[id].status, 'done'); assert.equal(reopened.data.inbox[id].participation, undefined);
+    assert.equal(Object.keys(reopened.data.threads).length, 0); assert.deepEqual(f.sent, []);
+  } finally { await upgraded.stop(); }
+});
+
+test('legacy decision recovery rejects mismatched project user or original batch instead of borrowing an old decision', async t => {
+  for (const mismatch of ['project', 'user', 'batch']) {
+    const f = await fixture(t), id = `legacy-mismatch-${mismatch}`, original = event({ text: `<@${bot}> 原始旧需求。` });
+    await seedLegacyParticipation(f, id, original);
+    await f.store.update(state => {
+      const item = state.inbox[id];
+      if (mismatch === 'project') item.relevanceRequest.projectId = 'other';
+      else if (mismatch === 'user') item.relevanceRequest.userId = 'UOTHER';
+      else item.relevanceRequest.payload.inputs[0].text = 'different request';
+    });
+    f.gateway.command = async () => assert.fail('Mismatched cached decision cannot reach business Gateway');
+    await f.plugin.runEntry(id, f.store.data.inbox[id]);
+    assert.equal(f.store.data.inbox[id].status, 'attention'); assert.equal(f.store.data.inbox[id].error, 'ID_REUSED');
+    assert.equal(Object.keys(f.store.data.threads).length, 0); assert.deepEqual(f.sent, []);
+  }
+});
+
 test('channel rebind cannot redirect a saved participation frame to another project', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   f.gateway.command = async () => { throw Object.assign(new Error('Busy'), { code: 'BUSY' }); };
