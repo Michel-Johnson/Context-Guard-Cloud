@@ -2470,6 +2470,37 @@ test('连续补充的项目只读工具绑定最新真实发送者，不借原�
   }
 });
 
+test('网页轮次中的可信 Slack 补充可读取项目，后来网页输入不能借用早期 Slack 权限', async () => {
+  const slack = { kind: 'human', integration: 'slack', teamId: reactionActor.teamId, userId: reactionActor.userId,
+    sessionId: reactionActor.sessionId, channelId: 'CTESTCHANNEL' };
+  const human = { kind: 'human', sessionId: 'browser-human' };
+  for (const name of ['list_projects', 'read_project_map']) for (const scenario of [
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: slack, allowed: true },
+    { initial: 'slack', initialActor: slack, latest: 'human', latestActor: human, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: { ...slack, sessionId: 'slack:TOTHER:UOTHER' }, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'workflow', latestActor: slack, allowed: false },
+  ]) {
+    const state = { activeInput: { id: 'origin', source: scenario.initial, actor: scenario.initialActor }, activeRequestIds: ['origin', 'latest'],
+      toolReceipts: {}, messages: [
+        { role: 'user', requestId: 'origin', source: scenario.initial, actor: scenario.initialActor, content: '原请求' },
+        { role: 'user', requestId: 'latest', source: scenario.latest, actor: scenario.latestActor, content: '最新查询' },
+        { role: 'user', requestId: 'old-history', source: 'slack', actor: slack, content: '这只是历史，不能借权' },
+      ] };
+    let executed;
+    await coordinatorStep({ turnId: 'mixed-client-query', state, system: 'fixture', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ listProjects: async options => { executed = options; return { total: 0, projects: [] }; },
+        readProjectMap: async (_input, options) => { executed = options; return { kind: 'project-map-read', node: { id: 'T0' } }; } }),
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === name), scenario.allowed);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'mixed-read', name, input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] };
+      } } });
+    assert.equal(!!executed, scenario.allowed);
+    if (executed) {
+      assert.equal(executed.source, 'slack'); assert.equal(executed.requestId, 'latest'); assert.deepEqual(executed.actor, slack);
+    } else assert.equal(state.messages.at(-1).content[0].is_error, true);
+  }
+});
+
 test('Private timing persists failures and resumes pending tools with their original operation ID', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-timing-recovery-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

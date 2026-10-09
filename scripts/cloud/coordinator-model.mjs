@@ -449,8 +449,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const readProjectTools = ['list_projects', 'read_project_map'], projectTools = [...readProjectTools, 'switch_project'];
   // 补充已消费后，读取不能借用轮次最初发送者的更大权限。
   const projectReadInput = currentProjectReadInput(state);
-  const executableTools = sourceTools.filter(tool => (!['react_to_user', 'select_text_model', ...projectTools].includes(tool.name) || trustedSlackInput) &&
-    (!projectTools.includes(tool.name) || canUseSlackProjectTool(tool.name, readProjectTools.includes(tool.name) ? projectReadInput : state.activeInput)));
+  const executableTools = sourceTools.filter(tool => readProjectTools.includes(tool.name)
+    ? !!projectReadInput?.id && canUseSlackProjectTool(tool.name, projectReadInput)
+    : (!['react_to_user', 'select_text_model', 'switch_project'].includes(tool.name) || trustedSlackInput) &&
+      (tool.name !== 'switch_project' || canUseSlackProjectTool(tool.name, state.activeInput)));
   const availableModelTools = tools.filter(tool => !projectTools.includes(tool.name) || executableTools.includes(tool));
   // Private operator diagnostics only; public timing and transcript contracts
   // stay unchanged. No prompts, arguments, results or provider IDs are copied.
@@ -600,13 +602,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         try {
           // Model settings use the integration's identifier alphabet, while
           // the original native tool receipt keeps its unchanged identity.
-          const projectInput = readProjectTools.includes(name) ? projectReadInput : state.activeInput;
           const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
             ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
-            ...(['select_text_model', ...projectTools].includes(name) && trustedSlackInput ? { source: 'slack',
-              actor: projectTools.includes(name) ? projectInput.actor : slackActor,
-              ...(projectTools.includes(name) ? { requestId: projectInput.id } : {}) } : {}) });
+            ...(readProjectTools.includes(name) ? { source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id }
+              : ['select_text_model', 'switch_project'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
+                ...(name === 'switch_project' ? { requestId: state.activeInput.id } : {}) } : {}) });
           receipt = { fingerprint, result: name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
             ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result };
         }

@@ -129,6 +129,8 @@ changes require fresh held-out evidence, not relabelling or discarding failures.
 | NAT-18 | A current receiver transfer or mixed invitation arrives as the final message of a short burst | Judge all current messages in order; follow the final transfer, preserve earlier requirements, and issue one final reply |
 | NAT-19 | Participation provider fails, times out or returns an invalid decision | Record the actual participation/generation failure, retain the input and retry within its existing limits; legacy classification errors and attempts retain their compatibility contract; never claim intentional silence |
 
+NAT-19 的新模型 HTTP 402 通知明确提示检查账户可用额度或选择已配置模型，不将它称为 Cloud 断连，不建议反复刷新或自动换模型。新提示复用原发送编号；升级后已发送的旧通知不改写，未知发送只核对原消息，无法核对的记录保留待处理。不展示供应商错误正文、凭据或私有余额，不改变重试预算。真实模型可用性与源测试分开验收。
+
 Tester labels expected participation before model calls and keeps explicit,
 indirect, clear-negative and ambiguous cases separate. Include both mentioned
 and unmentioned inputs, with and without another Bot, and different histories
