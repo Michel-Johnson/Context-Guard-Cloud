@@ -571,15 +571,20 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     next.content.some(block => block.type === 'text' && block.text?.trim()) &&
     next.content.filter(block => block.type === 'tool_use').every(call =>
       ['show_nodes', 'open_node', 'tour_nodes'].includes(call.name) && call.input?.replyComplete === true);
-  // A reaction intent does not complete the requested textual answer. Let the
-  // model consume its receipt and end the turn normally, with or without text.
+  // 纯社交回应必须由模型明确标记，无正文、无本轮业务工具且所有意图回执成功。
+  // 默认表情意图仍不能结束应有的文字答复；平台送达继续由私有队列核验。
+  const reactionOnly = trustedSlackInput && !failed && responses.length > 0 && visible.length === responses.length &&
+    !next.content.some(block => block.type === 'text' && block.text?.trim()) &&
+    next.content.filter(block => block.type === 'tool_use').every(call => call.name === 'react_to_user' && call.input?.replyComplete === true) &&
+    !state.messages.some(message => message.role === 'assistant' && message.requestId === state.activeInput.id &&
+      message.content?.some(block => block.type === 'tool_use' && block.name !== 'react_to_user' || block.type === 'text' && block.text?.trim()));
   changed = checkpoint ? await checkpoint() : changed;
   if (changed.steered || changed.interrupted) {
     const response = state.messages.at(-2);
     if (response?.role === 'assistant') response.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (presentationOnly || next.content.some(block => block.type === 'tool_use' &&
+    transferred || !failed && (presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
       (block.name === 'ask_user' || block.name === 'mount_conversation' || block.name === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;

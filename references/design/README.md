@@ -4,7 +4,7 @@ Cloud 是 Skill 的可选云端扩展。核心、UI、角色提示词和通用�
 
 | 主题 | 本仓库设计 |
 | --- | --- |
-| Slack | [项目查询与切换、模型选择与表情回应](design-slack-integration-v1.4.0.md) |
+| Slack | [项目查询与切换、模型选择与表情回应](design-slack-integration-v1.5.0.md) |
 | 云端附件 | [附件设计](design-cloud-attachments-v1.0.0.md) |
 | 云端对话压缩 | [压缩设计](design-coordinator-compaction-v1.0.0.md) |
 | 云端模型缓存前缀 | [稳定前缀与逐轮状态](design-coordinator-cache-prefix-v1.0.0.md) |
