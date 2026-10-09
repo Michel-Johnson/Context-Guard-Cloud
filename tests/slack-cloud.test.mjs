@@ -247,7 +247,7 @@ test('Cloud integration listener is disabled by default and plugin credentials c
   assert.equal(projects.status, 200); assert.deepEqual(projects.body.data.projects.map(item => item.id).sort(), [projectId, otherProjectId].sort());
 });
 
-test('真实 Cloud 项目工具沿原目录授权交接，对话和 Main 隔离，非私聊不能获得目录', async t => {
+test('真实 Cloud 项目工具沿原目录授权交接，对话和 Main 隔离，频道可查开放目录但不能切换', async t => {
   const f = await fixture(t, { projectSelection: true });
   const conversationId = await f.newConversation('project-tools-chat');
   const before = await f.main();
@@ -269,12 +269,78 @@ test('真实 Cloud 项目工具沿原目录授权交接，对话和 Main 隔离�
   assert.equal(saved.body.data.messages.flatMap(m => m.actions || []).find(a => a.kind === 'project-switch').conversationId, action.conversationId);
   const channelConversation = await f.newConversation('channel-project-tools');
   await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'CTESTCHANNEL' }, { id: 'channel-list-turn', conversationId: channelConversation });
+  const channelListed = await f.wait(channelConversation, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+  assert.match(channelListed.messages.at(-1).text, /context-guard.*fixture-other/);
+  const last = f.modelCalls.filter(c => c.maxTokens !== 256).at(-1);
+  assert.equal(last.tools.some(t => t.name === 'list_projects'), true);
+  assert.equal(last.tools.some(t => t.name === 'switch_project'), false);
+  await f.gateway('conversation.submit', { text: '切换到另一个项目', slackChannelId: 'CTESTCHANNEL' }, { id: 'channel-switch-turn', conversationId: channelConversation });
   const denied = await f.wait(channelConversation, s => s.status === 'waiting-for-user' && !s.activeTurnId);
   assert.match(denied.messages.at(-1).text, /已拒绝/);
-  const last = f.modelCalls.filter(c => c.maxTokens !== 256).at(-1);
-  assert.equal(last.tools.some(t => ['list_projects', 'switch_project'].includes(t.name)), false);
+  assert.equal(denied.messages.flatMap(m => m.actions || []).some(a => a.kind === 'project-switch'), false);
+  assert.deepEqual(await f.main(), before);
   const invalid = await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'bad-channel' }, { id: 'invalid-channel-turn', conversationId });
   assert.equal(invalid.status, 400);
+});
+
+test('频道和群组查询在模型读取前过滤私有目录，私聊保留完整授权目录与实时总数', async t => {
+  const f = await fixture(t, { projectSelection: true, mapProjects: true });
+  const overview = async () => (await (await fetch(f.cloud.url + '/api/workbench/overview/api/state', { headers })).json());
+  const edit = async (operationId, operations) => {
+    const response = await fetch(f.cloud.url + '/api/workbench/overview/api/commit', { method: 'POST', headers,
+      body: JSON.stringify({ operationId, baseVersion: (await overview()).version, operations }) });
+    assert.equal(response.status, 200, JSON.stringify(await response.json()));
+  };
+  await edit('directory-seed', [
+    { type: 'update', id: `P_${projectId}`, fields: { title: '同名项目', purpose: '公开甲' } },
+    { type: 'update', id: `P_${otherProjectId}`, fields: { title: '同名项目', purpose: '公开乙' } },
+    { type: 'create', parentId: 'T0', node: { id: 'N-private', title: 'PRIVATE_DIRECTORY_SENTINEL', purpose: 'PRIVATE_DESCRIPTION_SENTINEL' } },
+  ]);
+  const before = await overview();
+  const conversations = {};
+  for (const channel of ['CTESTCHANNEL', 'GTESTGROUP', 'DTESTDM']) {
+    const conversationId = conversations[channel] = await f.newConversation(`directory-${channel}`);
+    const start = f.modelCalls.length;
+    const submission = { text: '列出项目', slackChannelId: channel };
+    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId })).status, 200);
+    const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+    const calls = f.modelCalls.slice(start), receipts = calls.flatMap(call => call.messages)
+      .flatMap(message => Array.isArray(message.content) ? message.content : []).filter(block => block.type === 'tool_result')
+      .map(block => JSON.parse(block.content)).filter(result => result.projects);
+    assert.equal(receipts.length, 1);
+    const directory = receipts[0], personal = channel.startsWith('D');
+    assert.equal(directory.scope, personal ? 'personal' : 'channel');
+    assert.equal(directory.total, personal ? 3 : 2);
+    assert.deepEqual(directory.projects.slice(0, 2).map(p => p.name), ['同名项目', '同名项目']);
+    if (personal) assert.match(state.messages.at(-1).text, /PRIVATE_DIRECTORY_SENTINEL/);
+    else {
+      assert.doesNotMatch(JSON.stringify(calls), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL|N-private/);
+      assert.doesNotMatch(JSON.stringify(state), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL|N-private/);
+      assert.equal(calls[0].tools.some(tool => tool.name === 'switch_project'), false);
+    }
+    const count = f.modelCalls.length;
+    assert.equal((await f.gateway('conversation.submit', submission, { id: `list-${channel}`, conversationId })).status, 200);
+    assert.equal(f.modelCalls.length, count, '同操作回执重放不重复模型查询');
+  }
+  assert.equal((await overview()).version, before.version, '查询不写 Main');
+  await edit('directory-rename', [{ type: 'update', id: `P_${otherProjectId}`, fields: { title: '新项目名' } }]);
+  await f.restart();
+  const conversationId = conversations.CTESTCHANNEL, start = f.modelCalls.length;
+  await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'CTESTCHANNEL' }, { id: 'fresh-after-restart', conversationId });
+  const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+  assert.match(state.messages.at(-1).text, /新项目名/);
+  assert.doesNotMatch(JSON.stringify(f.modelCalls.slice(start)), /PRIVATE_DIRECTORY_SENTINEL|PRIVATE_DESCRIPTION_SENTINEL/);
+});
+
+test('目录工具仍执行项目和动作授权，不把未授权来源降级成成功查询', async t => {
+  const f = await fixture(t, { projectSelection: true, integrationActions: ['conversation.create', 'conversation.submit', 'conversation.state'] });
+  const conversationId = await f.newConversation('directory-without-grant');
+  await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'CTESTCHANNEL' }, { id: 'directory-forbidden', conversationId });
+  const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId);
+  assert.match(state.messages.at(-1).text, /已拒绝/);
+  const receipt = f.modelCalls.at(-1).messages.at(-1).content[0];
+  assert.equal(receipt.is_error, true);
+  assert.equal(JSON.parse(receipt.content).error.code, 'FORBIDDEN');
 });
 
 test('隔离端到端：Slack 自然切换经真实 HTTP 和原生工具交接，后续原线程回复只读新项目上下文', async t => {

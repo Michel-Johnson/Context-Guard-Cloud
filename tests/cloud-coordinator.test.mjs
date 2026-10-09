@@ -2350,7 +2350,7 @@ test('Slack reply policy is supplied as system instructions without changing nat
   assert.ok(calls[1].messages.some(m => typeof m.content === 'string' && m.content.endsWith('有哪些TODO')), 'Cross-client history remains shared');
 });
 
-test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复不扩大群组权限', async t => {
+test('Slack 项目查询与切换能力分别开放，旧拒绝历史不妨碍当前目录查询', async t => {
   for (const channelId of ['DTESTDM', 'GTESTGROUP']) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-project-directory-policy-'));
     t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -2364,11 +2364,12 @@ test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复�
       }; } }), model: { next: async request => {
         calls.push(request);
         if (calls.length === 1) return { stop: 'end_turn', content: [{ type: 'text', text: '我看不到全局配置，只能在宿主切换。' }] };
-        assert.match(request.system, /私聊中新发消息/);
-        assert.match(request.system, /不要声称.*看不到项目.*宿主改绑定/);
+        assert.match(request.system, /频道仅含已开放项目/);
+        assert.match(request.system, /缺 switch_project 不代表不能查询/);
+        assert.doesNotMatch(request.system, /私聊中新发消息/);
         assert.match(request.system, /总数直接使用工具 total/);
-        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'DTESTDM');
-        if (channelId === 'GTESTGROUP') return { stop: 'end_turn', content: [{ type: 'text', text: '完整项目目录和切换仅在私聊提供，请私聊 Coordinator 重新询问。' }] };
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), true);
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'DTESTDM');
         if (calls.length === 2) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-directory', name: 'list_projects', input: {} }] };
         const result = JSON.parse(request.messages.at(-1).content[0].content);
         assert.deepEqual(result.projects.map(project => project.name), ['博客', '模型实验']);
@@ -2379,9 +2380,41 @@ test('Slack 项目目录按本轮工具说明私聊入口，历史错误答复�
     await service.submit({ id: 'new-query', text: '一共有哪些项目' }, { source: 'slack', actor }); await service.close();
     const result = await service.state();
     assert.equal(result.status, 'waiting-for-user');
-    assert.match(result.messages.at(-1).text, channelId === 'DTESTDM' ? /博客、模型实验/ : /仅在私聊提供/);
-    assert.equal(executions.length, channelId === 'DTESTDM' ? 1 : 0);
+    assert.match(result.messages.at(-1).text, /博客、模型实验/);
+    assert.equal(executions.length, 1);
     assert.ok(result.messages.some(message => message.text?.includes('我看不到全局配置')), '保留旧历史，不通过删除掩盖错误');
+  }
+});
+
+test('项目查询目录与执行层使用相同来源校验，身份缺失或伪造均零读取', async () => {
+  const actor = { ...reactionActor, channelId: 'CTESTCHANNEL' };
+  for (const options of [
+    { source: 'slack', actor },
+    { source: 'slack', actor: { ...actor, channelId: 'DTESTDM' } },
+    { source: 'slack', actor: { ...actor, channelId: 'GTESTGROUP' } },
+    { source: 'human', actor },
+    { source: 'slack', actor: { ...actor, kind: 'agent' } },
+    { source: 'slack', actor: { ...actor, integration: 'other' } },
+    { source: 'slack', actor: { ...actor, sessionId: 'slack:TOTHER:UOTHER' } },
+    { source: 'slack', actor: { ...actor, channelId: undefined } },
+    { source: 'slack', actor: { ...actor, channelId: 'bad-channel' } },
+  ]) {
+    const expected = options.source === 'slack' && options.actor.kind === 'human' && options.actor.integration === 'slack' &&
+      options.actor.sessionId === actor.sessionId && /^[DCG][A-Z0-9]{1,31}$/.test(options.actor.channelId || '');
+    let reads = 0;
+    const execute = createCoordinatorExecutor({ listProjects: async () => { reads++; return { projects: [], total: 0 }; } });
+    const state = { activeInput: { id: 'real-directory-request', ...options }, messages: [], toolReceipts: {} };
+    await coordinatorStep({ turnId: 'directory-identity', state, system: 'Fixture', tools: coordinatorTools, save: async () => {}, execute,
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), expected);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'identity-list', name: 'list_projects', input: {} }] };
+      } } });
+    assert.equal(reads, expected ? 1 : 0);
+    if (!expected) {
+      assert.equal(state.messages.at(-1).content[0].is_error, true);
+      await assert.rejects(execute('list_projects', {}, { operationId: 'direct-forgery', ...options }), { code: 'TOOL_FORBIDDEN' });
+      assert.equal(reads, 0, '执行层不信任模型可见目录或正文中的身份');
+    }
   }
 });
 
