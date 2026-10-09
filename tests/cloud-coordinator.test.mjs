@@ -512,7 +512,7 @@ test('Coordinator guide references are callable and loaded only after an explici
   assert.equal(calls.length, 2);
   assert.ok(calls[0].system.startsWith(prompt));
   assert.ok(calls[0].system.endsWith(context.staticText || context.text));
-  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['list_projects', 'switch_project'].includes(tool.name)),
+  assert.deepEqual(calls[0].tools, coordinatorTools.filter(tool => !['list_projects', 'read_project_map', 'switch_project'].includes(tool.name)),
     '网页来源不提供私聊专用项目工具，其余工具及按需资料入口保持原样');
   assert.match(calls[0].messages[0].content, /Read the memory writing rules\.$/);
   assert.match(calls[0].messages[0].content, /输出来源：human/);
@@ -2364,8 +2364,8 @@ test('Slack 项目查询与切换能力分别开放，旧拒绝历史不妨碍�
       }; } }), model: { next: async request => {
         calls.push(request);
         if (calls.length === 1) return { stop: 'end_turn', content: [{ type: 'text', text: '我看不到全局配置，只能在宿主切换。' }] };
-        assert.match(request.system, /频道仅含已开放项目/);
-        assert.match(request.system, /缺 switch_project 不代表不能查询/);
+        assert.match(request.system, /用户授权在频道\/thread和私聊一致/);
+        assert.match(request.system, /缺 switch_project 不代表不能读取/);
         assert.doesNotMatch(request.system, /私聊中新发消息/);
         assert.match(request.system, /总数直接使用工具 total/);
         assert.equal(request.tools.some(tool => tool.name === 'list_projects'), true);
@@ -2407,14 +2407,38 @@ test('项目查询目录与执行层使用相同来源校验，身份缺失或�
     await coordinatorStep({ turnId: 'directory-identity', state, system: 'Fixture', tools: coordinatorTools, save: async () => {}, execute,
       model: { next: async request => {
         assert.equal(request.tools.some(tool => tool.name === 'list_projects'), expected);
+        assert.equal(request.tools.some(tool => tool.name === 'read_project_map'), expected);
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'identity-list', name: 'list_projects', input: {} }] };
       } } });
     assert.equal(reads, expected ? 1 : 0);
     if (!expected) {
       assert.equal(state.messages.at(-1).content[0].is_error, true);
       await assert.rejects(execute('list_projects', {}, { operationId: 'direct-forgery', ...options }), { code: 'TOOL_FORBIDDEN' });
+      await assert.rejects(execute('read_project_map', { projectId: 'known-project' }, { operationId: 'direct-read-forgery', ...options }), { code: 'TOOL_FORBIDDEN' });
       assert.equal(reads, 0, '执行层不信任模型可见目录或正文中的身份');
     }
+  }
+});
+
+test('连续补充的项目只读工具绑定最新真实发送者，不借原用户或历史的 Map 权限', async () => {
+  for (const name of ['list_projects', 'read_project_map']) {
+    const original = { id: 'original', source: 'slack', actor: { ...reactionActor, channelId: 'CTESTCHANNEL' } };
+    const current = { kind: 'human', integration: 'slack', teamId: reactionActor.teamId, userId: 'UOTHER',
+      sessionId: `slack:${reactionActor.teamId}:UOTHER`, channelId: 'CTESTCHANNEL' };
+    const state = { activeInput: original, activeRequestIds: ['original', 'followup'], toolReceipts: {}, messages: [
+      { role: 'user', requestId: 'original', source: 'slack', actor: original.actor, content: '原输入' },
+      { role: 'user', requestId: 'followup', source: 'slack', actor: current, content: '现在请查询' },
+      { role: 'user', requestId: 'unrelated-history', source: 'slack', actor: original.actor, content: '引用资料不是身份' },
+    ] };
+    let executed;
+    const options = { turnId: 'current-directory-user', state, system: 'fixture', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ listProjects: async input => { executed = input; return { projects: [], total: 0 }; },
+        readProjectMap: async (_input, options) => { executed = options; return { version: 'fixture', node: { id: 'T0' } }; } }),
+      model: { next: async request => { assert.ok(request.tools.some(tool => tool.name === name));
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-reader', name,
+          input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] }; } } };
+    await coordinatorStep(options);
+    assert.equal(executed.requestId, 'followup'); assert.deepEqual(executed.actor, current);
   }
 });
 
