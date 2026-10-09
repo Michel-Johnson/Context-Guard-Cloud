@@ -479,7 +479,7 @@ for (const scenario of ['其他用户', '公共频道', '伪造原文', '生成�
   });
 }
 
-test('项目工具只向已验证 Slack 私聊开放，交接终止旧项目的后续工具', async () => {
+test('项目查询向已验证 Slack 频道开放，切换仍限私聊且终止旧项目的后续工具', async () => {
   const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: 'D000001', sessionId: `slack:${teamId}:${user}` };
   for (const channelId of [undefined, channel, 'D000001']) {
     const acceptedActor = { ...actor, ...(channelId ? { channelId } : {}) }; if (!channelId) delete acceptedActor.channelId;
@@ -488,7 +488,8 @@ test('项目工具只向已验证 Slack 私聊开放，交接终止旧项目的�
     await coordinatorStep({ turnId: `switch-${channelId}`, state, system: 'rule', tools: coordinatorTools, save: async () => {},
       execute: createCoordinatorExecutor({ switchProject: async (input, options) => { calls.push(options); return { kind: 'project-switch', projectId: input.projectId }; } }),
       model: { next: async request => {
-        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'D000001');
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), !!channelId);
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'D000001');
         modelToolsHash = hash(JSON.stringify(request.tools));
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'switch_project', input: { projectId: 'blog' } },
           { type: 'tool_use', id: 'should-not-write', name: 'edit_map', input: { mainVersion: 'old', actions: [] } }] };
