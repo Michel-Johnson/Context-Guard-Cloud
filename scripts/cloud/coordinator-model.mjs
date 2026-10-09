@@ -6,6 +6,7 @@ const problem = (code, message) => Object.assign(new Error(message), { code });
 const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
 const diagnosticPhases = new Set(['fetch', 'http', 'response-stream', 'response-json', 'response-validation']);
 const terminationCodes = new Set(['STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'STOP_REASON_INVALID', 'MODEL_MISMATCH', 'CONTENT_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH']);
+const callbackBoundaries = new Set(['onText', 'onToolStart']);
 const stopReasons = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'pause_turn', 'refusal', 'model_context_window_exceeded', 'stop', 'tool_calls', 'length', 'content_filter']);
 const ownValue = (value, field) => value && Object.getOwnPropertyDescriptor(value, field)?.value;
 function safeTermination(value) {
@@ -13,6 +14,10 @@ function safeTermination(value) {
     const result = {}, code = ownValue(value, 'validationCode'), stop = ownValue(value, 'stopReason');
     if (terminationCodes.has(code)) result.validationCode = code;
     if (stopReasons.has(stop)) result.stopReason = stop;
+    const origin = ownValue(value, 'failureOrigin'), boundary = ownValue(value, 'callbackBoundary');
+    if (origin === 'callback' && callbackBoundaries.has(boundary)) {
+      result.failureOrigin = origin; result.callbackBoundary = boundary;
+    }
     const open = ownValue(value, 'openBlockCount'), terminal = ownValue(value, 'messageStopSeen');
     if (Number.isSafeInteger(open) && open >= 0) result.openBlockCount = open;
     if (typeof terminal === 'boolean') result.messageStopSeen = terminal;
@@ -156,6 +161,11 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
   let buffer = '', size = 0, model = '', stopReason = '', usage = {}, visibleText = '';
   const blocks = [], openBlocks = new Set();
   let started = false, terminal = false, messageStopSeen = false, validationCode = 'STREAM_INVALID';
+  let callbackBoundary = null;
+  const notify = async (boundary, callback, value) => {
+    try { await callback?.(value); }
+    catch (error) { callbackBoundary = boundary; throw error; }
+  };
   const invalidStream = (code = 'STREAM_INVALID') => {
     validationCode = code;
     return problem('MODEL_INVALID_RESPONSE', 'Coordinator returned an incomplete or invalid event stream');
@@ -181,13 +191,13 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
       validatePrivateBlock(block);
       blocks[value.index] = block.type === 'tool_use' ? { type: 'tool_use', id: block.id, name: block.name, input: block.input || {}, _json: '' }
         : block.type === 'text' ? { type: 'text', text: block.text || '' } : { ...block };
-      if (block.type === 'tool_use') await onToolStart?.(block.name);
-      if (block.type === 'text' && block.text) { visibleText += block.text; await onText?.(visibleText); }
+      if (block.type === 'tool_use') await notify('onToolStart', onToolStart, block.name);
+      if (block.type === 'text' && block.text) { visibleText += block.text; await notify('onText', onText, visibleText); }
     }
     if (value.type === 'content_block_delta') {
       if (!openBlocks.has(value.index)) throw invalidStream();
       const block = blocks[value.index], delta = value.delta || {};
-      if (block?.type === 'text' && delta.type === 'text_delta') { block.text += delta.text || ''; visibleText += delta.text || ''; await onText?.(visibleText); }
+      if (block?.type === 'text' && delta.type === 'text_delta') { block.text += delta.text || ''; visibleText += delta.text || ''; await notify('onText', onText, visibleText); }
       if (block?.type === 'tool_use' && delta.type === 'input_json_delta') block._json += delta.partial_json || '';
       // Thinking is private provider history, not visible streaming text. Keep
       // both opaque signature and exact content for subsequent native tool
@@ -243,7 +253,8 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
   } catch (error) {
     // Never retain raw events, blocks, thoughts or arbitrary usage properties.
     try { Object.defineProperty(error, 'modelTermination', { value: safeTermination({
-      ...(ownValue(error, 'code') === 'MODEL_INVALID_RESPONSE' ? { validationCode } : {}), stopReason,
+      ...(callbackBoundary ? { failureOrigin: 'callback', callbackBoundary }
+        : ownValue(error, 'code') === 'MODEL_INVALID_RESPONSE' ? { validationCode } : {}), stopReason,
       openBlockCount: openBlocks.size, messageStopSeen, usage }), configurable: true }); } catch {}
     throw error;
   } finally { cancelReader(reader); try { reader.releaseLock(); } catch {} }
