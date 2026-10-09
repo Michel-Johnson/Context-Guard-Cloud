@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## SLACK-FAILED-STREAM-01 · 失败流标签与安全终止诊断（2026-10-09）
+
+- [x] Coordinator：批准最小范围，修观察器缺省修订为公共合同的0；失败预览仅原位标记同轮同修订的已保存TS，持久去重，保原错误通知/回执，不把半截生成当最终答案或完整模型历史。
+- [x] Executor：终止诊断仅保白名单验证代码/阶段/停止原因、块闭合与终止标志、非负安全整数usage，进入既有私有performance；原始响应、思考、正文、凭据不进入诊断或公共state。模型/预算/时限/重试/完整性校验不变；原真实失败根因未获保存证据，不能倒推为max_tokens。
+- [x] Executor：开发完成后唯一正式受影响窄批实际 `58b624` exit 0，29/29 passed、0 failed/skipped/cancelled、869.7421ms；日志 `temp/slack-failed-stream-executor-37ae-20261009.log`。覆盖缺失/无效终止、私有诊断与持久恢复、不完整响应零工具/零正式assistant、getter与恶意metadata拒绝、原TS失回/重启/重复去重、别的turn/revision/已正式占槽不可覆写。私有观察器只按精确已部署SHA、真人事件与真实stream+槽位触发，不重放旧失败。未全量/生产模型，不以合成终止原因倒推原真实失败。
+- [x] 独立 Tester：精确冻结四产品/正式测试、CI/private观察器和Root四版本文件的hash前后匹配；唯一同29正式目标 actual `ae27cb` exit 0，29/29 passed、0 failed/skipped/cancelled、832.3677ms，FS-01..06逐项通过。报告 `temp/slack-failed-stream-independent-37ae145-20261009.md`，日志 `temp/slack-failed-stream-independent-37ae145-20261009.log`；同TS失回/重启、修订和正式槽隔离、严格失败零工具/零正式历史及安全私有诊断不公开。原错误与首次观察器not-ready证据保留，不以mock通过代替真人验收。
+- [ ] Delivery：Root负责正常Required/PR/准确SHA部署，再以两个新真人只读场景分别验收已产生正文流后的补充及原生stop/resume。停止权限沿已授权既有配置，不新增模型/权限/业务写入或重放原失败输入。
+
 ## COORDINATOR-OVERVIEW-PURPOSE-01 · 动态用途资料（2026-10-09）
 
 - [x] 补供给而非再改 PE：未完成事项概览新增每条最多160字符的用途摘录，取 desc/description/text 首个非空 string；与原标题正规化空白相同则省略。超长明确「已截短，全文用 read_map」，没有无据测试标签识别或生成展示名，不改 Main 标题/状态或工具/brief/export 原值，不宣称摘录保留全部业务值。

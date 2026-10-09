@@ -1212,6 +1212,24 @@ export class SlackPlugin {
         });
       }
     }
+    if (state.status === 'error' && state.activeTurnId) {
+      const slotId = streamIdFor(state.activeTurnId, state.consumedInputRevision);
+      const thread = this.store.data.threads[key];
+      const stream = Number.isSafeInteger(state.consumedInputRevision) || thread.liveStream?.slotId === slotId && thread.liveStream.turnId === state.activeTurnId
+        ? streamFor(state.activeTurnId, false, slotId) : null;
+      const partial = state.streamingText || state.partialText || stream?.text;
+      if (stream && partial) {
+        const failedHash = digest({ text: partial, code: state.error?.code || 'UNKNOWN' });
+        if (stream.failedHash !== failedHash) {
+          const text = `Coordinator 部分回复（生成失败，非最终答案）：\n${partial}`;
+          await this.io.update(binding.channel, stream.ts, text, messageBlocks({ text }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId }));
+          await this.store.update(data => {
+            data.threads[key].mirrored[stream.slotId].failedHash = failedHash;
+            if (data.threads[key].liveStream?.slotId === stream.slotId) data.threads[key].liveStream.failedHash = failedHash;
+          });
+        }
+      }
+    }
     if (state.status === 'interrupted') {
       const turnId = state.activeTurnId || binding.lastStateRequestId;
       const stream = streamFor(turnId, false, streamIdFor(turnId, state.consumedInputRevision)) || streamFor(turnId);

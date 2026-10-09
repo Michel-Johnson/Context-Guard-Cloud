@@ -2104,6 +2104,72 @@ test('real waiting-for-user state finalizes streamed reply in place after restar
   f.gateway.command = async () => ({ status: 'waiting-for-user', activeTurnId: null, streamingText: '', messages: [{ id: 'u1', role: 'user', requestId: 'request-one', text: 'question' }, { id: 'a1', role: 'assistant', text: 'complete answer' }], approvals: [] });
   await f.plugin.mirror(key); assert.equal(f.sent.filter(call => call.channel).length, 1); assert.equal(f.sent.filter(call => call.update).length, 1); assert.equal(f.plugin.store.data.threads[key].liveStream, undefined);
 });
+test('Failed stream preview stays in its original slot and failure marking survives lost ACK restart and repeated snapshots', async t => {
+  for (const lostAck of [false, true]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-${lostAck}`), posts = new Map();
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    const post = f.io.post;
+    f.io.post = async input => { if (!posts.has(input.id)) posts.set(input.id, await post(input)); return posts.get(input.id); };
+    let state = { status: 'running', activeTurnId: 'failed-turn', consumedInputRevision: 0, streamingText: 'const value =',
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Explain a read-only example' }] };
+    f.gateway.command = async () => state;
+    await f.plugin.mirror(key);
+    const ts = f.plugin.store.data.threads[key].liveStream.ts;
+    state = { ...state, status: 'error', streamingText: 'const value = 3;\nconst pending =', error: { code: 'MODEL_INVALID_RESPONSE' } };
+    const update = f.io.update; let failed = false;
+    f.io.update = async (...args) => { await update(...args); if (lostAck && !failed) { failed = true; throw new Error('Lost preview ACK'); } };
+    if (lostAck) await assert.rejects(f.plugin.mirror(key), /Lost preview ACK/);
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key);
+    const count = f.sent.filter(call => call.update).length;
+    f.plugin.store = await new Store(f.directory).open();
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, count);
+    assert.equal(count, lostAck ? 2 : 1, 'Lost ACK retries the same slot, not a new partial or final');
+    for (const call of f.sent.filter(call => call.update)) {
+      assert.equal(call.update[1], ts); assert.equal(call.update[2], 'Coordinator 部分回复（生成失败，非最终答案）：\nconst value = 3;\nconst pending =');
+      assert.ok(call.update[3].some(block => block.text?.text.includes('非最终答案')));
+    }
+    const thread = f.plugin.store.data.threads[key], stream = thread.mirrored['stream:failed-turn:0'];
+    assert.equal(stream.ts, ts); assert.ok(stream.failedHash); assert.equal(stream.consumedBy, undefined);
+    assert.equal(thread.liveStream.failedHash, stream.failedHash);
+    assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
+    assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
+  }
+});
+
+test('Failed stream marking never borrows another revision or turn when the exact failed slot is missing', async t => {
+  for (const [priorTurn, revision, consumed] of [['failed-turn', 1, false], ['another-turn', 1, false], ['failed-turn', 2, true]]) {
+    const f = await fixture(t), key = threadKey(teamId, channel, `123.failed-scope-${priorTurn}-${revision}`);
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'failed-chat', userId: user, ownRequests: ['failed-turn'] });
+    await f.store.update(data => {
+      data.threads[key].mirrored[`stream:${priorTurn}:${revision}`] = { ts: '5.0', turnId: priorTurn, revision, text: 'Prior preview', ...(consumed ? { consumedBy: 'saved-final' } : {}) };
+      if (consumed) data.threads[key].mirrored['saved-final'] = { ts: '5.0', hash: 'completed-reply' };
+      data.threads[key].liveStream = { ts: '5.0', turnId: priorTurn, slotId: `stream:${priorTurn}:${revision}`, text: 'Prior preview' };
+    });
+    f.gateway.command = async () => ({ status: 'error', activeTurnId: 'failed-turn', consumedInputRevision: 2,
+      streamingText: 'Different revision failed', error: { code: 'MODEL_INVALID_RESPONSE' },
+      messages: [{ id: 'u', role: 'user', requestId: 'failed-turn', text: 'Ask' }] });
+    await f.plugin.mirror(key);
+    f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+    assert.equal(f.sent.filter(call => call.update).length, 0);
+    const slot = f.plugin.store.data.threads[key].mirrored[`stream:${priorTurn}:${revision}`];
+    assert.equal(slot.text, 'Prior preview'); assert.equal(slot.failedHash, undefined); assert.equal(slot.consumedBy, consumed ? 'saved-final' : undefined);
+  }
+});
+
+test('Failed legacy stream with no revision is marked only through its persisted same-turn pointer', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.failed-legacy');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'legacy-chat', userId: user, ownRequests: ['legacy-turn'] });
+  await f.store.update(data => { data.threads[key].liveStream = { ts: '7.0', turnId: 'legacy-turn', text: 'Legacy preview' }; });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'legacy-turn', streamingText: 'Legacy visible partial',
+    error: { code: 'MODEL_INVALID_RESPONSE' }, messages: [{ id: 'u', role: 'user', requestId: 'legacy-turn', text: 'Ask' }] });
+  await f.plugin.mirror(key); f.plugin.store = await new Store(f.directory).open(); await f.plugin.mirror(key);
+  assert.deepEqual(f.sent.filter(call => call.update).map(call => call.update[1]), ['7.0']);
+  assert.ok(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].failedHash);
+  assert.equal(f.plugin.store.data.threads[key].mirrored['stream:legacy-turn'].consumedBy, undefined);
+});
+
 test('overlapping turn previews finalize in their own slots after restart without reposting old replies', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.overlap');
   await f.store.bind(key, { channel, threadTs: '123.overlap', projectId: 'lab', conversationId: 'chat-overlap', userId: user, ownRequests: ['request-one', 'request-two'] });
