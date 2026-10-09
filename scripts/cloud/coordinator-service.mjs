@@ -33,7 +33,7 @@ function attachmentMetadata(item, id) {
 }
 function trustedActor(actor) {
   if (actor === undefined) return undefined;
-  if (!actor || actor.kind !== 'human' || Object.keys(actor).some(key => !['kind', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration'].includes(key)) ||
+  if (!actor || actor.kind !== 'human' || Object.keys(actor).some(key => !['kind', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration', 'channelId'].includes(key)) ||
       Object.entries(actor).some(([, value]) => typeof value !== 'string' || !value || value.length > 240)) {
     throw error('INVALID_INPUT', 'Provide verified human actor metadata');
   }

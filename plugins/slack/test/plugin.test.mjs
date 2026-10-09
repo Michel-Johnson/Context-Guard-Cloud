@@ -244,6 +244,162 @@ async function fixture(t) {
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
 
+async function projectSwitchFixture(t) {
+  const f = await fixture(t), dm = 'D000001', key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: dm, sessionId: `slack:${teamId}:${user}` };
+  const original = event({ channel: dm, channel_type: 'im', thread_ts: '100.001', text: '切换到博客' });
+  await f.store.receive('switch-inbox', { type: 'events_api', body: { team_id: teamId, event: original } });
+  await f.store.bind(key, { projectId: 'lab', conversationId: 'old-chat', channel: dm, threadTs: '100.001', userId: user, ownRequests: [requestId] });
+  await f.store.update(state => { state.preferences[user] = 'lab'; state.reactionInputs = { [requestId]: { key, projectId: 'lab', conversationId: 'old-chat',
+    channel: dm, userId: user, timestamp: original.ts, inboxId: 'switch-inbox', eventHash: digest({ ...original, type: 'message' }) } }; });
+  const input = { role: 'user', source: 'slack', actor, requestId, text: original.text };
+  const message = { role: 'assistant', source: 'slack', actor, requestId, text: '', actions: [{ kind: 'project-switch', actionId: 'native-switch', status: 'pending',
+    requestId, actor, sourceProjectId: 'lab', sourceConversationId: 'old-chat', projectId: 'blog', name: '博客', conversationId: 'new-chat', mapNodeId: 'BLOG' }] };
+  const snapshot = { status: 'waiting-for-user', activeTurnId: null, messages: [input, message] };
+  const command = f.gateway.command;
+  f.gateway.command = async (type, args) => {
+    if (type === 'project.list') { f.calls.push({ type, ...args }); return { projects: [{ id: 'lab', name: '实验项目' }, { id: 'blog', name: '博客', private: true, mapNodeId: 'BLOG' }] }; }
+    if (type === 'conversation.state') { f.calls.push({ type, ...args }); return args.projectId === 'lab' ? snapshot : { status: 'idle', messages: [], approvals: [] }; }
+    return command(type, args);
+  };
+  f.io.post = async input => { f.sent.push(input); return '1000.001'; };
+  return { ...f, dm, key, actor, input, message, snapshot };
+}
+
+test('自然切换保留旧绑定，创建独立目标路由，重放与重启不再改选或重复确认', async t => {
+  const f = await projectSwitchFixture(t), before = structuredClone(f.store.data.threads[f.key]);
+  await f.plugin.mirror(f.key);
+  assert.equal(f.store.data.preferences[user], 'blog');
+  assert.equal(f.store.data.threads[f.key].projectId, before.projectId);
+  assert.equal(f.store.data.threads[f.key].conversationId, before.conversationId);
+  const target = f.store.data.projectSwitches[Object.keys(f.store.data.projectSwitches)[0]];
+  assert.equal(target.status, 'applied'); assert.equal(target.announced, true);
+  const nextBinding = f.store.data.threads[target.targetKey];
+  assert.equal(nextBinding.projectId, 'blog'); assert.equal(nextBinding.conversationId, 'new-chat'); assert.ok(nextBinding.projectSwitch);
+  const fresh = event({ channel: f.dm, thread_ts: '100.001', ts: '1001.001' });
+  assert.equal(f.plugin.routedThreadKey(fresh), target.targetKey);
+  assert.equal(f.plugin.routedThreadKey({ ...fresh, user: 'UOTHER' }), f.key);
+  assert.equal(f.plugin.routedThreadKey({ ...fresh, ts: '123.001' }), f.key);
+  assert.equal(f.plugin.routedThreadKey({ ...fresh, ts: '124.001' }), target.targetKey, '确认发出前的后续消息也进入新项目');
+  const sent = f.sent.length;
+  await f.plugin.mirror(f.key); assert.equal(f.sent.length, sent);
+  await f.store.update(state => { state.preferences[user] = 'a-later-selection'; });
+  const reopened = await new Store(f.directory).open();
+  const resumed = new SlackPlugin({ store: reopened, gateway: f.gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot });
+  await resumed.mirror(f.key); assert.equal(reopened.data.preferences[user], 'a-later-selection'); assert.equal(f.sent.length, sent);
+});
+
+test('切换后旧线程的新回复按新项目处理，不携带旧 Slack 历史或旧项目上下文', async t => {
+  const f = await projectSwitchFixture(t); await f.plugin.mirror(f.key);
+  const next = event({ channel: f.dm, channel_type: 'im', thread_ts: '100.001', ts: '1001.002', text: '介绍当前项目' });
+  await f.store.receive('next-input', { type: 'events_api', body: { team_id: teamId, event: next } });
+  await f.plugin.message('next-input', next);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1); assert.equal(submits[0].projectId, 'blog'); assert.equal(submits[0].conversationId, 'new-chat');
+  assert.equal(submits[0].payload.history, undefined); assert.equal(submits[0].payload.slackChannelId, f.dm);
+  const relevance = f.calls.find(call => call.type === 'conversation.relevance');
+  assert.deepEqual(relevance.payload.context, []);
+});
+
+test('项目新线程发送失回后重启复用原编号，确认失败不再次切换', async t => {
+  const f = await projectSwitchFixture(t), roots = new Map(), rootIds = [];
+  let loseRoot = true, loseConfirmation = true;
+  f.io.post = async input => {
+    if (!input.threadTs) {
+      rootIds.push(input.id); roots.set(input.id, '1000.001');
+      if (loseRoot) { loseRoot = false; throw Object.assign(new Error('未知发送结果'), { code: 'NETWORK_ERROR' }); }
+      return roots.get(input.id);
+    }
+    if (loseConfirmation) { loseConfirmation = false; throw Object.assign(new Error('确认发送失败'), { code: 'NETWORK_ERROR' }); }
+    f.sent.push(input); return '1000.002';
+  };
+  await assert.rejects(f.plugin.mirror(f.key), { code: 'NETWORK_ERROR' });
+  assert.equal(f.store.data.preferences[user], 'lab');
+  const reopened = await new Store(f.directory).open();
+  const resumed = new SlackPlugin({ store: reopened, gateway: f.gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot });
+  await assert.rejects(resumed.mirror(f.key), { code: 'NETWORK_ERROR' });
+  assert.equal(reopened.data.preferences[user], 'blog');
+  assert.equal(roots.size, 1); assert.equal(rootIds.length, 2); assert.equal(rootIds[0], rootIds[1]);
+  await reopened.update(state => { state.preferences[user] = 'later'; });
+  await resumed.mirror(f.key);
+  assert.equal(reopened.data.preferences[user], 'later');
+  assert.equal(Object.keys(reopened.data.threads).length, 2);
+  const confirmations = () => f.sent.filter(call => call.text);
+  assert.equal(confirmations().length, 1); assert.match(confirmations()[0].text, /已切换到 博客/);
+  await resumed.mirror(f.key); assert.equal(confirmations().length, 1);
+});
+
+test('并发应用同一项目交接保持成功，旧回执不将新绑定改成拒绝', async t => {
+  const f = await projectSwitchFixture(t);
+  const results = await Promise.all([1, 2].map(() => f.plugin.applyProjectSwitch(f.key, f.message, [f.input, f.message], f.snapshot)));
+  assert.ok(results.every(result => result.status === 'applied'));
+  assert.equal(f.store.data.preferences[user], 'blog'); assert.equal(Object.keys(f.store.data.threads).length, 2);
+  assert.equal(Object.values(f.store.data.projectSwitches)[0].status, 'applied');
+});
+
+test('切换请求已完成但确认尚未发送时，先交接再处理紧接的用户回复', async t => {
+  const f = await projectSwitchFixture(t);
+  await f.store.update(state => { state.threads[f.key].awaitingReplyId = 'switch-request'; });
+  f.plugin.eventStreams.set(f.key, { controller: new AbortController(), projectId: 'lab', conversationId: 'old-chat', latest: f.snapshot });
+  const next = event({ channel: f.dm, channel_type: 'im', thread_ts: '100.001', ts: '124.001', text: '介绍当前项目' });
+  await f.store.receive('early-followup', { type: 'events_api', body: { team_id: teamId, event: next } });
+  await f.plugin.message('early-followup', next);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1); assert.equal(submits[0].projectId, 'blog'); assert.equal(submits[0].conversationId, 'new-chat');
+  assert.equal(submits[0].payload.history, undefined);
+  assert.deepEqual(f.calls.find(call => call.type === 'conversation.relevance').payload.context, []);
+});
+
+test('切换应用前重新校验目标权限，撤销授权不创建 Slack 线程', async t => {
+  const f = await projectSwitchFixture(t), original = f.gateway.command;
+  f.gateway.command = async (type, args) => {
+    if (type === 'conversation.state' && args.projectId === 'blog') throw Object.assign(new Error('目标授权已撤销'), { code: 'FORBIDDEN' });
+    return original(type, args);
+  };
+  const result = await f.plugin.applyProjectSwitch(f.key, f.message, [f.input, f.message], f.snapshot);
+  assert.equal(result.status, 'rejected'); assert.equal(result.error, 'FORBIDDEN');
+  assert.equal(f.store.data.preferences[user], 'lab'); assert.equal(f.sent.filter(call => call.text).length, 0);
+  assert.equal(Object.keys(f.store.data.threads).length, 1);
+});
+
+for (const scenario of ['其他用户', '公共频道', '伪造原文', '生成未结束', '部分输出', '项目已删除', '偏好已变']) {
+  test(`自然项目切换拒绝${scenario}，不覆盖偏好或借用旧绑定`, async t => {
+    const f = await projectSwitchFixture(t);
+    if (scenario === '其他用户') f.message.actions[0].actor = { ...f.actor, userId: 'UOTHER' };
+    if (scenario === '公共频道') await f.store.update(state => { state.threads[f.key].channel = channel; });
+    if (scenario === '伪造原文') await f.store.update(state => { state.inbox['switch-inbox'].envelope.body.event.text = '不是切换请求'; });
+    if (scenario === '生成未结束') f.snapshot.activeTurnId = 'still-running';
+    if (scenario === '部分输出') f.message.partial = true;
+    if (scenario === '项目已删除') f.gateway.command = async () => ({ projects: [] });
+    if (scenario === '偏好已变') await f.store.update(state => { state.preferences[user] = 'later'; });
+    const result = await f.plugin.applyProjectSwitch(f.key, f.message, [f.input, f.message], f.snapshot);
+    assert.ok(!result || result.status === 'rejected');
+    assert.equal(f.store.data.preferences[user], scenario === '偏好已变' ? 'later' : 'lab');
+    assert.equal(Object.keys(f.store.data.threads).length, 1); assert.equal(f.sent.filter(call => call.text).length, 0);
+  });
+}
+
+test('项目工具只向已验证 Slack 私聊开放，交接终止旧项目的后续工具', async () => {
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: 'D000001', sessionId: `slack:${teamId}:${user}` };
+  for (const channelId of [undefined, channel, 'D000001']) {
+    const acceptedActor = { ...actor, ...(channelId ? { channelId } : {}) }; if (!channelId) delete acceptedActor.channelId;
+    const state = { activeTurnId: 'project-tool-turn', activeInput: { id: 'request', source: 'slack', actor: acceptedActor }, messages: [], toolReceipts: {} };
+    const calls = []; let modelToolsHash;
+    await coordinatorStep({ turnId: `switch-${channelId}`, state, system: 'rule', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ switchProject: async (input, options) => { calls.push(options); return { kind: 'project-switch', projectId: input.projectId }; } }),
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === 'list_projects'), channelId === 'D000001');
+        modelToolsHash = hash(JSON.stringify(request.tools));
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'switch_project', input: { projectId: 'blog' } },
+          { type: 'tool_use', id: 'should-not-write', name: 'edit_map', input: { mainVersion: 'old', actions: [] } }] };
+      } } });
+    assert.equal(calls.length, channelId === 'D000001' ? 1 : 0);
+    assert.equal(state.performance.models[0].prefix.toolsHash, modelToolsHash, '诊断记录实际发送的工具目录');
+    if (calls.length) { assert.equal(calls[0].requestId, 'request'); assert.equal(state.status, 'waiting-for-user'); }
+    assert.ok(state.messages.at(-1).content[1].is_error, 'A switch cannot continue with an old-project write');
+  }
+});
+
 test('项目菜单打开后实时搜索；新建、同名和删除选项不使用旧缓存', async t => {
   const f = await fixture(t);
   let projects = [{ id: 'old', name: '旧项目' }];

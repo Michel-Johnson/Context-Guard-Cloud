@@ -1,6 +1,6 @@
 {
   "name": "@michelj/context-guard-cloud",
-  "version": "1.4.2",
+  "version": "1.5.1",
   "private": true,
   "type": "module",
   "description": "Context Guard Cloud workbench and Coordinator service",
