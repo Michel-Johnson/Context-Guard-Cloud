@@ -231,7 +231,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, targetNodeI
     assert.fail(`${label} timed out: ${JSON.stringify(last?.body)}`);
   };
   return { directory, memoryConfig, options, modelCalls, gateway, browser, wait, get cloud() { return cloud; },
-    ownPlugin(plugin) { plugins.add(plugin); },
+    ownPlugin(plugin) { plugins.add(plugin); }, releaseHeld,
     main: () => readMemoryView(memoryConfig, projectId),
     async restart() { releaseHeld(); await cloud.close(); cloud = await startCloudServer(options); },
     async newConversation(id) {
@@ -400,6 +400,32 @@ test('跨项目读取保留目标节点限制与现有动作白名单', async t 
     if (actions) assert.equal(result.error.code, 'FORBIDDEN');
     else assert.equal(result.node.memoryDocument, 'ALLOWED_NODE_MEMORY');
   }
+});
+
+test('同一人工对话从网页生成转入可信 Slack 查询，耐久补充消费后目录可用且绑定不变', async t => {
+  const f = await fixture(t, { projectSelection: true }), conversationId = await f.newConversation('mixed-client-directory');
+  const before = await f.main();
+  const original = await f.browser(conversationId, { human: true, body: { id: 'browser-origin', text: 'hold-busy-turn' } });
+  assert.equal(original.status, 202, JSON.stringify(original.body));
+  const deadline = Date.now() + 4000;
+  while (!f.modelCalls.length && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.ok(f.modelCalls.length);
+  assert.equal(f.modelCalls[0].tools.some(tool => tool.name === 'list_projects'), false);
+  const submitted = await f.gateway('conversation.submit', { text: '列出项目', slackChannelId: 'CTESTCHANNEL', followup: 'steer' },
+    { id: 'slack-directory-followup', conversationId });
+  assert.equal(submitted.status, 200, JSON.stringify(submitted.body));
+  f.releaseHeld();
+  const state = await f.wait(conversationId, s => s.status === 'waiting-for-user' && !s.activeTurnId && s.acceptedRequestIds.includes('slack-directory-followup'));
+  assert.match(state.messages.at(-1).text, /context-guard.*fixture-other/);
+  const humanMessages = state.messages.filter(message => message.role === 'user');
+  assert.equal(humanMessages.length, 2);
+  assert.equal(humanMessages[0].source, 'human'); assert.equal(humanMessages[1].actor.channelId, 'CTESTCHANNEL');
+  assert.ok(f.modelCalls.slice(1).some(call => call.tools.some(tool => tool.name === 'list_projects')));
+  assert.equal(state.executionMode, 'manual'); assert.deepEqual(await f.main(), before);
+  await f.restart();
+  const restored = (await f.gateway('conversation.state', {}, { conversationId })).body.data;
+  assert.equal(restored.executionMode, 'manual'); assert.equal(restored.messages.filter(message => message.role === 'user').length, 2);
+  assert.match(restored.messages.at(-1).text, /context-guard.*fixture-other/);
 });
 
 test('目录工具仍执行项目和动作授权，不把未授权来源降级成成功查询', async t => {
