@@ -12,6 +12,7 @@ import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/
 import { CoordinatorModel, coordinatorFailureDiagnostic } from '../scripts/cloud/coordinator-model.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
+import { CoordinatorConversations } from '../scripts/cloud/coordinator-service.mjs';
 
 assert.ok(process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_FILE, '须显式指定真实模型配置');
 const providerFile = path.resolve(process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_FILE);
@@ -66,6 +67,7 @@ const options = { host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig, 
 let service, browser, context, page, conversationId, passed = false, activeRound = null, savedTodo;
 const statePath = () => `/api/workbench/projects/${projectId}/api/coordinator?conversation=${encodeURIComponent(conversationId)}`;
 const state = async () => (await context.request.get(service.url + statePath())).json();
+const privateState = async () => JSON.parse(await fs.readFile(new CoordinatorConversations(path.join(directory, 'coordinators', projectId)).conversationFile(conversationId), 'utf8'));
 const settle = async text => {
   const deadline = Date.now() + 150000;
   for (;;) {
@@ -76,8 +78,16 @@ const settle = async text => {
     if ((!text || s.messages?.some(m => m.role === 'user' && m.text === text)) &&
         ['waiting-for-user', 'error', 'interrupted'].includes(s.status) && s.pendingInputCount === 0) {
       await fs.writeFile(path.join(output, 'latest-state.json'), JSON.stringify(s, null, 2));
-      if (activeRound) { rounds.push({ conversationId, input: activeRound.input, firstVisibleMs: activeRound.firstVisibleMs,
-        durationMs: Date.now() - activeRound.started, status: s.status }); activeRound = null; }
+      if (activeRound) {
+        const saved = await privateState(), models = saved.performance?.turnId !== activeRound.previousPerformanceTurn
+          ? (saved.performance?.models || []) : [];
+        rounds.push({ conversationId, input: activeRound.input, firstVisibleMs: activeRound.firstVisibleMs,
+          durationMs: Date.now() - activeRound.started, status: s.status,
+          attempts: models.map(({ durationMs, errorCode, diagnostic }) => ({ durationMs,
+            ...(errorCode ? { errorCode } : {}), ...(diagnostic ? { diagnostic } : {}) })),
+          ...(s.error ? { finalErrorCode: s.error.code } : {}) });
+        activeRound = null;
+      }
       assert.equal(s.status, 'waiting-for-user', JSON.stringify(s.error || s.status));
       return s;
     }
@@ -96,7 +106,8 @@ try {
   await page.locator('#btn-coordinator').click();
   const panel = page.locator('#coordinator-panel');
   const beginRound = async input => {
-    const current = await state(); activeRound = { input, started: Date.now(), firstVisibleMs: null,
+    const current = await state(), saved = await privateState(); activeRound = { input, started: Date.now(), firstVisibleMs: null,
+      previousPerformanceTurn: saved.performance?.turnId,
       messageIds: new Set(current.messages.map(message => message.id)), approvalIds: new Set(current.approvals.map(proposal => proposal.id)) };
   };
   const confirm = async (label, endpoint) => {
