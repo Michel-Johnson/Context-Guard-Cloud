@@ -98,7 +98,13 @@ export class CoordinatorManualBriefs {
   }
   async state() { return readJSON(this.file, { proposals: {}, operations: {}, reviews: {} }); }
   async approvals(conversationId) {
-    return Object.values((await this.state()).proposals).filter(proposal => proposal.conversationId === conversationId).map(publicProposal);
+    const binding = this.readBinding ? await this.readBinding(conversationId) : null;
+    return Object.values((await this.state()).proposals).filter(proposal => proposal.conversationId === conversationId).map(proposal => {
+      const value = publicProposal(proposal);
+      const stale = proposal.bindingApproval && (proposal.bindingApproval !== binding?.bindingApproval ||
+        proposal.nodeId !== binding?.nodeId || proposal.kind !== binding?.kind);
+      return stale && value.pending ? { ...value, pending: false, stale: true } : value;
+    });
   }
   async acknowledgeNotification(proposalId, conversationId) {
     return withFileLock(this.file + '.lock', async () => {

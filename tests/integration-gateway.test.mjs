@@ -975,7 +975,10 @@ test('未确认、跨主节点和多节点 brief 被拒绝；改绑使旧 brief 
   await assert.rejects(service.prepare({ ...input, nodeIds: ['T0'] }, context('other-node')), { code: 'APPROVAL_REQUIRED' });
   await assert.rejects(service.prepare({ ...input, nodeIds: ['LOGIN', 'T0'] }, context('multiple-nodes')), { code: 'INVALID_ARGUMENT' });
   const proposal = await service.prepare(input, context('before-rebind'));
+  assert.equal((await service.approvals('chat-fixture'))[0].pending, true);
   binding = { nodeId: 'T0', kind: 'todo', bindingApproval: 'confirmed-project' };
+  assert.equal((await service.approvals('chat-fixture'))[0].pending, false, '改绑后的旧需求卡片不再提供确认按钮');
+  assert.equal((await service.approvals('chat-fixture'))[0].stale, true);
   await assert.rejects(service.review(review(proposal), context('stale-confirm')), { code: 'VERSION_CONFLICT' });
   assert.deepEqual(await f.readMain(), original); assert.equal(f.commits, 0);
 });

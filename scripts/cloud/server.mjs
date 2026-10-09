@@ -922,6 +922,9 @@ export async function startCloudServer({
           prepareProjectTask: async (input, operationId) => {
             if (manual) {
               const state = await service.state();
+              if (state.messages.findLast(message => message.role === 'user')?.source === 'workflow') {
+                protocolFail('APPROVAL_REQUIRED', '这是确认结果通知，不是新的需求指令；简短说明结果并等待用户继续讨论，不自动整理新 brief。');
+              }
               const actor = [...state.messages].reverse().find(message => message.role === 'user' && message.actor)?.actor
                 || { kind: 'human', sessionId: 'cloud-workbench' };
               const focused = !input.itemId && conversation.itemId && ['todo', 'bug'].includes(conversation.kind);

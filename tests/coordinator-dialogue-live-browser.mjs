@@ -132,7 +132,10 @@ try {
   }
   assert.deepEqual(pageErrors, []); passed = true;
 } finally {
+  const finalState = service && conversationId ? await state() : null;
+  if (!passed && page) await page.screenshot({ path: path.join(output, 'failure.png') });
   await fs.writeFile(path.join(output, 'result.json'), JSON.stringify({ passed, model: provider.model, checks, calls, pageErrors,
+    ...(passed ? {} : { finalState }),
     boundary: '真实浏览器和模型；隔离项目数据；不替代生产 Slack 或安装后验收' }, null, 2));
   await context?.close(); await browser?.close(); await service?.close();
   await fs.rm(directory, { recursive: true, force: true });

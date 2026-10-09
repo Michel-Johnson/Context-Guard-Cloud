@@ -705,6 +705,26 @@ async function assertNoDispatch(f, existingBindings = {}) {
   }
 }
 
+test('绑定确认通知不是新的需求指令，模型不能据此自行生成待审批 brief', async t => {
+  const f = await fixture(t);
+  f.options.coordinatorModelFactory = () => ({ next: async request => {
+    const content = request.messages.at(-1)?.content;
+    if (typeof content === 'string' && content.includes('mount-todo')) return { stop: 'tool_use', content: [{ type: 'tool_use',
+      id: 'propose-focus', name: 'mount_conversation', input: { mainVersion: 'main-initial', nodeId: 'T0', kind: 'todo', title: '需求讨论', description: '先确认归属' } }] };
+    if (typeof content === 'string' && content.includes('human.binding-review')) return { stop: 'tool_use', content: [{ type: 'tool_use',
+      id: 'unsolicited-brief', name: 'prepare_task', input: { taskId: 'notification-brief', text: '未经用户要求整理需求', acceptance: '不得创建', nodeIds: ['T0'], mainVersion: 'main-initial' } }] };
+    return { stop: 'end_turn', content: [{ type: 'text', text: '归属已确认，等待继续讨论。' }] };
+  } });
+  await f.restart(); const conversation = await f.newConversation('notification-is-not-brief-request');
+  const before = await f.main(); await confirmBinding(f, conversation);
+  const state = (await f.browser(conversation)).body;
+  assert.equal(state.focus.nodeId, 'T0'); assert.equal(state.approvals.some(p => p.manual), false);
+  const registry = new CoordinatorConversations(path.join(f.directory, 'coordinators', projectId));
+  const native = await readJSON(registry.conversationFile(conversation));
+  assert.ok(Object.values(native.toolReceipts).some(receipt => receipt.isError && receipt.result.error.code === 'APPROVAL_REQUIRED'));
+  assert.deepEqual(await f.main(), before);
+});
+
 test('真实 HTTP 拒绝未经确认创建节点、未绑定或跨主节点 brief，并拒绝改绑后的旧审批', async t => {
   const f = await fixture(t, { childNodes: [{ id: 'OTHER', title: '另一模块', kind: 'module', children: [], todos: [], bugs: [] }] });
   f.options.coordinatorModelFactory = () => ({ next: async request => {
