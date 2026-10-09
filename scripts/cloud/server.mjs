@@ -839,14 +839,19 @@ export async function startCloudServer({
               ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
           },
           listProjects: async ({ operationId, actor }) => {
-            if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');
+            if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持查询 Slack 项目');
             validateIntegrationCommand(integrations, { id: `projects-${digest(operationId)}`, teamId: actor.teamId,
               userId: actor.userId, type: 'project.list', payload: {} });
             await authorizeIntegrationProject(project.id, actor);
+            const personal = actor.channelId.startsWith('D');
+            if (!personal && !integrations.projectIds.includes(project.id)) protocolFail('FORBIDDEN', '私有项目目录不能在频道查询');
             const result = await integrationCommand({ type: 'project.list' }, { actor, operationId });
-            const projects = result.projects.map(({ id, name, description }) => ({ id, name, description }));
-            return { currentProjectId: project.id, total: projects.length, projects,
-              instruction: '总数以 total 为准，同名项目已各计一次；只列名称，同名才用简介澄清，不展示内部 ID。' };
+            // 先按现有开放范围过滤，再交给模型；不泄露私有条目或其数量。
+            const projects = result.projects.filter(item => personal || integrations.projectIds.includes(item.id))
+              .map(({ id, name, description }) => ({ id, name, description }));
+            return { currentProjectId: project.id, scope: personal ? 'personal' : 'channel', total: projects.length, projects,
+              instruction: (personal ? '这是当前用户的授权目录。' : '这是频道已开放项目，不是完整私有目录。') +
+                '总数以 total 为准，同名项目各计一次；只列名称，同名才用简介澄清，不展示内部 ID。' };
           },
           switchProject: async ({ projectId: targetId }, { operationId, actor, requestId }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持切换 Slack 项目');

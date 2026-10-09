@@ -1769,3 +1769,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 后续只读消费者审查发现两个既有格式合同依赖原表达。Coordinator 批准仅恢复 prefix 的「本轮答复发往 Slack：使用纯文本」「段间留一个空行」「代码可用独立围栏代码块」，旧测试不改，不削权限。最终 prefix SHA256 `4846f2d4d22edef0f903b396c9c03670876d47598b040061446243c9b5546ffe`；其余三文件原样。最终静态组合为4637字符/10813字节，仍小于原4672/10980；Executor 未重跑，首批477367只对应上列旧prefix字节，不能套为最终通过。
 - [x] 用户要求停止调用 subagent 后 Root 接手：最终准确字节唯一六目标开发者验证 actual `402540` exit0，Node22.18.0，6/6、0失败/跳过/取消，2075.1538ms；UTC15:33:32.812→15:33:35.017，七源/test前后hash一致。原四合同与两个既有格式合同均通过，日志 `temp/slack-recipient-final-development-20261009.log` SHA256 `fdc0022aa4b6cd4a7fbf881f65c50ab3460cc32dec6ca60aae10e915b169dac4`。这不是独立Tester或真实语义结果；不再重复诊断四目标或本六目标。本轮Required对最终PR修订独立执行，真实语义及线上短名另外记录，不将开发测试称全计划完成。
 - [ ] 独立 Tester 同最终准确字节一次四合同＋两个既有格式目标：原四目标另加 `Slack reply policy is supplied as system instructions without changing native tools or other sources`、`Public manual conversation uses lean role and unchanged native schemas without weakening normal execution`（分别在 cloud-coordinator / slack-cloud）；不重测未改诊断目标。Required、正常合并和单次1.9.7发布由 Coordinator 收口。合同通过不证明模型语义判断或真实短名效果；原124为failed/seen，标签、首次错误和真实NAMING-02失败保留。未重新调用该集、真实模型或Slack，不改默认模型，不提交/部署。
+
+## SLACK-CHANNEL-DIRECTORY-01 · 当前频道查询被错误引导私聊（2026-10-10）
+
+- [x] 已观察 Bad Case：真实频道输入的来源、操作者、频道和项目开放范围核对正常；旧代码同时在模型目录与执行层将查询和切换限定为私聊，并由固定提示引导新开私聊。未删除原错误历史或伪造新的用户请求。
+- [x] 本轮直接开发：只读查询向已验证频道/群组开放，在模型读取前过滤原开放范围之外的项目；私聊保留完整授权目录，切换仍仅私聊。复用原目录、动作授权及回执，不新增供应商、监听范围、权限配置或第二份目录。固定提示更短，分别描述查询和切换。
+- [x] 开发者集中模块验证：基线 `edaca217` 加本轮修改，Node22.18.0 首批 actual `94fedf` exit1，12项中11通过/1失败，0跳过/取消；新增目录夹具尝试从公开 commit 设置禁止的 cloudProjectId，保留首次失败。仅改该夹具为更新服务生成的原项目入口，原过滤/数量/改名/重启/重放断言不变；唯一原目标 actual `c8b0c2` exit0，1/1、0失败/跳过/取消，1436.0743ms。产品代码从首批起未改；不把两次称为一次12/12。首次日志 SHA256 `96c1800fe922b8023096cfc46c78ed066c62e5d3236bcdd6f5357d37236f168e`，原失败目标复验日志 SHA256 `34085b9b9b4ce426d5a1c73aefb40206db818822b0e756663372c7476f50c6cc`。覆盖频道/群组/私聊真实隔离 HTTP、私有名称/简介/数量不泄露、同名总数、实时改名/重启、原请求重放、动作撤销、来源伪造拒绝及原私聊交接隔离。付费模型与 Slack 传输为替身，不作为真实聊天验收。
+- [ ] 独立 Tester TODO：按最终准确修订核验上述跨组件边界；本轮人类要求不调用 subagent，开发者和 Required CI 不冒充独立 Tester。
+- [ ] 交付：正常 PR/Required、Main CI、相同 SHA 部署与实际运行工具入口核验；不自动重放原失败消息或更改真实模型。
