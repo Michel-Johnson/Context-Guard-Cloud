@@ -23,7 +23,7 @@ sudo systemctl show context-guard-slack.service -p WorkingDirectory -p ExecStart
 
 ## 使用
 
-Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员只需首次关联 Map 与已核实的本人 Slack 账号；新增私有项目仅在本人私聊可选，不自动公开到频道。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.5.0.md)。
+Map 总览新建项目后，Home 或原问题的搜索菜单会实时加载，不必手动加入开发列表。管理员只需首次关联 Map 与已核实的本人 Slack 账号；新增私有项目仅在本人私聊可选，不自动公开到频道。同名项目独立，改名保留对话，删除后的旧选项会被拒绝。配置见[Slack 接入说明](../../references/design/design-slack-integration-v1.6.0.md)。
 
 私聊中可以直接问“有哪些项目”或说“切换到某项目”，不用进入 Home。Coordinator 查询当前授权目录，只显示项目名称；同名时先澄清。插件成功保存后才确认切换，目标使用独立对话，原项目记录保留；在原线程继续回复也会进入目标项目。公共频道不开放此切换工具，也不因此新增权限。
 
@@ -89,6 +89,22 @@ sudo /opt/context-guard-slack/runtime/bin/node /usr/local/libexec/context-guard-
 该只读检查有界等待本次 PID、当前 boot 及启动代次的 Socket 初始连接成功日志，读日志后复查同一启动代次；超时或无法核验返回失败，不输出日志正文，不启动第二个 Socket 客户端。它只证明本次初始连接曾成功，不证明之后的持续在线，仍须用真实 Slack 问答完成当前功能验收。停止旧候选服务并确认它不再使用 Socket、状态目录和旧源码后再清理；不把候选服务作为并行常驻部署。
 
 Slack 免费版的历史保留与应用数量有限，长期项目记录在 Map 和 Cloud。此插件不启动 Executor、Tester、worktree 或自动派发；人工 brief 确认只写 Main 事项并生成粘贴提示。更多节点和超长内容可通过 Home 的完整 Map 链接查看。
+
+## 旧参与失败的单次 operator 恢复
+
+此入口只处理有完整原冻结请求的 `attention/RELEVANCE_UNAVAILABLE` 或 `RELEVANCE_INVALID_RESPONSE`，原 `attempts=3/relevanceAttempts=3` 保留。旧 Inbox、批次、错误与原操作 ID 不重新入队或清零；恢复审计单独保存在 `recoveries`。新请求继续原调度，已有待处理同线程输入优先于历史恢复。
+
+默认关闭。部署审核后，管理员可配置 `CONTEXT_GUARD_SLACK_OPERATOR_DIR`，指向现有 root-owned、服务组只读的 Unix 目录（目录 `0750`、capsule `0640`，父目录均管理员所有且不可被服务写入）。Cloud 的显式 `actions` 还必须包含 `recovery.preflight`；默认 actions 不自动授予这一能力。本实现不创建目录、修改生产权限、新增后台服务或安装配置。
+
+管理员在已审核的源码入口执行 `plugins/slack/scripts/recover-attention.mjs`，先用 `--mode describe --state-dir <原状态目录> --inbox-id <原ID>` 取得有限元数据，再以明确的 `--operation-id`、`--snapshot-hash`、`--source-hash`、`--pid`、`--reason` 和 `--operator-dir` 分别提交 `preflight`、审核结果后提交 `apply`。所有参数都使用 `--name value`。CLI 只读原状态并原子写入受保护授权 capsule；运行中唯一 Slack 进程消费 capsule，串行持久审计，不允许 CLI 编辑 `state.json`。
+
+首版仅支持已核历史 writer 的完整新建对话格式：原 `relevanceRequest` 真正没有 own-key `conversationId`，原 actor/project/有序 inputs/text/context/routing/files 全匹配，且没有附件、后来改绑或待回答问题。缺字段、`conversationId:null`、未知历史格式或已绑定其他对话均拒绝，不补造 provenance。这个本地事实不是无业务效果的充分证明：Cloud 必须在原 create、batch-submit、各 submit 的回执锁及实际对话接受锁下核对原回执、输入/journal、工具与控制状态。预检之后最终接受前再次复核；任何在途、已接受或未知效果都拒绝，不能用新 ID 规避。
+
+通过预检后沿当前单调用 merged 接话路径处理原消息，不复活旧 classifier。初始处理只有一次模型机会；在调用前持久标记尝试，完整原生响应和接话验证通过后，接受标记与原 assistant 同一次保存，之后正常工具轮次及原回执恢复不受限制。结果不明时禁止自动再发初始模型请求；普通新请求原有重试预算不变。新增人类输入或停止仍优先，不改变工具权限和审批。
+
+同一恢复 ID 重复 apply 不新增代次。失 ACK 只允许每个 owner 一次精确已保存运输重放；重启后须以当前 PID 重新确认同一授权 capsule，不能重建原请求或改项目/正文/预算。若崩溃发生在保存运输前，审计保持 unknown，不能自动猜发。首次失败码单独保留，不被轮询覆盖。
+
+`preflighted` 只是无效果预检；`accepted` 只是原输入已耐久接受，不是任务完成或 Slack 送达。只有原批次完整 reply/silent 终态及原线程正式镜像/表情出站回执才标记恢复 `completed`；失败、停止和被新输入替代分别记录，原 attention 始终保留。真实旧 C4 是否满足预检必须现场核验，此实现和替身测试均不代表它已经恢复。
 
 ## 验证
 

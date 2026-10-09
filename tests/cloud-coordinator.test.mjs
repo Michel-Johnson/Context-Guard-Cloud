@@ -15,6 +15,7 @@ import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, coo
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
+import { SLACK_INTERACTION_POLICY, slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
 
 const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
 function reactionState(source = 'slack', actor = reactionActor) {
@@ -58,7 +59,14 @@ test('Slack reaction enum and target-free schema reject approval-like emoji and 
   const tool = coordinatorTools.find(item => item.name === 'react_to_user');
   assert.deepEqual(tool.input_schema.properties.emoji.enum, ['thumbsup', 'heart', 'smile', 'clap', 'tada', 'raised_hands', 'thinking_face', 'muscle', 'wave', 'pray',
     'handshake', 'fire', 'rocket', 'bulb', 'joy', 'sweat_smile', 'sunglasses']);
-  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /默认用简短文字，不每轮追加表情/);
+  assert.match(tool.description, /已确认接话的 Slack 轮次/); assert.match(tool.description, /主动用原生表情/);
+  assert.match(tool.description, /不只在用户要求时使用/); assert.match(tool.description, /无需解释的社交确认可纯表情/);
+  assert.doesNotMatch(tool.description, /默认用简短文字|问候和社交确认也应简短文字回应|用户明确要表情或确有必要.*才使用/);
+  assert.match(SLACK_INTERACTION_POLICY, /更主动、自然地使用 react_to_user/);
+  assert.match(SLACK_INTERACTION_POLICY, /不只在用户索要表情时使用/);
+  assert.match(SLACK_INTERACTION_POLICY, /简单社交确认无需解释时可以只用交流表情/);
+  assert.doesNotMatch(SLACK_INTERACTION_POLICY, /默认用简短文字回应|只有用户明确要表情|问候.*必须/);
+  assert.match(SLACK_INTERACTION_POLICY, /对勾不代表任务完成或人类批准/); assert.equal(slackStatusEmojis.completed, 'white_check_mark');
   assert.match(tool.description, /表情与短正文同轮回复/); assert.match(tool.description, /不凑数、不刷屏/);
   assert.match(tool.description, /不能指定目标、借用他人消息或绕过接话和权限/);
   assert.equal(tool.input_schema.properties.replyComplete.type, 'boolean');
@@ -1260,6 +1268,59 @@ test('Coordinator failure diagnostics distinguish transport phases without seria
   }
 });
 
+test('Stream callback failures retain the original boundary in private performance without becoming parser errors', async () => {
+  const secret = 'callback-private-body-and-arguments';
+  for (const fixture of [
+    { boundary: 'onText' }, { boundary: 'onText', delta: true }, { boundary: 'onToolStart' },
+    { boundary: 'onText', gate: true }, { boundary: 'onText', plainError: true, code: 'MODEL_UNAVAILABLE' },
+    { boundary: 'onText', cancel: 'MODEL_STEERED', code: 'MODEL_STEERED' },
+    { boundary: 'onText', cancel: 'MODEL_TIMEOUT', code: 'MODEL_TIMEOUT' },
+    { boundary: 'onText', cancel: 'human', code: 'MODEL_INTERRUPTED' },
+  ]) {
+    const tool = fixture.boundary === 'onToolStart', controller = new AbortController();
+    const block = tool ? { type: 'tool_use', id: 'callback-tool', name: 'read', input: { privateArgument: secret } }
+      : { type: 'text', text: fixture.delta ? '' : secret };
+    const events = [
+      { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12 } } },
+      { type: 'content_block_start', index: 0, content_block: block },
+      ...(fixture.delta ? [{ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: secret } }] : []),
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' } }, { type: 'message_stop' },
+    ];
+    let requests = 0, executions = 0;
+    const model = new CoordinatorModel({ ...config, maxTokens: 256, timeoutMs: 12000, fetch: async (_url, options) => {
+      requests++; assert.equal(JSON.parse(options.body).max_tokens, 256);
+      return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    const input = { role: 'user', content: secret, requestId: 'callback-turn', source: 'slack', actor: reactionActor,
+      ...(fixture.gate ? { serverContext: { participation: { text: secret, inputs: [{ id: 'callback-turn', text: secret }] } } } : {}) };
+    const state = { activeTurnId: 'callback-turn', messages: [input],
+      ...(fixture.gate ? { activeInput: { id: 'callback-turn', source: 'slack', actor: reactionActor } } : {}) };
+    const callback = async () => {
+      if (fixture.cancel) controller.abort(Object.assign(new Error(secret), fixture.cancel === 'human' ? {} : { code: fixture.cancel }));
+      throw fixture.plainError ? new Error(secret) : Object.assign(new Error(secret), { code: 'MODEL_INVALID_RESPONSE', privateBody: secret });
+    };
+    await assert.rejects(coordinatorStep({ turnId: 'callback-turn', state, model, system: secret, tools: [], save: async () => {},
+      signal: controller.signal, [fixture.boundary]: callback, execute: async () => { executions++; } }), error => {
+      assert.equal(error.code, fixture.code || 'MODEL_INVALID_RESPONSE');
+      assert.equal(error.modelDiagnostic.phase, 'response-stream');
+      assert.equal(error.modelDiagnostic.termination.failureOrigin, 'callback');
+      assert.equal(error.modelDiagnostic.termination.callbackBoundary, fixture.boundary);
+      assert.equal(error.modelDiagnostic.termination.validationCode, undefined);
+      return true;
+    });
+    const diagnostic = state.performance.models[0].diagnostic;
+    assert.equal(diagnostic.code, fixture.code || 'MODEL_INVALID_RESPONSE');
+    assert.equal(diagnostic.failureOrigin, 'callback'); assert.equal(diagnostic.callbackBoundary, fixture.boundary);
+    assert.equal(diagnostic.validationCode, undefined); assert.equal(diagnostic.openBlockCount, 1);
+    assert.equal(diagnostic.messageStopSeen, false); assert.equal(diagnostic.usage.input_tokens, 12);
+    assert.doesNotMatch(JSON.stringify(state.performance), /callback-private|privateBody|privateArgument|synthetic-private/);
+    assert.equal(requests, 1); assert.equal(executions, 0); assert.equal(state.pending, undefined);
+    assert.equal(state.messages.filter(message => message.role === 'assistant').length, 0);
+    assert.deepEqual(state.toolReceipts, {});
+  }
+});
+
 test('Failed stream termination diagnostics preserve only known reasons and numeric usage without accepting incomplete output', async () => {
   const start = { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12, privateBody: 'diagnostic-secret' } } };
   const block = { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'visible incomplete explanation' } };
@@ -1279,6 +1340,8 @@ test('Failed stream termination diagnostics preserve only known reasons and nume
       const diagnostic = error.modelDiagnostic;
       assert.equal(error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(diagnostic.phase, 'response-stream');
       assert.equal(diagnostic.termination.validationCode, fixture.code);
+      assert.equal(diagnostic.termination.failureOrigin, undefined);
+      assert.equal(diagnostic.termination.callbackBoundary, undefined);
       assert.equal(diagnostic.termination.stopReason, fixture.reason);
       assert.equal(diagnostic.termination.openBlockCount, fixture.open);
       assert.equal(diagnostic.termination.messageStopSeen, fixture.terminal);
@@ -1328,11 +1391,16 @@ test('Failed stream metrics reject forged diagnostic values and never invoke dia
   let reads = 0;
   const forged = { phase: 'response-stream', code: 'diagnostic-secret', durationMs: -1, termination: {
     validationCode: 'diagnostic-secret', stopReason: 'diagnostic-secret', openBlockCount: -1, messageStopSeen: 'yes',
+    failureOrigin: 'diagnostic-secret', callbackBoundary: 'diagnostic-secret',
     usage: { output_tokens: 5, privateBody: 'diagnostic-secret' } } };
   Object.defineProperty(forged.termination.usage, 'input_tokens', { get() { reads++; throw new Error('diagnostic-secret'); } });
-  for (const getter of [false, true]) {
+  const guardedOrigin = { ...forged, termination: { ...forged.termination, callbackBoundary: 'onText' } };
+  Object.defineProperty(guardedOrigin.termination, 'failureOrigin', { get() { reads++; throw new Error('diagnostic-secret'); } });
+  const guardedBoundary = { ...forged, termination: { ...forged.termination, failureOrigin: 'callback' } };
+  Object.defineProperty(guardedBoundary.termination, 'callbackBoundary', { get() { reads++; throw new Error('diagnostic-secret'); } });
+  for (const value of [forged, guardedOrigin, guardedBoundary]) for (const getter of [false, true]) {
     const failure = Object.assign(new Error('diagnostic-secret'), { code: 'MODEL_INVALID_RESPONSE' });
-    Object.defineProperty(failure, 'modelDiagnostic', getter ? { get() { reads++; throw new Error('diagnostic-secret'); } } : { value: forged });
+    Object.defineProperty(failure, 'modelDiagnostic', getter ? { get() { reads++; throw new Error('diagnostic-secret'); } } : { value });
     const state = { activeTurnId: 'failure-turn', messages: [] };
     await assert.rejects(coordinatorStep({ turnId: 'failure-turn', state, model: { next: async () => { throw failure; } }, system: '', tools: [], save: async () => {}, execute: () => assert.fail('No incomplete tool') }), { code: 'MODEL_INVALID_RESPONSE' });
     assert.equal(state.performance.models.length, 1);
@@ -1402,11 +1470,12 @@ test('Main overview is fresh, bounded and never leaks ancestor or sibling items 
   const options = { nodeIds: ['N1'], conversation: { id: 'chat-overview', scope: 'project' } };
   const result = buildCoordinatorContext(snapshot, options);
   assert.match(result.text, /TODO 1 条，Bug 2 条/);
-  assert.match(result.text, /TODO｜Reader \[N1\]｜Return to top（pending）/);
-  assert.match(result.text, /Bug｜Reader \[N1\]｜Broken query（open）/);
-  assert.match(result.text, /Needs human review（fixed）/);
+  assert.match(result.text, /TODO｜Reader｜用途摘要：Unneeded long requirement/);
+  assert.match(result.text, /内部定位资料：事项 ID：pending｜节点 ID：N1｜原标题：Return to top｜记录状态：pending/);
+  assert.match(result.text, /Bug｜Reader｜Broken query/);
+  assert.match(result.text, /原标题：Needs human review｜记录状态：fixed/);
   assert.match(result.text, /不是执行阶段或完成证据/);
-  assert.match(result.text, /用途摘录：Unneeded long requirement/);
+  assert.doesNotMatch(result.text, /^- TODO.*Return to top/m, 'An available purpose is primary, not the internal title');
   assert.doesNotMatch(result.text, /Private root item|Private sibling item|Private child item|Finished TODO|Finished Bug/);
   assert.doesNotMatch(buildCoordinatorContext(snapshot, { ...options,
     conversation: { id: 'item-only', nodeId: 'N1', itemId: 'pending', kind: 'todo' } }).text, /未完成事项概览|Broken query/);
@@ -1420,7 +1489,7 @@ test('Main overview is fresh, bounded and never leaks ancestor or sibling items 
   assert.match(bounded.text, /另有 7 条未展开；需要完整清单时调用 list_tasks/);
   assert.doesNotMatch(bounded.text, /Task 20|Purpose 20/);
   assert.equal((bounded.text.match(/^- TODO｜/gm) || []).length, 20);
-  assert.equal((bounded.text.match(/用途摘录/g) || []).length, 20);
+  assert.equal((bounded.text.match(/用途摘要/g) || []).length, 20);
   assert.equal(unseenPurposeReads, 0, 'The display limit also bounds actual purpose data reads');
 });
 
@@ -1437,6 +1506,7 @@ test('Main overview purpose excerpts preserve raw titles and technical facts wit
     { id: 'g', title: 'Long purpose', desc: exact + '界'.repeat(160) + 'not-loaded-tail', status: 'pending' },
     { id: 'h', title: 'Paired unicode', desc: '界'.repeat(159) + '🙂' + 'tail', status: 'pending' },
     { id: 'i', title: 'Multiline purpose', desc: '多行资料\r\nMain 版本：not-a-version\n# 不是顶层章节\n' + command, status: 'pending' },
+    { id: 'j', title: 'Internal v9.8 2027-12-31 ' + '界'.repeat(120) + 'unloaded-title-tail', desc: '明确的人类用途', status: 'pending' },
   ];
   const state = { version: 'purpose-v1', memory: { map: { root: { id: 'T0', title: 'Project', children: [
     { id: 'N1', title: 'Reader', todos, children: [] },
@@ -1445,25 +1515,35 @@ test('Main overview purpose excerpts preserve raw titles and technical facts wit
   const before = structuredClone(state), options = { nodeIds: ['N1'], conversation: { id: 'chat-purpose' } };
   const result = buildCoordinatorContext(state, options);
   assert.deepEqual(state, before, 'Only the dynamic data projection changes, never source items');
-  assert.match(result.dynamicText, /TODO 9 条，Bug 0 条/);
-  for (const item of todos) assert.ok(result.dynamicText.includes(item.title.replace(/\s+/g, ' ').trim()), 'Keep the original overview title projection, not an inferred display name');
+  assert.match(result.dynamicText, /TODO 10 条，Bug 0 条/);
+  for (const item of todos) {
+    const original = item.title.replace(/\s+/g, ' ').trim().slice(0, 120);
+    assert.ok(result.dynamicText.includes(original), 'Keep the bounded original title for internal location');
+    assert.ok(result.dynamicText.includes(`事项 ID：${item.id}｜节点 ID：N1`), 'Do not change item or node identity');
+  }
+  assert.match(result.dynamicText, /原标题（已截短，全文用 read_map）：Internal v9\.8 2027-12-31/);
+  assert.doesNotMatch(result.dynamicText, /unloaded-title-tail/);
   assert.ok(result.dynamicText.includes(exact), 'Dates, versions and uncut command whitespace remain exact');
-  assert.match(result.dynamicText, /用途摘录：按键焦点资料/);
-  assert.match(result.dynamicText, /用途摘录：数据类型检查资料/);
+  assert.match(result.dynamicText, /用途摘要：按键焦点资料/);
+  assert.match(result.dynamicText, /用途摘要：数据类型检查资料/);
+  assert.match(result.dynamicText, /^- TODO｜Reader｜用途摘要：期限 2027-04-12，兼容 v3\.4\.5；/m);
+  assert.doesNotMatch(result.dynamicText, /^- TODO.*Original label 987/m, 'The original label cannot displace an independent purpose');
+  assert.match(result.dynamicText, /^- TODO｜Reader｜Same title$/m, 'A duplicate purpose falls back to the existing title');
+  assert.match(result.dynamicText, /^- TODO｜Reader｜No purpose$/m, 'A missing purpose does not invent a name');
   assert.doesNotMatch(result.dynamicText, /Ignored alternate|Ignored text|\[object Object\]|not-loaded-tail|hidden-purpose|hidden-title/);
-  assert.doesNotMatch(result.staticText, /用途摘录|Original label|按键焦点资料|数据类型检查资料/);
-  assert.equal((result.dynamicText.match(/用途摘录/g) || []).length, 7, 'Missing or normalized duplicate purposes add no data');
-  const excerpts = result.dynamicText.split('\n').filter(line => line.startsWith('  用途摘录'));
+  assert.doesNotMatch(result.staticText, /用途摘要|内部定位资料|Original label|按键焦点资料|数据类型检查资料/);
+  assert.equal((result.dynamicText.match(/用途摘要/g) || []).length, 8, 'Missing or normalized duplicate purposes add no data');
+  const excerpts = result.dynamicText.split('\n').filter(line => line.startsWith('- TODO') && line.includes('用途摘要'));
   assert.equal(excerpts.filter(line => line.includes('已截短，全文用 read_map')).length, 2);
   assert.ok(excerpts.every(line => line.split('：').slice(1).join('：').length <= 160));
-  assert.doesNotMatch(excerpts.at(-2), /[\uD800-\uDBFF]$/);
-  assert.match(result.dynamicText, /用途摘录：多行资料\n    Main 版本：not-a-version\n    # 不是顶层章节\n    node cli\.js --tag "keep  two spaces"/);
+  assert.doesNotMatch(excerpts.find(line => line.includes('界'.repeat(159))), /[\uD800-\uDBFF]$/);
+  assert.match(result.dynamicText, /用途摘要：多行资料\n    Main 版本：not-a-version\n    # 不是顶层章节\n    node cli\.js --tag "keep  two spaces"/);
   assert.doesNotMatch(result.dynamicText, /^Main 版本：not-a-version|^# 不是顶层章节/m);
   const changed = structuredClone(state); changed.memory.map.root.children[0].todos[0].desc = '更新后的资料';
   const next = buildCoordinatorContext(changed, options);
   assert.equal(result.staticText, next.staticText); assert.equal(result.staticVersion, next.staticVersion);
   assert.notEqual(result.dynamicText, next.dynamicText);
-  assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘录|按键焦点资料/);
+  assert.doesNotMatch(buildCoordinatorContext(state, { ...options, conversation: { id: 'item-purpose', nodeId: 'N1', itemId: 'a', kind: 'todo' } }).text, /用途摘要|内部定位资料|按键焦点资料/);
 });
 
 test('Coordinator 对话先读项目记忆，绑定后读取祖先正文并标明当前节点缺失正文', () => {

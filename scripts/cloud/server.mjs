@@ -30,6 +30,7 @@ import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isE
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
 import { startIntegrationGateway, validateIntegrationConfig, validateIntegrationCommand, relevanceInput, relevanceOverview, classifyIntegrationMessage } from './integration-gateway.mjs';
+import { recoveryScope, requireEmptyRecoveryState } from './slack-recovery.mjs';
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
 import { releaseIdentity } from './release.mjs';
@@ -1132,7 +1133,8 @@ export async function startCloudServer({
         // idle conversation creates a transient in-memory `running` state, so
         // its first user submission can incorrectly fail with COORDINATOR_BUSY.
         const restored = await service.state();
-        if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored))) service.kick();
+        if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
+            (await service.inputSignals(restored)).interrupted)) service.kick();
         return service;
       })();
       coordinators.set(key, creating);
@@ -1249,7 +1251,7 @@ export async function startCloudServer({
     if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'Bind this conversation explicitly before plugin access');
     return conversation;
   };
-  const integrationCommand = async (request, { actor, operationId }) => {
+  const integrationCommand = async (request, { actor, operationId, recoveryCheck }) => {
     const { type, payload = {}, projectId, conversationId } = request;
     if (type === 'project.list') {
       const projects = mapProjects.allowed(actor) ? await mapProjects.projects() : registry.projects.filter(project => integrations.projectIds.includes(project.id) &&
@@ -1259,6 +1261,16 @@ export async function startCloudServer({
         ...(mapNodeId ? { mapNodeId } : {}) })) };
     }
     const project = await integrationProject(projectId);
+    if (type === 'recovery.preflight') {
+      if (typeof recoveryCheck !== 'function') protocolFail('PROOF_UNAVAILABLE', 'Recovery inspection requires its exact receipt lock boundary');
+      const scope = recoveryScope(payload, actor, projectId), file = conversationsFor(project).conversationFile(scope.conversationId);
+      return withFileLock(file + '.submit.lock', async () => {
+        await recoveryCheck();
+        const state = await readJSON(file, null), journal = await readJSON(path.join(path.dirname(file), 'input-journal.json'), null);
+        requireEmptyRecoveryState(state, journal);
+        return { noBusinessEffect: true, scopeHash: scope.fingerprint, conversationId: scope.conversationId, inputIds: scope.inputIds };
+      });
+    }
     if (type === 'models.state') return (await modelSettingsFor(project)).state();
     if (type === 'models.select') return (await modelSettingsFor(project)).select({ id: operationId, ...payload });
     if (type === 'conversation.relevance') {
@@ -1336,8 +1348,12 @@ export async function startCloudServer({
     await requireManualConversation(project, conversationId);
     if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
     if (type === 'conversation.submit') {
-      const { history, participation, slackChannelId: _deliveryChannel, ...input } = payload;
-      return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) });
+      const { history, participation, recovery, slackChannelId: _deliveryChannel, ...input } = payload;
+      const recoveryOptions = recovery ? { operatorRecovery: recovery.operationId, recoveryGuard: async (state, journal) => {
+        if (typeof recoveryCheck !== 'function') protocolFail('PROOF_UNAVAILABLE', 'Recovery requires authoritative checks under the original receipt locks');
+        await recoveryCheck(); requireEmptyRecoveryState(state, journal);
+      } } : {};
+      return submitCoordinator(project, conversationId, { ...input, id: operationId }, { source: 'slack', actor, ...recoveryOptions, ...(history !== undefined ? { history } : {}), ...(participation !== undefined ? { participation } : {}) });
     }
     if (type === 'conversation.interrupt') {
       if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');

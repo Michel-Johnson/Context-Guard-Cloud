@@ -96,9 +96,11 @@ export function buildCoordinatorContext(snapshot, { conversation = null, nodeIds
       `TODO ${unfinished.filter(item => item.kind === 'todo').length} 条，Bug ${unfinished.filter(item => item.kind === 'bug').length} 条。`,
       '这是本轮 Main 快照的记录状态，不是执行阶段或完成证据；询问概览可直接使用，核验执行阶段或证据时再读取任务。');
     for (const item of unfinished.slice(0, 20)) {
-      details.push(`- ${itemKinds[item.kind]}｜${treeText(item.nodeTitle)} [${item.nodeId}]｜${treeText(item.title)}（${treeText(item.status)}）`);
       const purpose = overviewPurpose(item.record);
-      if (purpose) details.push(`  用途摘录${purpose.truncated ? '（已截短，全文用 read_map）' : ''}：${treeText(purpose.text).replace(/\r?\n/g, '\n    ')}`);
+      const description = purpose ? `用途摘要${purpose.truncated ? '（已截短，全文用 read_map）' : ''}：${treeText(purpose.text).replace(/\r?\n/g, '\n    ')}` : treeText(item.title);
+      details.push(`- ${itemKinds[item.kind]}｜${treeText(item.nodeTitle)}｜${description}`);
+      const titleTruncated = compact(item.record.title || item.record.text || item.record.desc || item.record.id, Infinity).length > 120;
+      details.push(`  内部定位资料：事项 ID：${treeText(compact(item.record.id, 128))}｜节点 ID：${treeText(item.nodeId)}｜原标题${titleTruncated ? '（已截短，全文用 read_map）' : ''}：${treeText(item.title)}｜记录状态：${treeText(item.status)}`);
     }
     if (unfinished.length > 20) details.push(`另有 ${unfinished.length - 20} 条未展开；需要完整清单时调用 list_tasks。`);
   }

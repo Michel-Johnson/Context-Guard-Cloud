@@ -30,10 +30,12 @@ test('合并格式失败只释放已确定失败的生成，不丢弃未决工�
       journal.requests['retained-steer'] = { id: 'retained-steer', revision: 1, text: '保留补充' }; journal.revision = 1;
       await fs.writeFile(service.inputFile, JSON.stringify(journal));
     }
-    if (mode === 'interrupt') await service.interrupt({ id: 'human-stop', expectedTurnId: state.activeTurnId });
+    if (mode === 'interrupt') {
+      await service.interrupt({ id: 'human-stop', expectedTurnId: state.activeTurnId }); await service.close();
+    }
     const snapshot = await service.readConversation(null), journal = await service.inputJournal();
     const second = input('new', '在吗');
-    await assert.rejects(service.submitBatch(second, metadata(second)), { code: 'COORDINATOR_BUSY' });
+    await assert.rejects(service.submitBatch(second, metadata(second)), { code: mode === 'interrupt' ? 'TURN_INTERRUPTED' : 'COORDINATOR_BUSY' });
     assert.deepEqual(await service.readConversation(null), snapshot, mode);
     assert.deepEqual(await service.inputJournal(), journal, mode);
     assert.equal(models, 1); assert.equal(executions, 0);
@@ -190,6 +192,44 @@ test('Explicit interruption preserves partial text and requires an original-iden
   assert.equal(history.filter(message => message.id === partial.id).length, 1);
   assert.deepEqual(history.map(message => message.text), ['original', 'partial answer', 'resumed', 'next turn', 'resumed']);
   assert.equal(history[1].partial, true);
+});
+
+test('A persisted stop settles a failed turn before recovery without invoking the model', async t => {
+  for (const mode of ['same-instance', 'restart', 'step-limit']) {
+    const root = await directory(t); let calls = 0, writes = 0;
+    const options = { directory: root, system: 'test', tools: [{ name: 'write' }], maxModelRetries: 0,
+      maxSteps: mode === 'step-limit' ? 1 : 12,
+      execute: async () => { writes++; return { saved: true }; },
+      model: { next: async () => {
+        if (++calls === 1) return { stop: 'tool_use', content: [tool('confirmed')] };
+        if (calls === 2 && mode !== 'step-limit') throw Object.assign(new Error('Failed generation'), { code: 'MODEL_INVALID_RESPONSE' });
+        return answer('resumed');
+      } } };
+    let service = new CoordinatorService(options);
+    await service.submit({ id: 'original', text: 'original message' }); await service.close();
+    const failed = await service.readConversation(null), receipt = structuredClone(failed.toolReceipts);
+    const failedCalls = calls;
+    assert.equal(failed.status, 'error');
+    assert.equal(failed.error.code, mode === 'step-limit' ? 'STEP_LIMIT' : 'MODEL_INVALID_RESPONSE');
+    if (mode === 'restart') await service.close({ stop: true });
+    const stop = { id: 'human-stop', expectedTurnId: 'original' };
+    assert.equal((await service.interrupt(stop)).accepted, true);
+    if (mode === 'restart') { service = new CoordinatorService(options); service.kick(); }
+    await service.close();
+    const stopped = await service.readConversation(null), journal = await service.inputJournal();
+    assert.equal(stopped.status, 'interrupted'); assert.equal(stopped.activeTurnId, 'original');
+    assert.equal(stopped.controlRevision, 1); assert.equal(journal.controlRevision, 1);
+    assert.deepEqual(stopped.error, failed.error, 'Stopping cannot erase the original failure');
+    assert.deepEqual(stopped.toolReceipts, receipt); assert.deepEqual(stopped.messages, failed.messages);
+    assert.equal(calls, failedCalls, 'Settling a stop cannot call a model or retry a failed generation');
+    assert.equal(writes, 1);
+    await assert.rejects(service.submit({ id: 'new', text: 'new work', followup: 'steer' }), { code: 'TURN_INTERRUPTED' });
+    await service.submit({ id: 'original', text: 'original message', retry: true }); await service.close();
+    assert.equal((await service.state()).status, 'waiting-for-user');
+    assert.equal(calls, failedCalls + 1); assert.equal(writes, 1, 'Explicit recovery reuses the confirmed tool receipt');
+    assert.equal((await service.interrupt(stop)).replayed, true);
+    await service.close(); assert.equal(calls, failedCalls + 1);
+  }
 });
 
 test('Legacy interrupted buffer is retained on resume without rewriting native transcript or compaction', async t => {

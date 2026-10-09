@@ -7,6 +7,7 @@ import { Store } from './store.mjs';
 import { Gateway } from './gateway.mjs';
 import { SlackIO } from './slack-io.mjs';
 import { SlackPlugin } from './plugin.mjs';
+import { SlackRecoveryControl, operatorDirectory, recoverySourceHash } from './recovery.mjs';
 
 export function configuration(env = process.env) {
   const required = ['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN', 'CONTEXT_GUARD_GATEWAY_TOKEN', 'CONTEXT_GUARD_CLOUD_ORIGIN'];
@@ -15,7 +16,8 @@ export function configuration(env = process.env) {
   if (teamId !== 'T0BRW7G4Q6P') throw new Error('This installation is restricted to Jerry Family');
   return { appToken: env.SLACK_APP_TOKEN, botToken: env.SLACK_BOT_TOKEN, gatewayToken: env.CONTEXT_GUARD_GATEWAY_TOKEN,
     gatewayUrl: env.CONTEXT_GUARD_GATEWAY_URL || 'http://127.0.0.1:8790', cloudOrigin: env.CONTEXT_GUARD_CLOUD_ORIGIN,
-    directory: env.CONTEXT_GUARD_SLACK_STATE_DIR || path.join(os.homedir(), '.local', 'state', 'context-guard-slack'), teamId };
+    directory: env.CONTEXT_GUARD_SLACK_STATE_DIR || path.join(os.homedir(), '.local', 'state', 'context-guard-slack'), teamId,
+    ...(env.CONTEXT_GUARD_SLACK_OPERATOR_DIR ? { operatorDirectory: env.CONTEXT_GUARD_SLACK_OPERATOR_DIR } : {}) };
 }
 async function lock(directory) {
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -44,6 +46,12 @@ export async function start(config = configuration()) {
     const gateway = new Gateway({ url: config.gatewayUrl, token: config.gatewayToken, teamId: config.teamId });
     const io = new SlackIO({ client, store, botUserId: authentication.user_id, botToken: config.botToken });
     plugin = new SlackPlugin({ store, gateway, io, teamId: config.teamId, cloudOrigin: config.cloudOrigin, botUserId: authentication.user_id });
+    if (config.operatorDirectory) {
+      await operatorDirectory(config.operatorDirectory, process.getgid());
+      const sourceHash = await recoverySourceHash();
+      await store.update(state => { state.operatorOwner = { pid: process.pid, sourceHash }; });
+      plugin.recovery = new SlackRecoveryControl({ plugin, directory: config.operatorDirectory, sourceHash });
+    }
     socket = new SocketModeClient({ appToken: config.appToken, logger, clientOptions: { retryConfig: { retries: 0 } } });
     socket.on('slack_event', envelope => { void plugin.receive(envelope).catch(() => console.error('Slack envelope not acknowledged; journal unavailable')); });
     socket.on('error', () => console.error('Slack socket error'));

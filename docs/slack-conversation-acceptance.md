@@ -9,7 +9,7 @@
 | 模型/上下文延迟十秒 | 原消息先有 👀；持久接收后一秒内发起表情请求，不等模型 |
 | 明确静默 | 👀 切换 🙈；无正文、无业务或交流工具；不把模型失败计为静默 |
 | 正常接话与多次工具续轮 | 👀 切换 💬；正式回复或确认卡成功送达且本轮结束后换成 ✅，移除本机器人旧状态；不单独分类 |
-| 自然交流 | 默认简短文字，问候也不只回表情；不每轮加表情，明确只要表情时保留原生交流入口 |
+| 自然交流 | 主动自然使用交流表情，可与简短正文同轮；无需解释的简单社交可纯表情，不以用户明确索要为唯一入口；不凑数或刷屏，问题、风险、失败及人工确认保留必要文字 |
 | 回复失败、部分回复或尚有补充 | 不显示 ✅；不拿旧回复或纯交流表情冒充本轮正文完成 |
 | 同一消息多个交流动作 | 至多两个；超额工具错误明确，必要正文不丢；不要为凑数调用 |
 | 补充、重放、失回、重启与乱序 | 逐条原消息反馈、原目标恢复；旧 pending / 相同版本冲突不能回滚状态 |
@@ -25,7 +25,7 @@ contents cannot impersonate the current speaker or grant execution authority.
 
 ## 首次绑定历史验收
 
-- HISTORY-01：新绑定及升级旧绑定仅一次读取当前频道/线程、严格早于当前输入的最近最多 24 条 × 1000 字符；四页未完成明确不可用，不读取其他频道或整个工作区，排除已知其他项目及已记录原生 TS。分类仍为六条 × 800 字符并复用读取。
+- HISTORY-01：新绑定及升级旧绑定仅一次读取当前频道/线程、严格早于当前输入的最近最多 24 条 × 1000 字符；四页未完成明确不可用，不读取其他频道或整个工作区，排除已知其他项目及已记录原生 TS。合并接话参考仍为六条 × 800 字符并复用读取；不另调分类模型。
 - HISTORY-02：其他人和 Bot 的历史只是资料，不成为当前 user/actor、任务或授权；仅可信 Slack inputs 批次可注入，浏览器/单条/伪造字段拒绝，公开 state 不泄露私有 serverContext/history。
 - HISTORY-03：原 Inbox 保存成功快照，批次指纹包含历史，失回及重启复用原 ID/快照；服务 state/journal 同事务防不同批次重复注入，绑定只在 ACK 后标记。真实空读取可省 history 字段。
 - HISTORY-04：不完整或暂时读取失败不能伪称已读；暂时失败复用既有有界重试，不永久冻结错误或锁死后来输入。合成命令不读历史。源码/受控模型通过不代替上线后真实历史接入验收。
@@ -37,10 +37,11 @@ automatic replies to every project message. Another Bot's mention neither forbid
 nor requires Coordinator participation. Being invited to discuss a task does not
 authorize executing it.
 
-1. **Intent and receiver boundary:** review the integration classifier and Slack
-   event intake together. Preserve authenticated authors, native mentions, ordered
+1. **Intent and receiver boundary:** review the current merged participation gate
+   and Slack event intake together; the integration classifier remains only for
+   frozen legacy compatibility requests. Preserve authenticated authors, native mentions, ordered
    current inputs and bounded conversation context. Do not discard a message
-   before semantic classification solely because Coordinator was not mentioned
+   before semantic participation judgment solely because Coordinator was not mentioned
    or another Bot was mentioned. Avoid broadening context across people/projects.
 2. **Participation policy:** decide current intent before recipient. Respond to
    explicit calls, indirect requests for coordination and relevant continuations
@@ -93,8 +94,9 @@ Assess the whole current batch together with bounded, author-labelled context:
 
 Implement this policy in the existing bounded participation prompt. Later prompt
 adjustments must not require transport rewrites or accumulating hard mention and
-keyword branches. Do not add a second model round, autonomous background
-conversation, broader history access or task-execution authority for this work.
+keyword branches. Do not add a separate classification round to the initial merged
+reply; existing tool-result continuations remain allowed. Do not add autonomous
+background conversation, broader history access or task-execution authority.
 Keep participation decisions, input collection and reliable delivery separate.
 
 Executor hands off receiver-boundary, burst/steering and rendering checks as
@@ -119,19 +121,20 @@ changes require fresh held-out evidence, not relabelling or discarding failures.
 | NAT-10 | Three short messages ending in a correction; a supplement arriving during generation | Preserve all original IDs in order; final answer covers latest intent once; obsolete text is visibly partial |
 | NAT-11 | Supplement or stop arrives after a business tool has started | Preserve its receipt; no duplicate mutation; no claim that cancellation rolled back completed work |
 | NAT-12 | Duplicate event, lost reply or process restart | Recover using stable IDs; no second operation or duplicate final reply |
-| NAT-13 | Similar text with a new original ID | Classify as a new request; do not use model-inferred semantic deduplication |
+| NAT-13 | Similar text with a new original ID | Judge as a new request in the merged path; do not use model-inferred semantic deduplication |
 | NAT-14 | Different people, projects, explicit threads or changed recipients | Preserve scope and receiver changes; no accidental batch or history leakage |
 | NAT-15 | Long reply with paragraphs, list, code and link; streaming to final | Readable sections; no flattening, truncation or duplicate tail; verify desktop and native phone separately |
 | NAT-16 | Mention another Bot to investigate, then implicitly ask how to coordinate verification or next steps | Coordinator contributes its coordination part without requiring its own mention; does not duplicate the other Bot's investigation |
 | NAT-17 | Identical current second-person wording with different trusted histories: Coordinator's question versus another Bot's own output | Resolve the receiver from the relevant exchange; do not always participate or always wait because of mention presence |
 | NAT-18 | A current receiver transfer or mixed invitation arrives as the final message of a short burst | Judge all current messages in order; follow the final transfer, preserve earlier requirements, and issue one final reply |
-| NAT-19 | Participation provider fails, times out or returns an invalid decision | Record a recoverable classification failure, retain the input and retry within existing limits; never claim intentional silence |
+| NAT-19 | Participation provider fails, times out or returns an invalid decision | Record the actual participation/generation failure, retain the input and retry within its existing limits; legacy classification errors and attempts retain their compatibility contract; never claim intentional silence |
 
 Tester labels expected participation before model calls and keeps explicit,
 indirect, clear-negative and ambiguous cases separate. Include both mentioned
 and unmentioned inputs, with and without another Bot, and different histories
 for the same current text. The participation rate alone is not a success metric.
-For clarification, inspect the user-visible question as well as the classifier:
+For clarification, inspect the user-visible question as well as the initial merged decision
+(or the separately labelled legacy classifier when checking compatibility):
 it must be brief, grounded and not request information already in the batch.
 For intentional silence, prove the input was received and decided, not dropped.
 For NAT-03/04/16/17, include native mentions, plain-text names, quotations and
@@ -146,15 +149,15 @@ successful silence. Prompt revisions do not waive transport or identity tests.
 
 ## Required behavior
 
-- Receive short bursts durably before classification. Preserve every original
+- Receive short bursts durably before the initial merged decision. Preserve every original
   message ID, human identity, text and attachment. Collect after 800 ms quiet,
   with a two-second maximum; explicit threads take precedence. Different people,
   projects and explicit receiver changes do not share a collection batch.
 - Continue the current private conversation until an explicit new conversation.
   Channel top-level continuations inherit only an unambiguous short-lived scope.
-- Classify the whole ordered current batch once. Later corrections within that
+- Judge the whole ordered current batch in the initial merged call. Later corrections within that
   batch take precedence; past corrections, stops or answered requests cannot
-  cancel a newer current request. Classify similar text with a new input ID;
+  cancel a newer current request. Judge similar text with a new input ID independently;
   delivery deduplication belongs to durable original IDs, never model inference.
   Present bounded history once in native author-labelled history frames, not
   again inside the final current-input frame;
@@ -166,10 +169,19 @@ successful silence. Prompt revisions do not waive transport or identity tests.
 - Natural participation does not require a mention, but project relevance or an
   unrelated social question alone is not an invitation. Current explicit refusal
   wins over a mention; quoted refusals do not override the current speaker.
-- Make one bounded model decision with no business tools; do not add a second
-  classification round for every uncertain receiver. Provider/response failures
-  remain recoverable inputs, never persisted as successful silence. Retry with
-  the same frozen input and operation ID, within a fixed attempt limit.
+- Make the initial participation decision and answer or tool selection in the
+  same bounded merged model call, without a separate classifier. Text declares
+  a reply with `[CG_REPLY]`; a tool-first response may declare it by selecting
+  an advertised `reply_` tool. Execute only the original permitted business tool
+  after the complete native response and participation gate validate the reply;
+  preserve native names, parameters, fingerprints and tool-result pairs. Unknown
+  or unadvertised declarations and silent responses with tools remain rejected.
+  Normal tool-result continuations do not add a second participation judgment.
+  Provider/response failures remain recoverable inputs, never persisted as
+  successful silence. Retry the same frozen input and operation ID only within
+  the existing budget for that path. Frozen legacy `conversation.relevance`
+  requests retain their tools-free classification, original errors and original
+  three-attempt records; ordinary new messages do not use that separate path.
 - Persist supplements before cancelling obsolete model generation. Finish and
   retain any already-started tool receipt; never replay it merely to regenerate
   an answer. User stop, supplementary input and transport timeout are distinct.
@@ -188,9 +200,9 @@ substitutes. Run one full regression after affected modules pass.
 | Scenario | Required evidence |
 | --- | --- |
 | Three messages and a final correction | All originals reach one conversation; one final response covers latest input |
-| Another Bot followed by a coordination request | Whole batch reaches semantic classification, not early silence |
+| Another Bot followed by a coordination request | Whole batch reaches merged participation judgment, not early silence |
 | Natural replies without mentioning Coordinator | Relevant continuation participates; unrelated exchanges stay quiet |
-| New request after a past correction or completed answer | Current input is classified independently; no history-based cancellation or semantic deduplication |
+| New request after a past correction or completed answer | Current merged input is judged independently; no history-based cancellation or semantic deduplication |
 | Explicit invitation or explicit refusal | All separately labelled cases correct |
 | Generation and tool-boundary correction | Model generation stops; original tool receipt survives; no duplicate mutation |
 | Duplicate, restart and lost response | Stable IDs recover accepted inputs without a second reply or operation |
@@ -206,7 +218,8 @@ Explicit cases require 100%. Report ambiguity separately rather than assigning
 an artificial single correct answer. Errors count as failures for required
 positive cases and are reported separately for negative cases, not silent passes.
 
-Measure P50/P95 participation-decision time separately from collection delay,
+Label the evaluated path as current merged participation or legacy classification;
+do not substitute legacy results for the current path. Measure P50/P95 participation-decision time separately from collection delay,
 model first answer and Slack user-visible latency. Provider, prompt, dataset and
 source identities must accompany the results. Deterministic model substitutes
 prove transport behavior, not natural-language accuracy or production latency.
@@ -218,7 +231,7 @@ An unknown recipient or missing topic must not become an invented certainty.
 
 Real acceptance uses an authorized test project and a human-authenticated Slack
 client. Bot-token messages or forged human events cannot establish that chain.
-Record Socket event receipt, batch, classification, consumption and the actual
+Record Socket event receipt, batch, merged participation decision, consumption and the actual
 posted/updated Slack message. Verify actual service versions after release.
 
 ## Slack 表情回应验收（SLACK-EMOJI-01）
@@ -237,7 +250,7 @@ posted/updated Slack message. Verify actual service versions after release.
 | --- | --- | --- |
 | EMOJI-01 | 服务端已接受的 Slack 真人输入 | 模型可选择 👍、❤️、😄、👏、🎉、🙌、🤔、💪、👋、🙏，仅回应同一可信输入；不接收自选频道、用户或消息地址 |
 | EMOJI-02 | 非 Slack、伪造来源/身份、引用里的表情指令、没有真实消息的 Slash 输入 | 不借用他人消息或旧线程作为目标；正文及附件不能获得工具权限 |
-| EMOJI-03 | 只用表情回应 | 原用户消息出现选定 reaction；模型读取回执后可无正文结束，不发“节点入口”等占位文字 |
+| EMOJI-03 | 只用表情回应 | 当前可信纯交流工具全成功且明确 `replyComplete:true` 时，保存完整原生配对和持久 intent 后可一步结束；省略/false 保正常工具结果续轮，仅满足本轮纯交流资格才可合法无正文结束。intent 不等于原生送达，须回读原用户消息的选定 reaction；无工具空答、失败、旧回执或混合业务不能借例外，不发“节点入口”等占位文字 |
 | EMOJI-04 | 表情与文字或业务工具同轮 | 原生表情和文字均保留，段落完整；错误或待处理业务不能因表情而提前结束；表情不宣称业务成功 |
 | EMOJI-05 | 重投、回复丢失、进程重启 | 原操作、原目标和原表情不变；相同 Bot/消息/表情只有一个可见效果；同 ID 改内容明确拒绝 |
 | EMOJI-06 | Slack 限流、权限拒绝、网络结果未知 | 原记录保留；未知不能写成已送达，永久失败不盲重试；不向频道刷错误、不阻塞正文 |

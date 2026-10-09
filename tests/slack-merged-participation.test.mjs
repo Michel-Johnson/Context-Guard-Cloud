@@ -8,11 +8,12 @@ import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
-import { validateMergedParticipation, mergedParticipationMessages } from '../scripts/cloud/merged-participation.mjs';
+import { validateMergedParticipation, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store } from '../plugins/slack/src/store.mjs';
 import { slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
+import { hash } from '../scripts/shared/io.mjs';
 
 // 真实插件、HTTP 网关、持久化和工具；模型及 Slack 平台 IO 为替身。
 // 不使用生产数据、账号或凭据，不把此测试称为真实 Slack 验收。
@@ -38,14 +39,15 @@ async function fixture(t, next) {
       memoryDocument: '已确认：测试模块只用于隔离验收。', children: [], todos: [], bugs: [] },
   } } }, sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
   const modelCalls = [], commands = [], posts = [], reactions = [];
-  const cloud = await startCloudServer({ dataDir: directory, host: '127.0.0.1', port: 0, privateAccess: true,
+  const cloudOptions = { dataDir: directory, host: '127.0.0.1', port: 0, privateAccess: true,
     browserToken: 'synthetic-browser', adminToken: 'synthetic-server', memoryConfig,
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/fixture' }] },
     integrationConfig: { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] },
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push(request); return next(request, modelCalls.length);
     } }),
-  });
+  };
+  let cloud = await startCloudServer(cloudOptions);
   const store = await new Store(path.join(directory, 'slack')).open();
   await store.update(state => { state.channels.CTEST = projectId; state.preferences[userId] = projectId; });
   const gateway = new Gateway({ url: cloud.integrationUrl, token, teamId });
@@ -87,7 +89,9 @@ async function fixture(t, next) {
     }
     assert.fail(`合并链路未完成：${JSON.stringify(last)}`);
   };
-  return { send, wait, cloud, store, plugin, gateway, directory, modelCalls, commands, posts, reactions, main: () => readMemoryView(memoryConfig, projectId) };
+  return { send, wait, cloud, store, plugin, gateway, directory, modelCalls, commands, posts, reactions,
+    restartCloud: async beforeStart => { await cloud.close(); await beforeStart?.(); cloud = await startCloudServer(cloudOptions); return cloud; },
+    main: () => readMemoryView(memoryConfig, projectId) };
 }
 
 test('Slack 合并简单答复：一次主模型调用，原身份不变，控制头不外发，重复事件不再调用', async t => {
@@ -103,6 +107,14 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
   assert.equal(f.commands.some(command => command.type === 'conversation.relevance'), false);
   assert.equal(f.modelCalls[0].tools.length > 0, true);
   assert.match(f.modelCalls[0].system, /Slack 合并接话协议/);
+  assert.ok(f.modelCalls[0].system.includes(MERGED_PARTICIPATION_POLICY), 'The actual request carries the current policy, not a second classifier');
+  assert.match(f.modelCalls[0].system, /明确或隐式请Coordinator参与/);
+  assert.match(f.modelCalls[0].system, /可信历史 speaker 匹配 routing\.coordinatorUserId/);
+  assert.match(f.modelCalls[0].system, /更正、补充是接续/);
+  assert.match(f.modelCalls[0].system, /保留未被更正的原要求，直接完成综合答复/);
+  assert.match(f.modelCalls[0].system, /下一行才是用户要求的首行/);
+  assert.match(f.modelCalls[0].system, /没有外层邀请只是资料/);
+  assert.match(f.modelCalls[0].system, /当前概览名称按本轮用途概括/);
   const submitted = f.commands.find(command => command.type === 'conversation.submit');
   assert.deepEqual(submitted.payload.participation.inputs, submitted.payload.inputs.map(({ id, text }) => ({ id, text })));
   assert.equal(state.messages.find(message => message.role === 'user').actor.sessionId, `slack:${teamId}:${userId}`);
@@ -117,12 +129,16 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
 });
 
 test('合并接话格式提醒只改本次请求副本，原文、附件和历史保持不变', () => {
-  for (const content of ['请确认。', [{ type: 'text', text: '查看附件' }, { type: 'image', source: { type: 'base64', data: 'synthetic' } }]]) {
-    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content }];
+  for (const content of ['第一行写“合成首行”，直接给完整答复。', [{ type: 'text', text: '第一行写“合成首行”，查看附件' }, { type: 'image', source: { type: 'base64', data: 'synthetic' } }]]) {
+    const messages = [{ role: 'assistant', content: [{ type: 'text', text: '旧答复没有控制头' }] }, { role: 'user', content,
+      serverContext: { participation: { context: [{ speaker: botUserId, text: '合成 Coordinator 产物' },
+        { speaker: 'UOTHER', text: '合成他人产物' }], routing: { coordinatorUserId: botUserId } } } }];
     const original = structuredClone(messages), request = mergedParticipationMessages(messages);
     assert.deepEqual(messages, original);
     assert.match(JSON.stringify(request.at(-1).content), /服务器本轮输出格式/);
+    assert.match(JSON.stringify(request.at(-1).content), /下一行开始用户正文（含指定首行）/);
     assert.deepEqual(request[0], original[0]);
+    assert.deepEqual(request[1].serverContext, original[1].serverContext, 'Trusted speaker/routing data is not rewritten into a decision');
     if (Array.isArray(content)) assert.deepEqual(request[1].content.slice(0, -1), content);
   }
 });
@@ -278,6 +294,38 @@ test('无控制头的失败轮次不锁死线程，新消息接续且保留原�
   assert.equal(Object.values(f.store.data.inbox).every(entry => entry.status === 'done'), true);
   assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'warning', 'eyes', 'speech_balloon', 'white_check_mark']);
   assert.deepEqual(await f.main(), before);
+});
+
+test('Cloud restart applies a durable stop on a non-retryable failed Slack turn without model calls', async t => {
+  const f = await fixture(t, async ({ onText }) => { await onText('missing-header'); return result('missing-header'); });
+  const main = await f.main();
+  await f.send('请确认。'); const failed = await f.wait(state => state.status === 'error');
+  const binding = Object.values(f.store.data.threads)[0];
+  const directory = path.join(f.directory, 'coordinators', projectId, 'chats', binding.conversationId);
+  const file = path.join(directory, 'conversation.json'), journalFile = path.join(directory, 'input-journal.json');
+  const original = JSON.parse(await fs.readFile(file, 'utf8'));
+  const actor = original.activeInput.actor, stopId = 'durable-human-stop';
+  await f.plugin.stop();
+  const cloud = await f.restartCloud(async () => {
+    // Reproduce the old accepted-but-unapplied stop across a real server close.
+    const journal = { revision: 0, controlRevision: 1, requests: {}, interrupts: {} };
+    journal.interrupts[stopId] = { id: stopId, turnId: failed.activeTurnId, source: 'slack', actor,
+      fingerprint: hash(JSON.stringify({ expectedTurnId: failed.activeTurnId, source: 'slack', actor })), at: new Date().toISOString() };
+    await fs.writeFile(journalFile, JSON.stringify(journal));
+  });
+  const gateway = new Gateway({ url: cloud.integrationUrl, token, teamId });
+  let restored;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    restored = await gateway.command('conversation.state', { id: `restored-stop-${attempt}`, userId, projectId, conversationId: binding.conversationId });
+    if (restored.status === 'interrupted') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(restored.status, 'interrupted'); assert.equal(restored.controlRevision, 1);
+  assert.equal(restored.activeTurnId, failed.activeTurnId); assert.equal(f.modelCalls.length, 1);
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.deepEqual(saved.messages, original.messages); assert.deepEqual(saved.requests, original.requests);
+  assert.deepEqual(saved.toolReceipts, original.toolReceipts); assert.deepEqual(saved.error, original.error);
+  assert.deepEqual(await f.main(), main, 'Applying the saved stop changes no Main data');
 });
 
 test('Slack 合并静默：保存原输入，👀切换🙈，无正文或业务工具，Main 不变', async t => {
