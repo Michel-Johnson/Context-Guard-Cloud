@@ -116,6 +116,7 @@ export class CursorRoleFactory {
   }
   currentTask(state, actor, taskId) {
     this.requireActor(state, actor);
+    if (actor.kind === 'ci') this.requireActor(state, { session: actor.executorSession, worktreeId: actor.executorWorktreeId });
     if ((actor.ciPolicyHash || '') !== this.ciPolicyHash) fail('CURSOR_ROLE_CONFLICT', 'The original task trusted CI policy changed');
     const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
     const task = state.tasks[taskKey(this.repositoryId, session, taskId)];
@@ -414,6 +415,7 @@ export class CursorRoleFactory {
     });
     let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0, invocation.scope.createAttempt || 0) : baseScope;
     let operationId = hash(canonical(scope));
+    let sourceAvailability;
     if (invocation) {
       if (invocation.id !== operationId || canonical(invocation.scope) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the exact original invocation authority');
       // A lost follow-up confirmation has no client Run ID. Do not POST again
@@ -421,12 +423,15 @@ export class CursorRoleFactory {
       if (['dispatching', 'unknown'].includes(invocation.state)) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Preserve the original invocation and inspect its native result');
       // Recover the pre-diagnostic CI rejection once. Same client Agent ID,
       // explicit vendor absence, fresh lease, and the old receipt preserved.
+      const legacyRejection = invocation.httpStatus === undefined && !scope.createAttempt;
+      const sourceRejection = scope.createAttempt === 1 && invocation.httpStatus === 400 && invocation.providerErrorCode === 'validation_error';
       if (phase === 'ci' && invocation.state === 'failed' && !invocation.runId && invocation.error === 'CURSOR_HTTP_ERROR' &&
-          invocation.httpStatus === undefined && !scope.createAttempt && !actor.invocations.some(item => item.runId)) {
+          (legacyRejection || sourceRejection) && !actor.invocations.some(item => item.runId)) {
         await this.requireMissingAgent(actor.nativeAgentId);
+        if (sourceRejection) sourceAvailability = await this.ciSourceAvailability(actor);
         task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
         await this.channel.revoke(invocation.token);
-        scope = this.scope(actor, task, phase, 0, 1); operationId = hash(canonical(scope)); invocation = null;
+        scope = this.scope(actor, task, phase, 0, sourceRejection ? 2 : 1); operationId = hash(canonical(scope)); invocation = null;
       }
       if (invocation?.state === 'confirmed') {
         if (phase !== 'plan') return invocation;
@@ -459,7 +464,8 @@ export class CursorRoleFactory {
     const lease = await this.channel.issue({ operationId, scope });
     if (lease.state === 'revoked' || !Number.isSafeInteger(lease.expiresAt) || this.channel.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Do not dispatch with an old expired or revoked operation lease');
     if (!invocation) {
-      invocation = { id: operationId, scope, token: lease.token, state: 'prepared', mode: phase === 'plan' ? 'plan' : 'agent' };
+      invocation = { id: operationId, scope, token: lease.token, state: 'prepared', mode: phase === 'plan' ? 'plan' : 'agent',
+        ...(sourceAvailability ? { sourceAvailability } : {}) };
       actor.invocations.push(invocation); await atomicWrite(file, encode(actor));
     }
     // Persist the authorization tuple in the SAME transaction as the task
@@ -474,6 +480,8 @@ export class CursorRoleFactory {
     invocation.state = 'dispatching'; await atomicWrite(file, encode(actor));
     const mcpServers = [{ name: 'context_guard', type: 'http', url: this.endpoint, headers: { Authorization: 'Bearer ' + lease.token } }];
     try {
+      if (scope.createAttempt === 2 && canonical(await this.ciSourceAvailability(actor)) !== canonical(invocation.sourceAvailability))
+        fail('SOURCE_UNVERIFIED', 'The source PR precondition changed before native dispatch');
       // Save intent before the final authority read: disk persistence must not
       // create an unchecked authorization window before the network side effect.
       await this.store.transaction(async state => {
@@ -510,6 +518,19 @@ export class CursorRoleFactory {
     try { await this.provider.getAgent(nativeAgentId); }
     catch (cause) { if (cause.code === 'CURSOR_NOT_FOUND' && cause.httpStatus === 404) return; throw cause; }
     fail('CURSOR_ROLE_CONFLICT', 'The saved Cursor Agent exists; never replay its create or adopt an unrelated Run');
+  }
+
+  async ciSourceAvailability(actor) {
+    const executor = await readJSON(this.executorFile(actor.executorSession.id), null), invocation = executor?.invocations.at(-1);
+    if (!invocation?.handoff?.facts || invocation.handoff.facts.sourceSha !== actor.sourceSha ||
+        !await this.acceptedHandoff(executor, invocation) || typeof this.gitProof.sourcePullRequest !== 'function')
+      fail('SOURCE_UNVERIFIED', 'Require the original verified handoff and exact source PR observer');
+    const branch = invocation.handoff.facts.branch;
+    const proof = await this.gitProof.sourcePullRequest({ sourceSha: actor.sourceSha, branch });
+    if (!proof || typeof proof.repository !== 'string' || proof.repository.toLowerCase() !== new URL(this.repositoryUrl).pathname.slice(1).replace(/\.git$/, '').toLowerCase() ||
+        proof.sourceSha !== actor.sourceSha || proof.branch !== branch || !Number.isSafeInteger(proof.number) || proof.number <= 0)
+      fail('SOURCE_UNVERIFIED', 'The source PR proof does not match the original handoff');
+    return { repository: proof.repository, sourceSha: proof.sourceSha, branch: proof.branch, number: proof.number };
   }
 
   async pump(session, taskId) {
