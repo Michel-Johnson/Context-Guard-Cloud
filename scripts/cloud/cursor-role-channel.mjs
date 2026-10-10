@@ -13,13 +13,15 @@ const record = value => value && typeof value === 'object' && !Array.isArray(val
 const bounded = value => typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\x00-\x1f]/.test(value);
 const fail = (code, message) => { throw Object.assign(new Error(message), { code, status: code === 'INVALID_ARGUMENT' ? 400 : code === 'ROLE_UNAVAILABLE' ? 503 : code === 'ID_REUSED' ? 409 : 403 }); };
 const bindingKey = (scope, session) => hash(canonical([scope.repositoryId, session.id]));
+export const CURSOR_PLAN_CONTINUATIONS = 2;
 
 function validateScope(scope) {
-  const fields = ['projectId', 'repositoryId', 'ownerId', 'session', 'actor', 'worktreeId', 'actorWorktreeId', 'nativeAgentId', 'taskId', 'phase', 'sourceSha', 'plan', 'ciPolicyHash'];
+  const fields = ['projectId', 'repositoryId', 'ownerId', 'session', 'actor', 'worktreeId', 'actorWorktreeId', 'nativeAgentId', 'taskId', 'phase', 'sourceSha', 'plan', 'ciPolicyHash', 'attempt'];
   const validSession = session => record(session) && Object.keys(session).every(key => ['id', 'generation'].includes(key)) && uuid.test(session.id || '') && Number.isSafeInteger(session.generation) && session.generation > 0;
   if (!record(scope) || Object.keys(scope).some(key => !fields.includes(key)) ||
       ['projectId', 'repositoryId', 'ownerId', 'worktreeId', 'actorWorktreeId', 'taskId'].some(key => !bounded(scope[key])) ||
       !validSession(scope.session) || !validSession(scope.actor) || !['plan', 'execution', 'ci'].includes(scope.phase) ||
+      scope.attempt !== undefined && (scope.phase !== 'plan' || !Number.isSafeInteger(scope.attempt) || scope.attempt < 1 || scope.attempt > CURSOR_PLAN_CONTINUATIONS) ||
       !nativeId(scope.nativeAgentId) || !sha.test(scope.sourceSha || '') ||
       scope.phase === 'ci' && (scope.actor.id === scope.session.id || scope.actorWorktreeId === scope.worktreeId) ||
       scope.phase !== 'ci' && (canonical(scope.actor) !== canonical(scope.session) || scope.actorWorktreeId !== scope.worktreeId) ||
@@ -155,7 +157,7 @@ export class CursorRoleChannel {
   }
   // Task IDs may themselves contain separators. Fixed hashing of the tuple
   // prevents a "task" delegation from owning objects for "task:other".
-  prefix(scope) { return `${scope.phase === 'ci' ? 'ci' : 'cursor'}:${hash(canonical([scope.actor.id, scope.taskId]))}:`; }
+  prefix(scope) { return `${scope.phase === 'ci' ? 'ci' : 'cursor'}:${hash(canonical([scope.actor.id, scope.taskId]))}:${scope.attempt ? `attempt-${scope.attempt}:` : ''}`; }
 
   authorize(state, principal, message, lease, receiver) {
     if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired while waiting for the task transaction');
