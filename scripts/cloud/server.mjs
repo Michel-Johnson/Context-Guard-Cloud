@@ -1100,6 +1100,12 @@ export async function startCloudServer({
               }
               const actor = [...state.messages].reverse().find(message => message.role === 'user' && message.actor)?.actor
                 || { kind: 'human', sessionId: 'cloud-workbench' };
+              // authorizeTool 已刷新当前焦点。先保留原有参数错误分类；
+              // 锁内仍复查焦点及审批，不让本次只读检查授予写入权限。
+              if (!input.itemId && conversation.itemId && ['todo', 'bug'].includes(conversation.kind) &&
+                  (input.nodeId !== undefined || input.kind !== undefined)) {
+                protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
+              }
               return bindingsFor(project).withStableFocus(conversationId, live => {
                 if (live.executionMode !== 'manual') protocolFail('CONFLICT', 'Conversation execution mode changed');
                 const focused = !input.itemId && live.itemId && ['todo', 'bug'].includes(live.kind);
