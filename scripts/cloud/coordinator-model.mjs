@@ -688,7 +688,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
     // 回复纠正可能让模型换一个原生调用ID。只在本轮自动恢复时复用相同
     // 写入的已知成功回执，读取仍取当前状态；不重放未知或失败写入。
-    if (!receipt && (state.modelRetries || 0) > 0 && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
+    if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
       'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu'].includes(name)) {
       const businessFingerprint = hash(canonical({ name, input: call.input }));
       const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
