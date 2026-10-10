@@ -1979,6 +1979,7 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 根因：真实 Cursor 已初始化 MCP、读取原任务及 brief，但发现工具只描述笼统 `payload`。Plan 写入遗漏必填 `baseVersion`、报告未使用 `taskId/stage/data`，格式错误又只返回笼统拒绝；厂商 Run 结束没有产生原任务的 Plan 回执，不视为完成。
 - [x] 最小修复：保留两个工具名和原协议；按 Plan、执行、独立 CI 阶段公开对应字段、长度、枚举与失败复现要求。首次对象写入显式使用空字符串版本，不默认补参、不接受 null。仅映射 Core 白名单验证标签，返回安全字段位置和 `tools/list` 纠错入口；不回显私有值、任意错误正文或未知字段。Core 校验、原任务身份、阶段、权限、幂等与人审门禁不变。
 - [x] 正式 HTTP 回归：旧实现新增三目标 0/3，保留失败；首次修后 2/3，另一个失败来自夹具重复推进已结束 Plan 阶段，改为三个独立任务夹具，不放宽授权；该三目标复验 3/3。再增加执行/CI 错误与拒绝检查，完整角色通道及真实 HTTP 套件 39/39，0 失败/跳过/取消，49089.988875ms。Node24.18.0，基线 Main `e4fd3d911b43811ecc1fbb255018145226f100ff` 加本节修复。命令：`node --test --test-reporter=tap tests/cursor-role-channel.test.mjs tests/cursor-role-http.test.mjs`。实际 HTTP/磁盘协议，厂商/Git 核验为替身；不能替代真实 Cursor 完成任务。
-- [ ] 全量 `npm test`、准确修订独立 Tester、安全与 Required CI、正常合并和生产部署。未把旧提示范围的通过证据用于本项。
+- [x] 本次完整 `npm test` 终态 exit0：904 项，902 通过、0 失败、2 既有跳过、0 取消，197061.316792ms；准确产品提交 `374b335fd78d4eeaed0faca0af3d54cb525aed45`（本次运行开始时为同字节工作树）。原 staged 和该提交 tree 安全扫描各 177 文件通过。未替换原用户 Git hooks，单独执行安全门禁。
+- [ ] 准确修订独立 Tester、outgoing 安全与 Required CI、正常合并和生产部署。未把旧提示范围的通过证据用于本项。
 - [ ] 真实业务验收：在原任务、原 Cursor Agent 中继续，提交合法 Plan，经 Coordinator 审核后开发并独立测试；保留旧失败及过期凭据，不手工代签 Plan、不强改租期、不新建同义任务。厂商终态但原任务仍未提交 Plan 的自动接续需另行修复验证。
 - [ ] 总体仍待：本地 Coordinator → 本地 Cursor、Cloud Coordinator → 本地 Cursor、Cloud Coordinator → Cursor Cloud 三路径的实际连接、双向通讯、小任务产物与独立测试；不以工具发现、健康检查或模拟链路代替最终闭环。
