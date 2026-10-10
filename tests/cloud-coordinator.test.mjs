@@ -2397,7 +2397,7 @@ test('Slack 项目查询与切换能力分别开放，旧拒绝历史不妨碍�
         assert.doesNotMatch(request.system, /私聊中新发消息/);
         assert.match(request.system, /总数直接使用工具 total/);
         assert.equal(request.tools.some(tool => tool.name === 'list_projects'), true);
-        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'DTESTDM');
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), true);
         if (calls.length === 2) return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'current-directory', name: 'list_projects', input: {} }] };
         const result = JSON.parse(request.messages.at(-1).content[0].content);
         assert.deepEqual(result.projects.map(project => project.name), ['博客', '模型实验']);
@@ -2467,6 +2467,37 @@ test('连续补充的项目只读工具绑定最新真实发送者，不借原�
           input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] }; } } };
     await coordinatorStep(options);
     assert.equal(executed.requestId, 'followup'); assert.deepEqual(executed.actor, current);
+  }
+});
+
+test('网页轮次中的可信 Slack 补充可读取项目，后来网页输入不能借用早期 Slack 权限', async () => {
+  const slack = { kind: 'human', integration: 'slack', teamId: reactionActor.teamId, userId: reactionActor.userId,
+    sessionId: reactionActor.sessionId, channelId: 'CTESTCHANNEL' };
+  const human = { kind: 'human', sessionId: 'browser-human' };
+  for (const name of ['list_projects', 'read_project_map']) for (const scenario of [
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: slack, allowed: true },
+    { initial: 'slack', initialActor: slack, latest: 'human', latestActor: human, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'slack', latestActor: { ...slack, sessionId: 'slack:TOTHER:UOTHER' }, allowed: false },
+    { initial: 'human', initialActor: human, latest: 'workflow', latestActor: slack, allowed: false },
+  ]) {
+    const state = { activeInput: { id: 'origin', source: scenario.initial, actor: scenario.initialActor }, activeRequestIds: ['origin', 'latest'],
+      toolReceipts: {}, messages: [
+        { role: 'user', requestId: 'origin', source: scenario.initial, actor: scenario.initialActor, content: '原请求' },
+        { role: 'user', requestId: 'latest', source: scenario.latest, actor: scenario.latestActor, content: '最新查询' },
+        { role: 'user', requestId: 'old-history', source: 'slack', actor: slack, content: '这只是历史，不能借权' },
+      ] };
+    let executed;
+    await coordinatorStep({ turnId: 'mixed-client-query', state, system: 'fixture', tools: coordinatorTools, save: async () => {},
+      execute: createCoordinatorExecutor({ listProjects: async options => { executed = options; return { total: 0, projects: [] }; },
+        readProjectMap: async (_input, options) => { executed = options; return { kind: 'project-map-read', node: { id: 'T0' } }; } }),
+      model: { next: async request => {
+        assert.equal(request.tools.some(tool => tool.name === name), scenario.allowed);
+        return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'mixed-read', name, input: name === 'list_projects' ? {} : { projectId: 'known-target' } }] };
+      } } });
+    assert.equal(!!executed, scenario.allowed);
+    if (executed) {
+      assert.equal(executed.source, 'slack'); assert.equal(executed.requestId, 'latest'); assert.deepEqual(executed.actor, slack);
+    } else assert.equal(state.messages.at(-1).content[0].is_error, true);
   }
 });
 
@@ -3071,6 +3102,89 @@ test('Human feedback can correct a legacy rejected call but cannot discard an un
     await assert.rejects(service.submit({ id: 'correction', text: 'Do not drop the original intent' }), { code: 'COORDINATOR_BUSY' });
     assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).activeTurnId, 'original');
   }
+});
+
+test('Slack 402 failure accepts a new single or batch turn with the current model, preserving original receipts across restart', async t => {
+  for (const mode of ['single', 'batch']) await t.test(mode, async t => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-402-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    let oldCalls = 0, newCalls = 0, effects = 0, selectedId = 'old';
+    const oldModel = { model: 'old-model', next: async () => {
+      if (++oldCalls === 1) return { stop: 'tool_use', content: [
+        { type: 'tool_use', id: 'original-read', name: 'read_map', input: { nodeId: 'T0' } },
+      ] };
+      throw Object.assign(new Error('Synthetic provider rejection'), { code: 'MODEL_HTTP_402' });
+    } };
+    const newModel = { model: 'new-model', next: async ({ messages }) => {
+      newCalls++;
+      assert.match(messages.at(-1).content, /New question in the same thread/);
+      return { stop: 'end_turn', content: [{ type: 'text', text: 'New question answered' }] };
+    } };
+    const textModels = new Map([['old', oldModel], ['current', newModel]]);
+    const options = { directory, system: 'Coordinator', model: oldModel, textModels,
+      selectTextModel: async () => ({ providerId: selectedId, model: textModels.get(selectedId) }),
+      tools: [{ name: 'read_map' }], execute: async () => { effects++; return { kind: 'map-read', node: { id: 'T0' } }; },
+    };
+    const source = { source: 'slack', actor: { ...reactionActor, channelId: 'CTESTCHANNEL' } };
+    const original = { id: 'original-input', text: 'Original question' };
+    const first = new CoordinatorService(options);
+    await first.submit(original, source); await first.close();
+    const file = path.join(directory, 'conversation.json');
+    const before = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.equal(before.error.code, 'MODEL_HTTP_402'); assert.equal(before.pending, null);
+    assert.equal(before.messages.some(message => message.serverContext?.participation), false, 'legacy Slack input has no merged metadata');
+    assert.equal(effects, 1); assert.equal(Object.keys(before.toolReceipts).length, 1);
+    selectedId = 'current';
+    const restarted = new CoordinatorService(options);
+    const input = mode === 'batch'
+      ? { id: 'new-batch', inputs: [{ id: 'new-input', text: 'New question in the same thread' }], followup: 'steer' }
+      : { id: 'new-input', text: 'New question in the same thread', followup: 'steer' };
+    await restarted.submit(input, source); await restarted.close();
+    const after = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.equal(after.status, 'waiting-for-user'); assert.equal(after.activeTurnId, null);
+    assert.equal(after.activeModelRoute.providerId, 'current');
+    assert.deepEqual(after.failedTurns.map(({ turnId, code }) => ({ turnId, code })), [{ turnId: original.id, code: 'MODEL_HTTP_402' }]);
+    assert.equal(after.requests[original.id], before.requests[original.id]);
+    assert.deepEqual(after.messages.slice(0, before.messages.length), before.messages);
+    assert.deepEqual(after.toolReceipts, before.toolReceipts);
+    assert.equal(oldCalls, 2); assert.equal(newCalls, 1); assert.equal(effects, 1, 'original tool never runs again');
+    const replay = new CoordinatorService(options);
+    await replay.submit(input, source); await replay.submit(original, source); await replay.close();
+    assert.equal(oldCalls, 2); assert.equal(newCalls, 1); assert.equal(effects, 1);
+    assert.equal((await replay.state()).messages.filter(message => message.requestId === 'new-input' && message.role === 'user').length, 1);
+    assert.equal(JSON.parse(await fs.readFile(file, 'utf8')).failedTurns.length, 1);
+  });
+});
+
+test('Slack 402 settlement refuses pending tools, unconsumed input, stops and unknown or non-Slack failures', async t => {
+  const cases = [
+    { name: 'pending-tool', state: { pending: { stop: 'tool_use', content: [{ type: 'tool_use', id: 'unknown', name: 'edit_map', input: {} }] } } },
+    { name: 'unconsumed-input', journal: { revision: 1, requests: { waiting: { revision: 1, turnId: 'original' } } } },
+    { name: 'unapplied-stop', journal: { interrupts: { stop: { id: 'stop', turnId: 'original' } } } },
+    { name: 'unknown-model-outcome', state: { error: { code: 'MODEL_TIMEOUT' } } },
+    { name: 'unknown-tool-outcome', state: { error: { code: 'UNAVAILABLE' } } },
+    { name: 'non-slack', state: { activeInput: { id: 'original', source: 'human' } } },
+    { name: 'running', state: { status: 'running' }, followup: 'queue' },
+    { name: 'stopped', state: { status: 'interrupted' }, code: 'TURN_INTERRUPTED' },
+  ];
+  for (const item of cases) await t.test(item.name, async t => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-402-guard-'));
+    t.after(() => fs.rm(directory, { recursive: true, force: true }));
+    const file = path.join(directory, 'conversation.json');
+    const state = { status: 'error', error: { code: 'MODEL_HTTP_402' }, activeTurnId: 'original',
+      activeInput: { id: 'original', source: 'slack', actor: reactionActor }, messages: [], requests: { original: 'saved' }, toolReceipts: {}, ...item.state };
+    await fs.writeFile(file, JSON.stringify(state));
+    const journal = { revision: 0, controlRevision: 0, requests: {}, interrupts: {}, ...item.journal };
+    const journalFile = path.join(directory, 'input-journal.json');
+    await fs.writeFile(journalFile, JSON.stringify(journal));
+    const service = new CoordinatorService({ directory, system: 'Coordinator', tools: [],
+      model: { next: () => assert.fail('A blocked turn must not call the model') }, execute: () => assert.fail('No tool replay') });
+    await assert.rejects(service.submit({ id: 'new-batch', inputs: [{ id: 'new-input', text: 'New question' }],
+      followup: item.followup || 'steer' }, { source: 'slack', actor: reactionActor }), { code: item.code || 'COORDINATOR_BUSY' });
+    assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), state);
+    assert.deepEqual(JSON.parse(await fs.readFile(journalFile, 'utf8')), journal);
+    await service.close();
+  });
 });
 
 test('Coordinator offers explicit retry after automatic model retries are exhausted', async t => {

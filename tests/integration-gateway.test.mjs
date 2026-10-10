@@ -812,6 +812,25 @@ test('SSE subscription sends public snapshot and stops polling when disconnected
   await new Promise(resolve => setTimeout(resolve, 280)); assert.equal(calls, stoppedAt);
 });
 
+test('SSE heartbeat keeps an unchanged real subscription alive without duplicating state', { timeout: 30000 }, async t => {
+  const stateDir = await temporary(t); let reads = 0;
+  const gateway = await startIntegrationGateway({ config, stateDir, pollIntervalMs: 250, command: async () => ({}),
+    state: async (_scope, context) => { assert.deepEqual(context.actor, actor); reads++; return { conversationId: 'chat-fixture', status: 'running' }; } });
+  const controller = new AbortController();
+  t.after(async () => { controller.abort(); await gateway.close(); });
+  const query = new URLSearchParams({ teamId, userId, projectId, conversationId: 'chat-fixture' });
+  const response = await fetch(`${gateway.url}/v1/events?${query}`, { headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]) });
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  try {
+    assert.match(decoder.decode((await reader.read()).value), /event: state/);
+    const heartbeat = decoder.decode((await reader.read()).value);
+    assert.equal(heartbeat, ': heartbeat\n\n');
+    assert.ok(reads > 2, 'Unchanged authenticated snapshots remain deduplicated between heartbeats');
+    assert.equal(gateway.subscriberCount(), 1);
+  } finally { controller.abort(); await reader.cancel().catch(() => {}); reader.releaseLock(); }
+});
+
 test('SSE backpressure drains a long conversation and delivers its next snapshot without disconnecting', { timeout: 10000 }, async t => {
   const stateDir = await temporary(t); let generation = 1;
   const gateway = await startIntegrationGateway({ config, stateDir, pollIntervalMs: 250, command: async () => ({}),

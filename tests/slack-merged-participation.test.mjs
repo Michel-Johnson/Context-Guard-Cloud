@@ -296,6 +296,34 @@ test('无控制头的失败轮次不锁死线程，新消息接续且保留原�
   assert.deepEqual(await f.main(), before);
 });
 
+test('402 失败后的新 thread 消息正常接续，不重放原输入且保留失败回执', async t => {
+  const f = await fixture(t, async ({ onText }, count) => {
+    if (count === 1) throw Object.assign(new Error('Synthetic provider rejection'), { code: 'MODEL_HTTP_402' });
+    await onText('[CG_REPLY]\n新问题已收到。'); return result('[CG_REPLY]\n新问题已收到。');
+  });
+  const main = await f.main();
+  await f.send('原请求');
+  const failed = await f.wait(state => state.status === 'error');
+  assert.equal(failed.error.code, 'MODEL_HTTP_402');
+  const binding = Object.values(f.store.data.threads)[0];
+  const file = path.join(f.directory, 'coordinators', projectId, 'chats', binding.conversationId, 'conversation.json');
+  const original = JSON.parse(await fs.readFile(file, 'utf8'));
+  await f.send(`<@${botUserId}> 新问题`, '100.002', { thread_ts: '100.001' });
+  const completed = await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId &&
+    f.posts.some(post => post.text.includes('新问题已收到。')));
+  const saved = JSON.parse(await fs.readFile(file, 'utf8'));
+  assert.equal(saved.failedTurns[0].turnId, failed.activeTurnId); assert.equal(saved.failedTurns[0].code, 'MODEL_HTTP_402');
+  assert.deepEqual(saved.requests[failed.activeTurnId], original.requests[failed.activeTurnId]);
+  assert.deepEqual(saved.toolReceipts, original.toolReceipts);
+  assert.equal(completed.messages.filter(message => message.role === 'user').length, 2);
+  assert.equal(f.modelCalls.length, 2); assert.equal(Object.values(f.store.data.threads).length, 1);
+  assert.equal(Object.values(f.store.data.inbox).every(entry => entry.status === 'done'), true);
+  await f.send(`<@${botUserId}> 新问题`, '100.002', { thread_ts: '100.001' });
+  await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  assert.equal(f.modelCalls.length, 2, 'duplicate delivery cannot restart the old or new generation');
+  assert.deepEqual(await f.main(), main);
+});
+
 test('Cloud restart applies a durable stop on a non-retryable failed Slack turn without model calls', async t => {
   const f = await fixture(t, async ({ onText }) => { await onText('missing-header'); return result('missing-header'); });
   const main = await f.main();

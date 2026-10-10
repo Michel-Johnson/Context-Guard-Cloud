@@ -57,6 +57,79 @@ async function fixture(t, { automatic = false } = {}) {
   return { store, gateway, io, plugin, calls, posts, warnings, subscriptions: streamProvider.subscriptions, directory };
 }
 
+test('空闲镜像不重复写整份账本，新状态仍耐久保存且轮询截止时间有效', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null, acceptedRequestIds: ['request-1'], inputRevision: 1, consumedInputRevision: 1 });
+  await f.plugin.mirror(key);
+  const before = await fs.readFile(f.store.file), rename = fs.rename.bind(fs);
+  let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  for (let index = 0; index < 5; index++) await f.plugin.mirror(key);
+  assert.equal(writes, 0); assert.deepEqual(await fs.readFile(f.store.file), before);
+  assert.ok(f.store.data.threads[key].nextPoll > Date.now()); assert.equal(f.posts.length, 0);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null, inputRevision: 2, consumedInputRevision: 2 });
+  await f.plugin.mirror(key);
+  assert.equal(writes, 1); assert.equal((await new Store(f.directory).open()).data.threads[key].inputRevision, 2);
+});
+
+test('镜像平台失败保存安全子类型，重复错误不写盘，恢复仍保留首次失败诊断', async t => {
+  const f = await fixture(t);
+  const failure = Object.assign(Error('synthetic private message'), { code: 'slack_webapi_platform_error',
+    data: { error: 'invalid_blocks', response_metadata: { messages: ['synthetic private payload'] }, token: 'synthetic private credential' } });
+  f.gateway.command = async () => { throw failure; };
+  const started = Date.now(); await f.plugin.tick();
+  const details = { code: 'slack_webapi_platform_error', name: 'Error', platformCode: 'invalid_blocks' };
+  assert.deepEqual(JSON.parse(f.warnings[0][1]), details);
+  assert.equal(f.warnings[0][0], 'Slack mirror failed');
+  assert.doesNotMatch(JSON.stringify(f.warnings), /private|credential|payload|token|response_metadata/);
+  const thread = f.store.data.threads[key];
+  assert.deepEqual(thread.lastMirrorError, details); assert.equal(thread.error, failure.code);
+  assert.ok(thread.nextPoll >= started + 30000); assert.equal(f.posts.length, 0);
+  assert.deepEqual((await new Store(f.directory).open()).data.threads[key].lastMirrorError, details);
+  const rename = fs.rename.bind(fs); let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  await f.store.updateThread(key, item => { item.nextPoll = 0; }); await f.plugin.tick();
+  assert.equal(writes, 0); assert.deepEqual(f.store.data.threads[key].lastMirrorError, details);
+  f.gateway.command = async () => snapshot('chat-1', { status: 'idle', activeTurnId: null });
+  await f.store.updateThread(key, item => { item.nextPoll = 0; }); await f.plugin.tick();
+  assert.equal(f.store.data.threads[key].error, null);
+  assert.deepEqual(f.store.data.threads[key].lastMirrorError, details, '恢复不删除旧失败证据');
+});
+
+test('镜像诊断只取已知名称和网络代码，未识别平台值不泄露私有异常内容', async t => {
+  const scenarios = [
+    { error: Object.assign(new TypeError('synthetic private url'), { cause: { code: 'ECONNREFUSED', token: 'synthetic private' } }),
+      details: { code: 'MIRROR_ERROR', name: 'TypeError', causeCode: 'ECONNREFUSED' } },
+    { error: Object.assign(Error('synthetic private body'), { name: 'synthetic private name', code: 'slack_webapi_platform_error',
+      data: { error: 'https://private.invalid/credential' }, cause: { code: 'SYNTHETIC_PRIVATE' } }),
+      details: { code: 'slack_webapi_platform_error', platformCode: 'UNKNOWN_PLATFORM_ERROR' } },
+    { error: new DOMException('synthetic private timeout', 'TimeoutError'), details: { code: 23, name: 'TimeoutError' } },
+  ];
+  for (const { error, details } of scenarios) {
+    const f = await fixture(t); f.gateway.command = async () => { throw error; };
+    await f.plugin.tick();
+    assert.deepEqual(JSON.parse(f.warnings[0][1]), details);
+    assert.deepEqual(f.store.data.threads[key].lastMirrorError, details);
+    assert.doesNotMatch(JSON.stringify(f.warnings), /synthetic|private|credential|stack/);
+    assert.equal(f.posts.length, 0);
+  }
+});
+
+test('相同事件仅唤醒原线程不写盘，新最终状态仍镜像一次并保留回执', async t => {
+  const f = await fixture(t); await f.plugin.tick();
+  const rename = fs.rename.bind(fs); let writes = 0;
+  t.mock.method(fs, 'rename', async (...args) => { writes++; return rename(...args); });
+  f.subscriptions[0].send(snapshot()); await until(() => f.plugin.eventStreams.get(key)?.latest); await f.store.tail;
+  assert.equal(writes, 0); assert.equal(f.store.data.threads[key].nextPoll, 0);
+  const completed = snapshot('chat-1', { status: 'idle', activeTurnId: null, acceptedRequestIds: ['request-1'],
+    messages: [{ id: 'idle-write-final', role: 'assistant', requestId: 'request-1', text: '合成最终回复' }] });
+  f.subscriptions[0].send(completed); await until(() => f.plugin.eventStreams.get(key)?.latest === completed); await f.store.tail;
+  await f.plugin.tick(); assert.equal(f.posts.length, 1); assert.ok(writes > 0);
+  f.gateway.command = async () => completed;
+  await f.plugin.mirror(key); assert.equal(f.posts.length, 1);
+  assert.ok((await new Store(f.directory).open()).data.threads[key].mirrored['idle-write-final']);
+});
+
 test('scoped event snapshot mirrors real prose once without an extra state command and survives restart', async t => {
   const f = await fixture(t); await f.plugin.tick(); assert.equal(f.calls.length, 1);
   const subscription = f.subscriptions[0];
@@ -80,7 +153,7 @@ test('no pending snapshot means an active stream suppresses duplicate polls but 
   const f = await fixture(t); await f.plugin.tick();
   f.subscriptions[0].send(snapshot()); await until(() => f.plugin.eventStreams.get(key)?.latest); await f.store.tail; await f.plugin.tick();
   await f.store.update(data => { data.threads[key].nextPoll = 0; }); await f.plugin.tick(); assert.equal(f.calls.length, 1);
-  f.plugin.eventStreams.get(key).lastFallbackAt = Date.now() - 15001;
+  f.plugin.eventStreams.get(key).lastFallbackAt = Date.now() - 10001;
   await f.plugin.tick(); assert.equal(f.calls.length, 2, 'Stalled subscription cannot disable periodic state reads');
 });
 
@@ -94,6 +167,50 @@ test('failed and foreign event subscriptions fall back to polling without displa
     await f.store.update(data => { data.threads[key].nextPoll = 0; }); await f.plugin.tick();
     assert.equal(f.calls.length, 2); assert.equal(f.subscriptions.length, 1, 'Reconnect backoff avoids request storms');
   }
+});
+
+test('不断到来的旧事件不重置独立补读，丢失的最终状态由十秒核对恢复', async t => {
+  const f = await fixture(t); await f.plugin.tick();
+  const stream = f.plugin.eventStreams.get(key), checkedAt = Date.now() - 9000;
+  stream.lastFallbackAt = checkedAt;
+  for (let index = 0; index < 3; index++) {
+    f.subscriptions[0].send(snapshot());
+    await until(() => stream.latest); await f.store.tail; await f.plugin.tick();
+    assert.equal(stream.lastFallbackAt, checkedAt, 'Consuming snapshots never postpones a server reconciliation');
+  }
+  assert.equal(f.calls.length, 1);
+  f.gateway.command = async (type, args) => {
+    f.calls.push({ type, ...args });
+    return snapshot('chat-1', { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: ['request-1'],
+      messages: [{ id: 'lost-final', requestId: 'request-1', role: 'assistant', text: '补读恢复最终回答' }] });
+  };
+  stream.lastFallbackAt = Date.now() - 10001;
+  f.subscriptions[0].send(snapshot());
+  await until(() => stream.latest); await f.store.tail; await f.plugin.tick();
+  assert.equal(f.calls.length, 2, 'A due reconciliation wins even while a cached event is ready');
+  assert.equal(f.posts.length, 1); assert.match(f.posts[0].text, /补读恢复最终回答/);
+  assert.equal(f.store.data.threads[key].live, false);
+  await f.plugin.tick(); await until(() => f.subscriptions[0].closed);
+  assert.equal(f.posts.length, 1, 'Recovery neither duplicates the final reply nor leaves the old subscription active');
+});
+
+test('补读等待期间绑定变化或被删除，不向原频道投递迟到内容', async t => {
+  for (const field of ['projectId', 'conversationId', 'userId', 'channel', 'threadTs', 'removed']) {
+    const f = await fixture(t), entered = deferred(), result = deferred();
+    f.gateway.command = async () => { entered.resolve(); return result.promise; };
+    const pending = f.plugin.mirror(key); await entered.promise;
+    await f.store.update(data => { if (field === 'removed') delete data.threads[key]; else data.threads[key][field] = `changed-${field}`; });
+    result.resolve(snapshot('chat-1', { messages: [{ id: 'old-scope', role: 'assistant', text: 'PRIVATE OLD SCOPE' }] }));
+    await pending; assert.equal(f.posts.length, 0, field);
+  }
+});
+
+test('显式错会话的补读结果拒绝，旧无身份快照继续兼容', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => snapshot('other-chat', { messages: [{ id: 'foreign-poll', role: 'assistant', text: 'PRIVATE FOREIGN POLL' }] });
+  await assert.rejects(f.plugin.mirror(key), { code: 'GATEWAY_BAD_RESPONSE' }); assert.equal(f.posts.length, 0);
+  f.gateway.command = async () => ({ status: 'idle', messages: [], approvals: [] });
+  await f.plugin.mirror(key); assert.equal(f.posts.length, 0);
 });
 
 test('removing the last binding releases its active event subscription', async t => {

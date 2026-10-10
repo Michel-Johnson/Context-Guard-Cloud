@@ -343,10 +343,10 @@ async function fixture(t) {
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
 
-async function projectSwitchFixture(t) {
-  const f = await fixture(t), dm = 'D000001', key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';
+async function projectSwitchFixture(t, dm = 'D000001') {
+  const f = await fixture(t), key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';
   const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: dm, sessionId: `slack:${teamId}:${user}` };
-  const original = event({ channel: dm, channel_type: 'im', thread_ts: '100.001', text: '切换到博客' });
+  const original = event({ channel: dm, ...(dm.startsWith('D') ? { channel_type: 'im' } : {}), thread_ts: '100.001', text: '切换到博客' });
   await f.store.receive('switch-inbox', { type: 'events_api', body: { team_id: teamId, event: original } });
   await f.store.bind(key, { projectId: 'lab', conversationId: 'old-chat', channel: dm, threadTs: '100.001', userId: user, ownRequests: [requestId] });
   await f.store.update(state => { state.preferences[user] = 'lab'; state.reactionInputs = { [requestId]: { key, projectId: 'lab', conversationId: 'old-chat',
@@ -398,6 +398,77 @@ test('切换后旧线程的新回复按新项目处理，不携带旧 Slack 历�
   assert.equal(submits[0].payload.history, undefined); assert.equal(submits[0].payload.slackChannelId, f.dm);
   assert.deepEqual(submits[0].payload.participation.context, []);
   assert.equal(f.calls.some(call => call.type === 'conversation.relevance'), false);
+});
+
+test('频道与群组自然绑定仅切换当前用户在原 thread 的项目，持久收集和重启沿用同一路由', async t => {
+  for (const currentChannel of [channel, 'G000001']) await t.test(currentChannel, async t => {
+    const f = await projectSwitchFixture(t, currentChannel);
+    await f.store.update(state => { state.channels[currentChannel] = 'lab'; });
+    const preferences = structuredClone(f.store.data.preferences), channels = structuredClone(f.store.data.channels);
+    await f.plugin.mirror(f.key);
+    const switched = Object.values(f.store.data.projectSwitches)[0], target = f.store.data.threads[switched.targetKey];
+    assert.equal(switched.status, 'applied'); assert.equal(switched.announced, true);
+    assert.equal(target.projectId, 'blog'); assert.equal(target.conversationId, 'new-chat'); assert.equal(target.threadTs, '100.001');
+    assert.equal(f.store.data.threads[f.key].projectId, 'lab'); assert.equal(f.store.data.threads[f.key].conversationId, 'old-chat');
+    assert.deepEqual(f.store.data.channels, channels); assert.deepEqual(f.store.data.preferences, preferences);
+    assert.equal(f.store.data.directThreads, undefined);
+    assert.ok(f.sent.some(item => item.text?.includes('已绑定到 博客') && item.threadTs === '100.001'));
+    assert.equal(f.sent.some(item => item.text && !item.threadTs), false, 'does not create a new channel root');
+    const next = event({ channel: currentChannel, thread_ts: '100.001', ts: '124.001', text: '介绍当前项目' });
+    assert.equal(f.plugin.routedThreadKey(next), switched.targetKey);
+    assert.equal(f.plugin.routedThreadKey({ ...next, user: 'UOTHER' }), f.key);
+    assert.equal(f.plugin.routedThreadKey({ ...next, thread_ts: 'other-thread' }), threadKey(teamId, currentChannel, 'other-thread'));
+    assert.equal(f.plugin.routedThreadKey({ ...next, ts: '123.001' }), f.key, 'older input stays in the original project');
+    await f.store.receive('next-shared', { type: 'events_api', body: { team_id: teamId, event: next } }, { collectMs: 0, maxCollectMs: 0 });
+    const entry = f.store.data.inbox['next-shared'];
+    assert.equal(f.store.data.messageBatches[entry.batchId].projectId, 'blog', 'collector and executor agree');
+    await f.plugin.runEntry('next-shared', entry);
+    const submitted = f.calls.filter(call => call.type === 'conversation.submit').at(-1);
+    assert.equal(submitted.projectId, 'blog'); assert.equal(submitted.conversationId, 'new-chat');
+    assert.equal(submitted.payload.history, undefined); assert.deepEqual(submitted.payload.participation.context, []);
+    assert.equal(f.store.data.inbox['next-shared'].status, 'done');
+    const sent = f.sent.length;
+    const reopened = await new Store(f.directory).open();
+    const resumed = new SlackPlugin({ store: reopened, gateway: f.gateway, io: f.io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot });
+    t.after(() => resumed.stop());
+    assert.equal(resumed.routedThreadKey(next), switched.targetKey);
+    await resumed.mirror(f.key); assert.equal(f.sent.length, sent);
+    assert.deepEqual(reopened.data.preferences, preferences); assert.deepEqual(reopened.data.channels, channels);
+  });
+});
+
+test('频道 thread 交接完成前收到的下一条消息在交接后进入新项目，不因旧收集版本而冲突', async t => {
+  const f = await projectSwitchFixture(t, channel);
+  await f.store.update(state => { state.channels[channel] = 'lab'; state.threads[f.key].awaitingReplyId = 'switch-request'; });
+  f.plugin.eventStreams.set(f.key, { controller: new AbortController(), projectId: 'lab', conversationId: 'old-chat', latest: f.snapshot });
+  const next = event({ thread_ts: '100.001', ts: '124.001', text: '介绍当前项目' });
+  await f.store.receive('early-channel', { type: 'events_api', body: { team_id: teamId, event: next } }, { collectMs: 0, maxCollectMs: 0 });
+  assert.equal(f.store.data.messageBatches[f.store.data.inbox['early-channel'].batchId].projectId, 'lab');
+  await f.plugin.runEntry('early-channel', f.store.data.inbox['early-channel']);
+  assert.equal(f.store.data.inbox['early-channel'].status, 'done');
+  const submitted = f.calls.filter(call => call.type === 'conversation.submit').at(-1);
+  assert.equal(submitted.projectId, 'blog'); assert.equal(submitted.conversationId, 'new-chat');
+  assert.equal(submitted.payload.history, undefined); assert.equal(f.store.data.channels[channel], 'lab');
+});
+
+test('频道 thread 切换拒绝成员退出、目标撤权和晚到的旧切换，不覆盖他人或后来路由', async t => {
+  for (const scenario of ['left-channel', 'revoked', 'changed-route']) await t.test(scenario, async t => {
+    const f = await projectSwitchFixture(t, channel);
+    const command = f.gateway.command, ioCall = f.io.call;
+    if (scenario === 'left-channel') f.io.call = async (method, input) => method === 'conversations.members' ? { members: [] } : ioCall(method, input);
+    else f.gateway.command = async (type, args) => {
+      if (type === 'conversation.state' && args.projectId === 'blog') {
+        if (scenario === 'revoked') throw Object.assign(new Error('Target revoked'), { code: 'FORBIDDEN' });
+        await f.store.update(state => { (state.projectRoutes ||= {})[digest([f.key, user])] = { targetKey: 'later-route', afterTs: '999.001' }; });
+      }
+      return command(type, args);
+    };
+    const preferences = structuredClone(f.store.data.preferences), channels = structuredClone(f.store.data.channels);
+    const result = await f.plugin.applyProjectSwitch(f.key, f.message, [f.input, f.message], f.snapshot);
+    assert.equal(result.status, 'rejected'); assert.deepEqual(f.store.data.preferences, preferences); assert.deepEqual(f.store.data.channels, channels);
+    assert.equal(Object.keys(f.store.data.threads).length, 1); assert.equal(f.sent.some(item => item.text), false);
+    if (scenario === 'changed-route') assert.equal(f.store.data.projectRoutes[digest([f.key, user])].targetKey, 'later-route');
+  });
 });
 
 test('项目新线程发送失回后重启复用原编号，确认失败不再次切换', async t => {
@@ -462,11 +533,11 @@ test('切换应用前重新校验目标权限，撤销授权不创建 Slack 线�
   assert.equal(Object.keys(f.store.data.threads).length, 1);
 });
 
-for (const scenario of ['其他用户', '公共频道', '伪造原文', '生成未结束', '部分输出', '项目已删除', '偏好已变']) {
+for (const scenario of ['其他用户', '频道不匹配', '伪造原文', '生成未结束', '部分输出', '项目已删除', '偏好已变']) {
   test(`自然项目切换拒绝${scenario}，不覆盖偏好或借用旧绑定`, async t => {
     const f = await projectSwitchFixture(t);
     if (scenario === '其他用户') f.message.actions[0].actor = { ...f.actor, userId: 'UOTHER' };
-    if (scenario === '公共频道') await f.store.update(state => { state.threads[f.key].channel = channel; });
+    if (scenario === '频道不匹配') await f.store.update(state => { state.threads[f.key].channel = channel; });
     if (scenario === '伪造原文') await f.store.update(state => { state.inbox['switch-inbox'].envelope.body.event.text = '不是切换请求'; });
     if (scenario === '生成未结束') f.snapshot.activeTurnId = 'still-running';
     if (scenario === '部分输出') f.message.partial = true;
@@ -479,7 +550,7 @@ for (const scenario of ['其他用户', '公共频道', '伪造原文', '生成�
   });
 }
 
-test('项目查询向已验证 Slack 频道开放，切换仍限私聊且终止旧项目的后续工具', async () => {
+test('项目查询和切换向已验证 Slack 频道开放，交接终止旧项目的后续工具', async () => {
   const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: 'D000001', sessionId: `slack:${teamId}:${user}` };
   for (const channelId of [undefined, channel, 'D000001']) {
     const acceptedActor = { ...actor, ...(channelId ? { channelId } : {}) }; if (!channelId) delete acceptedActor.channelId;
@@ -489,12 +560,12 @@ test('项目查询向已验证 Slack 频道开放，切换仍限私聊且终止�
       execute: createCoordinatorExecutor({ switchProject: async (input, options) => { calls.push(options); return { kind: 'project-switch', projectId: input.projectId }; } }),
       model: { next: async request => {
         assert.equal(request.tools.some(tool => tool.name === 'list_projects'), !!channelId);
-        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), channelId === 'D000001');
+        assert.equal(request.tools.some(tool => tool.name === 'switch_project'), !!channelId);
         modelToolsHash = hash(JSON.stringify(request.tools));
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch', name: 'switch_project', input: { projectId: 'blog' } },
           { type: 'tool_use', id: 'should-not-write', name: 'edit_map', input: { mainVersion: 'old', actions: [] } }] };
       } } });
-    assert.equal(calls.length, channelId === 'D000001' ? 1 : 0);
+    assert.equal(calls.length, channelId ? 1 : 0);
     assert.equal(state.performance.models[0].prefix.toolsHash, modelToolsHash, '诊断记录实际发送的工具目录');
     if (calls.length) { assert.equal(calls[0].requestId, 'request'); assert.equal(state.status, 'waiting-for-user'); }
     assert.ok(state.messages.at(-1).content[1].is_error, 'A switch cannot continue with an old-project write');
@@ -599,6 +670,25 @@ test('native Slack reaction adds only the chosen emoji and never posts a placeho
   assert.deepEqual(f.sent, [{ method: 'reactions.add', input: { channel, timestamp: '123.001', name: 'heart' } }]);
   assert.equal(Object.values(f.store.data.reactionOutbox)[0].status, 'sent');
   await f.plugin.mirror(f.key); await settleReactions(f.plugin); assert.equal(f.sent.length, 1);
+});
+
+test('重复交流表情镜像只核对原记录，不复制整个账本或改变原指纹', async t => {
+  const f = await reactionFixture(t); f.plugin.stopped = false;
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  const [id] = Object.keys(f.store.data.reactionOutbox), original = f.store.data.reactionOutbox[id], inbox = f.store.data.inbox;
+  const clone = structuredClone; let recordCopies = 0;
+  t.mock.method(globalThis, 'structuredClone', value => {
+    assert.notEqual(value, f.store.data, '重放原交流意图不复制全部消息和历史');
+    if (value === f.store.data.reactionOutbox[id]) recordCopies++;
+    return clone(value);
+  });
+  await f.plugin.mirror(f.key); await settleReactions(f.plugin);
+  assert.equal(recordCopies, 1); assert.equal(f.store.data.inbox, inbox);
+  assert.equal(f.store.data.reactionOutbox[id], original); assert.equal(f.sent.length, 1);
+  const changed = { ...f.message, actions: [{ ...f.message.actions[0], emoji: 'smile' }] };
+  await assert.rejects(f.plugin.queueReactions(f.key, changed, [f.input, changed]), { code: 'ID_REUSED' });
+  assert.equal(f.store.data.reactionOutbox[id], original);
+  assert.equal((await new Store(f.directory).open()).data.reactionOutbox[id].emoji, 'heart');
 });
 test('native Slack reaction uses real publicMessages projection without inventing a delivery receipt', async t => {
   const f = await reactionFixture(t), state = { activeInput: { id: f.requestId, source: 'slack', actor: f.input.actor }, messages: [{ ...f.input, content: f.input.text }], toolReceipts: {} };
@@ -1508,6 +1598,56 @@ test('plain section boundaries preserve paragraphs code and emoji and transport 
   const count = calls.length; await io.post({ id: 'long-answer', channel, threadTs: '1.0', text, blocks }); assert.equal(calls.length, count);
   await io.update(channel, ts, '简短的新回复', messageBlocks({ text: '简短的新回复' }, 'thread'));
   assert.equal(calls.filter(call => call.method === 'chat.update').length, count, 'Retire every old continuation after a stream shrinks');
+});
+
+test('1687字符4059字节的旧回复更新按编码预算拆分，完整保留且续段重试不重复', async t => {
+  const f = await fixture(t), text = '中'.repeat(1186) + 'a'.repeat(501), calls = [];
+  assert.equal(text.length, 1687); assert.equal(Buffer.byteLength(text), 4059);
+  await f.store.update(state => { state.outgoing.original = { id: 'original', channel, threadTs: '1.0', ts: '100.0', status: 'sent', hash: 'old' }; });
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    assert.ok(Buffer.byteLength(args.text) <= 4000);
+    assert.ok(args.blocks.every(block => Buffer.byteLength(block.text?.text || '') <= 2800));
+    calls.push({ method, args }); return { ts: method === 'chat.update' ? args.ts : '101.0' };
+  } } });
+  const blocks = [{ type: 'section', text: { type: 'plain_text', text } }];
+  await io.update(channel, '100.0', text, blocks);
+  assert.deepEqual(calls.map(call => call.method), ['chat.update', 'chat.postMessage']);
+  assert.equal(calls.flatMap(call => call.args.blocks).map(block => block.text.text).join(''), text);
+  assert.equal(f.store.data.outgoing.original.partCount, 2);
+  await io.update(channel, '100.0', text, blocks);
+  assert.equal(calls.filter(call => call.method === 'chat.postMessage').length, 1);
+  assert.equal((await new Store(f.directory).open()).data.outgoing['original:part:1'].ts, '101.0');
+});
+
+test('UTF8与HTML转义共同计入预算，代码字面量和emoji不丢失且不拆代理对', async t => {
+  const f = await fixture(t), literal = '🙂中<>&**Status'.repeat(1200), text = `\`\`\`txt\n${literal}\n\`\`\``, calls = [];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    assert.ok(Buffer.byteLength(args.text) <= 4000);
+    assert.ok(!/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(args.text));
+    calls.push({ method, args }); return { ts: `${calls.length + 100}.0` };
+  } } });
+  await io.post({ id: 'escaped-code', channel, text });
+  const decode = value => value.replace(/&(amp|lt|gt);/g, (_, entity) => ({ amp: '&', lt: '<', gt: '>' })[entity]);
+  assert.equal(calls.map(call => decode(call.args.text)).join(''), literal);
+  const chunks = plainChunks(literal, 16, { rendered: true, measure: value => Buffer.byteLength(value) });
+  assert.equal(chunks.join(''), literal); assert.ok(chunks.every(chunk => Buffer.byteLength(chunk) <= 16));
+  assert.throws(() => plainChunks('🙂', 1, { measure: value => Buffer.byteLength(value), rendered: true }), RangeError);
+});
+
+test('大段落拆分只保留一次原控件，生成唯一稳定block身份而不截正文', async t => {
+  const f = await fixture(t), text = '项目说明'.repeat(800), calls = [];
+  const accessory = { type: 'button', action_id: 'existing-action', text: { type: 'plain_text', text: '查看' }, value: 'synthetic-original' };
+  const blocks = [{ type: 'section', block_id: 'original-block', text: { type: 'plain_text', text }, accessory }];
+  const io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { async apiCall(method, args) {
+    calls.push({ method, args }); return { ts: `${calls.length + 100}.0` };
+  } } });
+  await io.post({ id: 'controlled-long', channel, text, blocks });
+  const actual = calls.flatMap(call => call.args.blocks);
+  assert.equal(actual.map(block => block.text.text).join(''), text);
+  assert.deepEqual(actual.filter(block => block.accessory).map(block => block.accessory), [accessory]);
+  assert.equal(new Set(actual.map(block => block.block_id)).size, actual.length);
+  assert.ok(actual.every(block => block.block_id.length <= 255));
+  const before = calls.length; await io.post({ id: 'controlled-long', channel, text, blocks }); assert.equal(calls.length, before);
 });
 
 async function uncertainMultipart(t) {
@@ -2820,6 +2960,62 @@ test('Failed stream preview stays in its original slot and failure marking survi
     assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
     assert.ok(f.sent.find(call => call.text?.includes('处理已停止')));
   }
+});
+
+test('模型402提示区分账户问题，重放与重启不重复发出或改写旧通知', async t => {
+  for (const legacy of [null,
+    'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。',
+    'Coordinator 当前失败：MODEL_HTTP_402。请在工作台查看并重试；不会显示假成功。']) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.402'), writes = [];
+    await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: ['quota-turn'] });
+    const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+    f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { apiCall: async (method, input) => {
+      if (method === 'chat.postMessage' || method === 'chat.update') writes.push({ method, input });
+      return { ts: '500.402' };
+    } } });
+    if (legacy) await f.plugin.io.post({ id, channel, threadTs: '123.402', text: legacy });
+    writes.length = 0;
+    const state = { status: 'error', activeTurnId: 'quota-turn', consumedInputRevision: 0, error: { code: 'MODEL_HTTP_402', message: 'private-token-sentinel' },
+      messages: [{ role: 'user', requestId: 'quota-turn', id: 'source', text: '读取目录' }], approvals: [] };
+    f.gateway.command = async () => state;
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+    if (legacy) assert.equal(writes.length, 0, '旧通知不现代化或再次发送');
+    else {
+      assert.equal(writes.length, 1); assert.equal(writes[0].method, 'chat.postMessage');
+      assert.match(writes[0].input.text, /账户可用额度/); assert.doesNotMatch(writes[0].input.text, /稍后重试|private-token-sentinel/);
+    }
+    f.plugin.store = await new Store(f.directory).open(); f.plugin.io.store = f.plugin.store;
+    await f.plugin.mirror(key);
+    assert.equal(writes.length, legacy ? 0 : 1, '重启仍复用原发送编号');
+  }
+});
+
+test('模型402已冻结的未知发送只核对原消息，不再次发送或改写内容', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.quota-lost-ack');
+  await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: [] });
+  const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+  const text = '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。';
+  await f.store.update(data => { data.outgoing[id] = { id, channel, threadTs: '123.402', status: 'unknown', hash: digest({ text }) }; });
+  const writes = [], reads = [];
+  f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, wait: async () => {}, client: { apiCall: async (method, input) => {
+    if (['chat.postMessage', 'chat.update'].includes(method)) { writes.push(method); assert.fail('未知旧发送不能重发或改文'); }
+    reads.push(method); return { messages: [{ user: bot, ts: 'saved.402', text, metadata: { event_type: 'context_guard', event_payload: { id } } }] };
+  } } });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'quota-turn', error: { code: 'MODEL_HTTP_402' }, messages: [], approvals: [] });
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.deepEqual(reads, ['conversations.replies']); assert.equal(writes.length, 0);
+  assert.equal(f.store.data.outgoing[id].status, 'sent'); assert.equal(f.store.data.outgoing[id].ts, 'saved.402');
+});
+
+test('模型402的原未知通知无法核实时保留账本，不用新提示覆盖未知内容', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.quota-unknown');
+  await f.store.bind(key, { channel, threadTs: '123.402', projectId: 'lab', conversationId: 'quota-chat', userId: user, ownRequests: [] });
+  const id = 'slack-' + digest(`${key}:quota-turn:MODEL_HTTP_402:error`);
+  const original = { id, channel, threadTs: '123.402', status: 'unknown', hash: 'unsupported-original-projection' };
+  await f.store.update(data => { data.outgoing[id] = original; });
+  f.gateway.command = async () => ({ status: 'error', activeTurnId: 'quota-turn', error: { code: 'MODEL_HTTP_402' }, messages: [], approvals: [] });
+  await assert.rejects(f.plugin.mirror(key), { code: 'DELIVERY_UNCERTAIN' });
+  assert.deepEqual(f.store.data.outgoing[id], original); assert.equal(f.sent.length, 0);
 });
 
 test('Failed stream marking never borrows another revision or turn when the exact failed slot is missing', async t => {

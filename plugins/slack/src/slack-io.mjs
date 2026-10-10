@@ -2,17 +2,33 @@ import { digest } from './store.mjs';
 import { plainText, plainChunks } from './plain-text.mjs';
 
 const fallbackText = (text, rendered = false) => (rendered ? text : plainText(text)).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+const fallbackBytes = text => Buffer.byteLength(fallbackText(text, true));
 const blockFallback = block => {
   const value = item => typeof item?.text === 'string' ? item.type === 'mrkdwn' ? plainText(item.text) : item.text : '';
   return block.type === 'context' ? (block.elements || []).map(value).filter(Boolean).join('\n') : value(block.text);
 };
 function messageParts(text, blocks) {
-  if (!blocks?.length) return plainChunks(text, 6000).map(value => ({ text: value, rendered: true }));
+  if (!blocks?.length) return plainChunks(text, 4000, { measure: fallbackBytes }).map(value => ({ text: value, rendered: true }));
+  // Count encoded bytes, not UTF-16 units. Split full content, including the
+  // accessible fallback; an accessory stays on exactly one resulting block.
+  const bounded = blocks.flatMap(block => {
+    const body = blockFallback(block);
+    if (!['section', 'context'].includes(block.type) || fallbackBytes(body) <= 2800) return [block];
+    const chunks = plainChunks(body, 2800, { measure: fallbackBytes, rendered: true });
+    return chunks.map((value, index) => {
+      const { text, elements, accessory, block_id, ...rest } = block;
+      return { ...rest, ...(block.type === 'context' ? { elements: [{ type: 'plain_text', text: value }] }
+        : { text: { type: 'plain_text', text: value } }),
+        ...(accessory && index === chunks.length - 1 ? { accessory } : {}),
+        ...(block_id ? { block_id: `part-${digest([block_id, index])}` } : {}) };
+    });
+  });
   const parts = []; let group = [], size = 0;
-  for (const block of blocks) {
-    const content = block.text?.text || (block.type === 'context' ? block.elements.map(item => item.text || '').join('\n') : '');
-    if (group.length && (group.length >= 49 || size + content.length > 6000)) { parts.push(group); group = []; size = 0; }
-    group.push(block); size += content.length;
+  for (const block of bounded) {
+    const cost = fallbackBytes(blockFallback(block));
+    const separator = cost && size ? 2 : 0;
+    if (group.length && (group.length >= 49 || size + separator + cost > 4000)) { parts.push(group); group = []; size = 0; }
+    group.push(block); size += cost + (cost && size ? 2 : 0);
   }
   if (group.length) parts.push(group);
   // Each message has the content's own fallback for notifications and assistive

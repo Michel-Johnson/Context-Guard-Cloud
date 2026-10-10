@@ -286,7 +286,7 @@ test('普通网页来源不能借用接话工具别名获得执行权限', async
   assert.ok(Object.values(raw.toolReceipts).some(receipt => receipt.isError && receipt.result.error.code === 'TOOL_FORBIDDEN'));
 });
 
-test('群组没有项目切换权限时，接话别名也不能调用项目工具', async t => {
+test('缺少可信频道时，接话别名也不能调用项目切换工具', async t => {
   const f = await fixture(t, async ({ tools, onToolStart }) => {
     assert.equal(tools.some(tool => tool.name === 'reply_switch_project'), false);
     await onToolStart?.('reply_switch_project');
@@ -294,7 +294,7 @@ test('群组没有项目切换权限时，接话别名也不能调用项目工�
   }, { tools: [{ name: 'write' }, { name: 'switch_project' }] });
   const text = '测试项目切换';
   await f.service.submit({ id: 'batch', inputs: [{ id: 'original', text }] },
-    { source: 'slack', actor: { ...actor, channelId: 'CTESTPUBLIC' }, participation: participation(text) });
+    { source: 'slack', actor: { ...actor, channelId: 'invalid-channel' }, participation: participation(text) });
   await f.service.close(); assert.equal((await f.service.state()).status, 'error'); assert.deepEqual(f.writes, []);
 });
 

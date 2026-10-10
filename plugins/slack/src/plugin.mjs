@@ -1,4 +1,4 @@
-import { digest, threadKey } from './store.mjs';
+import { digest, threadKey, routedThreadKey } from './store.mjs';
 import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
@@ -6,9 +6,39 @@ import { SlackFeedback } from './feedback.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
+function modelFailureText(code, ownsFeedback, outgoing, message) {
+  const owned = 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。';
+  const legacy = `Coordinator 当前失败：${code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。`;
+  const current = code === 'MODEL_HTTP_402'
+    ? '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。'
+    : message === '自动恢复未成功，原消息与已完成操作已保留。'
+      ? message : '处理已停止，原消息与已完成操作已保留。';
+  if (!outgoing) return current;
+  // 升级不改旧通知或原未知发送；复用原编号与已经冻结的显示内容。
+  const text = [current, owned, legacy, '处理已停止，原消息与已完成操作已保留。', '自动恢复未成功，原消息与已完成操作已保留。']
+    .find(value => outgoing.hash === digest({ text: value }));
+  if (!text) throw Object.assign(new Error('Original error notice cannot be verified'), { code: 'DELIVERY_UNCERTAIN' });
+  return text;
+}
+
 const operationId = (id, suffix) => `slack-${digest(`${id}:${suffix}`)}`;
+const EVENT_RECONCILE_MS = 10000;
 const reactionRejected = new Set(['invalid_name', 'message_not_found', 'channel_not_found', 'not_in_channel', 'no_reaction',
   'is_archived', 'restricted_action', 'not_authed', 'invalid_auth', 'account_inactive', 'token_revoked', 'missing_scope', 'permission_denied']);
+const mirrorPlatformCodes = new Set([...reactionRejected, 'cant_update_message', 'edit_window_closed', 'invalid_blocks',
+  'invalid_blocks_format', 'msg_too_long', 'no_permission', 'invalid_arguments', 'invalid_metadata', 'invalid_charset',
+  'too_many_attachments', 'fatal_error', 'internal_error', 'request_timeout', 'ratelimited', 'ekm_access_denied', 'org_login_required']);
+const mirrorErrorNames = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'TimeoutError', 'AbortError', 'GatewayError']);
+const mirrorNetworkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_ABORTED']);
+function mirrorFailureDetails(error) {
+  const details = { code: error.code || 'MIRROR_ERROR' };
+  if (mirrorErrorNames.has(error.name)) details.name = error.name;
+  if (mirrorNetworkCodes.has(error.cause?.code)) details.causeCode = error.cause.code;
+  if (error.code === 'slack_webapi_platform_error') details.platformCode = mirrorPlatformCodes.has(error.data?.error)
+    ? error.data.error : 'UNKNOWN_PLATFORM_ERROR';
+  return details;
+}
 const reactionEventHash = event => digest({ ...event, type: 'message' });
 const participationTransient = error => {
   // Authentication, identity and contract failures require attention, even when
@@ -111,8 +141,8 @@ export class SlackPlugin {
     if (message.partial) {
       for (const action of message.actions || []) if (action.kind === 'slack-reaction') {
         const id = `reaction-${digest([key, action.actionId])}`;
-        if (this.store.data.reactionOutbox?.[id]?.status === 'pending') await this.store.update(state => {
-          if (state.reactionOutbox[id].status === 'pending') state.reactionOutbox[id].status = 'superseded';
+        if (this.store.data.reactionOutbox?.[id]?.status === 'pending') await this.store.updateReaction(id, item => {
+          if (item.status === 'pending') item.status = 'superseded';
         });
       }
       return ready;
@@ -138,8 +168,12 @@ export class SlackPlugin {
       const id = `reaction-${digest([key, read ? `read:${action.actionId}` : action.actionId])}`;
       const target = { key, requestId: action.requestId, projectId: binding.projectId, conversationId: binding.conversationId,
         channel: input.channel, timestamp: input.timestamp, userId: input.userId, emoji: action.emoji };
-      await this.store.update(state => {
-        const previous = (state.reactionOutbox ||= {})[id], fingerprint = digest(target);
+      const fingerprint = digest(target);
+      if (this.store.data.reactionOutbox?.[id]) await this.store.updateReaction(id, previous => {
+        if (previous.fingerprint !== fingerprint) throw Object.assign(new Error('Reaction intent changed'), { code: 'ID_REUSED' });
+      });
+      else await this.store.update(state => {
+        const previous = (state.reactionOutbox ||= {})[id];
         if (previous && previous.fingerprint !== fingerprint) throw Object.assign(new Error('Reaction intent changed'), { code: 'ID_REUSED' });
         state.reactionOutbox[id] ||= { ...target, fingerprint, status: 'pending', attempts: 0, next: 0 };
       });
@@ -184,24 +218,23 @@ export class SlackPlugin {
         // Persist the original destination before any platform call. A crash or
         // lost acknowledgement replays only this same user/message/emoji.
         if (record.attempts >= 8) {
-          await this.store.update(state => { state.reactionOutbox[id].status = 'attention'; });
+          await this.store.updateReaction(id, item => { item.status = 'attention'; });
           return;
         }
-        await this.store.update(state => { const item = state.reactionOutbox[id]; item.status = 'sending'; item.attempts++; });
+        await this.store.updateReaction(id, item => { item.status = 'sending'; item.attempts++; });
         if (this.stopped) {
-          await this.store.update(state => { state.reactionOutbox[id].status = 'pending'; state.reactionOutbox[id].attempts--; });
+          await this.store.updateReaction(id, item => { item.status = 'pending'; item.attempts--; });
           return;
         }
         try {
           await this.io.call('reactions.add', { channel: record.channel, timestamp: record.timestamp, name: record.emoji });
-          await this.store.update(state => { state.reactionOutbox[id].status = 'sent'; });
+          await this.store.updateReaction(id, item => { item.status = 'sent'; });
         } catch (error) {
           const confirmed = error.code === 'slack_webapi_platform_error' && error.data?.error === 'already_reacted';
           // Platform fatal/internal errors may have applied the reaction. Only
           // precise permanent rejections and exhausted SDK 429 are non-delivery.
           const known = error.code === 'slack_webapi_rate_limited_error' || error.code === 'slack_webapi_platform_error' && reactionRejected.has(error.data?.error);
-          await this.store.update(state => {
-            const item = state.reactionOutbox[id];
+          await this.store.updateReaction(id, item => {
             item.status = confirmed ? 'sent' : known ? 'failed' : item.attempts >= 8 ? 'attention' : 'unknown';
             if (!confirmed) { item.error = error.code || 'REACTION_UNCERTAIN'; item.next = Date.now() + Math.min(60000, 1000 * 2 ** item.attempts); }
           });
@@ -289,7 +322,7 @@ export class SlackPlugin {
     if (this.stopped) return;
     for (const [key, stream] of this.eventStreams) {
       const binding = this.store.data.threads[key];
-      if (!binding || !(binding.live || binding.awaitingReplyId || stream.latest) || binding.conversationId !== stream.conversationId || binding.projectId !== stream.projectId) {
+      if (!binding || !(binding.live || binding.awaitingReplyId || stream.latest) || binding.conversationId !== stream.conversationId || binding.projectId !== stream.projectId || binding.userId !== stream.userId) {
         stream.latest = null;
         stream.controller.abort();
         this.eventStreams.delete(key);
@@ -303,7 +336,7 @@ export class SlackPlugin {
     // deadline, so sustained activity cannot starve another due thread.
     const due = bindings.filter(([key, binding]) => {
       const stream = this.eventStreams.get(key);
-      return (binding.nextPoll || 0) <= Date.now() && (!stream?.lastEventAt || stream.latest || Date.now() - stream.lastFallbackAt >= 15000);
+      return (binding.nextPoll || 0) <= Date.now() && (!stream?.lastEventAt || stream.latest || Date.now() - stream.lastFallbackAt >= EVENT_RECONCILE_MS);
     })
       .sort(([, a], [, b]) => (a.nextPoll || 0) - (b.nextPoll || 0));
     const hot = due.filter(([, binding]) => binding.awaitingReplyId || binding.live);
@@ -313,23 +346,29 @@ export class SlackPlugin {
     for (const [key] of selected) {
       if (this.stopped) return;
       try { await this.mirror(key); }
-      catch (error) { this.logger.warn('Slack mirror failed', { code: error.code || 'MIRROR_ERROR' }); await this.store.update(state => { state.threads[key].nextPoll = Date.now() + 30000; state.threads[key].error = error.code || 'MIRROR_ERROR'; }); }
+      catch (error) {
+        const details = mirrorFailureDetails(error);
+        // One-line diagnostics retain only classified errors, never SDK payloads.
+        this.logger.warn('Slack mirror failed', JSON.stringify(details));
+        await this.store.updateThread(key, thread => {
+          thread.nextPoll = Date.now() + 30000; thread.error = error.code || 'MIRROR_ERROR'; thread.lastMirrorError = details;
+        });
+      }
     }
   }
   watchEvents(key, binding) {
     if (this.stopped || typeof this.gateway.events !== 'function' || this.eventStreams.has(key) || this.eventStreams.size >= 4 || (this.eventRetry.get(key) || 0) > Date.now()) return;
-    const stream = { controller: new AbortController(), projectId: binding.projectId, conversationId: binding.conversationId, lastFallbackAt: Date.now(), latest: null };
+    const stream = { controller: new AbortController(), userId: binding.userId, projectId: binding.projectId, conversationId: binding.conversationId, lastFallbackAt: Date.now(), latest: null };
     this.eventStreams.set(key, stream);
     stream.promise = (async () => {
       try {
         for await (const state of this.gateway.events({ userId: binding.userId, projectId: stream.projectId, conversationId: stream.conversationId, signal: stream.controller.signal })) {
           const current = this.store.data.threads[key];
-          if (this.stopped || stream.controller.signal.aborted || current?.projectId !== stream.projectId || current?.conversationId !== stream.conversationId) break;
+          if (this.stopped || stream.controller.signal.aborted || current?.projectId !== stream.projectId || current?.conversationId !== stream.conversationId || current?.userId !== stream.userId) break;
           if (state?.conversationId !== stream.conversationId) throw Object.assign(new Error('Event scope mismatch'), { code: 'GATEWAY_EVENT_INVALID' });
           stream.latest = state; stream.lastEventAt = Date.now();
-          await this.store.update(data => {
-            const thread = data.threads[key];
-            if (thread?.projectId === stream.projectId && thread?.conversationId === stream.conversationId) thread.nextPoll = 0;
+          await this.store.updateThread(key, thread => {
+            if (thread?.projectId === stream.projectId && thread?.conversationId === stream.conversationId && thread?.userId === stream.userId) thread.nextPoll = 0;
           });
           this.kick();
         }
@@ -695,18 +734,7 @@ export class SlackPlugin {
     }
   }
   routedThreadKey(event) {
-    let key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
-    if (!event.channel?.startsWith('D')) return key;
-    const visited = new Set();
-    for (;;) {
-      if (visited.has(key)) throw Object.assign(new Error('项目切换路径出现循环'), { code: 'CONFLICT' });
-      visited.add(key);
-      const route = this.store.data.projectRoutes?.[digest([key, event.user])];
-      if (!route || Number(event.ts) <= Number(route.afterTs)) return key;
-      const target = this.store.data.threads[route.targetKey];
-      if (!target || target.channel !== event.channel || target.userId !== event.user) throw Object.assign(new Error('项目切换记录与私聊不一致'), { code: 'CONFLICT' });
-      key = route.targetKey;
-    }
+    return routedThreadKey(this.store.data, this.teamId, event);
   }
   async applyProjectSwitch(key, message, messages, snapshot) {
     const action = message.actions?.find(action => action.kind === 'project-switch');
@@ -716,7 +744,7 @@ export class SlackPlugin {
     const input = this.store.data.reactionInputs?.[action.requestId], original = input && this.store.data.inbox[input.inboxId];
     const event = original?.projectResume?.event || original?.envelope?.body?.event;
     const source = messages.find(item => item.role === 'user' && item.requestId === action.requestId);
-    if (!binding?.channel.startsWith('D') || actor?.channelId !== binding.channel || actor.kind !== 'human' || actor.integration !== 'slack' ||
+    if (!/^[DCG][A-Z0-9]{1,31}$/.test(binding?.channel || '') || actor?.channelId !== binding.channel || actor.kind !== 'human' || actor.integration !== 'slack' ||
         actor.teamId !== this.teamId || actor.sessionId !== `slack:${this.teamId}:${actor.userId}` ||
         message.source !== 'slack' || message.requestId !== action.requestId || message.actor?.sessionId !== actor.sessionId ||
         source?.source !== 'slack' || source.actor?.sessionId !== actor.sessionId || source.actor?.channelId !== binding.channel ||
@@ -728,39 +756,52 @@ export class SlackPlugin {
         action.status !== 'pending' || !action.actionId || !action.projectId || !action.conversationId) {
       return { status: 'rejected', error: 'UNVERIFIED_INPUT' };
     }
+    const direct = binding.channel.startsWith('D'), routeKey = digest([key, actor.userId]);
     const id = `project-switch-${digest([key, action.actionId])}`, fingerprint = digest(action);
     let record = this.store.data.projectSwitches?.[id];
     if (record && record.fingerprint !== fingerprint) throw Object.assign(new Error('项目切换回执内容改变'), { code: 'ID_REUSED' });
     if (!record) {
       await this.store.update(state => {
         state.projectSwitches ||= {};
-        state.projectSwitches[id] ||= { id, fingerprint, status: 'pending', expectedPreference: state.preferences[actor.userId], action };
+        state.projectSwitches[id] ||= { id, fingerprint, status: 'pending',
+          ...(direct ? { expectedPreference: state.preferences[actor.userId] } : { expectedRoute: digest(state.projectRoutes?.[routeKey] || null) }), action };
       });
       record = this.store.data.projectSwitches[id];
     }
     if (record.status !== 'pending') return record;
     try {
-      if (this.store.data.preferences[actor.userId] !== record.expectedPreference || record.expectedPreference !== binding.projectId) {
+      if (direct && (this.store.data.preferences[actor.userId] !== record.expectedPreference || record.expectedPreference !== binding.projectId)) {
         throw Object.assign(new Error('私聊已选择另一个项目'), { code: 'CONFLICT' });
+      }
+      if (!direct && (this.store.data.projectRoutes?.[routeKey] || record.expectedRoute !== digest(null))) {
+        throw Object.assign(new Error('本线程项目已切换'), { code: 'CONFLICT' });
       }
       const target = (await this.loadProjects(actor.userId, id)).find(project => project.id === action.projectId);
       if (!target) throw Object.assign(new Error('目标项目已不可用'), { code: 'NOT_FOUND' });
-      const info = await this.io.call('conversations.info', { channel: binding.channel });
-      if (info.channel?.user !== actor.userId) throw Object.assign(new Error('只能切换自己的私聊'), { code: 'FORBIDDEN' });
+      if (direct) {
+        const info = await this.io.call('conversations.info', { channel: binding.channel });
+        if (info.channel?.user !== actor.userId) throw Object.assign(new Error('只能切换自己的私聊'), { code: 'FORBIDDEN' });
+      } else if (!(await this.channelMembers(binding.channel)).includes(actor.userId)) {
+        throw Object.assign(new Error('只能切换自己所在频道的线程'), { code: 'FORBIDDEN' });
+      }
       const targetBinding = { channel: binding.channel, userId: actor.userId, projectId: target.id, conversationId: action.conversationId };
       await this.command('conversation.state', targetBinding, actor.userId, operationId(id, 'target-state'));
-      const root = await this.io.post({ id: operationId(id, 'root'), channel: binding.channel, text: `${target.name || '项目'} · 项目对话` });
-      const targetKey = threadKey(this.teamId, binding.channel, root);
+      const root = direct ? await this.io.post({ id: operationId(id, 'root'), channel: binding.channel, text: `${target.name || '项目'} · 项目对话` }) : binding.threadTs;
+      const targetKey = threadKey(this.teamId, binding.channel, direct ? root : `switch-${digest([key, action.actionId])}`);
       await this.store.update(state => {
         if (state.projectSwitches[id].status === 'applied') return;
-        if (state.preferences[actor.userId] !== record.expectedPreference) throw Object.assign(new Error('切换期间项目选择改变'), { code: 'CONFLICT' });
+        if (direct ? state.preferences[actor.userId] !== record.expectedPreference : digest(state.projectRoutes?.[routeKey] || null) !== record.expectedRoute) {
+          throw Object.assign(new Error('切换期间项目选择改变'), { code: 'CONFLICT' });
+        }
         state.threads[targetKey] ||= { ...targetBinding, threadTs: root, mirrored: {}, cursor: null, ownRequests: [], at: Date.now(),
           projectSwitch: id, ...(target.mapNodeId ? { mapNodeId: target.mapNodeId } : {}) };
         state.projectRoutes ||= {};
-        state.projectRoutes[digest([key, actor.userId])] = { targetKey, afterTs: input.timestamp, actionId: action.actionId };
-        state.preferences[actor.userId] = target.id;
-        state.directThreads ||= {};
-        state.directThreads[digest([this.teamId, binding.channel, actor.userId, target.id])] = targetKey;
+        state.projectRoutes[routeKey] = { targetKey, afterTs: input.timestamp, actionId: action.actionId };
+        if (direct) {
+          state.preferences[actor.userId] = target.id;
+          state.directThreads ||= {};
+          state.directThreads[digest([this.teamId, binding.channel, actor.userId, target.id])] = targetKey;
+        }
         Object.assign(state.projectSwitches[id], { status: 'applied', name: target.name, targetKey, root });
       });
       return this.store.data.projectSwitches[id];
@@ -786,7 +827,9 @@ export class SlackPlugin {
     if (existing) {
       if (!direct) {
         const project = (await this.loadProjects(event.user, id)).find(project => project.id === existing.projectId);
-        if (!project || project.private) throw Object.assign(new Error('此项目无法在该频道访问，请在私聊重新选择'), { code: 'FORBIDDEN' });
+        if (!project || project.private && !(existing.projectSwitch && existing.userId === event.user)) {
+          throw Object.assign(new Error('此项目无法在当前线程访问'), { code: 'FORBIDDEN' });
+        }
       }
       if (expectedProjectId && existing.projectId !== expectedProjectId) throw Object.assign(new Error('Thread project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
       return [key, existing];
@@ -934,9 +977,9 @@ export class SlackPlugin {
     if (text.length > 8000 && !synthetic) throw Object.assign(new Error('每批消息正文最多 8000 字符'), { code: 'RELEVANCE_INPUT_LIMIT', silent: !direct && !explicit });
     const inputIds = events.map(item => events.length === 1 ? operationId(id, 'submit') : operationId(envelopeId('events_api', { team_id: this.teamId, event: item }), 'submit'));
     const batchInputs = events.map((item, index) => ({ id: inputIds[index], text: String(item.text || '') }));
-    if (!recovery && direct && !synthetic) {
+    if (!recovery && !synthetic) {
       const currentKey = event.thread_ts ? this.routedThreadKey(event) :
-        this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])];
+        direct ? this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])] : this.routedThreadKey(event);
       const observedSwitch = this.eventStreams.get(currentKey)?.latest?.messages?.some(message =>
         message.actions?.some(action => action.kind === 'project-switch'));
       const pendingSwitch = Object.values(this.store.data.projectSwitches || {}).some(record =>
@@ -951,6 +994,10 @@ export class SlackPlugin {
       const existing = this.store.data.threads[existingKey];
       const projectId = existing?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
       if (!projectId) { if (direct || explicit) await this.chooseProject(id, event); return; }
+      // 收集后才完成的交接只重定向该原用户的新输入；不改已有业务回执。
+      const switched = existing?.projectSwitch && this.store.data.projectSwitches?.[existing.projectSwitch];
+      if (!direct && switched?.status === 'applied' && switched.action.actor.userId === event.user &&
+          expectedProjectId === switched.action.sourceProjectId) expectedProjectId = projectId;
       if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Project changed after accepting this message batch'), { code: 'CONFLICT', silent: true });
       let participation = this.store.data.inbox[id]?.participation;
       const legacy = !participation && this.store.data.inbox[id]?.relevance;
@@ -1263,13 +1310,18 @@ export class SlackPlugin {
     await this.io.uploadPrompt({ id: operationId(id, 'file-export'), channel: binding.channel, threadTs: binding.threadTs, ...prompt });
   }
   async mirror(key) {
-    const binding = this.store.data.threads[key];
+    let binding = this.store.data.threads[key];
     if (!binding) return;
     const stream = this.eventStreams.get(key);
-    const sameScope = stream && !stream.controller.signal.aborted && stream.projectId === binding.projectId && stream.conversationId === binding.conversationId;
-    const cached = sameScope ? stream.latest : null;
-    if (stream) { stream.latest = null; stream.lastFallbackAt = Date.now(); }
+    const sameScope = stream && !stream.controller.signal.aborted && stream.projectId === binding.projectId && stream.conversationId === binding.conversationId && stream.userId === binding.userId;
+    // 快照消费不能推迟独立补读；过期时即使事件不断到来也核对服务器状态。
+    const cached = sameScope && Date.now() - stream.lastFallbackAt < EVENT_RECONCILE_MS ? stream.latest : null;
+    if (sameScope) { stream.latest = null; if (!cached) stream.lastFallbackAt = Date.now(); }
     const state = cached || await this.command('conversation.state', binding, binding.userId, operationId(`${key}:${Date.now()}`, 'state'));
+    const current = this.store.data.threads[key];
+    if (!current || ['projectId', 'conversationId', 'userId', 'channel', 'threadTs'].some(field => current[field] !== binding[field])) return;
+    if (state?.conversationId !== undefined && state.conversationId !== binding.conversationId) throw Object.assign(new Error('State scope mismatch'), { code: 'GATEWAY_BAD_RESPONSE' });
+    binding = current;
     if (Number.isSafeInteger(binding.controlRevision) && binding.controlRevision > 0 &&
         (!Number.isSafeInteger(state.controlRevision) || state.controlRevision < binding.controlRevision)) return;
     if (Number.isSafeInteger(state.inputRevision) && Number.isSafeInteger(binding.inputRevision) &&
@@ -1338,7 +1390,7 @@ export class SlackPlugin {
         const switched = await this.applyProjectSwitch(key, message, messages, state);
         if (switched) {
           if (switched.announced) continue;
-          const text = switched.status === 'applied' ? `已切换到 ${switched.name}。后续消息会使用该项目的独立上下文，原项目记录保留。` :
+          const text = switched.status === 'applied' ? binding.channel.startsWith('D') ? `已切换到 ${switched.name}。` : `已绑定到 ${switched.name}，后续在本线程继续。` :
             '项目没有切换：选择已改变、目标不可用或来源无法验证。请重新说要切换到哪个项目。';
           let resultSlot = switched.resultSlot;
           if (!resultSlot) {
@@ -1512,9 +1564,11 @@ export class SlackPlugin {
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
     const ownsFeedback = state.participationRequestIds?.some(id => this.feedback.valid(this.store.data.reactionInputs?.[id]?.inboxId));
-    if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) await this.io.post({ id: operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error'), channel: binding.channel, threadTs: binding.threadTs,
-      text: state.error?.message === '自动恢复未成功，原消息与已完成操作已保留。'
-        ? state.error.message : '处理已停止，原消息与已完成操作已保留。' });
+    if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) {
+      const id = operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error');
+      await this.io.post({ id, channel: binding.channel, threadTs: binding.threadTs,
+        text: modelFailureText(state.error?.code, ownsFeedback, this.store.data.outgoing[id], state.error?.message) });
+    }
     // 模型结束不等于 Slack 送达。只用当前批次之后已发送的正式回答/卡片作证据，
     // 续写时回答仍归最初请求，不能仅匹配最后一条补充的 requestId。
     const batch = state.participationRequestIds || [], currentThread = this.store.data.threads[key];
@@ -1543,8 +1597,7 @@ export class SlackPlugin {
       catch (error) { this.logger.warn('Slack 完成状态保留', { code: error.code || 'FEEDBACK_JOURNAL_ERROR' }); }
     }
     const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer && !question.superseded);
-    await this.store.update(data => {
-      const thread = data.threads[key];
+    await this.store.updateThread(key, (thread, data) => {
       thread.status = state.status;
       if (lastRequestId) thread.lastStateRequestId = lastRequestId;
       thread.live = state.status === 'running' || !!state.activeTurnId && !['error', 'interrupted'].includes(state.status);
@@ -1570,9 +1623,9 @@ export class SlackPlugin {
       const status = item ? item.status || (watch.kind === 'bug' ? 'open' : 'pending') : 'removed';
       if (watch.status && watch.status !== status) await this.io.post({ id: operationId(`${key}:${itemId}:${project.version}:${status}`, 'item-status'), channel: thread.channel, threadTs: thread.threadTs,
         text: `${item?.title || (watch.kind === 'bug' ? '已关联 Bug' : '已关联 TODO')}：${watch.status} → ${status}` });
-      await this.store.update(data => { data.threads[key].watchedItems[itemId].status = status; });
+      await this.store.updateThread(key, next => { if (next.watchedItems?.[itemId]) next.watchedItems[itemId].status = status; });
     }
-    await this.store.update(data => { data.threads[key].nextItemPoll = Date.now() + 30000; });
+    await this.store.updateThread(key, next => { next.nextItemPoll = Date.now() + 30000; });
   }
   async unfurl(id, event) {
     const binding = this.store.data.threads[threadKey(this.teamId, event.channel, event.thread_ts || event.message_ts)];
