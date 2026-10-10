@@ -22,7 +22,7 @@ function validateScope(scope) {
       ['projectId', 'repositoryId', 'ownerId', 'worktreeId', 'actorWorktreeId', 'taskId'].some(key => !bounded(scope[key])) ||
       !validSession(scope.session) || !validSession(scope.actor) || !['plan', 'execution', 'ci'].includes(scope.phase) ||
       scope.attempt !== undefined && (scope.phase !== 'plan' || !Number.isSafeInteger(scope.attempt) || scope.attempt < 1 || scope.attempt > CURSOR_PLAN_CONTINUATIONS) ||
-      scope.createAttempt !== undefined && (scope.phase !== 'ci' || scope.createAttempt !== 1 || scope.attempt !== undefined) ||
+      scope.createAttempt !== undefined && (scope.phase !== 'ci' || ![1, 2].includes(scope.createAttempt) || scope.attempt !== undefined) ||
       !nativeId(scope.nativeAgentId) || !sha.test(scope.sourceSha || '') ||
       scope.phase === 'ci' && (scope.actor.id === scope.session.id || scope.actorWorktreeId === scope.worktreeId) ||
       scope.phase !== 'ci' && (canonical(scope.actor) !== canonical(scope.session) || scope.actorWorktreeId !== scope.worktreeId) ||

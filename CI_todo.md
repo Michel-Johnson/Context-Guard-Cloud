@@ -1,5 +1,13 @@
 # Cloud 验证台账
 
+## CURSOR-CI-SOURCE-AVAILABILITY-01 · 原准确 SHA 的厂商创建前提
+
+- 原恢复上线后实际收到 HTTP400/validation_error，无 Run；请求形状、约3KiB提示和原提交一致。Cursor 技术支持对同类拒绝说明：未在默认分支或同仓库 PR 的提交 SHA 会被拒绝，公开 schema 未列此限制。目标提交确实不在默认 main 且没有关联 PR；已正常建立同仓库草稿 PR，源码不变、不合并。此线索仍需真实原生恢复成功验证，不将推断记作已解决。
+- 仅此前 createAttempt1 的确定400/validation_error、无 Run 且准确 Agent404可再恢复一次：从 GitHub 只读核唯一开放同仓库 PR、原 sourceSha 与原生分支头，保存证明并在最后派发前重核；原 Task/审核/交接/命令/完整 CI 门禁不变。未知接收、PR缺失/漂移、外仓、撤权和 createAttempt2 再次失败拒绝自动重发；旧失败及租期保留，命名空间独立。
+- [x] 首版影响套件200/200及完整1007项中1005通过、2既有跳过，但独立审核仍发现 P1：最后 PR 读取期间原 Executor 绑定迁移，旧 CI 仍可创建 Run。正式确定性交错通过实际 Core session.bind 迁移，修前1目标失败、exit1、894.567125ms；在同一 currentTask 快照复核原 Executor 设备/Agent/代次/工作树后，该目标通过、exit0、916.841416ms。两次窄运行各51目标未选择；旧全量不覆盖新字节。
+- [x] 最终 Node18.20.8 五文件完整影响套件234/234、exit0、96510.736917ms；新字节完整 npm test exit0，1008项中1006通过、0失败、2既有跳过，255303.953625ms。独立 Node24 原正式迁移目标1/1、1742.207209ms，原私有迁移与 prepared过期/证明缺失/接收未知边界5/5、7416.8415ms，均exit0；P1关闭，未发现新增 P0/P1。厂商/Git为受控边界，不签原生业务验收；工具启动失败及旧失败保留。
+- [ ] 最终正式回归、独立审核、准确 PR/Required/Main、保留原实验包的生产组合与部署，以及原 Task 实际独立 Tester 和本地两路径验收。新路径首轮定向20/20通过、exit0、6578.71975ms，仅受控 Git/厂商依赖及真实 Core；首次失败证据保留，不冒称原生通过。
+
 ## CURSOR-CREATE-DIAGNOSTIC-01 · 原独立 CI 创建拒绝与恢复
 
 - 原不可变 TODO 兼容修复上线后，宿主读取了准确机器事实，但 Cursor 拒绝原 Tester 创建；旧记录只有 CURSOR_HTTP_ERROR，没有 HTTP 状态或安全厂商码，准确 Agent GET 为 404。此项不把 GET/me/models 成功当成任务执行通过。
