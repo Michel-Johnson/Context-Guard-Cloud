@@ -23,14 +23,26 @@ function payloadSchemas(phase) {
     evidenceRef: string(), reproductionRef: string() }, ['testId', 'todoId', 'status', 'evidenceRef']);
   check.if = { properties: { status: { const: 'failed' } }, required: ['status'] };
   check.then = { required: ['reproductionRef'] };
+  const put = object({ kind: { enum: phase === 'plan' ? ['plan'] : phase === 'ci' ? ['evidence'] : ['evidence', 'ciTodo', 'experience'] },
+    ref: { ...string(), description: 'Append a nonempty suffix to the writePrefix returned by context_guard_context.' },
+    baseVersion: { type: 'string', maxLength: 4096, description: 'Required: use the empty string "" for the first version, not null. For updates, use the last returned version; never guess it.' },
+    content: { type: 'object', additionalProperties: true, description: phase === 'plan'
+      ? 'Plan JSON object with steps, paths, validation and acceptance. Do not serialize it as a string. Writing this object does not report or approve the Plan.'
+      : 'Evidence, CI TODO or experience JSON object; never serialize it as a string.' } });
+  if (phase === 'execution') put.allOf = [{
+    if: { properties: { kind: { const: 'ciTodo' } }, required: ['kind'] },
+    then: { properties: { content: { type: 'object', required: ['items'], additionalProperties: true, properties: {
+      items: { type: 'array', minItems: 1, items: { type: 'object', required: ['id'], additionalProperties: true,
+        dependentRequired: { testId: ['argv'], argv: ['testId'] }, properties: {
+        id: { ...string(), description: 'Canonical TODO identity. When testPolicy is present, copy testPolicy.checks[].todoId exactly; number is only a display label.' },
+        testId: { ...string(), description: 'When testPolicy is present, copy the same policy check testId together with argv; never invent coverage.' },
+        argv: { type: 'array', minItems: 1, maxItems: 40, items: { type: 'string', minLength: 1, maxLength: 2000, pattern: '^[^\\u0000-\\u001f]+$' }, description: 'When testPolicy is present, copy the exact same policy check argv with testId, without changing order or arguments. This is not authorization to execute another command.' },
+      } } },
+    } } } },
+  }];
   return {
     'object.read': object({ ref: string(), version: { ...string(4096), description: 'Read the exact immutable version returned by context or object.put.' } }),
-    'object.put': object({ kind: { enum: phase === 'plan' ? ['plan'] : phase === 'ci' ? ['evidence'] : ['evidence', 'ciTodo', 'experience'] },
-      ref: { ...string(), description: 'Append a nonempty suffix to the writePrefix returned by context_guard_context.' },
-      baseVersion: { type: 'string', maxLength: 4096, description: 'Required: use the empty string "" for the first version, not null. For updates, use the last returned version; never guess it.' },
-      content: { type: 'object', additionalProperties: true, description: phase === 'plan'
-        ? 'Plan JSON object with steps, paths, validation and acceptance. Do not serialize it as a string. Writing this object does not report or approve the Plan.'
-        : 'Evidence, CI TODO or experience JSON object; never serialize it as a string.' } }),
+    'object.put': put,
     ...(phase === 'ci' ? {
       'ci.result': object({ taskId: string(), sourceSha, verdict: { enum: ['passed', 'failed', 'incomplete'] },
         checks: { type: 'array', minItems: 1, maxItems: 100, items: check } }),

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { CursorRoleFactory, cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
+import { scopedObjectKey } from '../scripts/shared/protocol-workflow.mjs';
 import { canonical } from '../scripts/shared/protocol.mjs';
 import { hash } from '../scripts/shared/io.mjs';
 
@@ -496,7 +497,7 @@ test('A definitely rejected hosted launch remains an explicit failure, not a suc
   assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
 });
 
-async function handoffFixture(t, verify, { ciPolicy, trustedChecks } = {}) {
+async function handoffFixture(t, verify, { ciPolicy, trustedChecks, ciTodoItems = [{ id: 'CI-1', title: 'Independent check' }] } = {}) {
   const inspected = [], f = await fixture(t, { ciPolicy, gitProof: { ...(trustedChecks ? { trustedChecks } : {}), verify: async input => {
     inspected.push(input);
     return verify ? verify(input, f) : { repository: 'example/repo', branch: 'cursor/task', baseSha: sourceSha, sourceSha: handoffSha, files: ['src/fixture.mjs'] };
@@ -506,7 +507,7 @@ async function handoffFixture(t, verify, { ciPolicy, trustedChecks } = {}) {
   const invocation = await f.factory.pump(reserved.session, 'task'), prefix = f.factory.channel.prefix(invocation.scope);
   const put = async (name, kind, content) => (await f.factory.channel.exchange(invocation.token, { id: 'handoff-' + name,
     type: 'object.put', payload: { kind, ref: prefix + name, baseVersion: '', content } })).data;
-  const todo = await put('todo', 'ciTodo', { items: [{ id: 'CI-1', title: 'Independent check' }] });
+  const todo = await put('todo', 'ciTodo', { items: ciTodoItems });
   const evidence = await put('unit', 'evidence', { observation: 'Executor module tests, not independent CI' });
   const input = { id: 'original-handoff', type: 'task.report', payload: { taskId: 'task', stage: 'handoff',
     data: { sourceSha: handoffSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref], experienceRefs: [] } } };
@@ -540,10 +541,10 @@ test('Original Cursor handoff is deferred, verified and applied through the same
 
 const ciPolicy = { checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv: ['node', '--test', '--test-reporter=tap', 'tests/fixture.mjs'],
   name: 'Formal tests', appId: 15368, workflowPath: '.github/workflows/ci.yml', workflowBlobSha: 'd'.repeat(40), testStep: 'Run formal tests' }] };
-async function ciFixture(t, { nativeFailed = false, machineFailed = false, unavailable = false } = {}) {
+async function ciFixture(t, { nativeFailed = false, machineFailed = false, aggregateFailed = false, unavailable = false, ciTodoItems } = {}) {
   const machine = [{ name: 'Formal tests', sourceSha: handoffSha, conclusion: machineFailed ? 'failure' : 'success',
-    runConclusion: machineFailed ? 'failure' : 'success', testConclusion: machineFailed ? 'failure' : 'success' }], workflowCalls = [];
-  const f = await handoffFixture(t, null, { ciPolicy, trustedChecks: async input => {
+    runConclusion: machineFailed || aggregateFailed ? 'failure' : 'success', testConclusion: machineFailed ? 'failure' : 'success' }], workflowCalls = [];
+  const f = await handoffFixture(t, null, { ciPolicy, ciTodoItems, trustedChecks: async input => {
     workflowCalls.push(input);
     if (unavailable) throw Object.assign(new Error('Synthetic workflow pending'), { code: 'SOURCE_UNVERIFIED' });
     return machine;
@@ -577,6 +578,41 @@ async function ciProposal(f, { verdict = 'passed', status = 'passed', reproducti
     checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', status, evidenceRef: evidence.ref, ...(reproductionRef ? { reproductionRef } : {}) }] } };
   return { invocation, context, input, evidence };
 }
+test('Mapped original CI TODO aliases launch and return through real Core without replacing handoff versions', async t => {
+  for (const identity of [{ todoId: 'CI-1' }, { id: 'CI-1' }, { id: 'CI-1', todoId: 'CI-1' }]) await t.test(JSON.stringify(identity), async child => {
+    const item = { ...identity, testId: ciPolicy.checks[0].testId, argv: ciPolicy.checks[0].argv, number: 1 };
+    const f = await ciFixture(child, { ciTodoItems: [item] }), before = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+    assert.match(f.factory.prompt(f.invocation.scope, {}), /write CI TODO items as \{id: check.todoId, testId: check.testId, argv: check.argv\}/);
+    assert.match(f.factory.prompt(f.invocation.scope, {}), /number is only a display label, never identity/);
+    const p = await ciProposal(f);
+    assert.equal(f.calls.length, 3); assert.equal(f.workflowCalls.length, 1);
+    await f.factory.channel.exchange(p.invocation.token, p.input); await f.factory.pump(f.reserved.session, 'task');
+    const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+    assert.equal(task.stage, 'awaiting-merge'); assert.equal(task.ci.verdict, 'passed'); assert.equal(task.acceptanceReview, undefined);
+    assert.deepEqual(task.references, before.references); assert.deepEqual(task.planReview, before.planReview);
+    assert.equal(task.sourceSha, handoffSha); assert.notEqual(task.ciTodoResult.version, f.todo.version);
+    const state = await f.store.transaction(value => value, { readOnly: true });
+    const todo = state.objects[scopedObjectKey(f.human, f.reserved.session, f.todo.ref)];
+    assert.deepEqual(todo.versions[f.todo.version].content.items, [item]);
+    assert.deepEqual(todo.versions[task.ciTodoResult.version].content.items, [{ ...item, status: 'done', testIds: [ciPolicy.checks[0].testId] }]);
+    await f.factory.pump(f.reserved.session, 'task'); assert.equal(f.calls.length, 3); assert.equal(f.workflowCalls.length, 2);
+  });
+});
+test('Conflicting or incomplete TODO mappings fail before workflow reads or another paid native Run', async t => {
+  const item = { todoId: 'CI-1', testId: ciPolicy.checks[0].testId, argv: ciPolicy.checks[0].argv };
+  const cases = [[{ ...item, id: 'different' }], [{ ...item, id: '' }], [{ todoId: 'CI-1' }],
+    [{ ...item, testId: 'wrong' }], [{ ...item, argv: ['node', '--test', 'tests/another.mjs'] }],
+    [{ ...item }, { id: 'CI-1' }], [{ id: 'CI-1', testId: 'wrong', argv: item.argv }],
+    [{ id: 'CI-1', testId: item.testId }]];
+  for (const [index, ciTodoItems] of cases.entries()) await t.test(String(index), async child => {
+    const f = await ciFixture(child, { ciTodoItems }), before = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'SOURCE_UNVERIFIED' });
+    assert.equal(f.calls.length, 2); assert.equal(f.workflowCalls.length, 0);
+    assert.deepEqual(await f.store.taskRecord(f.human, f.reserved.session, 'task'), before);
+    const tester = JSON.parse(await fs.readFile(f.file, 'utf8'));
+    assert.equal(tester.state, 'reserved'); assert.equal(tester.invocations.length, 0);
+  });
+});
 test('Independent Cursor CI original proposal reaches the original task only with native observation AND declared exact-source workflow facts', async t => {
   const f = await ciFixture(t), p = await ciProposal(f);
   assert.notEqual(p.invocation.scope.nativeAgentId, f.invocation.scope.nativeAgentId);
@@ -617,6 +653,23 @@ test('A truthful failed independent CI preserves owned reproduction evidence and
   await f.factory.channel.exchange(p.invocation.token, p.input); await f.factory.pump(f.reserved.session, 'task');
   const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
   assert.equal(task.stage, 'ci-failed'); assert.equal(task.ci.verdict, 'failed'); assert.equal(f.calls.length, 3);
+});
+test('Mapped alias CI honestly returns aggregate workflow failure even when its exact job and native command pass', async t => {
+  const item = { todoId: 'CI-1', testId: ciPolicy.checks[0].testId, argv: ciPolicy.checks[0].argv };
+  const f = await ciFixture(t, { aggregateFailed: true, ciTodoItems: [item] });
+  const p = await ciProposal(f, { verdict: 'failed', status: 'failed', reproduction: true });
+  assert.equal(p.context.testPolicy.checks[0].machineStatus, 'failed');
+  assert.equal(f.machine[0].conclusion, 'success'); assert.equal(f.machine[0].testConclusion, 'success');
+  await f.factory.channel.exchange(p.invocation.token, p.input); await f.factory.pump(f.reserved.session, 'task');
+  const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  assert.equal(task.stage, 'ci-failed'); assert.equal(task.ci.verdict, 'failed'); assert.equal(task.review, undefined);
+  assert.equal(task.acceptanceReview, undefined); assert.equal(f.calls.length, 3);
+  const state = await f.store.transaction(value => value, { readOnly: true });
+  const todo = state.objects[scopedObjectKey(f.human, f.reserved.session, f.todo.ref)];
+  assert.deepEqual(todo.versions[f.todo.version].content.items, [item]);
+  assert.deepEqual(todo.versions[task.ciTodoResult.version].content.items, [{ ...item, status: 'pending', testIds: [item.testId] }]);
+  const ci = state.objects[scopedObjectKey(f.human, f.reserved.session, task.ci.ref)].versions[task.ci.version];
+  assert.equal(ci.content.checks[0].reproductionRef, p.input.payload.checks[0].reproductionRef);
 });
 test('Pending workflow facts do not launch CI, and a policy change cannot reauthorize an existing role', async t => {
   const f = await ciFixture(t, { unavailable: true });
