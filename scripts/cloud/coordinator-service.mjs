@@ -6,6 +6,7 @@ import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage }
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
 import { outputProtocolRecord, nativeOutputEnabled } from './coordinator-output.mjs';
+import { coordinatorPresentationKey } from '../shared/coordinator-reply.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -135,6 +136,7 @@ export function publicMessages(state) {
     if (!partials.has(index)) partials.set(index, []);
     partials.get(index).push({ id: output.id, requestId: output.turnId, role: 'assistant', text: output.text, partial: true, tools: [] });
   }
+  const bindingReceipts = new Set();
   const raw = state.messages.map((message, index) => {
     // While a tool is executing, its assistant block is still the live stream.
     // Exposing it now creates a duplicate row that is later replaced by a card.
@@ -158,7 +160,14 @@ export function publicMessages(state) {
       ...(questions.length ? { questions } : {}),
       ...(actions.length ? { actions } : {}),
       tools: blocks.filter(block => block.type === 'tool_use' && !(message.output?.protocol === 'native-json-v1' && block.name === 'respond')).map(block => ({ id: block.id, name: block.name })) };
-  }).flatMap((message, index) => [message, ...(partials.get(index) || [])])
+  }).flatMap((message, index) => {
+    const receipt = state.messages[index]?.serverContext?.bindingReceipt;
+    const displayReceipt = message?.role === 'user' && receipt && !bindingReceipts.has(receipt.id);
+    if (displayReceipt) bindingReceipts.add(receipt.id);
+    return [message, ...(displayReceipt ? [{ id: receipt.id, role: 'assistant',
+      text: receipt.text, requestId: message.requestId, source: message.source,
+      ...(message.actor ? { actor: message.actor } : {}), tools: [], bindingReceipt: true }] : []), ...(partials.get(index) || [])];
+  })
     .filter(message => message && (message.text || message.tools.length || message.attachments?.length));
   const visible = []; let carriedActions = [];
   for (let index = 0; index < raw.length; index++) {
@@ -172,7 +181,17 @@ export function publicMessages(state) {
     } else if (message.role === 'user') carriedActions = [];
     visible.push(message);
   }
-  return visible;
+  const presentations = new Map();
+  return visible.map(message => {
+    if (message.role !== 'assistant' || !message.actions?.length || !message.requestId) return message;
+    const seen = presentations.get(message.requestId) || new Set(); presentations.set(message.requestId, seen);
+    return { ...message, actions: message.actions.filter(action => {
+      const key = coordinatorPresentationKey(action);
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    }) };
+  });
 }
 
 // Conversation identity belongs to a Map item, not to its execution Session.

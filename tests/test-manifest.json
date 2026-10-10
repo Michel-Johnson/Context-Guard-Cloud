@@ -66,6 +66,7 @@
     "tests/merged-participation-independent.test.mjs",
     "tests/coordinator-native-output.test.mjs",
     "tests/coordinator-length-correction.test.mjs",
+    "tests/coordinator-five-cases.test.mjs",
     "tests/slack-merged-participation.test.mjs",
     "tests/map-translations.test.mjs",
     "tests/map-relations-independent.test.mjs",
