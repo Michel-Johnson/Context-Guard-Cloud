@@ -567,6 +567,27 @@ export async function startCloudServer({
       ...(isMapProject(project) ? { mapOnly: true } : {}),
       readMain: async () => { const { main } = await readMemoryProject(configuredMemory, project.id); return { version: main?.version, document: main?.memory?.map }; },
       readBinding: conversationId => conversationsFor(project).get(conversationId),
+      canReuseCancelledExecution: async (item, routing) => {
+        const dispatch = item.dispatch;
+        if (!dispatch?.task_id || !dispatch.session_id || dispatch.status !== 'cancelled') return false;
+        try {
+          const { store, principal } = interfaceProject(project);
+          const binding = await store.registeredBinding(principal, dispatch.session_id);
+          if (!binding) return false;
+          const task = await store.taskRecord(principal, { id: dispatch.session_id, generation: binding.generation }, dispatch.task_id);
+          if (task.busy !== false || !['cancelled', 'closed'].includes(task.stage)) return false;
+          if (task.stage === 'cancelled' && task.control?.action !== 'cancel') return false;
+          if (task.stage === 'closed' && !task.completion) return false;
+          return !(await store.projectTaskStatuses(principal)).some(value => value.itemId === item.id &&
+            value.nodeId === routing.nodeId && value.kind === routing.kind &&
+            !(value.taskId === dispatch.task_id && value.sessionId === dispatch.session_id) &&
+            // 其他取消任务可能仍占执行槽；没有释放证据时保守拦截。
+            !['closed', 'completed', 'brief-rejected'].includes(value.state));
+        } catch (error) {
+          if (['NOT_FOUND', 'UNAVAILABLE'].includes(error.code)) return false;
+          throw error;
+        }
+      },
       readCommitReceipt: (input, actor) => mapProjectRefs.has(project.id)
         ? readOverviewReceipt(input, actor, mapProjectRefs.get(project.id))
         : readMainMemoryReceipt(configuredMemory, project.id, input, actor),
@@ -1079,16 +1100,23 @@ export async function startCloudServer({
               }
               const actor = [...state.messages].reverse().find(message => message.role === 'user' && message.actor)?.actor
                 || { kind: 'human', sessionId: 'cloud-workbench' };
-              const focused = !input.itemId && conversation.itemId && ['todo', 'bug'].includes(conversation.kind);
-              if (focused && (input.nodeId !== undefined || input.kind !== undefined)) {
+              // authorizeTool 已刷新当前焦点。先保留原有参数错误分类；
+              // 锁内仍复查焦点及审批，不让本次只读检查授予写入权限。
+              if (!input.itemId && conversation.itemId && ['todo', 'bug'].includes(conversation.kind) &&
+                  (input.nodeId !== undefined || input.kind !== undefined)) {
                 protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
-              }
-              const requirements = focused ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind } : input;
-              if (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId) {
-                protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
               }
               return bindingsFor(project).withStableFocus(conversationId, live => {
                 if (live.executionMode !== 'manual') protocolFail('CONFLICT', 'Conversation execution mode changed');
+                const focused = !input.itemId && live.itemId && ['todo', 'bug'].includes(live.kind);
+                if (focused && (input.nodeId !== undefined || input.kind !== undefined)) {
+                  protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
+                }
+                if (!live.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== live.nodeId) {
+                  protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
+                }
+                const requirements = focused ? { ...input, itemId: live.itemId, nodeId: live.nodeId, kind: live.kind }
+                  : !input.itemId && input.kind === undefined && ['todo', 'bug'].includes(live.kind) ? { ...input, kind: live.kind } : input;
                 return manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor });
               });
             }
@@ -1231,7 +1259,10 @@ export async function startCloudServer({
           const snapshot = (await readMemoryProject(configuredMemory, project.id)).main;
           const context = buildCoordinatorContext(snapshot, { conversation: await conversations.get(conversationId), nodeIds: config.nodeIds || null });
           const pending = (await bindingsFor(project).approvals(conversationId)).find(item => item.pending);
-          return { ...context, bindingRef: pending ? { id: pending.id, version: pending.version } : null };
+          const confirmed = (await bindingsFor(project).notifications(conversationId)).at(-1);
+          return { ...context, bindingRef: pending ? { id: pending.id, version: pending.version } : null,
+            ...(confirmed ? { bindingReceipt: { id: 'binding-notice:' + confirmed.proposalId + ':' + confirmed.decision,
+              text: confirmed.decision === 'approved' ? '绑定已保存，可以继续讨论。' : '暂不绑定，继续讨论。' } } : {}) };
         };
         await assertCurrentMode();
         const service = ownedService = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
@@ -1258,8 +1289,10 @@ export async function startCloudServer({
               if (!result) return context;
               const refreshed = await loadContext();
               return { ...refreshed, internalIds: [...(refreshed.internalIds || []), result.proposalId, result.conversationId],
+                bindingReceipt: { id: 'binding-notice:' + result.proposalId + ':' + result.decision,
+                  text: result.decision === 'approved' ? '绑定已保存，可以继续讨论。' : '暂不绑定，继续讨论。' },
                 dynamicText: refreshed.dynamicText + '\n[服务器已保存本条人类确认；不是新的开发审批]\n' + JSON.stringify(result) +
-                  '\n绑定已生效，不能重复提出同一候选要求再次确认；依据此回执简短报告结果。' };
+                  '\n绑定确认回执由宿主直接展示，不复述、不重复要求确认。依据真实结果继续处理本次请求；遇到业务限制说明原因，不伪报完成。' };
             } catch (error) {
               if (!(error instanceof MapError)) throw error;
               return { ...context, dynamicText: context.dynamicText + '\n绑定未生效：' + error.message };
@@ -1351,7 +1384,7 @@ export async function startCloudServer({
     for (const result of await bindingsFor(project).notifications(conversationId)) {
       const id = 'binding-notice:' + result.proposalId + ':' + result.decision;
       const state = await service.state();
-      if (state.acceptedRequestIds?.includes(id) || result.humanInputId && state.acceptedRequestIds?.includes(result.humanInputId)) {
+      if (state.messages.some(message => message.id === id && message.bindingReceipt)) {
         await bindingsFor(project).acknowledge(result.proposalId, conversationId); continue;
       }
       if (state.activeTurnId || state.status === 'running') return { pending: true };

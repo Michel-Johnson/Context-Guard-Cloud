@@ -1974,6 +1974,13 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 正式原插件回归：默认不发；指定频道幂等；旧频道卡片保留且不更新；范围外旧按钮在网关调用前拒绝。旧逻辑三项实际 0/3，正确断言复现；修后 3/3，最终四项 4/4，Slack 全量 322/322。首次 Cloud 全量原 HTTP 卡片夹具因未显式测试频道失败，保留原日志；随后按新契约显式配置 CTEST，并修正独立 Review 指出的只读调用 Oracle，须对新字节补验。
 - [ ] 最终单测、独立 Review、Required CI、合并与准确部署；部署仅配置指定测试频道，不扩大项目/用户授权。完整真实 Cursor 三路径业务闭环仍未验收。
 
+## COORDINATOR-FIVE-CASE-01 · 五项反馈统一回归（2026-10-11）
+
+- [x] 正式回归覆盖：取消派发的权威槽释放证据、业务拒绝后继续聊天及绑定回执、卡片内部标识和段落长度、同轮重复展示与重复问句；包含实际 HTTP、鉴权和 ProtocolStore，模型使用受控替身，不冒充真实对话验收。
+- [x] 节点去重只合并展示，不缓存读取：正式反例复现节点更新后仍展示旧资料；修后重新授权读取并展示新名称，保留工具回执和写入幂等。
+- [ ] 最终合并修订的真实模型 Map 与生产 Chrome Slack 联合验收、原生按钮和完成表情状态复验；保留首次失败、自动恢复及最终结果。源码测试和隔离 HTTP 不代替上线后的原生入口。
+- [ ] 本机 Skill 安装后入口及 Cloud 固定 core 2.4.2 / UI 1.5.2 的版本一致性验收。JSON 格式实验单独保留，不能以其结果宣称正式 main 已采用 JSON。
+
 ## CURSOR-MCP-CONTRACT-01 · 原任务 Plan 的可发现接口契约
 
 - 根因：真实 Cursor 已初始化 MCP、读取原任务及 brief，但发现工具只描述笼统 `payload`。Plan 写入遗漏必填 `baseVersion`、报告未使用 `taskId/stage/data`，格式错误又只返回笼统拒绝；厂商 Run 结束没有产生原任务的 Plan 回执，不视为完成。

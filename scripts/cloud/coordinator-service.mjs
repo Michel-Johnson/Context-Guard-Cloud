@@ -5,6 +5,7 @@ import { coordinatorModelMessages, coordinatorStep, correctableToolError, settle
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
+import { coordinatorPresentationKey } from '../shared/coordinator-reply.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -134,6 +135,7 @@ export function publicMessages(state) {
     if (!partials.has(index)) partials.set(index, []);
     partials.get(index).push({ id: output.id, requestId: output.turnId, role: 'assistant', text: output.text, partial: true, tools: [] });
   }
+  const bindingReceipts = new Set();
   const raw = state.messages.map((message, index) => {
     // While a tool is executing, its assistant block is still the live stream.
     // Exposing it now creates a duplicate row that is later replaced by a card.
@@ -156,7 +158,14 @@ export function publicMessages(state) {
       ...(questions.length ? { questions } : {}),
       ...(actions.length ? { actions } : {}),
       tools: blocks.filter(block => block.type === 'tool_use').map(block => ({ id: block.id, name: block.name })) };
-  }).flatMap((message, index) => [message, ...(partials.get(index) || [])])
+  }).flatMap((message, index) => {
+    const receipt = state.messages[index]?.serverContext?.bindingReceipt;
+    const displayReceipt = message?.role === 'user' && receipt && !bindingReceipts.has(receipt.id);
+    if (displayReceipt) bindingReceipts.add(receipt.id);
+    return [message, ...(displayReceipt ? [{ id: receipt.id, role: 'assistant',
+      text: receipt.text, requestId: message.requestId, source: message.source,
+      ...(message.actor ? { actor: message.actor } : {}), tools: [], bindingReceipt: true }] : []), ...(partials.get(index) || [])];
+  })
     .filter(message => message && (message.text || message.tools.length || message.attachments?.length));
   const visible = []; let carriedActions = [];
   for (let index = 0; index < raw.length; index++) {
@@ -170,7 +179,17 @@ export function publicMessages(state) {
     } else if (message.role === 'user') carriedActions = [];
     visible.push(message);
   }
-  return visible;
+  const presentations = new Map();
+  return visible.map(message => {
+    if (message.role !== 'assistant' || !message.actions?.length || !message.requestId) return message;
+    const seen = presentations.get(message.requestId) || new Set(); presentations.set(message.requestId, seen);
+    return { ...message, actions: message.actions.filter(action => {
+      const key = coordinatorPresentationKey(action);
+      if (!key) return true;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    }) };
+  });
 }
 
 // Conversation identity belongs to a Map item, not to its execution Session.
@@ -702,7 +721,7 @@ export class CoordinatorService {
         if (this.running && state.requests[id] === fingerprint && !retry) return;
         if (this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
         if (state.activeTurnId && state.activeTurnId !== id) {
-          if (!isHumanSource(source) || state.status !== 'error' || !(settleRejectedTools(state) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          if (!isHumanSource(source) || state.status !== 'error' || !(settleRejectedTools(state, this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
           state.activeTurnId = null;
         }
         if (state.requests[id]) {
@@ -827,7 +846,7 @@ export class CoordinatorService {
         if (!steering && this.running && state.status === 'waiting-for-user' && !state.activeTurnId) { finishingRunner = this.running; return; }
         if (!steering && this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
         if (!steering && state.activeTurnId) {
-          if (state.status !== 'error' || !(settleRejectedTools(state) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          if (state.status !== 'error' || !(settleRejectedTools(state, this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
           state.activeTurnId = null;
         }
         const pending = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0));

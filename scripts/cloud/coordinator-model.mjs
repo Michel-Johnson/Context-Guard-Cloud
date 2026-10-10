@@ -1,6 +1,6 @@
 import { hash } from '../shared/io.mjs';
 import { canonical } from '../shared/protocol.mjs';
-import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
+import { coordinatorTurnReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { canUseSlackProjectTool } from './coordinator-tools.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
@@ -62,7 +62,7 @@ function safeModelDiagnostic(value) {
       ...safeTermination(ownValue(value, 'termination')) };
   } catch { return null; }
 }
-export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'APPROVAL_REQUIRED', 'CONFLICT', 'VERSION_CONFLICT'].includes(code);
+export const correctableToolError = code => ['INVALID_ARGUMENT', 'INVALID_INPUT', 'NOT_FOUND', 'FORBIDDEN', 'TOOL_FORBIDDEN', 'APPROVAL_REQUIRED', 'CONFLICT', 'VERSION_CONFLICT', 'ACTIVE_EXECUTION', 'EXECUTION_NOT_RELEASED'].includes(code);
 export function coordinatorInputTokens(usage) {
   const input = usage?.input_tokens;
   if (Number.isSafeInteger(input) && input >= 0) {
@@ -287,12 +287,12 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
 
 // A human can correct a definitively rejected call. Successful preceding tools
 // retain their receipts; unexecuted following tools are not silently invoked.
-export function settleRejectedTools(state) {
+export function settleRejectedTools(state, turnId = state.activeTurnId) {
   if (state.error?.code === 'STEP_LIMIT' && !state.pending) return true;
   if (!correctableToolError(state.error?.code) || state.pending?.stop !== 'tool_use') return false;
   let first = true;
   const responses = state.pending.content.filter(block => block.type === 'tool_use').map(call => {
-    const id = `coordinator:${hash(`${state.activeTurnId}:${call.id}`)}`;
+    const id = `coordinator:${hash(`${turnId}:${call.id}`)}`;
     const fingerprint = hash(JSON.stringify({ name: call.name, input: call.input }));
     let receipt = state.toolReceipts[id];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Tool receipt differs');
@@ -557,7 +557,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         const calls = next.content.filter(block => block.type === 'tool_use');
         const repairTools = [...new Set(calls.map(call => businessToolName(call.name)).filter(name => ['mount_conversation', 'prepare_task', 'ask_user'].includes(name)))];
         const questions = calls.filter(call => businessToolName(call.name) === 'ask_user');
-        if (questions.length > 1) throw invalidReply('MULTIPLE_QUESTIONS', '', repairTools);
+        if (questions.length > 1) throw invalidReply('MULTIPLE_QUESTIONS', '', repairTools.filter(name => name !== 'ask_user'));
         const internalIds = new Set(state.activeContext?.internalIds || []);
         for (const receipt of Object.values(state.toolReceipts)) {
           const visit = value => {
@@ -572,12 +572,17 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         }
         const options = { ...profile, internalIds: [...internalIds] };
         const text = next.content.filter(block => block.type === 'text').map(block => block.text).join('');
-        const displayed = [text, ...questions.flatMap(call => [call.input?.question || '',
-          ...(Array.isArray(call.input?.options) ? call.input.options : [])]),
-          ...calls.filter(call => businessToolName(call.name) === 'mount_conversation').flatMap(call => [call.input?.title || '', call.input?.description || ''])];
-        const rejected = displayed.map((value, index) => ({ value, issue: coordinatorReplyIssue(value,
-          index === 0 ? options : { ...options, technical: false, detailed: false }) })).find(item => item.issue);
-        if (rejected) throw invalidReply(rejected.issue, rejected.value, repairTools.length ? repairTools : state.modelRepairTools);
+        const activeIds = new Set(state.activeRequestIds || [state.activeInput?.id]);
+        const previousTexts = state.messages.filter(message => message.role === 'assistant' && !message.superseded && activeIds.has(message.requestId))
+          .flatMap(message => message.content || []).filter(block => block.type === 'text')
+          .map(block => block.text || '');
+        const rejected = coordinatorTurnReplyIssue(text, calls.map(call => ({ ...call, name: businessToolName(call.name) })), { ...options, previousTexts });
+        if (rejected) {
+          const required = repairTools.length ? repairTools : state.modelRepairTools || [];
+          // 重复问题可直接省略；审批工具仍须恢复，不能用文字冒充审批卡。
+          throw invalidReply(rejected.issue, rejected.text,
+            rejected.issue === 'MULTIPLE_QUESTIONS' ? required.filter(name => name !== 'ask_user') : required);
+        }
         if (state.modelRepairTools?.some(name => !calls.some(call => businessToolName(call.name) === name))) {
           throw invalidReply('RECOVERY_TOOL_OMITTED', text, state.modelRepairTools);
         }
@@ -661,10 +666,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
-    // 回复纠正可能让模型换一个原生调用ID。只在本轮自动恢复时复用相同
-    // 写入的已知成功回执，读取仍取当前状态；不重放未知或失败写入。
+    // 回复纠正可换调用ID，已完成写入复用本轮成功回执。
+    // 新读取重新授权取当前状态；节点卡片仅在展示层去重。
     if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
-      'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu'].includes(name)) {
+      'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu', 'show_nodes'].includes(name)) {
       const businessFingerprint = hash(canonical({ name, input: call.input }));
       const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
         item.businessFingerprint === businessFingerprint);
@@ -700,7 +705,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         catch (error) {
           errorCode = error.code || 'TOOL_FAILED';
           if (!correctableToolError(error.code)) throw error;
-          receipt = { fingerprint, ...failedTool(error.code, error.toolHint) };
+          receipt = { fingerprint, ...failedTool(error.code, error.toolHint ||
+            (error.code === 'ACTIVE_EXECUTION' ? '该事项仍有执行任务，不能转入人工执行。保留已完成操作，说明限制并继续讨论，不重复准备 brief。'
+              : error.code === 'EXECUTION_NOT_RELEASED' ? '旧派发已取消，但尚不能确认执行任务已释放。保留已完成操作，说明限制并继续讨论，不重复准备 brief。' : undefined)) };
         } finally {
           if (state.performance) state.performance.tools = [...state.performance.tools,
             { name, durationMs: Date.now() - started, ...(errorCode ? { errorCode } : {}) }].slice(-120);
