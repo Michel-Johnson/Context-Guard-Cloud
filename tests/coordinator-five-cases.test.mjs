@@ -6,12 +6,27 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { startCloudServer } from '../scripts/cloud/server.mjs';
+import { settleRejectedTools } from '../scripts/cloud/coordinator-model.mjs';
+import { hash } from '../scripts/shared/io.mjs';
 import { CoordinatorService, publicMessages } from '../scripts/cloud/coordinator-service.mjs';
 import { coordinatorInputContext } from '../scripts/cloud/coordinator-prefix.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
 
 const call = (name, input, id = 'call') => ({ stop: 'tool_use', content: [{ type: 'tool_use', name, input, id }] });
 const reply = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
+test('旧失败轮次恢复沿用带对话命名空间的成功回执，不把已完成操作标成失败', () => {
+  const completed = { type: 'tool_use', id: 'saved', name: 'edit_map', input: { mainVersion: 'v1', actions: [] } };
+  const rejected = { type: 'tool_use', id: 'rejected', name: 'prepare_task', input: {} };
+  const turnId = 'chat:original';
+  const operationId = 'coordinator:' + hash(turnId + ':' + completed.id);
+  const receipt = { fingerprint: hash(JSON.stringify({ name: completed.name, input: completed.input })), result: { kind: 'map-action', saved: true } };
+  const state = { activeTurnId: 'original', error: { code: 'ACTIVE_EXECUTION' }, pending: { stop: 'tool_use', content: [completed, rejected] },
+    messages: [], toolReceipts: { [operationId]: receipt } };
+  assert.equal(settleRejectedTools(state, turnId), true);
+  assert.deepEqual(state.messages[0].content[0], { type: 'tool_result', tool_use_id: 'saved', content: JSON.stringify(receipt.result) });
+  assert.equal(JSON.parse(state.messages[0].content[1].content).error.code, 'ACTIVE_EXECUTION');
+  assert.deepEqual(state.toolReceipts[operationId], receipt);
+});
 async function fixture(t, model, execute, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-five-cases-'));
   const service = new CoordinatorService({ directory, system: '合成测试', model: { next: model }, execute,

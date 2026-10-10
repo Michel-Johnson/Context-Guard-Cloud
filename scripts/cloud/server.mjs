@@ -581,7 +581,8 @@ export async function startCloudServer({
           return !(await store.projectTaskStatuses(principal)).some(value => value.itemId === item.id &&
             value.nodeId === routing.nodeId && value.kind === routing.kind &&
             !(value.taskId === dispatch.task_id && value.sessionId === dispatch.session_id) &&
-            !['closed', 'cancelled', 'completed', 'brief-rejected'].includes(value.state));
+            // 其他取消任务可能仍占执行槽；没有释放证据时保守拦截。
+            !['closed', 'completed', 'brief-rejected'].includes(value.state));
         } catch (error) {
           if (['NOT_FOUND', 'UNAVAILABLE'].includes(error.code)) return false;
           throw error;

@@ -721,7 +721,7 @@ export class CoordinatorService {
         if (this.running && state.requests[id] === fingerprint && !retry) return;
         if (this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
         if (state.activeTurnId && state.activeTurnId !== id) {
-          if (!isHumanSource(source) || state.status !== 'error' || !(settleRejectedTools(state) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          if (!isHumanSource(source) || state.status !== 'error' || !(settleRejectedTools(state, this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
           state.activeTurnId = null;
         }
         if (state.requests[id]) {
@@ -846,7 +846,7 @@ export class CoordinatorService {
         if (!steering && this.running && state.status === 'waiting-for-user' && !state.activeTurnId) { finishingRunner = this.running; return; }
         if (!steering && this.running) throw error('COORDINATOR_BUSY', 'Coordinator is processing the previous turn');
         if (!steering && state.activeTurnId) {
-          if (state.status !== 'error' || !(settleRejectedTools(state) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
+          if (state.status !== 'error' || !(settleRejectedTools(state, this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId) || settleFailedSlackGeneration(state, journal))) throw error('COORDINATOR_BUSY', 'Preserve the original turn until its outcome is known');
           state.activeTurnId = null;
         }
         const pending = Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0));

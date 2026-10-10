@@ -287,12 +287,12 @@ async function readEventStream(response, onText, onToolStart, deadlineAt, abort)
 
 // A human can correct a definitively rejected call. Successful preceding tools
 // retain their receipts; unexecuted following tools are not silently invoked.
-export function settleRejectedTools(state) {
+export function settleRejectedTools(state, turnId = state.activeTurnId) {
   if (state.error?.code === 'STEP_LIMIT' && !state.pending) return true;
   if (!correctableToolError(state.error?.code) || state.pending?.stop !== 'tool_use') return false;
   let first = true;
   const responses = state.pending.content.filter(block => block.type === 'tool_use').map(call => {
-    const id = `coordinator:${hash(`${state.activeTurnId}:${call.id}`)}`;
+    const id = `coordinator:${hash(`${turnId}:${call.id}`)}`;
     const fingerprint = hash(JSON.stringify({ name: call.name, input: call.input }));
     let receipt = state.toolReceipts[id];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Tool receipt differs');
