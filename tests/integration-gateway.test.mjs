@@ -20,6 +20,24 @@ const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
 
+test('私有 Cursor 授权保留 Map 用户范围，不要求向整个 workspace 开放项目', () => {
+  const privateProject = 'private-cursor-repository';
+  const grant = { templateSessionId: 'cursor-template', userIds: [userId] };
+  const scoped = { ...config, mapProjects: { coordinatorProjectId: projectId, userIds: [userId] },
+    cursorExecution: { [privateProject]: grant } };
+  const verified = validateIntegrationConfig(scoped);
+  assert.deepEqual(verified.projectIds, [projectId]);
+  assert.deepEqual(verified.cursorExecution[privateProject], grant);
+  for (const changed of [
+    { ...scoped, mapProjects: undefined },
+    { ...scoped, cursorExecution: { [privateProject]: { ...grant, userIds: ['UOTHER'] } } },
+    { ...scoped, cursorExecution: { [privateProject]: { ...grant, userIds: [userId, 'UOTHER'] } } },
+    { ...scoped, cursorExecution: { '../invalid': grant } },
+  ]) assert.throws(() => validateIntegrationConfig(changed), { code: 'INVALID_INTEGRATION_CONFIG' });
+  assert.deepEqual(validateIntegrationConfig({ ...config, cursorExecution: { [projectId]: grant } }).cursorExecution[projectId], grant,
+    '原全局项目显式授权不依赖 Map 用户配置');
+});
+
 test('Map 自动接入默认关闭，配置必须指定真实用户且缺少实时授权检查时拒绝启动', async () => {
   assert.equal(validateIntegrationConfig(config).mapProjects, undefined);
   for (const mapProjects of [null, {}, { coordinatorProjectId: projectId, userIds: [] },

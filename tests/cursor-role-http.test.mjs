@@ -24,7 +24,7 @@ const ciPolicy = { checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', argv:
 
 // Real loopback HTTP, Coordinator tools, scheduler, ProtocolStore and MCP.
 // Both vendor models are controlled dependencies: this is not native acceptance.
-async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false, trustedCi = false, slack = false, cursorExecution = true, enableAction = true, holdModel = false, manualItem = false } = {}) {
+async function fixture(t, { enabled = true, mismatchedRepository = false, mixed = false, trustedCi = false, slack = false, cursorExecution = true, enableAction = true, holdModel = false, manualItem = false, privateProject = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-role-http-'));
   let cloud;
   let releaseModel; const heldModel = new Promise(resolve => { releaseModel = resolve; });
@@ -78,7 +78,9 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       } })), { event: 'result', data: { runId, status: 'FINISHED' } }] };
     },
   };
-  const integrationConfig = slack ? { host: '127.0.0.1', port: 0, token: 'synthetic-slack-integration-credential', teamId: 'TTEST', projectIds: ['context-guard'],
+  const integrationConfig = slack ? { host: '127.0.0.1', port: 0, token: 'synthetic-slack-integration-credential', teamId: 'TTEST',
+    projectIds: privateProject ? ['public-fixture'] : ['context-guard'],
+    ...(privateProject ? { mapProjects: { coordinatorProjectId: 'context-guard', userIds: ['UTEST'] } } : {}),
     ...(enableAction ? { actions: [...INTEGRATION_COMMANDS] } : {}), ...(cursorExecution ? { cursorExecution: { 'context-guard': { templateSessionId: templateId, userIds: ['UTEST'] } } } : {}) } : undefined;
   cloud = await startCloudServer({ dataDir: directory, port: 0, publicOrigin: 'https://roles.example', browserToken: 'synthetic-human', memoryConfig, cursorConfigFile,
     ...(integrationConfig ? { integrationConfig } : {}),
@@ -188,15 +190,53 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   };
-  const gateway = async (type, payload = {}, { conversationId, userId = 'UTEST', id = 'slack-' + type.replaceAll('.', '-') } = {}) => {
+  const gateway = async (type, payload = {}, { conversationId, userId = 'UTEST', projectId = 'context-guard', id = 'slack-' + type.replaceAll('.', '-') } = {}) => {
     const response = await fetch(cloud.integrationUrl + '/v1/command', { method: 'POST', headers: { Authorization: 'Bearer synthetic-slack-integration-credential', 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, teamId: 'TTEST', userId, projectId: 'context-guard', ...(conversationId ? { conversationId } : {}), type, payload }) });
+      body: JSON.stringify({ id, teamId: 'TTEST', userId, ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
     return { status: response.status, body: await response.json() };
   };
   return { directory, store, human, nativeCalls, gitCalls, commands, config, integrationConfig, gateway, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
     releaseModel, modelEntered: () => enteredModel,
     url: cloud.url, integrationUrl: cloud.integrationUrl };
 }
+
+test('Private registered Cursor project stays hidden from other workspace users before and after enable', async t => {
+  const f = await fixture(t, { slack: true, privateProject: true });
+  const listed = await f.gateway('project.list');
+  assert.equal(listed.status, 200);
+  assert.equal(listed.body.data.projects.find(item => item.id === 'context-guard').private, true,
+    '原注册仓库使用权威 overview 的既有映射，不新增公共项目授权');
+  const otherList = await f.gateway('project.list', {}, { userId: 'UOTHER', projectId: null });
+  assert.equal(otherList.status, 200);
+  assert.ok(!otherList.body.data.projects.some(item => item.id === 'context-guard'));
+  const created = await f.gateway('conversation.create'); assert.equal(created.status, 200);
+  const conversationId = created.body.data.conversationId;
+  const before = await f.gateway('conversation.state', {}, { conversationId });
+  assert.equal(before.status, 200); assert.equal(before.body.data.cursorAvailable, true);
+  const forbidden = async userId => {
+    for (const [type, payload] of [['project.read', {}], ['conversation.state', {}],
+      ['conversation.submit', { text: 'Do not invoke the model' }], ['conversation.cursor', { expectedMode: 'manual' }]]) {
+      const response = await f.gateway(type, payload, { userId, conversationId, id: 'denied-' + userId + '-' + type });
+      assert.equal(response.status, 403, JSON.stringify(response.body)); assert.equal(response.body.error.code, 'FORBIDDEN');
+      assert.equal(response.body.data, undefined);
+    }
+    const events = await fetch(f.integrationUrl + '/v1/events?' + new URLSearchParams({ teamId: 'TTEST', userId,
+      projectId: 'context-guard', conversationId }), { headers: { Authorization: 'Bearer synthetic-slack-integration-credential' } });
+    assert.equal(events.status, 403); await events.body.cancel();
+  };
+  await forbidden('UOTHER');
+  const options = { conversationId, id: 'private-enable' };
+  const enabled = await f.gateway('conversation.cursor', { expectedMode: 'manual' }, options);
+  assert.equal(enabled.status, 200); assert.equal(enabled.body.data.executionMode, 'automatic');
+  assert.equal(enabled.body.data.conversationId, conversationId);
+  await forbidden('UOTHER');
+  f.integrationConfig.mapProjects.userIds = [];
+  assert.equal((await f.gateway('conversation.cursor', { expectedMode: 'manual' }, options)).status, 403,
+    '撤销原 Map 用户后不能重放已接受的启用回执');
+  await forbidden('UTEST');
+  assert.deepEqual(await f.store.projectTasks(f.human), []);
+  assert.equal(f.nativeCalls.length, 0); assert.equal(f.modelEntered(), false);
+});
 
 test('Slack Cursor opt-in preserves the original conversation and original human-approved task', async t => {
   const f = await fixture(t, { slack: true, mixed: true });

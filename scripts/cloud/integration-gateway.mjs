@@ -155,11 +155,12 @@ export function validateIntegrationConfig(config) {
     fail('INVALID_INTEGRATION_CONFIG', 'Map 项目需要默认模型项目和明确授权的 Slack 用户');
   }
   if (config.cursorExecution !== undefined && (!object(config.cursorExecution) || Object.keys(config.cursorExecution).length > 100 ||
-      Object.entries(config.cursorExecution).some(([id, grant]) => !config.projectIds.includes(id) || !object(grant) ||
+      Object.entries(config.cursorExecution).some(([id, grant]) => !identifier(id) || !object(grant) ||
         Object.keys(grant).some(key => !['templateSessionId', 'userIds'].includes(key)) || !identifier(grant.templateSessionId) ||
         !Array.isArray(grant.userIds) || !grant.userIds.length || grant.userIds.length > 100 ||
-        grant.userIds.some(value => !/^[UW][A-Z0-9]{1,31}$/.test(value)) || new Set(grant.userIds).size !== grant.userIds.length))) {
-    fail('INVALID_INTEGRATION_CONFIG', 'Cursor 执行须明确指定已开放项目、模板与 Slack 用户');
+        grant.userIds.some(value => !/^[UW][A-Z0-9]{1,31}$/.test(value)) || new Set(grant.userIds).size !== grant.userIds.length ||
+        !config.projectIds.includes(id) && !grant.userIds.every(value => map?.userIds.includes(value))))) {
+    fail('INVALID_INTEGRATION_CONFIG', 'Cursor 执行须明确指定已开放或 Map 用户可访问的项目、模板与 Slack 用户');
   }
   return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790,
     actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor'].includes(type)) };
