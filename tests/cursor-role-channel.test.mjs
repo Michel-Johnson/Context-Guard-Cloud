@@ -585,6 +585,27 @@ test('Cursor role MCP wire hints never echo unknown error paths or private provi
   }
 });
 
+test('Cursor role MCP never publishes an unknown provider error code in either result format', async t => {
+  const f = await fixture(t), lease = await f.issue('plan'), mcp = await mcpFixture(t, f);
+  await mcp.initialize(lease.token); await mcp.initialized(lease.token);
+  const before = await f.store.transaction(state => state, { readOnly: true });
+  for (const code of ['synthetic-private-code', '/private/provider/config.json', 'UNRECOGNIZED_INTERNAL_CODE', undefined]) {
+    f.channel.exchange = async () => { throw Object.assign(new Error('private-provider-message'), { code, details: { token: 'private-provider-details' } }); };
+    const response = await mcp.request(lease.token, { jsonrpc: '2.0', id: 'provider-error', method: 'tools/call', params: {
+      name: 'context_guard_exchange', arguments: { id: 'unknown-code', type: 'object.read', payload: { ref: 'brief', version: 'version' } },
+    } });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.result.isError, true);
+    const error = JSON.parse(response.body.result.content[0].text).error;
+    assert.equal(error.code, 'ROLE_CALL_FAILED');
+    assert.deepEqual(response.body.result.structuredContent, { error });
+    for (const value of [code, 'private-provider-message', 'private-provider-details'].filter(Boolean)) {
+      assert.equal(JSON.stringify(response.body).includes(value), false, 'Neither MCP result format discloses private provider data');
+    }
+    assert.deepEqual(await f.store.transaction(state => state, { readOnly: true }), before);
+  }
+});
+
 test('Cursor role MCP execution and CI wire hints retain role denials and failed reproduction requirements', async t => {
   for (const phase of ['execution', 'ci']) {
     const f = await fixture(t);

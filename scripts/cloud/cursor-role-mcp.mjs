@@ -9,6 +9,9 @@ const string = (maxLength = 128) => ({ type: 'string', minLength: 1, maxLength, 
 const object = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false });
 const sourceSha = { type: 'string', pattern: '^[a-f0-9]{40}$' };
 const refs = () => ({ type: 'array', items: string(), maxItems: 100 });
+const errorCodes = new Set(['INVALID_ARGUMENT', 'UNAUTHORIZED', 'FORBIDDEN', 'NOT_FOUND', 'CONFLICT', 'ID_REUSED',
+  'STALE_SESSION', 'TOO_LARGE', 'UNAVAILABLE', 'ROLE_FORBIDDEN', 'ROLE_UNAVAILABLE', 'ROLE_EXPIRED',
+  'SOURCE_UNVERIFIED', 'CURSOR_ROLE_CONFLICT', 'ROLE_CALL_FAILED']);
 
 // A discoverable projection of the shared wire contract, not its validator or
 // authority. CursorRoleChannel still injects identity, validates with Core and
@@ -68,7 +71,8 @@ function wireErrorField(cause, type, phase) {
 }
 
 function toolError(cause, type, phase) {
-  const code = String(cause.code || 'ROLE_CALL_FAILED').slice(0, 100);
+  // Provider/internal error codes are data too; truncation is not redaction.
+  const code = errorCodes.has(cause.code) ? cause.code : 'ROLE_CALL_FAILED';
   const field = wireErrorField(cause, type, phase);
   return { error: { code, ...(field ? { field, message: field === 'payload.baseVersion'
     ? 'payload.baseVersion must be a string: use "" for the first write, or the exact previous version for an update. See tools/list; keep the original task.'

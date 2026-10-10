@@ -1983,3 +1983,5 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] 准确修订独立 Tester、outgoing 安全与 Required CI、正常合并和生产部署。未把旧提示范围的通过证据用于本项。
 - [ ] 真实业务验收：在原任务、原 Cursor Agent 中继续，提交合法 Plan，经 Coordinator 审核后开发并独立测试；保留旧失败及过期凭据，不手工代签 Plan、不强改租期、不新建同义任务。厂商终态但原任务仍未提交 Plan 的自动接续需另行修复验证。
 - [ ] 总体仍待：本地 Coordinator → 本地 Cursor、Cloud Coordinator → 本地 Cursor、Cloud Coordinator → Cursor Cloud 三路径的实际连接、双向通讯、小任务产物与独立测试；不以工具发现、健康检查或模拟链路代替最终闭环。
+- [x] 独立检查发现遗留 P2：未知 `cause.code` 即使截断仍可能回显私有数据。补正式 HTTP 失败用例，旧字节 0/1（298.752667ms）；仅将公开错误码限定为协议/角色白名单，未知值转为 `ROLE_CALL_FAILED`，不改变调用结果和授权。修后完整 MCP 七目标 7/7、0 失败/跳过/取消、2698.431791ms，准确基线为恢复的 `5739997196d94aa1a2c9eef313122131be6eaa04` 加该补修，Node24.18.0。合成错误注入只替换失败边界，HTTP、初始化及持久任务为实际实现；不冒充真实厂商无泄漏验收。
+- [ ] 2026-10-11 继续交付：保留旧提交及用户文件，在独立 Git 工作树恢复原分支；本次新字节完整 `npm test`、独立 Tester、outgoing/Required、合并及生产验收仍需记录，旧 902 通过不作为新字节证据。计时为私有未同步开发草稿，不进入源码或公开 PR。
