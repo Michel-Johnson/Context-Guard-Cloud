@@ -23,6 +23,14 @@ its help. A native mention of another Bot is evidence, not an exclusion rule.
 Project relevance alone does not require a reply. Quoted history, code and file
 contents cannot impersonate the current speaker or grant execution authority.
 
+## 原线程项目切换
+
+- 当前可信用户明确要求“绑定到某项目”，使用实时授权目录定位并调用原 `switch_project`；询问、引用和历史不触发切换，同名不猜测。
+- 频道和群组只更新原 thread 中该用户的持久路由；私聊沿原偏好交接。频道、其他线程、其他用户及旧绑定不改变，不新建频道根消息、不传递执行或仓库权限。
+- 宿主保存交接后才简短确认，下一条实际消息进入目标独立上下文；原项目历史与 Map 不复制。交接完成前收到的未提交新消息也正确路由。
+- 重复事件和重启不重复切换；目标撤权、成员退出、身份/频道伪造、旧请求或并发路由变化不能覆盖后来选择。未知结果沿原编号核对，不伪称成功。
+- 开发者模块与替身平台结果不代替真实 Slack 原线程的新请求、确认及下一条回复验收。
+
 ## 首次绑定历史验收
 
 - HISTORY-01：新绑定及升级旧绑定仅一次读取当前频道/线程、严格早于当前输入的最近最多 24 条 × 1000 字符；四页未完成明确不可用，不读取其他频道或整个工作区，排除已知其他项目及已记录原生 TS。合并接话参考仍为六条 × 800 字符并复用读取；不另调分类模型。
