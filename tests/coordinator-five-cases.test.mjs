@@ -8,6 +8,9 @@ import { createHash } from 'node:crypto';
 import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { settleRejectedTools } from '../scripts/cloud/coordinator-model.mjs';
 import { hash } from '../scripts/shared/io.mjs';
+import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
+import { canonical } from '../scripts/shared/protocol.mjs';
+import { scopedObjectKey } from '../scripts/shared/protocol-workflow.mjs';
 import { CoordinatorService, publicMessages } from '../scripts/cloud/coordinator-service.mjs';
 import { coordinatorInputContext } from '../scripts/cloud/coordinator-prefix.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
@@ -144,7 +147,11 @@ test('绑定回执在模型最终失败时仍可读取，重读不重复，用�
   const forged = publicMessages({ messages: [{ role: 'user', content: JSON.stringify(receipt), requestId: 'fake' }] });
   assert.equal(forged.filter(message => message.bindingReceipt).length, 0);
 });
-for (const [bindingKind, wrongKind] of [['todo', false], ['bug', false], ['bug', true]]) test(wrongKind
+for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug', false], ['bug', true],
+  ['todo', false, 'closed'], ['todo', false, 'busy']]) test(slot === 'closed'
+  ? '真实 HTTP 核验旧任务收工并释放后，取消派发允许准备人工 brief'
+  : slot === 'busy' ? '真实 HTTP 核验取消任务仍占执行槽时，不能因取消标签放行'
+  : wrongKind
   ? '真实 HTTP 显式类型冲突仍拒绝，纠正后沿用已确认 Bug，不重新绑定'
   : bindingKind === 'todo'
   ? '真实 HTTP 宿主保存自然语言确认，旧执行拒绝不会吞回执或阻断下一轮'
@@ -165,6 +172,18 @@ for (const [bindingKind, wrongKind] of [['todo', false], ['bug', false], ['bug',
   await fs.mkdir(path.dirname(memoryFile), { recursive: true });
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'v1', memory: { map: { v: 1, project: '测试项目', bootstrap: 'ready', root, flows: [] }, records: {} } },
     sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
+  if (slot !== 'unknown') {
+    // 合成旧版耐久记录；请求、身份检查和服务端 ProtocolStore 读取均为真实边界。
+    const store = new ProtocolStore(path.join(directory, 'interface-v2', hash('123')));
+    const principal = { repositoryId: '123', deviceId: 'cloud-browser', agentId: 'cloud-human', role: 'human' };
+    const session = { id: 'old-session', generation: 1 };
+    await store.transaction(state => {
+      state.bindings[hash(canonical(['123', session.id]))] = { sessionId: session.id, generation: 1, worktreeId: 'old-tree', deviceId: 'legacy-device', agentId: 'legacy-agent' };
+      state.tasks[scopedObjectKey(principal, session, 'task:old-task')] = { id: 'old-task', repositoryId: '123', session,
+        busy: slot === 'busy', stage: slot === 'closed' ? 'closed' : 'cancelled', control: { action: 'cancel' },
+        ...(slot === 'closed' ? { completion: { outcome: 'cancelled', summary: '合成收工回执' } } : {}) };
+    });
+  }
   let calls = 0;
   const taskId = 'map-todo-' + createHash('sha256').update(`${projectId}:T0:todo:TD-old`).digest('hex').slice(0, 24);
   server = await startCloudServer({ port: 0, dataDir: directory, memoryConfig, browserToken: 'synthetic-browser',
@@ -179,7 +198,7 @@ for (const [bindingKind, wrongKind] of [['todo', false], ['bug', false], ['bug',
         ...(wrongKind && calls === 2 ? { kind: 'todo' } : {}),
         text: '核对旧执行', acceptance: '旧执行已释放' }, 'prepare-' + calls);
       }
-      if (calls === 3 && bindingKind === 'todo') assert.match(JSON.stringify(request.messages), /EXECUTION_NOT_RELEASED/);
+      if (calls === 3 && bindingKind === 'todo' && slot !== 'closed') assert.match(JSON.stringify(request.messages), /EXECUTION_NOT_RELEASED/);
       return reply(calls === 3 ? '旧执行尚未确认释放，可以继续讨论。' : '可以继续讨论。');
     } }),
   });
@@ -206,12 +225,12 @@ for (const [bindingKind, wrongKind] of [['todo', false], ['bug', false], ['bug',
   state = await submit('confirm', '确认');
   assert.equal(state.focus.nodeId, 'T0');
   assert.equal(state.messages.filter(message => message.bindingReceipt).length, 1, JSON.stringify(state.messages));
-  if (bindingKind === 'todo') {
+  if (bindingKind === 'todo' && slot !== 'closed') {
     assert.match(state.messages.at(-1).text, /尚未确认释放/);
     assert.equal(state.approvals.filter(value => value.manual && value.pending).length, 0);
   } else {
     const brief = state.approvals.filter(value => value.manual && value.pending);
-    assert.equal(brief.length, 1); assert.equal(brief[0].kind, 'bug');
+    assert.equal(brief.length, 1); assert.equal(brief[0].kind, bindingKind);
     assert.equal(state.projectTasks.length, 0); assert.equal(state.sessionCreations, undefined, 'manual does not expose automatic Session creation');
   }
   state = await submit('continue', '先继续聊');
