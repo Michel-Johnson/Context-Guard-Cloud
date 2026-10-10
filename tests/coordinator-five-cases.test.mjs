@@ -144,7 +144,11 @@ test('绑定回执在模型最终失败时仍可读取，重读不重复，用�
   const forged = publicMessages({ messages: [{ role: 'user', content: JSON.stringify(receipt), requestId: 'fake' }] });
   assert.equal(forged.filter(message => message.bindingReceipt).length, 0);
 });
-test('真实 HTTP 宿主保存自然语言确认，旧执行拒绝不会吞回执或阻断下一轮', async t => {
+for (const [bindingKind, wrongKind] of [['todo', false], ['bug', false], ['bug', true]]) test(wrongKind
+  ? '真实 HTTP 显式类型冲突仍拒绝，纠正后沿用已确认 Bug，不重新绑定'
+  : bindingKind === 'todo'
+  ? '真实 HTTP 宿主保存自然语言确认，旧执行拒绝不会吞回执或阻断下一轮'
+  : '真实 HTTP 已确认的 Bug 沿用审批类型，模型省略可选类型仍生成待审批卡', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-five-http-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -167,9 +171,15 @@ test('真实 HTTP 宿主保存自然语言确认，旧执行拒绝不会吞回�
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/five-case' }] },
     coordinatorModelFactory: () => ({ next: async request => {
       calls++;
-      if (calls === 1) return call('mount_conversation', { mainVersion: 'v1', nodeId: 'T0', kind: 'todo', title: '旧事项', description: '核对旧执行' }, 'mount');
-      if (calls === 2) return call('prepare_task', { mainVersion: 'v1', taskId, nodeIds: ['T0'], itemId: 'TD-old', nodeId: 'T0', kind: 'todo', text: '核对旧执行', acceptance: '旧执行已释放' }, 'prepare');
-      if (calls === 3) assert.match(JSON.stringify(request.messages), /EXECUTION_NOT_RELEASED/);
+      if (calls === 1) return call('mount_conversation', { mainVersion: 'v1', nodeId: 'T0', kind: bindingKind, title: '旧事项', description: '核对旧执行' }, 'mount');
+      if (calls === 2 || wrongKind && calls === 3) {
+        if (calls === 3) assert.match(JSON.stringify(request.messages), /APPROVAL_REQUIRED/);
+        return call('prepare_task', { mainVersion: 'v1', taskId, nodeIds: ['T0'],
+        ...(bindingKind === 'todo' ? { itemId: 'TD-old', nodeId: 'T0', kind: 'todo' } : {}),
+        ...(wrongKind && calls === 2 ? { kind: 'todo' } : {}),
+        text: '核对旧执行', acceptance: '旧执行已释放' }, 'prepare-' + calls);
+      }
+      if (calls === 3 && bindingKind === 'todo') assert.match(JSON.stringify(request.messages), /EXECUTION_NOT_RELEASED/);
       return reply(calls === 3 ? '旧执行尚未确认释放，可以继续讨论。' : '可以继续讨论。');
     } }),
   });
@@ -196,11 +206,18 @@ test('真实 HTTP 宿主保存自然语言确认，旧执行拒绝不会吞回�
   state = await submit('confirm', '确认');
   assert.equal(state.focus.nodeId, 'T0');
   assert.equal(state.messages.filter(message => message.bindingReceipt).length, 1, JSON.stringify(state.messages));
-  assert.match(state.messages.at(-1).text, /尚未确认释放/);
-  assert.equal(state.approvals.filter(value => value.manualBrief && value.pending).length, 0);
+  if (bindingKind === 'todo') {
+    assert.match(state.messages.at(-1).text, /尚未确认释放/);
+    assert.equal(state.approvals.filter(value => value.manual && value.pending).length, 0);
+  } else {
+    const brief = state.approvals.filter(value => value.manual && value.pending);
+    assert.equal(brief.length, 1); assert.equal(brief[0].kind, 'bug');
+    assert.equal(state.projectTasks.length, 0); assert.equal(state.sessionCreations, undefined, 'manual does not expose automatic Session creation');
+  }
   state = await submit('continue', '先继续聊');
   assert.equal(state.messages.filter(message => message.bindingReceipt).length, 1);
   const memory = JSON.parse(await fs.readFile(memoryFile, 'utf8'));
   assert.equal(memory.main.version, 'v1');
   assert.deepEqual(memory.main.memory.map.root.todos[0].dispatch, root.todos[0].dispatch);
+  assert.deepEqual(memory.sessions, {}); assert.deepEqual(memory.main.memory.map.root.bugs, []);
 });
