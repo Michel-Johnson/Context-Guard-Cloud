@@ -39,7 +39,7 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
     startingRef: sourceSha, roles: { templateSessionId: templateId, ...(trustedCi ? { ciPolicy } : {}) },
   } } }), { mode: 0o600 });
   const config = { enabled, providerFile, bindings: { [templateId]: cursorTemplateWorktree(templateId) },
-    sessionTemplates: [templateId], maxConcurrentTasks: 1 };
+    sessionTemplates: [templateId], maxConcurrentTasks: 1, ...(manualItem ? { mapWrite: true } : {}) };
   if (mixed) { config.bindings['local-template'] = 'local-tree'; config.sessionTemplates.unshift('local-template'); }
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic-admin', projects: {
     'context-guard': { root: directory, token: 'synthetic-memory', ref: 'refs/heads/main', coordinator: config },
@@ -48,7 +48,7 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
   await fs.mkdir(path.dirname(memoryFile), { recursive: true });
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1, main: { version: 'main-1', memory: { records: {}, map: {
     v: 1, bootstrap: 'ready', root: { id: 'T0', title: 'Synthetic project', kind: 'module', state: 'dirty', owns: [], children: [],
-      ...(manualItem ? { todos: [{ id: 'TD1', title: 'Synthetic manual item', status: 'pending' }] } : {}) },
+      ...(manualItem ? { todos: [{ id: 'TD1', title: 'Synthetic manual item', status: 'pending', executionMode: 'manual' }] } : {}) },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
   const commands = [{ name: 'prepare_task', input: { taskId, text: 'Implement one isolated fixture', acceptance: 'Formal assertion passes', nodeIds: ['T0'], mainVersion: 'main-1' } }];
   const nativeCalls = [], gitCalls = [], runs = new Map(); let count = 0;
@@ -365,13 +365,36 @@ test('Slack Cursor mode change rejects an old registry read arriving after cache
 
 test('Slack Cursor pending manual approval cannot become execution authority after enabling', async t => {
   const f = await fixture(t, { slack: true, manualItem: true });
-  // Manual preparation requires a real existing item or an independently
-  // confirmed node binding. Seed it before starting Cloud, not by a partial
-  // write racing its background reader; keep the original business gate.
+  // 旧事项同样须走当前主节点确认；使用正式人审入口，不直接写绑定。
   Object.assign(f.commands[0].input, { itemId: 'TD1', nodeId: 'T0', kind: 'todo' });
+  const briefCommand = f.commands.shift();
+  f.commands.push({ name: 'mount_conversation', input: { mainVersion: 'main-1', nodeId: 'T0', kind: 'todo',
+    title: 'Synthetic manual item', description: 'Confirm the existing item scope' } });
   const created = await f.gateway('conversation.create');
   assert.equal(created.status, 200); const conversationId = created.body.data.conversationId;
-  assert.equal((await f.gateway('conversation.submit', { text: 'Prepare the original manual brief' }, { conversationId })).status, 200);
+  assert.equal((await f.gateway('conversation.submit', { text: 'Confirm the original manual item scope' }, { conversationId, id: 'request-manual-binding' })).status, 200);
+  let bindingProposal;
+  const bindingDeadline = Date.now() + 5000;
+  for (;;) {
+    const response = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(response.status, 200);
+    bindingProposal = response.body.data.approvals.find(item => item.kind === 'binding-proposal' && item.pending);
+    if (bindingProposal && response.body.data.status === 'waiting-for-user' && !response.body.data.activeTurnId) break;
+    assert.notEqual(response.body.data.status, 'error', JSON.stringify(response.body.data.error));
+    assert.ok(Date.now() < bindingDeadline, 'The original item binding was not proposed'); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  const reviewed = await f.gateway('binding.review', { proposalId: bindingProposal.id, version: bindingProposal.version, decision: 'approved' },
+    { conversationId, id: 'confirm-manual-binding' });
+  assert.equal(reviewed.status, 200, JSON.stringify(reviewed.body));
+  const noticeDeadline = Date.now() + 5000;
+  for (;;) {
+    const response = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(response.status, 200);
+    if (response.body.data.status === 'waiting-for-user' && !response.body.data.activeTurnId && !response.body.data.bindingNotification.pending) break;
+    assert.ok(Date.now() < noticeDeadline, 'The original binding notice did not settle'); await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(f.nativeCalls.length, 0); assert.deepEqual(await f.store.projectTasks(f.human), []);
+  f.commands.push(briefCommand);
+  const prepared = await f.gateway('conversation.submit', { text: 'Prepare the original manual brief' }, { conversationId, id: 'prepare-after-manual-binding' });
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
   const deadline = Date.now() + 5000; let proposal;
   for (;;) {
     const response = await f.gateway('conversation.state', {}, { conversationId }); assert.equal(response.status, 200);

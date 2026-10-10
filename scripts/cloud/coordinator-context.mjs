@@ -143,7 +143,12 @@ export function buildCoordinatorContext(snapshot, { conversation = null, nodeIds
   const dynamicText = `Main 版本：${snapshot.version}${details.length ? `\n\n${details.join('\n')}` : ''}`;
   // Global Main changes must refresh facts without invalidating unrelated
   // project memory/navigation. The version is the actual rendered content hash.
-  return { format: 2, version: snapshot.version, staticVersion: hash(staticText),
+  const internalIds = directory.flatMap(({ id }) => {
+    const node = index.get(id)?.node;
+    return [...(node?.title === id && /^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/u.test(id) ? [] : [id]),
+      ...['todos', 'bugs'].flatMap(field => (node?.[field] || []).map(item => item.id))];
+  }).filter(value => typeof value === 'string');
+  return { format: 2, version: snapshot.version, staticVersion: hash(staticText), internalIds: [...internalIds, snapshot.version],
     memoryPath: pathContext.map(({ id, memoryStatus }) => ({ id, status: memoryStatus, version: snapshot.version })),
     staticText, dynamicText, text: staticText + '\n\n' + dynamicText };
 }

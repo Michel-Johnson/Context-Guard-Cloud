@@ -1212,7 +1212,7 @@ function nativeQuestionProjection(questions, { text = '', answered = [], attachm
   for (const index of answered) state.answers[initial.questions[index].id] = { text: `answer-${index}`, requestId: `answer-request-${index}` };
   return publicMessages(state).find(message => message.role === 'assistant');
 }
-const blockText = blocks => blocks.map(block => block.text?.text || '').join('\n\n');
+const blockText = blocks => blocks.map(block => block.text?.text || block.elements?.map(element => element.text?.text || '').join('\n') || '').join('\n\n');
 const occurrences = (text, value) => text.split(value).length - 1;
 
 test('Slack question-only render uses the real public ask_user projection without duplicated clarification', () => {
@@ -1234,7 +1234,7 @@ test('Slack question render preserves real multiple mixed and all-answered publi
     for (const question of questions) assert.equal(occurrences(text, question.question), 1);
     assert.ok(text.indexOf(questions[0].question) < text.indexOf(questions[1].question));
     assert.equal(occurrences(text, '直接在这个线程回复'), questions.length - answered.length);
-    assert.equal(text.includes('可参考：'), answered.length < questions.length);
+    assert.equal(blocks.some(block => block.elements?.some(element => element.action_id?.startsWith('answer_choice:'))), answered.length < questions.length);
     if (answered.length === 2) assert.equal(text, plainText(message.text), 'All answered history keeps the original joined body rather than empty blocks');
     if (!answered.length) assert.ok(text.indexOf('文章页') < text.indexOf(questions[1].question), 'Options stay attached to their question');
   }
@@ -1262,7 +1262,7 @@ test('Slack question render preserves attachment node links and approval control
   const original = structuredClone(message), blocks = messageBlocks(message, 'thread', context);
   assert.equal(occurrences(blockText(blocks), message.text), 1);
   assert.ok(blocks.some(block => block.type === 'context' && block.elements[0].text.includes('evidence.txt')));
-  assert.equal(blocks.find(block => block.type === 'actions').elements[0].url, 'https://map.example.com/projects/lab?relation=N1');
+  assert.ok(blocks.some(block => block.elements?.some(element => element.url === 'https://map.example.com/projects/lab?relation=N1')));
   assert.deepEqual(message, original);
   const approval = approvalBlocks({ id: 'p1', version: 'v1', text: '已对齐需求', acceptance: '可验收' }, 'thread');
   assert.deepEqual(approval.find(block => block.type === 'actions').elements.map(element => element.action_id), ['approve_brief', 'reject_brief']);
@@ -2703,7 +2703,7 @@ test('natural thread reply answers the pending question with a pinned identity, 
   assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].answerTo, 'q1');
   assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].text, `<@${bot}> 先修复刷新逻辑`);
   assert.equal(f.sent.some(input => input.method === 'views.open'), false);
-  assert.equal(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['a', 'b'] }] }, key).some(block => block.type === 'actions'), false);
+  assert.equal(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['a', 'b'] }] }, key).some(block => block.type === 'actions'), true);
   assert.match(JSON.stringify(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['只改刷新', '完整登录'] }] }, key)), /只改刷新/);
 });
 test('BUSY retry without an initial question cannot become the answer to a later question', async t => {
@@ -2721,6 +2721,31 @@ test('BUSY retry without an initial question cannot become the answer to a later
   await f.plugin.message('original', event());
   const submits = f.calls.filter(input => input.type === 'conversation.submit');
   assert.deepEqual(submits[0].payload, submits[1].payload); assert.equal(submits[0].id, submits[1].id);
+});
+
+test('选择按钮绑定当前真人问题，重复点击只提交一次，过期和跨用户不提交', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'choice-chat', userId: user, ownRequests: [] });
+  const question = { id: 'q1', text: '回答范围？', options: ['当前文章', '全站文章'], answer: null };
+  const message = { id: 'choice-message', role: 'assistant', text: '', questions: [question] };
+  const gateway = f.gateway.command;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.state') return { status: 'waiting-for-user', messages: [message] };
+    if (type === 'conversation.submit') question.answer = { text: input.payload.text, requestId: input.id };
+    return gateway(type, input);
+  };
+  await f.plugin.mirror(key);
+  const ts = f.store.data.threads[key].mirrored[message.id].ts;
+  const body = { type: 'block_actions', user: { id: user }, channel: { id: channel }, message: { ts },
+    actions: [{ action_id: 'answer_choice:1', value: JSON.stringify({ key, questionId: 'q1', optionIndex: 1 }) }] };
+  await f.plugin.process('choice-first', { type: 'interactive', body });
+  await f.plugin.process('choice-repeat', { type: 'interactive', body });
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1); assert.equal(submits[0].payload.text, '全站文章');
+  assert.equal(submits[0].payload.answerTo, 'q1');
+  await assert.rejects(f.plugin.process('choice-other-user', { type: 'interactive', body: { ...body, user: { id: 'UOTHER' } } }), { code: 'FORBIDDEN' });
+  await assert.rejects(f.plugin.process('choice-old-card', { type: 'interactive', body: { ...body, message: { ts: 'old' } } }), { code: 'CONFLICT' });
+  assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
 });
 test('message shortcut retains its original thread project after the channel mapping changes', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
@@ -2952,7 +2977,7 @@ test('Failed stream preview stays in its original slot and failure marking survi
     assert.equal(stream.ts, ts); assert.ok(stream.failedHash); assert.equal(stream.consumedBy, undefined);
     assert.equal(thread.liveStream.failedHash, stream.failedHash);
     assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
-    assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
+    assert.ok(f.sent.find(call => call.text?.includes('处理已停止')));
   }
 });
 

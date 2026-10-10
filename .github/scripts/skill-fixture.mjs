@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 
 const fixtureUrl = /^https:\/\/github\.com\/Michel-Johnson\/Context-Guard-Skill\/releases\/download\/split-fixture-([a-f0-9]{40})\/michelj-context-guard-(0\.(?:5\.0|6\.[0135]|7\.[01]|11\.0))\.tgz$/;
-const cursorFixtureCommit = '0ce5a2a528f0a56ebc5af525a74316eb0166c561';
+const cursorFixtureCommit = 'dababe445976a2504bc8d02ccc747056bcde30a0';
 
 // A released fixture is distinct from the Cloud service's runtime dependencies.
 // Exact URL identity and npm's SHA-512 lock prevent silent source substitution.

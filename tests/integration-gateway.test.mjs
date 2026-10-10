@@ -214,8 +214,8 @@ test('Both Coordinator profiles reserve internal identifiers for tools and expli
     const prompt = coordinatorRolePrompt(document, { manual });
     for (const rule of ['只去测试标签及其编号/日期、内部ID/哈希', '保留业务日期/版本', '用途不明不猜',
       '索要技术编号再给', '工具参数、链接/URL、代码、命令、回执和执行提示用原值',
-      '普通回复约 50–100 字', '通常不超 150 字', '保留必要事实和不确定性',
-      'TODO 概览报总数与可识别短名称', '同状态只报一次、不漏事项', '不附未问 Bug']) assert.ok(prompt.includes(rule), rule);
+      '每段最多60个可见字符', '不强凑40字', '保留必要事实和不确定性',
+      'TODO 概览先报总数和最多两个重点', '不逐条列出全部事项', '不附未问 Bug']) assert.ok(prompt.includes(rule), rule);
     assert.ok(prompt.includes('同名加描述'));
   }
 });
@@ -974,7 +974,7 @@ test('新 TODO 和 Bug 只在已确认主节点形成 brief，审批后各存一
     const before = await f.readMain();
     const proposal = await service.prepare({ ...brief(before.version), kind }, context('new-' + kind));
     assert.equal(proposal.kind, kind); assert.equal(f.commits, 0);
-    assert.equal(proposal.pathText, 'Fixture：尚未填写描述\n└─ Login：Token renewal');
+    assert.equal(proposal.pathText, 'Fixture → Login');
     const result = await service.review(review(proposal), context('approve-new-' + kind));
     const node = (await f.readMain()).document.root.children[0];
     const item = node[kind === 'bug' ? 'bugs' : 'todos'].find(item => item.id === result.itemId);
@@ -1000,6 +1000,24 @@ test('未确认、跨主节点和多节点 brief 被拒绝；改绑使旧 brief 
   assert.equal((await service.approvals('chat-fixture'))[0].stale, true);
   await assert.rejects(service.review(review(proposal), context('stale-confirm')), { code: 'VERSION_CONFLICT' });
   assert.deepEqual(await f.readMain(), original); assert.equal(f.commits, 0);
+});
+
+test('复用旧 Bug 仍检查人类挂载确认，改绑使旧 brief 失效且不重复写入', async t => {
+  const f = await manualFixture(t); let binding = { nodeId: 'LOGIN', kind: 'bug' };
+  const service = new CoordinatorManualBriefs({ ...f.options, readBinding: async () => binding });
+  const input = { ...brief((await f.readMain()).version), itemId: 'B1', nodeId: 'LOGIN', kind: 'bug' };
+  await assert.rejects(service.prepare(input, context('old-unbound')), { code: 'APPROVAL_REQUIRED' });
+  binding.bindingApproval = 'human-confirmed-old';
+  const proposal = await service.prepare(input, context('old-confirmed'));
+  assert.equal(f.commits, 0);
+  assert.equal((await service.approvals('chat-fixture'))[0].pending, true);
+  binding = { nodeId: 'LOGIN', kind: 'bug', bindingApproval: 'new-confirmation' };
+  await assert.rejects(service.review(review(proposal), context('old-stale')), { code: 'VERSION_CONFLICT' });
+  const fresh = await service.prepare(input, context('old-fresh'));
+  await service.review(review(fresh), context('old-save'));
+  await service.review(review(fresh), context('old-save'));
+  assert.equal(f.commits, 1);
+  assert.equal((await f.readMain()).document.root.children[0].bugs.length, 1);
 });
 
 test('提交前失败后改绑不得把旧 intent 写入原节点；已提交失回只恢复原回执', async t => {

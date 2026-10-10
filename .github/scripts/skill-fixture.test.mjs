@@ -31,12 +31,12 @@ test('Skill fixture rejects local, arbitrary-host, unpinned and ambiguous releas
 });
 
 test('Cursor owning-backend fixture permits only the exact reviewed release commit and version', () => {
-  const approvedCommit = '0ce5a2a528f0a56ebc5af525a74316eb0166c561';
+  const approvedCommit = 'dababe445976a2504bc8d02ccc747056bcde30a0';
   const nextUrl = url.replace(commit, approvedCommit).replace('0.5.0', '0.11.0');
   const nextLock = { resolved: nextUrl, version: '0.11.0', integrity };
   assert.deepEqual(validateSkillFixture(nextUrl, nextLock, { ...installed, version: '0.11.0' }),
     { commit: approvedCommit, version: '0.11.0', integrity });
-  for (const rejected of [nextUrl.replace(approvedCommit, commit), nextUrl.replace('0.11.0', '0.11.1'),
+  for (const rejected of [nextUrl.replace(approvedCommit, commit), nextUrl.replace(approvedCommit, '0ce5a2a528f0a56ebc5af525a74316eb0166c561'), nextUrl.replace('0.11.0', '0.11.1'),
     nextUrl.replace('0.11.0', '0.12.0')]) {
     assert.throws(() => validateSkillFixture(rejected, { ...nextLock, resolved: rejected }));
   }

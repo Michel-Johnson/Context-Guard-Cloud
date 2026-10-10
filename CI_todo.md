@@ -1,5 +1,12 @@
 # Cloud 验证台账
 
+## CURSOR-FIXED-DELIVERY-20261010 · 当前固定制品与原对话
+
+- [x] 正常整合 main `0b4fe15`，保留其回复校验、恢复、节点确认与 Slack 控件；Cursor 能力启用使用原绑定锁，不要求先批准需求。两处 manual brief 仍验证已批准节点与路径；原 pending、旧 registry、并发及权限 Oracle 不放宽。当前定向 38/38、完整 `npm test` 876 项/874 通过/2 既有跳过、Slack 318/318，实际均 exit0。独立最小复核 9/9、exit0，关闭启用入口的 P1。
+- [x] 固定 test-only Skill 制品改为准确 `dababe445976a2504bc8d02ccc747056bcde30a0` 的成功 CI 原始包；108 文件精确核对与公开下载摘要一致，锁定 SHA-512。validator 拒绝旧 `0ce` 与其他未审核提交；owning 后端四个准备场景经过原 device/IPC/Cloud，仍只覆盖无原生执行的准备边界。
+- [x] runtime 从正常合入 main `406bae4` 发布的 core2.4.1/UI1.5.1 安装，不加载相邻源码；51 生成物与安装包及 manifest 精确一致。旧版生成设计文档保留在本地备份，不删除用户文件。
+- [ ] 当前固定安装组合的原 owning worker 私有业务提交、实际官方 Cursor/Docker/Cloud 结果回传与三条真实 Coordinator 任务路径仍须验收。受控供应商、合成批准、只读准备或制品发布均不代表这些验收完成。
+
 ## CURSOR-CI-TASK-SCOPE-01 · 原任务范围与回执
 
 - [ ] 已补宿主证据 header 的严格解码、原 Core 同事务版本/内容核验、proof 摘要随原结果提交及双 ACK；验证固定 Skill 制品与原 owning worker 私有 commit 的完整组合、未知回执恢复和实际原生观察。独立 sender/HTTP 正反用例不替代该组合，不证明隔离或任务闭环；原生硬停与公开结果拒绝仍保留。
@@ -29,6 +36,15 @@
 - [x] 正常同步 main `e23d493`，仅 root 版本冲突保留候选 1.10.0，主分支 Slack/绑定/交流权限与正式测试保留。固定依赖沿 main 的公开 core 2.3.0/UI 1.4.1，不消费相邻 Skill 未发布的候选。
 - 保留旧依赖实际失败：普通安装显示 up-to-date，但磁盘仍为 UI 1.4.0，生成器正确拒绝；该环境的 782 项/780 通过/2 跳过/退出 0 不算当前固定消费通过。原依赖完整保留后，从锁文件新安装公开包；安装版本与 URL、61 生成物及摘要均匹配，没有手改共享生成物。
 - [x] 准确固定依赖组合完整 `npm test`：782 项、780 通过、0 失败、2 既有跳过，实际退出 0、171758.771791ms。独立当前 CI/绑定/Slack 4/4、退出 0，冻结前后 hash 一致；61 文件与安装包逐字节 parity。当前公开 UI 仍有旧独立 Cursor 入口，退役要等待 Skill 候选 UI 1.4.2 正常发布后消费，不宣称原生接线或三路径任务通过。
+
+## COORDINATOR-BADCASE-20261010 · 修复计划的真实验收缺口
+
+- 正式受控验证在 `merged-participation-independent`、`coordinator-binding`、`slack-cloud`、`integration-gateway`、Slack 插件和 Cloud 浏览器测试中；覆盖格式恢复、非法 SSE 参数、回执复用、旧事项审批、过期/跨用户按钮。受控平台 IO 不算真实 Slack。
+- [x] GLM-5.3 真实 Map 三段十轮：新待办、新 Bug、旧事项；正式入口 `tests/coordinator-dialogue-live-browser.mjs`。冻结产品修订 `e831c31` 的记录前后源码 hash 一致，30/30 流程通过；4 次格式违规自动纠正，原输出与逐轮诊断保留。后续仅调整读取测试替身，产品文件仍与验收 hash 一致。不是 Chrome Slack、人工体验或安装后验收。
+- [ ] Chrome 中真实 Slack 三段十轮、原生选择/绑定按钮与 ✅ 送达。当前仅有正式机器人，尚无候选版独立测试入口，不拿线上旧版代替验收。
+- [ ] 人工检查每段最多60字、单个核心问题、挂载时机和事实准确性；首个有意义回复以两秒为目标，不能用表情或“正在处理”计时。
+- [ ] Skill 最终固定包的精确锁安装与线上真实入口复验，不以临时候选包替代发布产物验收。
+- DeepSeek 真实测试已出现 `MODEL_HTTP_402`；保留原失败，不盲重试、不静默换线上模型、不代用户充值。其他已配置模型的隔离测试单独标注名称。
 
 ## SLACK-UTF8-BUDGET-01 · 多字节与转义后的发送预算
 
