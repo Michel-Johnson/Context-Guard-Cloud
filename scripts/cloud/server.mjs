@@ -1271,6 +1271,14 @@ export async function startCloudServer({
           return (await coordinatorFor(project, id)).submit(request, options);
         } }) : null;
         await intake?.initialize();
+        // Finish every asynchronous initialization check before installing an
+        // Inbox whose event/timer consumer can await this cached initializer.
+        // Otherwise failure cleanup could wait for its own unresolved promise.
+        const restored = await service.state();
+        const recover = restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
+          (await service.inputSignals(restored)).interrupted);
+        await assertCurrentMode();
+        assertCurrentEpoch();
         service.bindings = bindings; service.refreshBindings = refreshBindings;
         service.inbox = manual ? { lastError: null, close: async () => {}, pump: async () => {} } : conversationId !== 'legacy' ? {
           lastError: null, close: async () => {}, pump: async () => (await coordinatorFor(project)).inbox.pump(),
@@ -1303,11 +1311,6 @@ export async function startCloudServer({
         // Recover only a durable unfinished turn. Kicking every newly-created
         // idle conversation creates a transient in-memory `running` state, so
         // its first user submission can incorrectly fail with COORDINATOR_BUSY.
-        const restored = await service.state();
-        const recover = restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
-          (await service.inputSignals(restored)).interrupted);
-        await assertCurrentMode();
-        assertCurrentEpoch();
         if (recover) service.kick();
         return service;
         } catch (cause) {
