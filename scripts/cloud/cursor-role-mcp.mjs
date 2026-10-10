@@ -1,19 +1,90 @@
-import { MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
+import { MAX_MESSAGE_BYTES, ProtocolError } from '../shared/protocol.mjs';
 
 const record = value => value && typeof value === 'object' && !Array.isArray(value);
 const invalid = (message, code = -32602, status = 400) => { throw Object.assign(new Error(message), { rpcCode: code, status }); };
 const versions = new Set(['2025-03-26', '2025-06-18', '2025-11-25']);
 const emptyParams = params => !params || record(params) && Object.keys(params).every(key => key === '_meta');
 const idValid = id => typeof id === 'string' && id.length > 0 && id.length <= 128 || Number.isSafeInteger(id);
+const string = (maxLength = 128) => ({ type: 'string', minLength: 1, maxLength, pattern: '\\S' });
+const object = (properties, required = Object.keys(properties)) => ({ type: 'object', properties, required, additionalProperties: false });
+const sourceSha = { type: 'string', pattern: '^[a-f0-9]{40}$' };
+const refs = () => ({ type: 'array', items: string(), maxItems: 100 });
+const errorCodes = new Set(['INVALID_ARGUMENT', 'UNAUTHORIZED', 'FORBIDDEN', 'NOT_FOUND', 'CONFLICT', 'ID_REUSED',
+  'STALE_SESSION', 'TOO_LARGE', 'UNAVAILABLE', 'ROLE_FORBIDDEN', 'ROLE_UNAVAILABLE', 'ROLE_EXPIRED',
+  'SOURCE_UNVERIFIED', 'CURSOR_ROLE_CONFLICT', 'ROLE_CALL_FAILED']);
+
+// A discoverable projection of the shared wire contract, not its validator or
+// authority. CursorRoleChannel still injects identity, validates with Core and
+// checks the current role/task/Run inside the real ProtocolStore transaction.
+function payloadSchemas(phase) {
+  const report = (stage, data) => object({ taskId: { ...string(), description: 'Copy taskId from context_guard_context; do not create another task.' },
+    stage: { const: stage }, data: object(data) });
+  const check = object({ testId: string(), todoId: string(), status: { enum: ['passed', 'failed', 'incomplete'] },
+    evidenceRef: string(), reproductionRef: string() }, ['testId', 'todoId', 'status', 'evidenceRef']);
+  check.if = { properties: { status: { const: 'failed' } }, required: ['status'] };
+  check.then = { required: ['reproductionRef'] };
+  return {
+    'object.read': object({ ref: string(), version: { ...string(4096), description: 'Read the exact immutable version returned by context or object.put.' } }),
+    'object.put': object({ kind: { enum: phase === 'plan' ? ['plan'] : phase === 'ci' ? ['evidence'] : ['evidence', 'ciTodo', 'experience'] },
+      ref: { ...string(), description: 'Append a nonempty suffix to the writePrefix returned by context_guard_context.' },
+      baseVersion: { type: 'string', maxLength: 4096, description: 'Required: use the empty string "" for the first version, not null. For updates, use the last returned version; never guess it.' },
+      content: { type: 'object', additionalProperties: true, description: phase === 'plan'
+        ? 'Plan JSON object with steps, paths, validation and acceptance. Do not serialize it as a string. Writing this object does not report or approve the Plan.'
+        : 'Evidence, CI TODO or experience JSON object; never serialize it as a string.' } }),
+    ...(phase === 'ci' ? {
+      'ci.result': object({ taskId: string(), sourceSha, verdict: { enum: ['passed', 'failed', 'incomplete'] },
+        checks: { type: 'array', minItems: 1, maxItems: 100, items: check } }),
+    } : {
+      'task.report': { oneOf: phase === 'plan'
+        ? [report('planReady', { planRef: string(), planVersion: { ...string(4096), description: 'Copy data.version from the successful Plan object.put response.' }, sourceSha })]
+        : [report('progress', { seq: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, summary: string(2000) }),
+          report('handoff', { sourceSha, ciTodoRef: string(), unitTestRefs: refs(), experienceRefs: refs() })] },
+    }),
+  };
+}
+
+function exchangeSchema(phase) {
+  const payloads = payloadSchemas(phase);
+  return { ...object({ id: { ...string(), description: 'Stable protocol message ID. Replay an uncertain request unchanged; a saved ID cannot be reused for another payload.' },
+    type: { type: 'string', enum: Object.keys(payloads) }, payload: { type: 'object' } }),
+  oneOf: Object.entries(payloads).map(([type, payload]) => ({ properties: { type: { const: type }, payload } })) };
+}
+
+function wireErrorField(cause, type, phase) {
+  // Only Core's known validation labels are exposed. Never forward arbitrary
+  // provider messages, object values, private paths or unknown caller fields.
+  if (!(cause instanceof ProtocolError) || cause.code !== 'INVALID_ARGUMENT') return;
+  const fields = new Map(['id', 'type', 'payload'].map(field => ['Invalid message.' + field, field]));
+  const payload = payloadSchemas(phase)[type];
+  if (!payload) return fields.get(cause.message);
+  fields.set('Invalid payload', 'payload'); fields.set('Invalid payload fields', 'payload');
+  for (const field of Object.keys(payload.properties || {})) fields.set('Invalid payload.' + field, 'payload.' + field);
+  for (const branch of payload.oneOf || []) {
+    for (const field of Object.keys(branch.properties)) fields.set('Invalid payload.' + field, 'payload.' + field);
+    for (const field of Object.keys(branch.properties.data.properties)) fields.set('Invalid payload.' + field, 'payload.data.' + field);
+  }
+  if (type === 'ci.result') {
+    for (const field of Object.keys(payload.properties.checks.items.properties)) fields.set('Invalid payload.' + field, 'payload.checks[].' + field);
+    fields.set('Invalid failed check reproduction', 'payload.checks[].reproductionRef');
+  }
+  return fields.get(cause.message);
+}
+
+function toolError(cause, type, phase) {
+  // Provider/internal error codes are data too; truncation is not redaction.
+  const code = errorCodes.has(cause.code) ? cause.code : 'ROLE_CALL_FAILED';
+  const field = wireErrorField(cause, type, phase);
+  return { error: { code, ...(field ? { field, message: field === 'payload.baseVersion'
+    ? 'payload.baseVersion must be a string: use "" for the first write, or the exact previous version for an update. See tools/list; keep the original task.'
+    : `Invalid ${field}; follow the phase-specific payload schema in tools/list. Keep the original task; do not substitute an approval or vendor-only Plan.` }
+    : { message: 'Role operation denied or unavailable; keep the original task and request ID' }) } };
+}
+
 const tools = phase => [
   { name: 'context_guard_context', description: 'Read the fixed task identity, phase, source revision and immutable object references. Use writePrefix for own objects.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false } },
   { name: 'context_guard_exchange', description: 'Exchange a stable-ID message with the original Coordinator task. The credential fixes identity and permissions; approval is never an agent operation.',
-    inputSchema: { type: 'object', required: ['id', 'type', 'payload'], additionalProperties: false, properties: {
-      id: { type: 'string', minLength: 1, maxLength: 128 },
-      type: { type: 'string', enum: phase === 'ci' ? ['object.read', 'object.put', 'ci.result'] : ['object.read', 'object.put', 'task.report'] },
-      payload: { type: 'object' },
-    } }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true } },
+    inputSchema: exchangeSchema(phase), annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true } },
 ];
 
 async function readInput(req) {
@@ -116,8 +187,9 @@ export function createCursorRoleMcpHandler({ channel, projectId, endpoint, allow
           result = await channel.context(token);
         } else result = await channel.exchange(token, p.arguments);
       } catch (cause) {
+        const error = toolError(cause, p.name === 'context_guard_exchange' ? p.arguments.type : undefined, state.phase);
         return send(200, { jsonrpc: '2.0', id: input.id, result: { isError: true, content: [{ type: 'text',
-          text: JSON.stringify({ error: { code: String(cause.code || 'ROLE_CALL_FAILED').slice(0, 100), message: 'Role operation denied or unavailable; keep the original task and request ID' } }) }] } });
+          text: JSON.stringify(error) }], structuredContent: error } });
       }
       return send(200, { jsonrpc: '2.0', id: input.id, result: { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result } });
     } catch (cause) {
