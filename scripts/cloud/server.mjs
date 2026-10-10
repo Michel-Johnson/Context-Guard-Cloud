@@ -1100,16 +1100,17 @@ export async function startCloudServer({
               }
               const actor = [...state.messages].reverse().find(message => message.role === 'user' && message.actor)?.actor
                 || { kind: 'human', sessionId: 'cloud-workbench' };
-              const focused = !input.itemId && conversation.itemId && ['todo', 'bug'].includes(conversation.kind);
-              if (focused && (input.nodeId !== undefined || input.kind !== undefined)) {
-                protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
-              }
-              const requirements = focused ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind } : input;
-              if (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId) {
-                protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
-              }
               return bindingsFor(project).withStableFocus(conversationId, live => {
                 if (live.executionMode !== 'manual') protocolFail('CONFLICT', 'Conversation execution mode changed');
+                const focused = !input.itemId && live.itemId && ['todo', 'bug'].includes(live.kind);
+                if (focused && (input.nodeId !== undefined || input.kind !== undefined)) {
+                  protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
+                }
+                if (!live.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== live.nodeId) {
+                  protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
+                }
+                const requirements = focused ? { ...input, itemId: live.itemId, nodeId: live.nodeId, kind: live.kind }
+                  : !input.itemId && input.kind === undefined && ['todo', 'bug'].includes(live.kind) ? { ...input, kind: live.kind } : input;
                 return manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor });
               });
             }
