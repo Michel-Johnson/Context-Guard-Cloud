@@ -77,7 +77,11 @@ function safeEnvelope(type, body) {
 function contextFrom(binding, userId, id) { return { id, userId, projectId: binding.projectId, conversationId: binding.conversationId }; }
 
 export class SlackPlugin {
-  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console }) {
+  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [] }) {
+    if (!Array.isArray(cursorOfferChannels) || cursorOfferChannels.length > 20 ||
+        cursorOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
+        new Set(cursorOfferChannels).size !== cursorOfferChannels.length) throw new TypeError('Configure explicit Cursor offer channel IDs');
+    this.cursorOfferChannels = Object.freeze([...cursorOfferChannels]);
     this.store = store; this.gateway = gateway; this.io = io; this.teamId = teamId; this.cloudOrigin = new URL(cloudOrigin).origin; this.botUserId = botUserId;
     this.pollMs = Math.max(1000, pollMs); this.logger = logger; this.projects = new Map(); this.maps = new Map(); this.stopped = true; this.active = null;
     this.collectMs = collectMs; this.maxCollectMs = maxCollectMs;
@@ -1300,6 +1304,7 @@ export class SlackPlugin {
   }
   async enableCursor(id, userId, value) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
+    if (!this.cursorOfferChannels.includes(binding.channel)) throw Object.assign(new Error('Cursor 启用入口仅在指定测试频道开放。'), { code: 'FORBIDDEN' });
     const result = await this.command('conversation.cursor', binding, userId, operationId(id, 'enable-cursor'), { expectedMode: 'manual' });
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     await this.io.post({ id: operationId(id, 'cursor-enabled'), channel: binding.channel, threadTs: binding.threadTs,
@@ -1573,7 +1578,9 @@ export class SlackPlugin {
         const thread = data.threads[key]; thread.watchedItems ||= {}; thread.watchedItems[approval.itemId] ||= { nodeId: approval.nodeId, kind: approval.kind || 'todo', status: null };
       });
     }
-    if (state.cursorAvailable || this.store.data.threads[key].mirrored['cursor-execution']) {
+    // Execution permission is not consent to advertise in every saved thread.
+    // Preserve old cards outside this explicit operator-owned UI scope silently.
+    if (this.cursorOfferChannels.includes(binding.channel) && (state.cursorAvailable || this.store.data.threads[key].mirrored['cursor-execution'])) {
       const active = state.executionProvider === 'cursor', text = active ? '已启用当前对话的 Cursor 执行能力，任务仍须确认 brief。' :
         state.cursorAvailable ? '可以在当前对话启用 Cursor。启用不批准任务，也不会另开聊天。' : '当前对话未获得 Cursor 执行权限，请联系项目管理员。';
       const blocks = [section(text), ...(!active && state.cursorAvailable ? [{ type: 'actions', elements: [{ type: 'button', action_id: 'enable_cursor',
