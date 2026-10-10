@@ -17,6 +17,7 @@ import { CoordinatorModelSettings } from '../../../scripts/cloud/coordinator-mod
 import { coordinatorStep } from '../../../scripts/cloud/coordinator-model.mjs';
 import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cloud/coordinator-tools.mjs';
 import { hash } from '../../../scripts/shared/io.mjs';
+import { configuration as slackConfiguration } from '../src/main.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
@@ -316,7 +317,7 @@ test('plugin lockfile is portable outside the developer registry', async () => {
   }
 });
 const project = { id: 'lab', name: 'Lab', version: 'v1', map: { id: 'T0', title: 'Root', children: [{ id: 'login', title: '登录', todos: [{ id: 'TD1', title: 'refresh', status: 'pending' }], bugs: [], memories: [{ text: '现有记忆' }], children: [] }] }, sessions: [{ id: 'session-1', status: 'running' }] };
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-'));
   const store = await new Store(directory).open(), calls = [], sent = [];
   const receive = store.receive.bind(store);
@@ -337,11 +338,69 @@ async function fixture(t) {
   } };
   const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { if (['conversations.history', 'conversations.replies'].includes(method)) return { messages: [] }; sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
     async download() { return { filename: 'screen.png', mimeType: 'image/png', base64: 'aGVsbG8=' }; }, async uploadPrompt(input) { sent.push({ export: input }); } };
-  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} } });
+  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} }, ...options });
   t.after(async () => { await plugin.stop(); await fs.rm(directory, { recursive: true, force: true }); });
   return { plugin, store, gateway, io, calls, sent, directory };
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
+
+test('Cursor offer defaults to silence despite project permission and retained historical cards', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => ({ status: 'idle', messages: [], approvals: [], cursorAvailable: true });
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    if (target === 'COTHER') await f.store.update(state => { state.threads[key].mirrored['cursor-execution'] = { ts: 'old-card', hash: 'old-content' }; });
+    await f.plugin.mirror(key);
+  }
+  assert.deepEqual(f.sent, [], 'No unsolicited posts or updates in historical threads');
+  const preserved = f.store.data.threads[threadKey(teamId, 'COTHER', '123.001')].mirrored['cursor-execution'];
+  assert.deepEqual(preserved, { ts: 'old-card', hash: 'old-content' });
+});
+
+test('Cursor offer is channel scoped, idempotent and does not create or approve tasks', async t => {
+  const f = await fixture(t, { cursorOfferChannels: [channel] });
+  f.gateway.command = async type => {
+    f.calls.push({ type });
+    assert.equal(type, 'conversation.state', 'Offer rendering cannot submit a task or approval');
+    return { status: 'idle', messages: [], approvals: [], cursorAvailable: true };
+  };
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+  }
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].channel, channel);
+  assert.match(JSON.stringify(f.sent[0].blocks), /enable_cursor/);
+  assert.equal(f.calls.length, 6);
+  assert.ok(f.calls.every(item => item.type === 'conversation.state'), 'Only read-only state polling, no task or approval commands');
+});
+
+test('Cursor enable rejects stale buttons outside the configured channel before calling the gateway', async t => {
+  const f = await fixture(t, { cursorOfferChannels: [channel] });
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    if (target !== channel) await assert.rejects(f.plugin.enableCursor('stale-'+target, user, { key }), { code: 'FORBIDDEN' });
+  }
+  assert.deepEqual(f.calls, []); assert.deepEqual(f.sent, []);
+  await f.plugin.enableCursor('test-enable', user, { key: threadKey(teamId, channel, '123.001') });
+  assert.deepEqual(f.calls.map(item => item.type), ['conversation.cursor']);
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0].channel, channel);
+});
+
+test('Cursor offer configuration is explicit, copied and rejects wildcard or private-message scope', async t => {
+  const env = { SLACK_APP_TOKEN: 'test-app', SLACK_BOT_TOKEN: 'test-bot', CONTEXT_GUARD_GATEWAY_TOKEN: 'test-gateway',
+    CONTEXT_GUARD_CLOUD_ORIGIN: 'https://map.example.com' };
+  assert.deepEqual(slackConfiguration(env).cursorOfferChannels, []);
+  assert.deepEqual(slackConfiguration({ ...env, CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS: 'C000001,G000002' }).cursorOfferChannels, ['C000001', 'G000002']);
+  const channels = [channel], f = await fixture(t, { cursorOfferChannels: channels });
+  channels.push('COTHER'); assert.deepEqual(f.plugin.cursorOfferChannels, [channel]);
+  for (const invalid of [['*'], ['DPRIVATE'], [channel, channel], 'C000001', [null], [' C000001'], Array.from({length: 21}, (_, i) => 'C'+i)]) {
+    assert.throws(() => new SlackPlugin({ ...f.plugin, cursorOfferChannels: invalid }), TypeError);
+  }
+});
 
 async function projectSwitchFixture(t, dm = 'D000001') {
   const f = await fixture(t), key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';

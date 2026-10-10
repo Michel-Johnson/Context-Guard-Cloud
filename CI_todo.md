@@ -1955,3 +1955,21 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 最终产品 SHA256：tools `885bed764f42c8088756114cc0d1d08b94c1e53441f6035dab9f92b367d181fd`；prefix `6afa1ac0da989b31650332daa98fa2f995c1cdd2b231b42c85e6a8a693a2b020`（首批后仅恢复两字）；plugin `1a9dd7292299e87eab960b510f9ce6080e2936fbd40a8a36dc77eba6309ac23a`；store `d47310e908d4287f876565db3d7c4fcd5af38ce13bd8bf69dd0872322ca9f386`。最终测试 SHA256：plugin test `d24bd948ebd0dabec83658af932b042b0b426c15360493963a3ccc9f42ebd951`；slack-cloud `d603190034fd762fbc8130c48fc04aab3ddb95523e8e5b9e07da96a759051b6f`；cloud-coordinator `2c96b63ccd3c877f370e8d54d883bdecbdf6656bfc042c77f75b1e7ced11883c`；independent `e94255027dc76ffe96494bd2b5a1ce1b121a0d3158e6641cc8840f534decff97`。前一项 402 修复保留，不用本批结果替换其原受测修订。
 - [ ] Tester：按最终准确提交独立验证原 thread 绑定、私聊兼容、用户/线程隔离、交接前后消息、重启/重复去重、成员退出、目标撤权和晚到旧路由拒绝；模型及平台 IO 替身不冒充自然语言意图或原生 Slack 验收。本轮不调用 subagent、不跑全量/付费模型。
 - [ ] 正常交付与上线后验收：当前未提交、合并或部署。真实已授权原线程中确认明确绑定请求和后续只读查询均闭合；同名/引用不误切换、不改变整个频道。保留已有消息、失败和回执，不用其他项目或频道的成功替代。
+
+## CI-IMPACT-CLOUD-01 · Cloud 接入统一 PR 影响分析（2026-10-10）
+
+- [x] 已确认缺口：Skill 已有按 merge-base 差异选择 Job 的策略，Cloud PR 仍无条件运行全部六项检查。沿同一原则补 Cloud 路径表，不修改 Skill 的既有工作树、业务代码、依赖或版本。
+- [x] 实现：PR 合并路径影响，重命名保留新旧路径，未知/空差异与 diff 故障回退全量；Main/标签及 CI/包/锁/清单/策略变更仍全量。安全和影响分析始终运行，输出计划 artifact/summary；Required 逐项核对成功与预期跳过，分析/安全失败、缺项、取消或不合法输出拒绝。各 Job 保留原命令、运行时、超时与 Action pins。
+- [x] 开发后唯一集中自检：基线 Main `34d8054df837ff35561f101fff0ae45bbdd12c68` 加本地修改，Node22.18.0。首批 actual `4116d5` exit1，13项12通过1失败、0跳过/取消，1532.1506ms；CLI 负例发现 Required 命令入口未调用校验函数。补齐调用，不弱化断言；只复验原失败目标 actual `eeee4c` exit0，1/1、0失败/跳过/取消，2800.7044ms。清单静态检查 actual `6bda44` exit0，46自动测试/5独立套件/2 helper；未跑全量，不拼成一次13/13。
+- 命令：`node --test --test-reporter=spec .github/scripts/ci-impact.test.mjs`；最小复验增加 `--test-name-pattern "^CLI emits plans and summaries"`。测试覆盖仓库/发布文档、Slack/Cloud 依赖、浏览器、合并/删除/重命名、未知与治理回退、已跟踪路径、配置拒绝、Required 正反条件和真实 CLI/工作流守卫。
+- 最终 SHA256：规则 `b54c4bf6dcb89ee8de9392ca8572246cc97492fcbfb5a90171632a5debd26344`；选择器 `f101ed1d762fa5d1807a8fcf799aa34909c6e37be2c9dfe19e4a3fccb6afb37c`（提交前仅去除文件尾部多余空行，原受测逻辑未改）；测试 `90849a0d07e76b94f0bf83197aa0fb5773c58de65d49e137a60239ccbac160f9`；守卫 `54223f4ad325580316efa52972b91e344e0037cbb49498e4b153c17b7e075fe0`；工作流 `d4ef60f394acb9609cd994aa5955717a34558bbdaefccdf2d4781cb100d58aba`。
+- [ ] 独立 Tester：按准确修订验证文档 PR 有意跳过、Slack 选中 Cloud 集成而非浏览器、未知路径与关键变更全量、Main/标签全量；分析失败/取消、所选任务异常 skipped、缺失输出和安全失败均不能通过 Required。核 rename/delete 的真实差异，检查分支保护继续要求同名 Required。Root 自检不冒充独立测试，本轮不调用 subagent。
+- [ ] 交付：尚未提交、推送或远端运行；此修复自身改变 CI，因此首次 PR 必须跑完整门禁，不能用轻量结果代替。之后用准确提交的文档与 Slack 变更核对 artifact/summary 的实际选择；不为验证制造生产用户消息或修改业务数据。
+- [x] 发布整合：PR70 保留 Main a3b9404 的全部功能，唯一台账追加冲突两边保留；整合 head b4a3e05 相对 Main 仍9个 CI/说明文件。准确远端 run38039076550 的 impact/security/browser/package/slack 通过，Node22和18均897通过/1失败/2既有跳过，Required正确拒绝。唯一失败为旧诊断测试硬编码六个 Required 依赖，遗漏新增 impact；不跳过、不重跑原失败流水线。
+- [x] 最小兼容返工：只把诊断测试依赖断言更新为准确七项，保留原六项、发现清单、诊断仅最低运行时启用、15分钟期限、并发2与Action pins。原失败目标 Node22.18.0 actual856911 exit0，1/1、0失败/跳过/取消，130.7727ms；未运行其他诊断目标或本地全量。后续新提交须经完整远端 CI，不以旧897通过称新的 Required 已通过。
+
+# CURSOR-SLACK-OFFER-01 · 提示范围纠正
+
+- 原因：Cursor 项目执行权限被用于全部已有 Slack 线程的启用卡片镜像；实际私有只读审计发现 56 个卡片，其中 16 个在测试频道外（含私聊）。审计不删除或修改历史消息。
+- [x] 正式原插件回归：默认不发；指定频道幂等；旧频道卡片保留且不更新；范围外旧按钮在网关调用前拒绝。旧逻辑三项实际 0/3，正确断言复现；修后 3/3，最终四项 4/4，Slack 全量 322/322。首次 Cloud 全量原 HTTP 卡片夹具因未显式测试频道失败，保留原日志；随后按新契约显式配置 CTEST，并修正独立 Review 指出的只读调用 Oracle，须对新字节补验。
+- [ ] 最终单测、独立 Review、Required CI、合并与准确部署；部署仅配置指定测试频道，不扩大项目/用户授权。完整真实 Cursor 三路径业务闭环仍未验收。

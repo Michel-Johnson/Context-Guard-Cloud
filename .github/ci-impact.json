@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "jobs": ["test", "minimum-runtime", "slack", "browser", "package"],
+  "fullRunPatterns": [
+    ".github/**",
+    ".gitattributes",
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "plugins/slack/package.json",
+    "plugins/slack/package-lock.json",
+    "tests/test-manifest.json",
+    "docs/ci.md"
+  ],
+  "rules": [
+    {
+      "id": "repository-docs",
+      "patterns": ["AGENTS.md", "CI_todo.md", "TODO.md", "docs/**", "plugins/slack/README.md"],
+      "jobs": []
+    },
+    {
+      "id": "packaged-docs",
+      "patterns": ["README.md", "THIRD_PARTY_NOTICES.md", "references/**", "licenses/**"],
+      "jobs": ["package"]
+    },
+    {
+      "id": "cloud-runtime",
+      "patterns": ["scripts/cloud/**"],
+      "jobs": ["test", "minimum-runtime", "browser", "package"]
+    },
+    {
+      "id": "cloud-slack-integration",
+      "patterns": [
+        "scripts/cloud/coordinator-*.mjs",
+        "scripts/cloud/merged-participation.mjs",
+        "scripts/cloud/slack-*.mjs",
+        "scripts/cloud/integration-*.mjs",
+        "scripts/cloud/server.mjs",
+        "scripts/cloud/protocol-auth.mjs",
+        "scripts/cloud/memory*.mjs",
+        "scripts/cloud/map-projects.mjs"
+      ],
+      "jobs": ["slack"]
+    },
+    {
+      "id": "runtime-build",
+      "patterns": ["scripts/build-runtime.mjs", "scripts/shared/**", "prototype/**"],
+      "jobs": ["test", "minimum-runtime", "slack", "browser", "package"]
+    },
+    {
+      "id": "slack-runtime",
+      "patterns": ["plugins/slack/src/**", "plugins/slack/scripts/**", "plugins/slack/app-manifest.json", "plugins/slack/.env.example", "plugins/slack/.gitignore"],
+      "jobs": ["test", "minimum-runtime", "slack", "package"]
+    },
+    {
+      "id": "slack-tests",
+      "patterns": ["plugins/slack/test/**"],
+      "jobs": ["slack"]
+    },
+    {
+      "id": "cloud-tests",
+      "patterns": ["tests/*.test.mjs"],
+      "jobs": ["test"]
+    },
+    {
+      "id": "browser-tests",
+      "patterns": ["tests/browser-device-login-runner.mjs", "tests/cloud-workbench-browser.mjs", "tests/cloud-sync-browser.mjs"],
+      "jobs": ["browser"]
+    },
+    {
+      "id": "test-helpers",
+      "patterns": ["tests/helpers/**"],
+      "jobs": ["test", "minimum-runtime", "browser"]
+    },
+    {
+      "id": "live-acceptance-runner",
+      "patterns": ["tests/coordinator-dialogue-live-browser.mjs"],
+      "jobs": ["test", "browser"]
+    },
+    {
+      "id": "deployment",
+      "patterns": ["deploy/**"],
+      "jobs": ["test", "package"]
+    }
+  ]
+}
