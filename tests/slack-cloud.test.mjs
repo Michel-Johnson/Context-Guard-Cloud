@@ -831,7 +831,7 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);
   const manualCall = f.modelCalls.at(-1);
   assert.match(manualCall.system, /不创建、派发或恢复执行 Session/);
-  assert.doesNotMatch(manualCall.system, /系统为新任务创建独立执行 Session|自动发起中断恢复/);
+  assert.doesNotMatch(manualCall.system, /系统(?:为新任务)?创建独立执行 Session|自动发起中断恢复/);
   assert.match(manualCall.system, /Current project facts/);
   assert.match(manualCall.system, /本轮答复发往 Slack/);
   const nonDMTools = coordinatorTools.filter(tool => !['list_projects', 'read_project_map', 'switch_project'].includes(tool.name));
@@ -849,7 +849,7 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   assert.equal((await f.browser('main', { body: { id: 'role-automatic', text: 'role-automatic' } })).status, 202);
   await f.wait('main', value => value.status === 'waiting-for-user' && !value.activeTurnId);
   const automaticCall = f.modelCalls.at(-1);
-  assert.match(automaticCall.system, /系统为新任务创建独立执行 Session/);
+  assert.match(automaticCall.system, /prepare_task 提 brief，等待需求审批回执；批准后由系统创建独立执行 Session\/worktree、绑定派发/);
   assert.doesNotMatch(automaticCall.system, /以下仅用于宿主已声明的人工执行对话/);
   assert.match(automaticCall.messages.at(-1).content, /输出来源：human/);
   assert.deepEqual(automaticCall.tools, selectCoordinatorTools(nonDMTools, { fileWrite: false }));
@@ -858,7 +858,7 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   await f.restart();
   assert.equal((await f.gateway('conversation.submit', { text: 'role-after-restart' }, { id: 'role-after-restart', conversationId: conversation })).status, 200);
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);
-  assert.doesNotMatch(f.modelCalls.at(-1).system, /系统为新任务创建独立执行 Session/);
+  assert.doesNotMatch(f.modelCalls.at(-1).system, /系统(?:为新任务)?创建独立执行 Session/);
   assert.deepEqual(f.modelCalls.at(-1).tools, manualCall.tools);
 });
 
