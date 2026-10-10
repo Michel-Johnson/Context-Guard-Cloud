@@ -1955,3 +1955,9 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 最终产品 SHA256：tools `885bed764f42c8088756114cc0d1d08b94c1e53441f6035dab9f92b367d181fd`；prefix `6afa1ac0da989b31650332daa98fa2f995c1cdd2b231b42c85e6a8a693a2b020`（首批后仅恢复两字）；plugin `1a9dd7292299e87eab960b510f9ce6080e2936fbd40a8a36dc77eba6309ac23a`；store `d47310e908d4287f876565db3d7c4fcd5af38ce13bd8bf69dd0872322ca9f386`。最终测试 SHA256：plugin test `d24bd948ebd0dabec83658af932b042b0b426c15360493963a3ccc9f42ebd951`；slack-cloud `d603190034fd762fbc8130c48fc04aab3ddb95523e8e5b9e07da96a759051b6f`；cloud-coordinator `2c96b63ccd3c877f370e8d54d883bdecbdf6656bfc042c77f75b1e7ced11883c`；independent `e94255027dc76ffe96494bd2b5a1ce1b121a0d3158e6641cc8840f534decff97`。前一项 402 修复保留，不用本批结果替换其原受测修订。
 - [ ] Tester：按最终准确提交独立验证原 thread 绑定、私聊兼容、用户/线程隔离、交接前后消息、重启/重复去重、成员退出、目标撤权和晚到旧路由拒绝；模型及平台 IO 替身不冒充自然语言意图或原生 Slack 验收。本轮不调用 subagent、不跑全量/付费模型。
 - [ ] 正常交付与上线后验收：当前未提交、合并或部署。真实已授权原线程中确认明确绑定请求和后续只读查询均闭合；同名/引用不误切换、不改变整个频道。保留已有消息、失败和回执，不用其他项目或频道的成功替代。
+
+# CURSOR-SLACK-OFFER-01 · 提示范围纠正
+
+- 原因：Cursor 项目执行权限被用于全部已有 Slack 线程的启用卡片镜像；实际私有只读审计发现 56 个卡片，其中 16 个在测试频道外（含私聊）。审计不删除或修改历史消息。
+- [x] 正式原插件回归：默认不发；指定频道幂等；旧频道卡片保留且不更新；范围外旧按钮在网关调用前拒绝。旧逻辑三项实际 0/3，正确断言复现；修后 3/3，最终四项 4/4，Slack 全量 322/322。首次 Cloud 全量原 HTTP 卡片夹具因未显式测试频道失败，保留原日志；随后按新契约显式配置 CTEST，并修正独立 Review 指出的只读调用 Oracle，须对新字节补验。
+- [ ] 最终单测、独立 Review、Required CI、合并与准确部署；部署仅配置指定测试频道，不扩大项目/用户授权。完整真实 Cursor 三路径业务闭环仍未验收。

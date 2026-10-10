@@ -308,6 +308,7 @@ test('Slack Cursor controls reuse the original thread, exact brief approval and 
   const key = threadKey('TTEST', 'CTEST', '1.0'), posts = [];
   await store.bind(key, { projectId: 'context-guard', conversationId, channel: 'CTEST', threadTs: '1.0', userId: 'UTEST', ownRequests: [] });
   const plugin = new SlackPlugin({ store, teamId: 'TTEST', cloudOrigin: 'https://roles.example', botUserId: 'UBOT',
+    cursorOfferChannels: ['CTEST'],
     gateway: { command: async (type, input) => {
       const response = await f.gateway(type, input.payload, { conversationId: input.conversationId, userId: input.userId, id: input.id });
       assert.equal(response.status, 200, JSON.stringify(response.body)); return response.body.data;
