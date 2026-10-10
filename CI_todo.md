@@ -1973,3 +1973,18 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 原因：Cursor 项目执行权限被用于全部已有 Slack 线程的启用卡片镜像；实际私有只读审计发现 56 个卡片，其中 16 个在测试频道外（含私聊）。审计不删除或修改历史消息。
 - [x] 正式原插件回归：默认不发；指定频道幂等；旧频道卡片保留且不更新；范围外旧按钮在网关调用前拒绝。旧逻辑三项实际 0/3，正确断言复现；修后 3/3，最终四项 4/4，Slack 全量 322/322。首次 Cloud 全量原 HTTP 卡片夹具因未显式测试频道失败，保留原日志；随后按新契约显式配置 CTEST，并修正独立 Review 指出的只读调用 Oracle，须对新字节补验。
 - [ ] 最终单测、独立 Review、Required CI、合并与准确部署；部署仅配置指定测试频道，不扩大项目/用户授权。完整真实 Cursor 三路径业务闭环仍未验收。
+
+## CURSOR-MCP-CONTRACT-01 · 原任务 Plan 的可发现接口契约
+
+- 根因：真实 Cursor 已初始化 MCP、读取原任务及 brief，但发现工具只描述笼统 `payload`。Plan 写入遗漏必填 `baseVersion`、报告未使用 `taskId/stage/data`，格式错误又只返回笼统拒绝；厂商 Run 结束没有产生原任务的 Plan 回执，不视为完成。
+- [x] 最小修复：保留两个工具名和原协议；按 Plan、执行、独立 CI 阶段公开对应字段、长度、枚举与失败复现要求。首次对象写入显式使用空字符串版本，不默认补参、不接受 null。仅映射 Core 白名单验证标签，返回安全字段位置和 `tools/list` 纠错入口；不回显私有值、任意错误正文或未知字段。Core 校验、原任务身份、阶段、权限、幂等与人审门禁不变。
+- [x] 正式 HTTP 回归：旧实现新增三目标 0/3，保留失败；首次修后 2/3，另一个失败来自夹具重复推进已结束 Plan 阶段，改为三个独立任务夹具，不放宽授权；该三目标复验 3/3。再增加执行/CI 错误与拒绝检查，完整角色通道及真实 HTTP 套件 39/39，0 失败/跳过/取消，49089.988875ms。Node24.18.0，基线 Main `e4fd3d911b43811ecc1fbb255018145226f100ff` 加本节修复。命令：`node --test --test-reporter=tap tests/cursor-role-channel.test.mjs tests/cursor-role-http.test.mjs`。实际 HTTP/磁盘协议，厂商/Git 核验为替身；不能替代真实 Cursor 完成任务。
+- [x] 本次完整 `npm test` 终态 exit0：904 项，902 通过、0 失败、2 既有跳过、0 取消，197061.316792ms；准确产品提交 `374b335fd78d4eeaed0faca0af3d54cb525aed45`（本次运行开始时为同字节工作树）。原 staged 和该提交 tree 安全扫描各 177 文件通过。未替换原用户 Git hooks，单独执行安全门禁。
+- [ ] 准确修订独立 Tester、outgoing 安全与 Required CI、正常合并和生产部署。未把旧提示范围的通过证据用于本项。
+- [ ] 真实业务验收：在原任务、原 Cursor Agent 中继续，提交合法 Plan，经 Coordinator 审核后开发并独立测试；保留旧失败及过期凭据，不手工代签 Plan、不强改租期、不新建同义任务。厂商终态但原任务仍未提交 Plan 的自动接续需另行修复验证。
+- [ ] 总体仍待：本地 Coordinator → 本地 Cursor、Cloud Coordinator → 本地 Cursor、Cloud Coordinator → Cursor Cloud 三路径的实际连接、双向通讯、小任务产物与独立测试；不以工具发现、健康检查或模拟链路代替最终闭环。
+- [x] 独立检查发现遗留 P2：未知 `cause.code` 即使截断仍可能回显私有数据。补正式 HTTP 失败用例，旧字节 0/1（298.752667ms）；仅将公开错误码限定为协议/角色白名单，未知值转为 `ROLE_CALL_FAILED`，不改变调用结果和授权。修后完整 MCP 七目标 7/7、0 失败/跳过/取消、2698.431791ms，准确基线为恢复的 `5739997196d94aa1a2c9eef313122131be6eaa04` 加该补修，Node24.18.0。合成错误注入只替换失败边界，HTTP、初始化及持久任务为实际实现；不冒充真实厂商无泄漏验收。
+- [ ] 2026-10-11 继续交付：保留旧提交及用户文件，在独立 Git 工作树恢复原分支；本次新字节完整 `npm test`、独立 Tester、outgoing/Required、合并及生产验收仍需记录，旧 902 通过不作为新字节证据。计时为私有未同步开发草稿，不进入源码或公开 PR。
+- [x] 本次新字节完整 `npm test` 终态 exit0：905 项，903 通过、0 失败、2 既有跳过、0 取消，208548.483ms；准确产品提交 `c985dab0f8e91701eea07230753fdf482120da6b`，Node24.18.0。staged 177 文件、outgoing 1 更新/3 提交安全通过；所有用户 hooks 与原 Git 提交保留。
+- [x] 独立 Tester 按准确 `c985dab` 新字节运行全部七个 MCP 正式目标，7/7、0 失败/跳过/取消、exit0，2913.753333ms。未知错误码 P2 关闭，未发现新 P0/P1。产品 MCP SHA256 `438f97660139b47f824b4e32c4f59aef373a9561fb5306f1a21199f8725f1505`；测试 `96ed97ef55d73ca9a18dedbd27e7e10b5db18ebfb1e7a39823daad798d573c35`。真实 HTTP/Core，错误注入及厂商/Git 为合成边界，不签真实 Cursor、生产或三路径完成。
+- [ ] PR72 的准确最终 Required、正常合并和 Main 门禁、保留原生产组合的部署及真实业务验收。此后台账变更不等于增加已测试产品字节；每个新产品修订仍需匹配自身证据。
