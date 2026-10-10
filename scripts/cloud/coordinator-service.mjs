@@ -66,10 +66,13 @@ export function coordinatorCompactBoundary(messages, through = 0, { humanOnly = 
   const boundary = starts.length > COMPACT_KEEP_TURNS ? starts.at(-COMPACT_KEEP_TURNS) : starts.length > 1 ? starts.at(-1) : 0;
   return boundary > through ? boundary : 0;
 }
+const isReplyLengthCorrection = (code, validationCode) => code === 'MODEL_INVALID_RESPONSE' &&
+  ['REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS'].includes(validationCode);
 export const coordinatorCanAutoResume = (state, maxRetries = 2) => !!state?.activeTurnId &&
   state.status === 'error' && (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(state.error?.code) || state.error?.recoverable === true) &&
   !(state.operatorRecovery && !state.operatorRecovery.initialAccepted) &&
-  (state.modelRetries || 0) < maxRetries;
+  (isReplyLengthCorrection(state.error?.code, state.error?.diagnostic?.validationCode)
+    ? !state.pending : (state.modelRetries || 0) < maxRetries);
 
 function currentQuestionBoundary(state) {
   for (let index = state.messages.length - 2; index >= 0; index--) {
@@ -1190,10 +1193,14 @@ export class CoordinatorService {
               if (this.steerSettleMs) await new Promise(resolve => setTimeout(resolve, this.steerSettleMs));
               continue;
             }
-            if (recoverableModelFailure(cause) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
+            const validationCode = coordinatorFailureDiagnostic(cause)?.validationCode;
+            const lengthCorrection = isReplyLengthCorrection(cause.code, validationCode);
+            // 展示长度不合格继续用原上下文纠正，不耗尽模型故障预算或业务步骤。
+            // 下一轮仍检查中止、追加输入及停服；已保存的工具回执不重做。
+            if (recoverableModelFailure(cause) && (lengthCorrection || (state.modelRetries || 0) < this.maxModelRetries) && !state.pending &&
                 !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
-              state.modelRetries = (state.modelRetries || 0) + 1;
-              state.modelRepairCode = coordinatorFailureDiagnostic(cause)?.validationCode || null;
+              if (!lengthCorrection) state.modelRetries = (state.modelRetries || 0) + 1;
+              state.modelRepairCode = validationCode || null;
               state.modelRepairText = typeof cause.repairText === 'string' ? cause.repairText : null;
               state.modelRepairTools = Array.isArray(cause.repairTools) ? cause.repairTools : state.modelRepairTools || [];
               state.steps--; state.streaming = null; state.activity = null;

@@ -64,6 +64,7 @@
     "tests/coordinator-dialogue-live-browser.mjs",
     "tests/coordinator-binding.test.mjs",
     "tests/merged-participation-independent.test.mjs",
+    "tests/coordinator-length-correction.test.mjs",
     "tests/slack-merged-participation.test.mjs",
     "tests/map-translations.test.mjs",
     "tests/map-relations-independent.test.mjs",
