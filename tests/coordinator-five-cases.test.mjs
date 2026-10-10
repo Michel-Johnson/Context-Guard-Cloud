@@ -14,7 +14,18 @@ const call = (name, input, id = 'call') => ({ stop: 'tool_use', content: [{ type
 const reply = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
 async function fixture(t, model, execute, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-five-cases-'));
-  const service = new CoordinatorService({ directory, system: '合成测试', model: { next: model }, execute,
+  const native = process.env.CG_FIVE_NATIVE === '1';
+  let responseId = 0;
+  const adaptedModel = async request => {
+    const result = await model(request);
+    if (!native) return result;
+    if (result.stop === 'end_turn') return request.tools.some(tool => tool.name === 'respond')
+      ? call('respond', { reply: true, text: result.content.map(block => block.text || '').join('') }, 'response-' + ++responseId) : result;
+    return { ...result, content: result.content.map(block => block.type !== 'tool_use' || request.tools.some(tool => tool.name === block.name)
+      ? block : { ...block, name: 'reply_' + block.name }) };
+  };
+  const service = new CoordinatorService({ directory, system: '合成测试', model: { next: adaptedModel }, execute,
+    ...(native ? { outputProtocol: 'native-json-v1' } : {}),
     tools: coordinatorTools, validateReplies: true, retryDelayMs: 0, steerSettleMs: 0, ...options });
   t.after(async () => { await service.close({ stop: true }); await fs.rm(directory, { recursive: true, force: true }); });
   return service;
