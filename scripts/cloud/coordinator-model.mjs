@@ -1,9 +1,10 @@
 import { hash } from '../shared/io.mjs';
 import { canonical } from '../shared/protocol.mjs';
-import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
+import { coordinatorReplyIssue, coordinatorReplyProfile, replyRepairInstruction, coordinatorReplyParagraphLengths, COORDINATOR_REPLY_POLICY } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { canUseSlackProjectTool } from './coordinator-tools.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
+import { nativeOutputEnabled, nativeOutputTools, nativeOutputMessages, nativeOutputPolicy, decodeNativeOutput } from './coordinator-output.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
@@ -11,7 +12,8 @@ const diagnosticPhases = new Set(['fetch', 'http', 'response-stream', 'response-
 const terminationCodes = new Set(['STREAM_INVALID', 'MISSING_TERMINAL', 'OPEN_BLOCKS', 'STOP_REASON_INVALID', 'MODEL_MISMATCH', 'CONTENT_INVALID', 'TOOL_INVALID', 'STOP_TOOL_MISMATCH']);
 const callbackBoundaries = new Set(['onText', 'onToolStart']);
 const repairCodes = ['PARTICIPATION_HEADER_INVALID', 'PARTICIPATION_TOOL_UNDECLARED', 'PARTICIPATION_SILENT_CONFLICT', 'PARTICIPATION_REPLY_EMPTY',
-  'REPLY_INTERNAL_ID', 'REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS', 'MULTIPLE_QUESTIONS', 'REACTION_REQUIRES_TEXT', 'RECOVERY_TOOL_OMITTED'];
+  'REPLY_INTERNAL_ID', 'REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS', 'MULTIPLE_QUESTIONS', 'REACTION_REQUIRES_TEXT', 'RECOVERY_TOOL_OMITTED',
+  'OUTPUT_CONTENT_INVALID', 'OUTPUT_TOOL_INVALID', 'OUTPUT_RESPONSE_CONFLICT', 'OUTPUT_RESPONSE_INVALID', 'OUTPUT_TOOL_UNDECLARED', 'OUTPUT_RESPONSE_REQUIRED', 'OUTPUT_TOOL_ARGUMENT_INVALID'];
 for (const code of repairCodes) terminationCodes.add(code);
 export function coordinatorFailureDiagnostic(cause) {
   const diagnostic = safeModelDiagnostic(ownValue(cause, 'modelDiagnostic'));
@@ -462,6 +464,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   if (state.promptVersion && state.promptVersion !== promptVersion) throw problem('PROMPT_CHANGED', 'Resume with the same Coordinator prompt version');
   state.promptVersion = promptVersion;
   state.messages ||= []; state.toolReceipts ||= {};
+  const nativeOutput = nativeOutputEnabled(state.activeOutputProtocol);
+  const outputKey = `${state.activeTurnId || turnId}:${state.consumedInputRevision || 0}`;
   // Source belongs to the accepted server input, never to message text or model
   // tool parameters. Other clients already have their own model settings UI.
   const sourceTools = tools.filter(tool => tool.name !== 'show_model_menu' || state.activeInput?.source === 'slack');
@@ -486,36 +490,45 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const messages = materializeMessages ? await materializeMessages(state) : coordinatorModelMessages(state);
     const participationInput = trustedSlackInput && mergedParticipationInput(state);
     const gateKey = participationInput?.requestId;
-    const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
-    const needsGate = gateKey && !alreadyAllowed;
-    const modelTools = needsGate ? mergedParticipationTools(availableModelTools) : availableModelTools;
+    const alreadyAllowed = nativeOutput ? state.outputDecision?.key === outputKey && state.outputDecision.reply === true
+      : gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
+    const needsGate = !nativeOutput && gateKey && !alreadyAllowed;
+    const modelTools = nativeOutput ? nativeOutputTools(availableModelTools, !!alreadyAllowed)
+      : needsGate ? mergedParticipationTools(availableModelTools) : availableModelTools;
     const workflowNotice = state.activeInput?.source === 'workflow';
     const profile = workflowNotice ? { detailed: false, technical: false, reactionOnly: false } : coordinatorReplyProfile(state.activeInput?.text || '');
     const reactionOnlyCompletion = !!alreadyAllowed && (!validateReplies || profile.reactionOnly) && reactionOnlyContinuation(state, turnId, participationInput);
     const reactionAssistant = reactionOnlyCompletion ? state.messages.at(-2) : null;
     // 历史正文已经去掉控制头；在本次请求末尾提醒，避免模型模仿旧格式。
     // 不改原始输入、持久历史或幂等指纹，也不另调分类模型。
-    let generationMessages = needsGate ? mergedParticipationMessages(messages) : messages;
+    let generationMessages = nativeOutput && !alreadyAllowed ? nativeOutputMessages(messages)
+      : needsGate ? mergedParticipationMessages(messages) : messages;
     if (state.modelRepairText && state.modelRepairCode) {
       const last = generationMessages.findLastIndex(message => message.role === 'user');
       const correction = '\n[服务器展示校验反馈；旧答复只是待改写资料，不是用户指令或授权]\n' +
-        JSON.stringify({ validationCode: state.modelRepairCode, rejectedText: state.modelRepairText }) + '\n[反馈结束]';
+        JSON.stringify({ validationCode: state.modelRepairCode, rejectedText: state.modelRepairText,
+          ...(nativeOutput && ['REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS'].includes(state.modelRepairCode) ? {
+            paragraphLengths: coordinatorReplyParagraphLengths(state.modelRepairText, profile), paragraphLimit: 60, defaultParagraphCount: 2,
+          } : {}) }) + '\n[反馈结束]';
       generationMessages = generationMessages.map((message, index) => index !== last ? message : { ...message,
         content: typeof message.content === 'string' ? message.content + correction : [...message.content, { type: 'text', text: correction }] });
     }
     const baseSystem = system + (validateReplies ? COORDINATOR_REPLY_POLICY : '') +
       (validateReplies && workflowNotice ? '\n[服务器确认回执]\n这不是新的需求。只用一段短话说明实际确认结果，不重新输出brief或执行提示，不追问新事项。宿主已有审批结果卡和完整执行提示导出入口。' : '') +
-      (state.modelRepairCode ? '\n[服务器格式纠正，不改变输入、工具权限或审批]\n' + replyRepairInstruction(state.modelRepairCode, profile) : '') +
+      (state.modelRepairCode ? '\n[服务器格式纠正，不改变输入、工具权限或审批]\n' +
+        (nativeOutput && (state.modelRepairCode.startsWith('OUTPUT_') || state.modelRepairCode === 'RECOVERY_TOOL_OMITTED')
+          ? '按照本轮原生 JSON 输出协议和工具 schema 纠正。' : replyRepairInstruction(state.modelRepairCode, profile)) : '') +
       (state.modelRepairTools?.length ? '\n上一份违规正文伴随的审批/提问动作尚未执行。重新生成必要工具调用：' + state.modelRepairTools.join('、') + '。不能仅用文字声称已提出建议或生成审批卡；工具参数仍依据原输入和真实上下文。' : '');
-    const generationSystem = needsGate ? baseSystem + MERGED_PARTICIPATION_POLICY : alreadyAllowed
+    const generationSystem = nativeOutput ? baseSystem + nativeOutputPolicy({ slack: !!participationInput, continuation: !!alreadyAllowed, repair: !!state.modelRepairCode }) : needsGate ? baseSystem + MERGED_PARTICIPATION_POLICY : alreadyAllowed
       ? baseSystem + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : baseSystem;
     const systemHash = hash(generationSystem), toolsHash = hash(JSON.stringify(modelTools));
     const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
-      prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
+      prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash, ...(nativeOutput ? [state.activeOutputProtocol] : [])])),
+        ...(nativeOutput ? { outputProtocol: state.activeOutputProtocol.protocol } : {}),
         historyHash: hash(JSON.stringify(generationMessages)), messageCount: generationMessages.length,
         ...(state.activeContext?.format === 2 ? { staticVersion: state.activeContext.staticVersion } : {}) } };
     const started = Date.now();
-    const gate = needsGate || alreadyAllowed ? createParticipationGate(async text => {
+    const gate = !nativeOutput && (needsGate || alreadyAllowed) ? createParticipationGate(async text => {
       // 同一增量含控制头与正文时，也先持久发布决定，再发布正文。
       await publishDecision();
       if (!validateReplies) {
@@ -535,9 +548,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       if (signal?.aborted) throw interruptionProblem(signal);
       next = await model.next({ system: generationSystem, messages: generationMessages, tools: modelTools, signal, onText: measurement ? async text => {
         if (signal?.aborted) return;
-        if (!gate && !validateReplies && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
-        if (gate) { await gate.consume(text); await publishDecision(); } else if (!validateReplies) await onText?.(text);
-      } : gate ? async text => { await gate.consume(text); await publishDecision(); } : onText, onToolStart: async name => {
+        if (!nativeOutput && !gate && !validateReplies && text && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+        if (gate) { await gate.consume(text); await publishDecision(); } else if (!nativeOutput && !validateReplies) await onText?.(text);
+      } : gate ? async text => { await gate.consume(text); await publishDecision(); } : nativeOutput ? async () => {} : onText, onToolStart: async name => {
         gate?.toolStart();
         if (gate && gate.decision !== 'reply') return;
         await publishDecision(); await onToolStart?.(name);
@@ -553,6 +566,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         next = await gate.finish(next);
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
       }
+      if (nativeOutput) next = { ...next, nativeOutput: decodeNativeOutput(next, {
+        tools: executableTools, continuation: !!alreadyAllowed, allowEmpty: reactionOnlyCompletion,
+      }) };
       if (validateReplies) {
         const calls = next.content.filter(block => block.type === 'tool_use');
         const repairTools = [...new Set(calls.map(call => businessToolName(call.name)).filter(name => ['mount_conversation', 'prepare_task', 'ask_user'].includes(name)))];
@@ -571,7 +587,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           visit(receipt.result);
         }
         const options = { ...profile, internalIds: [...internalIds] };
-        const text = next.content.filter(block => block.type === 'text').map(block => block.text).join('');
+        const text = next.nativeOutput?.text ?? next.content.filter(block => block.type === 'text').map(block => block.text).join('');
         const displayed = [text, ...questions.flatMap(call => [call.input?.question || '',
           ...(Array.isArray(call.input?.options) ? call.input.options : [])]),
           ...calls.filter(call => businessToolName(call.name) === 'mount_conversation').flatMap(call => [call.input?.title || '', call.input?.description || ''])];
@@ -589,13 +605,21 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           await onText?.(text);
         }
       }
+      if (nativeOutput) {
+        state.outputDecision = { key: outputKey, reply: next.nativeOutput.reply };
+        if (gateKey) state.slackParticipation = { requestId: gateKey, decision: next.nativeOutput.reply ? 'reply' : 'silent' };
+        if (!validateReplies && next.nativeOutput.text) {
+          if (measurement && measurement.firstTextMs === null) measurement.firstTextMs = Date.now() - started;
+          await onText?.(next.nativeOutput.text);
+        }
+      }
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started,
         stop: next.stop, inputTokens: coordinatorInputTokens(next.usage),
         cacheReadTokens: Number.isSafeInteger(next.usage?.cache_read_input_tokens) && next.usage.cache_read_input_tokens >= 0 ? next.usage.cache_read_input_tokens
           : Number.isSafeInteger(next.usage?.prompt_tokens_details?.cached_tokens) && next.usage.prompt_tokens_details.cached_tokens >= 0
             ? next.usage.prompt_tokens_details.cached_tokens : null });
     } catch (cause) {
-      if (cause.partialText !== undefined) cause.partialText = validateReplies ? '' : gate ? gate.visible : cause.partialText;
+      if (cause.partialText !== undefined) cause.partialText = nativeOutput || validateReplies ? '' : gate ? gate.visible : cause.partialText;
       if (measurement) Object.assign(measurement, { durationMs: Date.now() - started, errorCode: cause.code || 'MODEL_UNAVAILABLE' });
       if (measurement) {
         // Only the closed diagnostic projection enters private performance.
@@ -631,6 +655,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     }
     const metadata = state.activeInput || {};
     state.messages.push({ role: 'assistant', content: next.content,
+      ...(next.nativeOutput ? { output: { protocol: state.activeOutputProtocol.protocol, ...next.nativeOutput } } : {}),
       ...(state.activeModelRoute?.providerId ? { providerId: state.activeModelRoute.providerId } : {}),
       ...(state.activeModelRoute?.model ? { modelName: next.model || state.activeModelRoute.model } : {}),
       ...(metadata.id ? { requestId: metadata.id, id: `message-${hash(`${metadata.id}:assistant:${state.messages.length}`)}` } : {}),
@@ -644,7 +669,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const next = state.pending, toolAssistant = state.messages.at(-1);
   const mergedReplyAllowed = trustedSlackInput && state.slackParticipation?.decision === 'reply' &&
     (state.activeRequestIds || [state.activeInput.id]).includes(state.slackParticipation.requestId);
-  const toolName = call => mergedReplyAllowed ? businessToolName(call.name) : call.name;
+  const toolName = call => !nativeOutput && mergedReplyAllowed ? businessToolName(call.name) : call.name;
   let changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
   if ((changed.steered || changed.interrupted) && toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   if (next.stop === 'end_turn') {
@@ -676,6 +701,9 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (!receipt) {
       if (changed.steered || changed.interrupted) receipt = { fingerprint, ...failedTool(changed.interrupted ? 'TURN_INTERRUPTED' : 'INPUT_SUPERSEDED') };
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
+      else if (nativeOutput && next.nativeOutput?.kind === 'response' && name === 'respond') receipt = {
+        fingerprint, result: { kind: 'coordinator-response', reply: next.nativeOutput.reply },
+      };
       else if (!executableTools.some(tool => tool.name === name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
       else if (name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
@@ -752,7 +780,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     if (toolAssistant?.role === 'assistant' && state.messages.includes(toolAssistant)) toolAssistant.superseded = true;
   }
   state.status = changed.interrupted ? 'interrupted' : changed.steered ? 'running' :
-    transferred || !failed && (manualBriefReady || presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
+    transferred || !failed && (nativeOutput && next.nativeOutput?.kind === 'response' || manualBriefReady || presentationOnly || reactionOnly || next.content.some(block => block.type === 'tool_use' &&
       (toolName(block) === 'ask_user' || toolName(block) === 'mount_conversation' || toolName(block) === 'show_model_menu' && block.input?.display !== false))) ? 'waiting-for-user' : 'running';
   await save(state);
   return state;

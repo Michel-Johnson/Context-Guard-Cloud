@@ -24,7 +24,7 @@ const participation = (id, text) => ({ text, inputs: [{ id, text }], files: [], 
   routing: { coordinatorUserId: botUserId, mentionedUsers: [], replyToCoordinator: false } });
 const result = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
 
-async function fixture(t, next) {
+async function fixture(t, next, { nativeOutput = false } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-merged-'));
   const providerFile = path.join(directory, 'provider.json');
   await fs.writeFile(providerFile, JSON.stringify({ token: 'synthetic', baseUrl: 'https://fixture.invalid', model: 'fixture-model' }));
@@ -32,6 +32,8 @@ async function fixture(t, next) {
     projects: [{ id: projectId, name: '测试项目', description: '隔离验收' }] }));
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic-admin',
     projects: { [projectId]: { root: directory, ref: 'refs/heads/main', coordinator: { enabled: true, providerFile, bindings: {} } } } };
+  if (nativeOutput) Object.assign(memoryConfig.projects[projectId].coordinator,
+    { outputProtocol: 'native-json-v1', outputProtocolConversations: [] });
   const file = legacyProjectMemoryFile(memoryConfig.dataDir, projectId);
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, JSON.stringify({ revision: 1, main: { version: 'fixture-main', memory: { records: {}, map: {
@@ -52,7 +54,10 @@ async function fixture(t, next) {
   await store.update(state => { state.channels.CTEST = projectId; state.preferences[userId] = projectId; });
   const gateway = new Gateway({ url: cloud.integrationUrl, token, teamId });
   const command = gateway.command.bind(gateway);
-  gateway.command = async (type, args) => { commands.push({ type, ...structuredClone(args) }); return command(type, args); };
+  gateway.command = async (type, args) => {
+    if (nativeOutput && type === 'conversation.create') memoryConfig.projects[projectId].coordinator.outputProtocolConversations.push('chat-' + hash(args.payload.operationId));
+    commands.push({ type, ...structuredClone(args) }); return command(type, args);
+  };
   const plugin = new SlackPlugin({ store, gateway, teamId, botUserId, cloudOrigin: cloud.url, collectMs: 0, maxCollectMs: 0,
     logger: { warn() {}, error() {} }, io: {
       post: async input => { posts.push(input); return `${1000 + posts.length}.001`; },
@@ -126,6 +131,39 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
   await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId);
   assert.equal(f.modelCalls.length, 1);
   assert.equal(f.reactions.length, 3);
+});
+
+test('Slack 原生JSON：真实网关与插件只发正文，一次调用，送达后换对勾且重复事件不重发', async t => {
+  const f = await fixture(t, async request => {
+    assert.ok(request.tools.some(tool => tool.name === 'respond'));
+    await request.onText('{"partial":');
+    return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'native-reply', name: 'respond', input: { reply: true, text: '已收到，先确认主节点。' } }] };
+  }, { nativeOutput: true });
+  const before = await f.main(); await f.send('请确认收到。');
+  await f.wait(state => state.status === 'waiting-for-user' && !state.activeTurnId && f.posts.length > 0);
+  assert.equal(f.modelCalls.length, 1); assert.deepEqual(await f.main(), before);
+  assert.ok(f.posts.some(post => post.text.includes('已收到，先确认主节点。')));
+  assert.doesNotMatch(JSON.stringify(f.posts), /native-reply|respond|partial|CG_REPLY/);
+  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'speech_balloon', 'white_check_mark']);
+  await f.send('请确认收到。'); await f.wait(state => !state.activeTurnId);
+  assert.equal(f.modelCalls.length, 1);
+});
+test('Slack 原生JSON静默不发正文或工具动作，也不显示完成对勾', async t => {
+  const f = await fixture(t, async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'silent', name: 'respond', input: { reply: false, text: '' } }] }), { nativeOutput: true });
+  const before = await f.main(); await f.send('只记录，不回复。');
+  await f.wait(state => state.status === 'waiting-for-user' && state.participationDecision === 'silent');
+  assert.deepEqual(f.posts, []); assert.equal(f.modelCalls.length, 1);
+  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'see_no_evil']); assert.deepEqual(await f.main(), before);
+});
+test('Slack 原生JSON选项仍由原问句卡片呈现，不外发内部工具参数', async t => {
+  const f = await fixture(t, async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'choose', name: 'ask_user',
+    input: { question: '使用哪个客户端？', options: ['Claude Code', 'Cursor'] } }] }), { nativeOutput: true });
+  await f.send('请给客户端选择按钮。');
+  const state = await f.wait(state => state.status === 'waiting-for-user' && state.messages.some(message => message.questions?.length));
+  assert.deepEqual(state.messages.at(-1).questions[0].options, ['Claude Code', 'Cursor']);
+  assert.ok(JSON.stringify(f.posts).includes('Claude Code')); assert.ok(JSON.stringify(f.posts).includes('Cursor'));
+  assert.deepEqual(f.reactions.map(item => item.name), ['eyes', 'speech_balloon', 'white_check_mark']);
+  assert.equal(f.modelCalls.length, 1);
 });
 
 test('合并接话格式提醒只改本次请求副本，原文、附件和历史保持不变', () => {

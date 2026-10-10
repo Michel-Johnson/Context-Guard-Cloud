@@ -18,6 +18,7 @@ import { reviewInput, reviewOperations, pendingReviewFeedback } from './task-rev
 import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
 import { canonical, validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
 import { CoordinatorModel } from './coordinator-model.mjs';
+import { configuredOutputProtocol } from './coordinator-output.mjs';
 import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
 import { MapTranslations, translationInput } from './map-translations.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
@@ -1238,6 +1239,7 @@ export async function startCloudServer({
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
           ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true, validateReplies: true } : {}),
+          ...(manual ? { outputProtocol: configuredOutputProtocol(config, conversationId) } : {}),
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
           ...(integrations ? { onStateChange: () => integrationGateway?.notify({ projectId: project.id, conversationId }) } : {}),

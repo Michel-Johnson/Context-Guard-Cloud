@@ -14,18 +14,31 @@ import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs'
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { CoordinatorConversations } from '../scripts/cloud/coordinator-service.mjs';
 
-assert.ok(process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_FILE, '须显式指定真实模型配置');
-const providerFile = path.resolve(process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_FILE);
-const provider = JSON.parse(await fs.readFile(providerFile, 'utf8'));
+const providerSource = process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_FILE;
+const providerSsh = process.env.CONTEXT_GUARD_COORDINATOR_PROVIDER_SSH;
+assert.ok(!!providerSource !== !!providerSsh, '须明确选择文件或 SSH 读取真实模型配置');
+assert.ok(!providerSsh || /^[a-zA-Z0-9_.@-]+$/.test(providerSsh), 'SSH 目标必须为单个主机');
+const provider = providerSource ? JSON.parse(await fs.readFile(path.resolve(providerSource), 'utf8')) : JSON.parse(execFileSync('ssh',
+  ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', providerSsh, 'node --input-type=module'], {
+    input: "import fs from 'node:fs';process.stdout.write(fs.readFileSync('/etc/context-guard-cloud/claude-lab-coordinator.json','utf8'));",
+    encoding: 'utf8', maxBuffer: 64 * 1024, windowsHide: true,
+  }));
+const outputProtocol = process.env.CONTEXT_GUARD_COORDINATOR_OUTPUT_PROTOCOL || null;
+assert.ok(!outputProtocol || outputProtocol === 'native-json-v1', '只验证本轮明确的输出协议');
 const output = path.resolve(process.argv[2] || `temp/dialogue-live-browser-${Date.now()}`);
 await fs.mkdir(output, { recursive: true });
 const sourceFiles = [...new Set([...execFileSync('git', ['ls-files', 'scripts/cloud', 'plugins/slack/src', 'tests/coordinator-dialogue-live-browser.mjs'], { encoding: 'utf8' }).trim().split('\n'),
   'package.json', 'package-lock.json', 'scripts/shared/coordinator-reply.mjs', 'scripts/shared/coordinator-path.mjs',
+  'scripts/shared/coordinator-output.mjs', 'scripts/cloud/coordinator-output.mjs', '.runtime-generated.json',
   'prototype/coordinator-markdown.mjs', 'prototype/workbench-app.js', 'scripts/shared/package.json', 'prototype/package.json'])].sort();
 const sourceHashes = async () => Object.fromEntries(await Promise.all(sourceFiles.map(async file => [file,
   createHash('sha256').update(await fs.readFile(file)).digest('hex')])));
 const sourceBefore = await sourceHashes(), sourceRevision = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-dialogue-live-'));
+// Real credentials remain only in memory; the HTTP fixture reads a harmless
+// descriptor, and the explicitly injected model factory uses the real provider.
+const providerFile = path.join(directory, 'provider-fixture.json');
+await fs.writeFile(providerFile, JSON.stringify({ model: provider.model, baseUrl: 'https://model.invalid', token: 'synthetic-test-token' }));
 const projectId = 'dialogue-acceptance';
 const memories = ['项目规则：不得自动创建执行会话。', '登录规则：失败后保留已输入用户名。', '提示规则：提示用中文且不得泄露凭据。'];
 const node = (id, title, purpose, children = [], memoryDocument = '') => ({ id, title, purpose, children, memoryDocument,
@@ -35,7 +48,8 @@ const document = { v: 1, project: '对话验收', bootstrap: 'ready', flows: [],
   node('PERMISSION', '权限控制', '校验访问权限', [], '权限规则：拒绝访问时不泄露资源详情。'),
 ], memories[0]) };
 const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: randomUUID(), projects: { [projectId]: {
-  root: directory, ref: 'refs/heads/main', token: randomUUID(), coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true },
+  root: directory, ref: 'refs/heads/main', token: randomUUID(), coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true,
+    ...(outputProtocol ? { outputProtocol, outputProtocolConversations: [] } : {}) },
 } } };
 const memoryFile = legacyProjectMemoryFile(memoryConfig.dataDir, projectId);
 await fs.mkdir(path.dirname(memoryFile), { recursive: true });
@@ -47,8 +61,10 @@ const options = { host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig, 
   browserToken: randomUUID(), browserPasswordHash: await createWorkbenchPasswordHash('isolated-dialogue-password'),
   protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/dialogue-acceptance' }] },
   coordinatorModelFactory: config => {
-    const model = new CoordinatorModel(config);
+    const model = new CoordinatorModel(provider);
     return { model: model.model, next: async input => {
+      if (outputProtocol) assert.ok(input.tools.some(tool => tool.name === 'respond') || input.system.includes('不调用 respond'),
+        '验收必须实际启用原生协议，不能误测旧链路');
       const start = Date.now(), rendered = JSON.stringify({ system: input.system, messages: input.messages });
       const bodyCounts = memories.map(body => rendered.split(body).length - 1);
       const backgroundCounts = memories.map(body => JSON.stringify(input.system).split(body).length - 1);
@@ -58,6 +74,7 @@ const options = { host: '127.0.0.1', port: 0, dataDir: directory, memoryConfig, 
       catch (error) { calls.push({ durationMs: Date.now() - start, errorCode: error.code, diagnostic: coordinatorFailureDiagnostic(error) }); throw error; }
       calls.push({ durationMs: Date.now() - start, bodyCounts, backgroundCounts,
         text: result.content.filter(block => block.type === 'text').map(block => block.text).join(''),
+        ...(outputProtocol ? { nativeCalls: result.content.filter(block => block.type === 'tool_use').map(block => ({ name: block.name, input: block.input })) } : {}),
         toolRouting: result.content.filter(block => block.type === 'tool_use').map(block => ({ name: block.name,
           ...(block.input?.kind ? { kind: block.input.kind } : {}), ...(block.input?.nodeId ? { nodeId: block.input.nodeId } : {}) })),
         tools: result.content.filter(block => block.type === 'tool_use').map(block => block.name) });
@@ -84,6 +101,7 @@ const settle = async text => {
       if (activeRound) {
         const saved = await privateState(), models = saved.performance?.turnId !== activeRound.previousPerformanceTurn
           ? (saved.performance?.models || []) : [];
+        if (outputProtocol) assert.equal(saved.activeOutputProtocol?.protocol, outputProtocol, '实际轮次必须保存原生输出协议');
         rounds.push({ conversationId, input: activeRound.input, firstVisibleMs: activeRound.firstVisibleMs,
           durationMs: Date.now() - activeRound.started, status: s.status,
           attempts: models.map(({ durationMs, errorCode, diagnostic }) => ({ durationMs,
@@ -103,6 +121,15 @@ try {
   service = await startCloudServer(options);
   browser = await chromium.launch({ headless: true }); context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
   page = await context.newPage(); page.on('pageerror', error => pageErrors.push(error.message));
+  if (outputProtocol) await page.route('**/api/coordinator/conversations/new*', async route => {
+    // Select this fixture conversation before the server constructs its service.
+    // The actual UI request and response remain unchanged.
+    const operationId = route.request().postDataJSON().id;
+    const id = 'chat-' + createHash('sha256').update(operationId).digest('hex');
+    memoryConfig.projects[projectId].coordinator.outputProtocolConversations.push(id);
+    console.log('原生实验对话已配置：' + id);
+    await route.continue();
+  });
   await page.goto(service.url + `/login?next=${encodeURIComponent('/projects/' + projectId)}`);
   await page.getByLabel('密码').fill('isolated-dialogue-password'); await page.getByRole('button', { name: '登录', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'synced');
@@ -225,7 +252,7 @@ try {
   passed = passed && sourceUnchanged;
   const finalState = service && conversationId ? await state() : null;
   if (!passed && page) await page.screenshot({ path: path.join(output, 'failure.png') });
-  await fs.writeFile(path.join(output, 'result.json'), JSON.stringify({ passed, model: provider.model, checks, calls, rounds, pageErrors,
+  await fs.writeFile(path.join(output, 'result.json'), JSON.stringify({ passed, model: provider.model, outputProtocol, checks, calls, rounds, pageErrors,
     sourceRevision, sourceBefore, sourceAfter, sourceUnchanged,
     ...(passed ? {} : { finalState }),
     boundary: '真实浏览器和模型；隔离项目数据；不替代生产 Slack 或安装后验收' }, null, 2));

@@ -95,7 +95,7 @@ export function canUseSlackProjectTool(name, { source, actor } = {}) {
     channelPattern.test(actor.channelId || '');
 }
 
-function validateInput(tool, input) {
+export function validateCoordinatorToolInput(tool, input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('Tool input must be an object');
   const { properties, required } = tool.input_schema;
   if (Object.keys(input).some(key => !Object.hasOwn(properties, key)) || required.some(key => !Object.hasOwn(input, key))) fail('Tool fields differ from its schema');
@@ -121,7 +121,7 @@ export function createCoordinatorExecutor(ctx) {
     if (!tool) fail('Tool is not registered');
     if (name === 'read_reference' && typeof input?.name === 'string') input = { ...input,
       name: input.name.replace(/^references\//, '').replace(/\.md$/, '') + '.md' };
-    validateInput(tool, input);
+    validateCoordinatorToolInput(tool, input);
     await ctx.authorizeTool?.(name, input, options);
     if (['list_projects', 'read_project_map', 'switch_project'].includes(name)) {
       if (!canUseSlackProjectTool(name, options)) {

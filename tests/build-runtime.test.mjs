@@ -7,6 +7,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const exec = promisify(execFile);
 const builder = fileURLToPath(new URL('../scripts/build-runtime.mjs', import.meta.url));
@@ -34,8 +35,8 @@ async function fixture(t, { declaredVersion = '1.0.0', installedVersion = '1.0.0
   }
   await fs.writeFile(path.join(root, 'package.json'), JSON.stringify({ dependencies: dependencies }));
   return { root, outside,
-    run: async () => {
-      try { const result = await exec(process.execPath, ['scripts/build-runtime.mjs'], { cwd: root, windowsHide: true }); return { code: 0, ...result }; }
+    run: async (args = []) => {
+      try { const result = await exec(process.execPath, ['scripts/build-runtime.mjs', ...args], { cwd: root, windowsHide: true }); return { code: 0, ...result }; }
       catch (error) { return { code: error.code, stdout: error.stdout, stderr: error.stderr }; }
     },
   };
@@ -146,4 +147,39 @@ test('runtime builder upgrades matching fixed releases from 1.0.0 to 1.0.1', asy
     assert.equal(generated.packages[name].version, '1.0.1');
     assert.equal(generated.packages[name].dependency, releaseURL(name, '1.0.1'));
   }
+});
+async function experimentalFixture(t) {
+  const f = await fixture(t), name = '@michelj/context-guard-core';
+  const source = path.join(f.root, 'node_modules', name), descriptorFile = path.join(source, 'package.json');
+  const descriptor = JSON.parse(await fs.readFile(descriptorFile, 'utf8'));
+  descriptor.version = '1.0.0-native-json.0'; await fs.writeFile(descriptorFile, JSON.stringify(descriptor));
+  const stage = path.join(f.root, 'artifact-stage'); await fs.mkdir(stage);
+  await fs.cp(source, path.join(stage, 'package'), { recursive: true });
+  const artifact = path.join(f.root, 'experimental-core.tgz');
+  await exec('tar', ['-czf', artifact, '-C', stage, 'package/package.json', 'package/example.mjs', 'package/roles/Tester.md'], { windowsHide: true });
+  const bytes = await fs.readFile(artifact), sha256 = createHash('sha256').update(bytes).digest('hex');
+  await fs.writeFile(path.join(f.root, 'node_modules/.package-lock.json'), JSON.stringify({ packages: {
+    ['node_modules/' + name]: { version: descriptor.version, integrity: 'sha512-' + createHash('sha512').update(bytes).digest('base64') },
+  } }));
+  return { ...f, source, artifact, sha256 };
+}
+test('experimental builder requires explicit checksum and preserves official dependencies', async t => {
+  const f = await experimentalFixture(t), before = await fs.readFile(path.join(f.root, 'package.json'), 'utf8');
+  assert.notEqual((await f.run()).code, 0);
+  assert.equal((await f.run(['--experimental-core', f.artifact, f.sha256])).code, 0);
+  const generated = JSON.parse(await fs.readFile(path.join(f.root, '.runtime-generated.json'), 'utf8'));
+  assert.deepEqual(generated.packages['@michelj/context-guard-core'].experimental, { sha256: f.sha256 });
+  assert.equal(await fs.readFile(path.join(f.root, 'package.json'), 'utf8'), before);
+});
+test('experimental builder rejects checksum mismatch before generating any output', async t => {
+  const f = await experimentalFixture(t);
+  assert.notEqual((await f.run(['--experimental-core', f.artifact, '0'.repeat(64)])).code, 0);
+  await assert.rejects(fs.access(path.join(f.root, '.runtime-generated.json')), { code: 'ENOENT' });
+});
+test('experimental builder compares actual installed bytes rather than trusting installation metadata', async t => {
+  const f = await experimentalFixture(t);
+  await fs.writeFile(path.join(f.source, 'example.mjs'), 'export const tampered = true;');
+  const result = await f.run(['--experimental-core', f.artifact, f.sha256]);
+  assert.notEqual(result.code, 0); assert.match(result.stderr, /installed bytes differ/);
+  await assert.rejects(fs.access(path.join(f.root, '.runtime-generated.json')), { code: 'ENOENT' });
 });

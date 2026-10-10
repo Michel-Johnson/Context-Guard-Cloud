@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(path.join(root, 'package.json'));
@@ -41,7 +42,7 @@ async function walk(directory, prefix = '') {
   return result;
 }
 
-export async function buildRuntime() {
+export async function buildRuntime({ experimentalCore = null } = {}) {
   await assertDestination('.runtime-generated.json');
   const packageManifest = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
   const outputs = new Map(), packages = {};
@@ -50,8 +51,27 @@ export async function buildRuntime() {
     const descriptor = JSON.parse(await fs.readFile(path.join(source, 'package.json'), 'utf8'));
     const expected = packageManifest.dependencies?.[name];
     const releaseURL = `https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v${descriptor.version}/michelj-${name.split('/')[1]}-${descriptor.version}.tgz`;
-    if (descriptor.name !== name || !/^\d+\.\d+\.\d+$/.test(descriptor.version) || expected !== releaseURL) throw new Error(`Unexpected runtime dependency: ${name}`);
-    packages[name] = { version: descriptor.version, dependency: expected };
+    let experimental = null;
+    if (experimentalCore && name === '@michelj/context-guard-core') {
+      const bytes = await fs.readFile(experimentalCore.artifact);
+      const installed = JSON.parse(await fs.readFile(path.join(root, 'node_modules/.package-lock.json'), 'utf8')).packages?.['node_modules/' + name];
+      if (!/^[a-f0-9]{64}$/.test(experimentalCore.sha256 || '') || hash(bytes) !== experimentalCore.sha256 ||
+        !/^\d+\.\d+\.\d+-native-json\.\d+$/.test(descriptor.version) || descriptor.name !== name ||
+        installed?.version !== descriptor.version || installed?.integrity !== 'sha512-' + createHash('sha512').update(bytes).digest('base64')) {
+        throw new Error('Experimental Core artifact or installed package does not match its fixed checksum');
+      }
+      const archive = path.resolve(experimentalCore.artifact), installedFiles = await walk(source);
+      const packedFiles = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', windowsHide: true }).trim().split('\n');
+      if (JSON.stringify(packedFiles.sort()) !== JSON.stringify(installedFiles.map(file => 'package/' + file).sort())) {
+        throw new Error('Experimental Core archive and installation file sets differ');
+      }
+      for (const file of installedFiles) {
+        const packed = execFileSync('tar', ['-xOf', archive, 'package/' + file], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+        if (!packed.equals(await fs.readFile(path.join(source, file)))) throw new Error('Experimental Core installed bytes differ from the fixed artifact');
+      }
+      experimental = { sha256: experimentalCore.sha256 };
+    } else if (descriptor.name !== name || !/^\d+\.\d+\.\d+$/.test(descriptor.version) || expected !== releaseURL) throw new Error(`Unexpected runtime dependency: ${name}`);
+    packages[name] = { version: descriptor.version, dependency: expected, ...(experimental ? { experimental } : {}) };
     for (const file of await walk(source)) {
       if (!accepts(file)) continue;
       const relative = path.posix.join(destination, rename(file));
@@ -93,5 +113,7 @@ export async function buildRuntime() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  buildRuntime().catch(error => { console.error(error.message); process.exitCode = 1; });
+  const index = process.argv.indexOf('--experimental-core');
+  const experimentalCore = index < 0 ? null : { artifact: process.argv[index + 1], sha256: process.argv[index + 2] };
+  buildRuntime({ experimentalCore }).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

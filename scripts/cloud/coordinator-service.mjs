@@ -5,6 +5,7 @@ import { coordinatorModelMessages, coordinatorStep, correctableToolError, settle
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
+import { outputProtocolRecord, nativeOutputEnabled } from './coordinator-output.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -136,7 +137,8 @@ export function publicMessages(state) {
     // Exposing it now creates a duplicate row that is later replaced by a card.
     if (state.pending && index === state.messages.length - 1 && message.role === 'assistant') return null;
     const blocks = Array.isArray(message.content) ? message.content : [];
-    const sourceText = typeof message.content === 'string' ? message.content : blocks.filter(block => block.type === 'text').map(block => block.text).join('');
+    const sourceText = message.output?.protocol === 'native-json-v1' ? message.output.text
+      : typeof message.content === 'string' ? message.content : blocks.filter(block => block.type === 'text').map(block => block.text).join('');
     const questions = questionsAt(state, index);
     const actions = message.actions || [];
     const answer = message.answerTo ? state.answers?.[message.answerTo] : null;
@@ -152,7 +154,7 @@ export function publicMessages(state) {
       ...(answer?.requestId ? { requestId: answer.requestId } : {}),
       ...(questions.length ? { questions } : {}),
       ...(actions.length ? { actions } : {}),
-      tools: blocks.filter(block => block.type === 'tool_use').map(block => ({ id: block.id, name: block.name })) };
+      tools: blocks.filter(block => block.type === 'tool_use' && !(message.output?.protocol === 'native-json-v1' && block.name === 'respond')).map(block => ({ id: block.id, name: block.name })) };
   }).flatMap((message, index) => [message, ...(partials.get(index) || [])])
     .filter(message => message && (message.text || message.tools.length || message.attachments?.length));
   const visible = []; let carriedActions = [];
@@ -385,7 +387,7 @@ export class CoordinatorMapIntake {
 export class CoordinatorService {
   constructor({ directory, model, system, tools, execute, context = null, maxSteps = 12, maxModelRetries = 2, retryDelayMs = 250,
     compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, validateReplies = false, onStateChange = null,
-    textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null }) {
+    textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null, outputProtocol = null }) {
     if (!Number.isSafeInteger(compactMinTurns) || compactMinTurns < 1) throw error('INVALID_ARGUMENT', 'Compaction requires a positive completed-turn interval');
     if (onStateChange !== null && typeof onStateChange !== 'function') throw error('INVALID_ARGUMENT', 'State observer must be a function');
     if (beforeAcceptHumanInput !== null && typeof beforeAcceptHumanInput !== 'function') throw error('INVALID_ARGUMENT', 'Human input handler must be a function');
@@ -410,6 +412,7 @@ export class CoordinatorService {
     this.namespace = namespace;
     this.completePresentations = completePresentations;
     this.validateReplies = validateReplies;
+    this.outputProtocol = outputProtocolRecord(outputProtocol);
     this.visionModel = visionModel; this.resolveAttachment = resolveAttachment;
     this.onStateChange = onStateChange;
     this.beforeAcceptHumanInput = beforeAcceptHumanInput;
@@ -762,6 +765,8 @@ export class CoordinatorService {
           state.activeContext = nextContext;
           state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs: contextCompletedAt - contextStartedAt };
           state.activeTurnId = id; state.steps = 0; state.modelRetries = 0;
+          state.activeOutputProtocol = this.outputProtocol && structuredClone(this.outputProtocol);
+          delete state.outputDecision;
           delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
           state.activeRequestIds = [id];
           state.partialText = '';
@@ -904,6 +909,8 @@ export class CoordinatorService {
         state.activeModelRoute = route; state.activeContext = nextContext;
         state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs };
         state.activeTurnId = first.id; state.steps = 0; state.modelRetries = 0;
+        state.activeOutputProtocol = this.outputProtocol && structuredClone(this.outputProtocol);
+        delete state.outputDecision;
         delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
         if (operatorRecovery) state.operatorRecovery = { id: operatorRecovery, initialAttempted: false, initialAccepted: false };
         else delete state.operatorRecovery;
@@ -1143,6 +1150,7 @@ export class CoordinatorService {
               state.operatorRecovery.initialAttempted = true;
               await save(state);
             }
+            if (nativeOutputEnabled(state.activeOutputProtocol) && !this.outputProtocol) throw error('OUTPUT_PROTOCOL_DISABLED', 'Experimental native turn is paused; do not resume it with the legacy protocol');
             state = await coordinatorStep({ turnId: this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId, state, model,
               materializeMessages: value => this.materializeMessages(value, { currentImages: value.activeModelRoute?.kind === 'vision' }),
               system: prefix.system, promptVersion: hash(this.system), tools: prefix.tools, save, execute: (...args) => {
