@@ -13,9 +13,10 @@ import { verifyChangeReferences } from '../shared/protocol-map.mjs';
 import { ProtocolAuth } from './protocol-auth.mjs';
 import { DeviceAuthorization } from './device-authorization.mjs';
 import { ProtocolStore, hasCiReceiver } from '../shared/protocol-store.mjs';
+import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
 import { reviewInput, reviewOperations, pendingReviewFeedback } from './task-review.mjs';
 import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
-import { validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
+import { canonical, validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
 import { CoordinatorModel } from './coordinator-model.mjs';
 import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
 import { MapTranslations, translationInput } from './map-translations.mjs';
@@ -25,7 +26,7 @@ import { coordinatorTools, coordinatorReferences, readCoordinatorReferenceFile, 
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
-import { coordinatorNodePath } from '../shared/coordinator-path.mjs';
+import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
@@ -37,6 +38,10 @@ import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
+import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
+import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
+import { CursorGitProof } from './cursor-git-proof.mjs';
+import { authorizeCursorCiTask, parseCursorCiTaskHeader, authorizeCursorCiHostEvidence, parseCursorCiEvidenceHeader } from './cursor-ci-task-authority.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const htmlPath = path.join(root, 'prototype/workbench.html');
@@ -406,7 +411,28 @@ export async function authorizeCiReceiver({ principal, ciSessionId, message, rec
   const ciBinding = await store.registeredBinding(principal, ciSessionId);
   const executorBinding = await store.registeredBinding(principal, executorId);
   if (!ciBinding || ciBinding.worktreeId !== receiver.worktreeId || !executorBinding || executorBinding.worktreeId === ciBinding.worktreeId) protocolFail('FORBIDDEN', 'CI must use its registered independent worktree on the owning device');
-  return { ...principal, agentId: ciSessionId, role: 'ci', bindings: { [executorId]: executorBinding.worktreeId } };
+  return { ...principal, agentId: ciSessionId, role: 'ci', ciBindingVersion: ciBinding.version, bindings: { [executorId]: executorBinding.worktreeId } };
+}
+
+export function authorizeCiTransaction(state, principal, message) {
+  authorizeCursorCiTask(state, principal, message);
+  authorizeCursorCiHostEvidence(state, principal, message);
+  if (principal.role !== 'ci') return;
+  // Recheck the delegated identity on the same authoritative snapshot as the
+  // object read, before ProtocolStore can reuse any accepted receipt.
+  const binding = state.bindings[digest(JSON.stringify([principal.repositoryId, principal.agentId]))];
+  if (!binding || binding.version !== principal.ciBindingVersion || binding.deviceId !== principal.deviceId ||
+      binding.worktreeId === principal.bindings?.[message.session.id]) protocolFail('FORBIDDEN', 'CI binding changed before the operation');
+  if (message.type !== 'object.read') return;
+  const tasks = Object.values(state.tasks).filter(task => task.repositoryId === principal.repositoryId &&
+    task.session?.id === message.session.id && task.session.generation === message.session.generation && task.busy && task.stage === 'testing');
+  if (tasks.length !== 1) protocolFail('FORBIDDEN', 'CI reads require one current testing task');
+  const task = tasks[0], { ref, version } = message.payload;
+  const assigned = [task.handoff?.ciTodoRef, ...(task.handoff?.unitTestRefs || [])].includes(ref) &&
+    Object.hasOwn(task.references || {}, ref) && task.references[ref] === version;
+  const ownEvidence = ref.startsWith(`ci:${principal.agentId}:`) &&
+    state.objects[scopedObjectKey(principal, message.session, ref)]?.versions?.[version]?.kind === 'evidence';
+  if (!assigned && !ownEvidence) protocolFail('FORBIDDEN', 'CI may only read current handoff versions and its own evidence');
 }
 
 function readCoordinatorMapNode(snapshot, id, nodeIds) {
@@ -434,6 +460,7 @@ export async function startCloudServer({
   protocolConfig,
   cursorConfigFile = process.env.CONTEXT_GUARD_CURSOR_CONFIG || '',
   cursorProviderFactory = config => new CursorCloudProvider(config),
+  cursorGitProofFactory = config => new CursorGitProof(config),
   coordinatorModelFactory = config => new CoordinatorModel(config),
   integrationConfig,
   attachmentProvider,
@@ -462,11 +489,13 @@ export async function startCloudServer({
   if (cursorConfigFile && !path.isAbsolute(cursorConfigFile)) throw new MapError('INVALID_CURSOR_CONFIG', 'Cursor configuration requires an absolute private file');
   const cursorConfiguration = cursorConfigFile ? await readJson(cursorConfigFile) : null;
   const cursorServices = new Map();
+  const cursorRoleServices = new Map();
+  const initializedCursorRoles = new Map();
   const cursorFor = async project => {
     const config = cursorConfiguration?.projects?.[project.id];
     if (!config) throw new MapError('CURSOR_NOT_CONFIGURED', '服务器尚未配置此项目的 Cursor Cloud', 503);
     if (cursorServices.has(project.id)) return cursorServices.get(project.id);
-    if (!path.isAbsolute(config.apiKeyFile || '') || Object.keys(config).some(key => !['apiKeyFile', 'repositoryUrl', 'startingRef', 'model'].includes(key))) throw new MapError('INVALID_CURSOR_CONFIG', '配置私有密钥文件、仓库和固定提交', 503);
+    if (!path.isAbsolute(config.apiKeyFile || '') || Object.keys(config).some(key => !['apiKeyFile', 'repositoryUrl', 'startingRef', 'model', 'roles'].includes(key))) throw new MapError('INVALID_CURSOR_CONFIG', '配置私有密钥文件、仓库和固定提交', 503);
     let apiKey;
     try {
       const secret = (await fs.readFile(config.apiKeyFile, 'utf8')).trim();
@@ -586,6 +615,46 @@ export async function startCloudServer({
     const principal = { repositoryId: repository.repositoryId, deviceId: 'cloud-browser', agentId: 'cloud-human', role: 'human' };
     return { repository, principal, ...interfaceStorage(principal) };
   };
+  const cursorRolesFor = async project => {
+    const config = cursorConfiguration?.projects?.[project?.id], roles = config?.roles;
+    if (!roles) return null;
+    const coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
+    const { repository, store } = interfaceProject(project);
+    if (isMapProject(project) || !coordinator?.enabled || Object.keys(roles).some(key => !['templateSessionId', 'githubTokenFile', 'ciPolicy'].includes(key)) ||
+        !coordinator.sessionTemplates?.includes(roles.templateSessionId) || coordinator.bindings?.[roles.templateSessionId] !== cursorTemplateWorktree(roles.templateSessionId) ||
+        config.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase() || !allowedOrigin) protocolFail('FORBIDDEN', 'Configure the hosted Cursor template explicitly for this repository Coordinator');
+    if (!cursorRoleServices.has(project.id)) {
+      const creating = (async () => {
+        // The same private provider, not a human chat Session or device identity.
+        const transport = await cursorFor(project);
+        const service = new CursorRoleFactory({ directory: path.join(dataDir, 'cursor-roles', digest(project.id)), projectId: project.id,
+          repositoryId: repository.repositoryId, templateSessionId: roles.templateSessionId, repositoryUrl: config.repositoryUrl,
+          startingRef: config.startingRef, model: config.model, store, provider: transport.provider,
+          gitProof: cursorGitProofFactory({ repository: repository.slug, tokenFile: roles.githubTokenFile }),
+          ...(roles.ciPolicy ? { ciPolicy: roles.ciPolicy } : {}),
+          endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
+          allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
+          authorizeSource: async ({ state, task }) => {
+            const original = Object.values(state.projectTasks || {}).find(item => item.repositoryId === repository.repositoryId && item.taskId === task.id && item.sessionId === task.session.id);
+            if (original?.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation);
+            const template = state.bindings[digest(JSON.stringify([repository.repositoryId, roles.templateSessionId]))];
+            if (!template || template.deviceId !== 'cloud-cursor:' + project.id || template.worktreeId !== coordinator.bindings[roles.templateSessionId]) return false;
+            const memory = await readMemoryProject(configuredMemory, project.id), document = memory.main?.memory?.map;
+            if (!document?.root || memory.main.version !== task.assignment?.mainVersion) return false;
+            const readable = filterNodeAccess(document, [...entries(document.root).keys()], task.session.id, 'read');
+            return task.assignment.nodeIds.every(id => readable.includes(id));
+          } });
+        await service.initialize();
+        service.mcp = createCursorRoleMcpHandler({ channel: service.channel, projectId: project.id, endpoint: service.endpoint,
+          allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:') });
+        initializedCursorRoles.set(project.id, service);
+        return service;
+      })();
+      cursorRoleServices.set(project.id, creating);
+      creating.catch(() => { if (cursorRoleServices.get(project.id) === creating) cursorRoleServices.delete(project.id); });
+    }
+    return cursorRoleServices.get(project.id);
+  };
   const verifyInterfaceRouting = async (identity, message) => {
     const repository = interfaceConfig?.repositories?.find(item => item.repositoryId === identity.repositoryId);
     if (!repository?.projectId || !configuredMemory?.projects?.[repository.projectId]) return false;
@@ -597,11 +666,20 @@ export async function startCloudServer({
     return message.payload.nodeIds.every(id => readable.includes(id));
   };
   const interfaceWorkflow = {
-    verifyCiReceiver: (state, principal, session) => {
+    verifyCiReceiver: async (state, principal, session) => {
       // An authenticated CI identity is itself the receiver; session authority
       // has already been checked by ProtocolStore before reaching the reducer.
       if (principal.role === 'ci') return true;
       const repository = interfaceConfig?.repositories?.find(item => item.repositoryId === principal.repositoryId);
+      const project = projectById(repository?.projectId);
+      if (project && cursorConfiguration?.projects?.[project.id]?.roles && Object.hasOwn(configuredMemory?.projects?.[project.id]?.coordinator?.bindings || {}, cursorConfiguration.projects[project.id].roles.templateSessionId)) {
+        // Initialize outside task transactions. Never acquire a factory/lease
+        // lock here; callbacks already hold ProtocolStore's transaction lock.
+        // Initialization itself needs ProtocolStore. Awaiting its promise here
+        // would deadlock when this verifier already holds the store lock.
+        const roles = initializedCursorRoles.get(project.id);
+        if (roles && await roles.owns(session.id)) return roles.hasCiReceiver(state, session);
+      }
       return hasCiReceiver(state, principal, session, configuredMemory?.projects?.[repository?.projectId]?.coordinator);
     },
     verifyRouting: verifyInterfaceRouting,
@@ -650,8 +728,36 @@ export async function startCloudServer({
 
   const projectById = id => registry.projects.find(project => project.id === id);
   const coordinators = new Map();
+  const cursorTransitions = new Set();
+  const cursorModeEpochs = new Map();
   let integrationGateway = null;
   const conversationsFor = project => new CoordinatorConversations(path.join(dataDir, 'coordinators', project.id));
+  const cursorExecutionScope = (project, actor) => {
+    const grant = integrations?.cursorExecution?.[project.id], roles = cursorConfiguration?.projects?.[project.id]?.roles;
+    const host = cursorConfiguration?.projects?.[project.id], coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
+    if (isMapProject(project) || actor?.kind !== 'human' || actor.integration !== 'slack' || actor.teamId !== integrations?.teamId ||
+        actor.sessionId !== `slack:${actor.teamId}:${actor.userId}` || !integrations?.actions.includes('conversation.cursor') ||
+        !grant?.userIds.includes(actor.userId) || grant.templateSessionId !== roles?.templateSessionId || !coordinator?.enabled ||
+        !coordinator.sessionTemplates?.includes(grant.templateSessionId) || coordinator.bindings?.[grant.templateSessionId] !== cursorTemplateWorktree(grant.templateSessionId)) {
+      protocolFail('FORBIDDEN', 'Cursor execution requires an explicit repository, template and Slack operator grant');
+    }
+    const { repository } = interfaceProject(project);
+    if (!/^[a-f0-9]{40}$/.test(host.startingRef || '') || host.repositoryUrl?.replace(/\.git$/, '').toLowerCase() !== `https://github.com/${repository.slug}`.toLowerCase()) protocolFail('FORBIDDEN', 'Cursor repository and fixed source commit must match this project');
+    return { projectId: project.id, repositoryId: repository.repositoryId, templateSessionId: grant.templateSessionId, actor: structuredClone(actor),
+      configurationHash: digest(JSON.stringify([grant, repository.repositoryId, repository.slug, host.repositoryUrl, host.startingRef])) };
+  };
+  const requireCursorGrant = async (project, conversation, actor = null, delegation = null) => {
+    const grant = conversation.cursorExecution;
+    if (!grant || conversation.executionMode !== 'automatic') protocolFail('FORBIDDEN', 'This conversation has no Cursor execution grant');
+    const current = cursorExecutionScope(project, grant.actor);
+    if (actor) cursorExecutionScope(project, actor);
+    if (grant.configurationHash !== current.configurationHash || grant.projectId !== current.projectId || grant.repositoryId !== current.repositoryId ||
+        grant.templateSessionId !== current.templateSessionId || delegation &&
+        (delegation.grantId !== grant.operationId || delegation.templateSessionId !== grant.templateSessionId || delegation.configurationHash !== grant.configurationHash)) {
+      protocolFail('FORBIDDEN', 'The original Cursor execution grant changed');
+    }
+    return grant;
+  };
   const normalizedSessions = item => (Array.isArray(item?.sessions) ? item.sessions : [])
     .map(value => String(value || '').trim()).filter(Boolean);
   const mapItem = async (project, nodeId, kind, itemId) => {
@@ -703,6 +809,11 @@ export async function startCloudServer({
     nodeIds: configuredMemory.projects[project.id].coordinator.nodeIds || null,
   });
   const coordinatorFor = async (project, conversationId = 'legacy') => {
+    const key = `${project.id}:${conversationId}`, epoch = cursorModeEpochs.get(key) || 0;
+    const assertCurrentEpoch = () => {
+      if (cursorTransitions.has(key) || (cursorModeEpochs.get(key) || 0) !== epoch) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
+    };
+    assertCurrentEpoch();
     const config = coordinatorConfigFor(project);
     if (!config?.enabled) throw new MapError('COORDINATOR_DISABLED', 'Coordinator is not enabled for this project', 404);
     const conversations = conversationsFor(project);
@@ -714,11 +825,23 @@ export async function startCloudServer({
       await conversations.ensureSession(sessionId, binding.name || 'Session 对话');
     }
     const conversation = await conversations.get(conversationId);
+    // A getter can carry an old registry snapshot across retirement. Reject
+    // it before it can occupy or overwrite the new mode's cache slot.
+    assertCurrentEpoch();
+    const modeRevision = value => JSON.stringify([value.executionMode || 'automatic', value.cursorExecution || null]);
+    const revision = modeRevision(conversation);
+    const assertCurrentMode = async () => {
+      assertCurrentEpoch();
+      const current = await conversations.get(conversationId);
+      assertCurrentEpoch();
+      if (modeRevision(current) !== revision) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode changed', 409);
+    };
     const manual = conversation.executionMode === 'manual';
     if (isMapProject(project) && !manual) protocolFail('FORBIDDEN', 'Map 项目只支持人工对话，不创建执行 Session');
-    const key = `${project.id}:${conversationId}`;
     if (!coordinators.has(key)) {
       const creating = (async () => {
+        let ownedService;
+        try {
         if (!path.isAbsolute(config.providerFile || '') || !config.bindings || typeof config.bindings !== 'object') throw new MapError('INVALID_COORDINATOR_CONFIG', 'Configure provider and explicit Session bindings', 503);
         // A Map-only project has no repository or execution Session. Its
         // isolated workflow store is empty; manual briefs use Map CAS instead.
@@ -767,6 +890,10 @@ export async function startCloudServer({
         const execute = createCoordinatorExecutor({
           authorizeTool: async (name, input, { caller }) => {
             const liveConversation = await conversations.get(conversationId);
+            // A live counted tool makes retireIdle reject the transition.
+            // Do not abort that step merely because an enable attempt is busy.
+            if (service.retired || (liveConversation.executionMode === 'manual') !== manual) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode changed', 409);
+            if (liveConversation.cursorExecution) await requireCursorGrant(project, liveConversation);
             Object.assign(conversation, liveConversation);
             for (const field of ['nodeId', 'kind', 'itemId', 'bindingApproval']) if (!Object.hasOwn(liveConversation, field)) delete conversation[field];
             if (!tools.some(tool => tool.name === name)) protocolFail('FORBIDDEN', 'Tool is not enabled for this conversation');
@@ -957,10 +1084,13 @@ export async function startCloudServer({
                 protocolFail('INVALID_ARGUMENT', 'Provide the complete itemId, nodeId and kind to select an existing item; only fully omitted routing may inherit this conversation focus.');
               }
               const requirements = focused ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind } : input;
-              if (!requirements.itemId && (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId)) {
-                protocolFail('APPROVAL_REQUIRED', '新需求先提出主节点绑定建议，等人类确认后再整理 brief；相关模块按需读取，不加入绑定。');
+              if (!conversation.bindingApproval || input.nodeIds.length !== 1 || input.nodeIds[0] !== conversation.nodeId) {
+                protocolFail('APPROVAL_REQUIRED', '先确认本需求的主节点，再整理 brief；复用旧事项也不绕过挂载确认。');
               }
-              return bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor }));
+              return bindingsFor(project).withStableFocus(conversationId, live => {
+                if (live.executionMode !== 'manual') protocolFail('CONFLICT', 'Conversation execution mode changed');
+                return manualBriefsFor(project).prepare(requirements, { operationId, conversationId, actor });
+              });
             }
             const requirements = conversation?.itemId
               ? { ...input, itemId: conversation.itemId, nodeId: conversation.nodeId, kind: conversation.kind }
@@ -981,7 +1111,9 @@ export async function startCloudServer({
                 if (routedNodes.length > 3) protocolFail('INVALID_ARGUMENT', 'Map TODO/Bug routing exceeds three nodes');
                 requirements.nodeIds = routedNodes;
               }
-              const ownerId = await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
+              if (conversation.cursorExecution && (await store.projectTasks(human)).some(task => task.itemId === requirements.itemId && task.nodeId === requirements.nodeId && task.kind === requirements.kind &&
+                  task.conversationId !== conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'This item already belongs to another active execution');
+              const ownerId = conversation.cursorExecution ? conversationId : await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
               if (conversationId !== ownerId) {
                 if (!await readJSON(conversations.conversationFile(ownerId), null)) {
                   await conversations.continueIn(conversationId, ownerId);
@@ -996,6 +1128,10 @@ export async function startCloudServer({
               }
             }
             if (JSON.stringify(requirements).length > 2000) protocolFail('INVALID_ARGUMENT', 'Keep requirements within 2000 characters');
+            if (conversation.cursorExecution) {
+              const grant = await requireCursorGrant(project, await conversations.get(conversationId));
+              requirements.cursorDelegation = { grantId: grant.operationId, templateSessionId: grant.templateSessionId, configurationHash: grant.configurationHash };
+            }
             const task = await store.prepareProjectTask(principal, requirements, operationId, conversationId);
             return { ...task, projectTask: true, requiresHumanApproval: true };
           },
@@ -1005,9 +1141,9 @@ export async function startCloudServer({
             return ids.map(id => {
               const entry = index.get(id), node = entry?.node;
               if (!node || Array.isArray(config.nodeIds) && !config.nodeIds.includes(id)) protocolFail('NOT_FOUND', 'Referenced Main node is unavailable');
-              return { id, title: node.title, purpose: node.purpose || '',
-                path: coordinatorNodePath(root, id, { nodeIds: config.nodeIds || null })
-                  .map(({ id, title, purpose }) => ({ id, title, purpose })) };
+              const path = coordinatorNodePath(root, id, { nodeIds: config.nodeIds || null })
+                .map(({ id, title, purpose }) => ({ id, title, purpose }));
+              return { id, title: node.title, label: coordinatorNodeLabel(node), purpose: node.purpose || '', path, pathText: coordinatorPathText(path) };
             });
           },
           readMap: async id => {
@@ -1065,6 +1201,9 @@ export async function startCloudServer({
           exchange: async (sessionId, id, type, payload, { caller } = {}) => {
             const message = validateMessage({ v: 2, id, type, session: await sessionFor(sessionId), payload });
             const identity = await executionPrincipal(caller, sessionId);
+            const binding = await store.registeredBinding(identity, sessionId);
+            const hosted = binding?.deviceId === 'cloud-cursor:' + project.id ? await cursorRolesFor(project) : null;
+            if (type === 'ci.request' && hosted && await hosted.owns(sessionId)) await hosted.reserveCi(message.session, payload.taskId);
             if (type === 'brief.submit') {
               const existing = (await store.workflowTasks(identity, message.session)).find(task => task.id === payload.taskId);
               // Do not let a second conversation redefine an existing brief.
@@ -1072,14 +1211,17 @@ export async function startCloudServer({
               if (existing && coordinatorTaskOwnerRequired(type)) await assertTaskOwner(sessionId, payload.taskId);
               await conversations.bind(conversationId, sessionId, payload.taskId);
             }
-            return (await store.handle(identity, message, { workflow: interfaceWorkflow })).data;
+            const reply = (await store.handle(identity, message, { workflow: interfaceWorkflow })).data;
+            if (hosted && await hosted.owns(sessionId)) kickTaskScheduler(project);
+            return reply;
           },
         });
         const itemScoped = conversationId.startsWith('item-');
         const fileWriteNote = config.fileWrite === true
           ? '\n项目允许 write_file 写入一个仓库相对路径的 UTF-8 文本文件。用户明确要求新建或替换单个文件时使用它，一次一个路径；不提交、不推送、不修改 Main。文件已存在时传入当前内容的 expectedSha。多文件修改和代码开发仍使用 brief。'
           : '';
-        const system = coordinatorRolePrompt(await fs.readFile(path.join(root, 'scripts/shared/roles/Coordinator.md'), 'utf8'), { manual }) + (!itemScoped ? '' :
+        const system = coordinatorRolePrompt(await fs.readFile(path.join(root, 'scripts/shared/roles/Coordinator.md'), 'utf8'), { manual }) +
+          (conversation.cursorExecution ? '\n当前对话已由真人启用受限 Cursor Cloud 执行能力，启用不是任务批准。\n新 brief 经人确认后，系统固定 Cursor 模板派发；不要请人另开 Session 或粘贴提示。\nPlan、交接和独立 CI 结果回到原对话，仍走原审核协议；不根据本轮结束判断任务完成。\n' : '') + (!itemScoped ? '' :
           '\n本对话仅负责下方「当前事项」；先读取其所在节点的最新原文，不处理其他事项。') + fileWriteNote;
         const directory = conversations.conversationDirectory(conversationId);
         const visionProvider = integrations?.visionProviderFile ? await readJson(integrations.visionProviderFile) : null;
@@ -1091,10 +1233,11 @@ export async function startCloudServer({
           const pending = (await bindingsFor(project).approvals(conversationId)).find(item => item.pending);
           return { ...context, bindingRef: pending ? { id: pending.id, version: pending.version } : null };
         };
-        const service = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
+        await assertCurrentMode();
+        const service = ownedService = new CoordinatorService({ directory, namespace: conversationId === 'legacy' ? '' : conversationId,
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
-          ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true } : {}),
+          ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true, validateReplies: true } : {}),
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
           ...(integrations ? { onStateChange: () => integrationGateway?.notify({ projectId: project.id, conversationId }) } : {}),
@@ -1102,11 +1245,21 @@ export async function startCloudServer({
           beforeAcceptHumanInput: async ({ inputs, context, source, actor }) => {
             if (!context?.bindingRef || !['human', 'slack'].includes(source) || actor?.kind !== 'human') return context;
             const slackAttribution = source === 'slack';
-            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution }));
+            const current = await service.state();
+            const lastAssistant = current.messages.findLast(message => message.role === 'assistant');
+            const otherQuestion = current.messages.some(message => message.questions?.some(question => !question.answer && !question.superseded));
+            const otherApproval = (await manualBriefsFor(project).approvals(conversationId)).some(proposal => proposal.pending);
+            const allowBareConfirmation = current.status === 'waiting-for-user' && !otherQuestion && !otherApproval &&
+              lastAssistant?.actions?.some(action => action.kind === 'binding-proposal' && action.id === context.bindingRef.id && action.version === context.bindingRef.version);
+            const confirmation = [...inputs].reverse().find(input => bindingReplyDecision(input.text, { slackAttribution, allowBareConfirmation }));
             if (!confirmation) return context;
             try {
-              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef, slackAttribution });
-              return result ? await loadContext() : context;
+              const result = await bindingsFor(project).naturalReview(confirmation.text, { id: confirmation.id, conversationId, actor, reference: context.bindingRef, slackAttribution, allowBareConfirmation });
+              if (!result) return context;
+              const refreshed = await loadContext();
+              return { ...refreshed, internalIds: [...(refreshed.internalIds || []), result.proposalId, result.conversationId],
+                dynamicText: refreshed.dynamicText + '\n[服务器已保存本条人类确认；不是新的开发审批]\n' + JSON.stringify(result) +
+                  '\n绑定已生效，不能重复提出同一候选要求再次确认；依据此回执简短报告结果。' };
             } catch (error) {
               if (!(error instanceof MapError)) throw error;
               return { ...context, dynamicText: context.dynamicText + '\n绑定未生效：' + error.message };
@@ -1150,14 +1303,26 @@ export async function startCloudServer({
         // idle conversation creates a transient in-memory `running` state, so
         // its first user submission can incorrectly fail with COORDINATOR_BUSY.
         const restored = await service.state();
-        if (restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
-            (await service.inputSignals(restored)).interrupted)) service.kick();
+        const recover = restored.activeTurnId && (restored.status !== 'error' || coordinatorCanAutoResume(restored) ||
+          (await service.inputSignals(restored)).interrupted);
+        await assertCurrentMode();
+        assertCurrentEpoch();
+        if (recover) service.kick();
         return service;
+        } catch (cause) {
+          // Drain only this initializer's instance, outside workflow locks.
+          // A late initializer must never close or delete its replacement.
+          if (ownedService) { await ownedService.inbox?.close(); await ownedService.close({ stop: true }); }
+          throw cause;
+        }
       })();
       coordinators.set(key, creating);
       creating.catch(() => { if (coordinators.get(key) === creating) coordinators.delete(key); });
     }
-    return coordinators.get(key);
+    const service = await coordinators.get(key);
+    await assertCurrentMode();
+    assertCurrentEpoch();
+    return service;
   };
   const notifyManualReviews = async (project, conversationId, service) => {
     let state = await service.state();
@@ -1213,6 +1378,17 @@ export async function startCloudServer({
       state.acceptances = [];
       state.projectTasks = [];
       state.sessionTemplates = [];
+    } else if (conversation.cursorExecution) {
+      await requireCursorGrant(project, conversation);
+      const { store, principal } = interfaceProject(project);
+      const tasks = (await store.projectTasks(principal)).filter(task => task.conversationId === conversationId);
+      state.executionMode = 'automatic'; state.executionProvider = 'cursor'; state.projectTasks = tasks;
+      state.approvals = [...state.approvals.filter(proposal => !proposal.manual), ...await manualBriefsFor(project).approvals(conversationId)];
+      state.approvals = state.approvals.map(proposal => {
+        const task = proposal.projectTask && tasks.find(item => item.taskId === proposal.taskId);
+        return task ? { ...proposal, executionProvider: 'cursor', pending: task.stage === 'brief' && task.brief.version === proposal.brief.version,
+          ...(task.review ? { decision: task.review.decision } : {}) } : proposal;
+      });
     }
     const bindingApprovals = await bindingsFor(project).approvals(conversationId);
     const bindingIds = new Set(bindingApprovals.map(proposal => proposal.id));
@@ -1242,9 +1418,10 @@ export async function startCloudServer({
     return service.submit(input, options);
   };
   const reviewManualBrief = async (project, conversationId, input, actor) => {
-    const conversation = await conversationsFor(project).get(conversationId);
-    if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'This conversation does not use manual execution');
-    const result = await bindingsFor(project).withStableFocus(conversationId, () => manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor }));
+    const result = await bindingsFor(project).withStableFocus(conversationId, conversation => {
+      if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'This conversation does not use manual execution');
+      return manualBriefsFor(project).review(input, { operationId: input.id, conversationId, actor });
+    });
     const notification = await notifyManualReviews(project, conversationId, await coordinatorFor(project, conversationId));
     return { ...result, notification };
   };
@@ -1258,15 +1435,29 @@ export async function startCloudServer({
     if (!project || !configuredMemory?.projects?.[id]) protocolFail('NOT_FOUND', 'Project is unavailable');
     return project;
   };
-  const authorizeIntegrationProject = async (id, actor) => {
-    if (mapProjects.allowed(actor)) { await mapProjects.get(id); return; }
-    if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+  const authorizeIntegrationProject = async (id, actor, input) => {
+    if (mapProjects.allowed(actor)) await mapProjects.get(id);
+    else if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
+    if (input?.type === 'conversation.cursor') cursorExecutionScope(await integrationProject(id), actor);
+    const conversationId = input?.conversationId || (input?.type === 'conversation.bind' && input.payload?.conversationId);
+    if (conversationId) {
+      const project = await integrationProject(id), conversation = await conversationsFor(project).get(conversationId);
+      if (conversation.cursorExecution) await requireCursorGrant(project, conversation, actor);
+    }
   };
-  const requireManualConversation = async (project, id) => {
+  const requireIntegrationConversation = async (project, id, actor) => {
     if (typeof id !== 'string') protocolFail('INVALID_ARGUMENT', 'Select a linked conversation');
     const conversation = await conversationsFor(project).get(id);
-    if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'Bind this conversation explicitly before plugin access');
+    if (conversation.executionMode !== 'manual') await requireCursorGrant(project, conversation, actor);
     return conversation;
+  };
+  const integrationPublicState = async (project, id, actor) => {
+    const state = await coordinatorPublicState(project, id);
+    if (state.executionMode === 'manual') {
+      try { cursorExecutionScope(project, actor); state.cursorAvailable = true; }
+      catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.cursorAvailable = false; }
+    }
+    return state;
   };
   const integrationCommand = async (request, { actor, operationId, recoveryCheck }) => {
     const { type, payload = {}, projectId, conversationId } = request;
@@ -1292,7 +1483,7 @@ export async function startCloudServer({
     if (type === 'models.select') return (await modelSettingsFor(project)).select({ id: operationId, ...payload });
     if (type === 'conversation.relevance') {
       const input = relevanceInput(payload);
-      if (conversationId) await requireManualConversation(project, conversationId);
+      if (conversationId) await requireIntegrationConversation(project, conversationId, actor);
       const config = coordinatorConfigFor(project);
       if (!config?.enabled || !path.isAbsolute(config.providerFile || '')) protocolFail('COORDINATOR_DISABLED', 'Coordinator is unavailable for relevance checks');
       const memory = await readMemoryProject(configuredMemory, projectId);
@@ -1312,10 +1503,34 @@ export async function startCloudServer({
       await coordinatorFor(project, id); return { conversationId: id,
         ...(isMapProject(project) ? { mapNodeId: project.mapNodeId } : {}) };
     }
+    if (type === 'conversation.cursor') {
+      if (Object.keys(payload).some(key => key !== 'expectedMode') || payload.expectedMode !== 'manual') protocolFail('INVALID_ARGUMENT', 'Confirm the current manual mode explicitly');
+      const grant = cursorExecutionScope(project, actor), conversations = conversationsFor(project), before = await conversations.get(conversationId);
+      if (before.cursorExecution?.operationId === operationId) return conversations.enableCursor(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+      const service = await coordinatorFor(project, conversationId), key = `${project.id}:${conversationId}`;
+      if (cursorTransitions.has(key)) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
+      cursorTransitions.add(key);
+      cursorModeEpochs.set(key, (cursorModeEpochs.get(key) || 0) + 1);
+      try {
+        return await service.retireIdle(() => bindingsFor(project).withStableConversation(conversationId, async () => {
+          if ((await manualBriefsFor(project).approvals(conversationId)).some(proposal => proposal.pending && !proposal.stale) ||
+              (await bindingsFor(project).approvals(conversationId)).some(proposal => proposal.pending)) protocolFail('CONFLICT', 'Resolve pending human approvals before enabling Cursor');
+          const { store, principal } = interfaceProject(project);
+          if ((await store.projectTasks(principal)).some(task => task.conversationId === conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'Resolve the original execution before changing its host');
+          cursorExecutionScope(project, actor);
+          return conversations.enableCursor(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+        }));
+      } finally {
+        // Never drain a runner while holding its submit/binding/registry locks.
+        if (service.retired) { coordinators.delete(key); await service.inbox.close(); await service.close({ stop: true }); }
+        cursorTransitions.delete(key);
+      }
+    }
     if (type === 'conversation.bind') {
       if (isMapProject(project)) protocolFail('FORBIDDEN', 'Map 项目不能关联仓库执行对话');
       const id = payload.conversationId;
       const conversation = await conversationsFor(project).get(id);
+      if (conversation.cursorExecution) { await requireCursorGrant(project, conversation, actor); return { conversationId: id, executionMode: 'automatic' }; }
       const service = await coordinatorFor(project, id), state = await service.state();
       if (state.activeTurnId || state.status === 'running') protocolFail('COORDINATOR_BUSY', 'Wait for the current turn before binding');
       const { store, principal } = interfaceProject(project);
@@ -1362,8 +1577,8 @@ export async function startCloudServer({
       }
       return commitMainMemoryMap(configuredMemory, projectId, { operationId, baseVersion: payload.baseVersion, operations }, actor);
     }
-    await requireManualConversation(project, conversationId);
-    if (type === 'conversation.state') return coordinatorPublicState(project, conversationId);
+    const integrationConversation = await requireIntegrationConversation(project, conversationId, actor);
+    if (type === 'conversation.state') return integrationPublicState(project, conversationId, actor);
     if (type === 'conversation.submit') {
       const { history, participation, recovery, slackChannelId: _deliveryChannel, ...input } = payload;
       const recoveryOptions = recovery ? { operatorRecovery: recovery.operationId, recoveryGuard: async (state, journal) => {
@@ -1376,7 +1591,19 @@ export async function startCloudServer({
       if (Object.keys(payload).some(key => key !== 'expectedTurnId')) protocolFail('INVALID_ARGUMENT', 'Provide only the active turn identity');
       return (await coordinatorFor(project, conversationId)).interrupt({ ...payload, id: operationId }, { source: 'slack', actor });
     }
-    if (type === 'brief.review') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
+    if (type === 'brief.review') {
+      if (integrationConversation.executionMode === 'manual') return reviewManualBrief(project, conversationId, { ...payload, id: operationId }, actor);
+      if (Object.keys(payload).some(key => !['proposalId', 'version', 'decision', 'reason'].includes(key)) || typeof payload.version !== 'string' ||
+          !['approved', 'rejected'].includes(payload.decision) || payload.reason !== undefined && (typeof payload.reason !== 'string' || payload.reason.length > 1000)) protocolFail('INVALID_ARGUMENT', 'Review the exact original brief version');
+      const service = await coordinatorFor(project, conversationId), proposal = (await service.state()).approvals.find(value => value.id === payload.proposalId && value.projectTask);
+      if (!proposal || proposal.brief.version !== payload.version) protocolFail('CONFLICT', 'The original conversation brief changed');
+      const { store, principal } = interfaceProject(project), task = (await store.projectTasks(principal)).find(item => item.taskId === proposal.taskId && item.conversationId === conversationId);
+      if (!task?.cursorDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
+      await requireCursorGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation);
+      const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
+      kickTaskScheduler(project);
+      return { executionMode: 'automatic', taskId: result.taskId, stage: result.stage };
+    }
     if (type === 'binding.review') {
       const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
       return { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) };
@@ -1392,28 +1619,37 @@ export async function startCloudServer({
       const config = configuredMemory?.projects?.[project.id]?.coordinator;
       if (!config?.enabled) return;
       const { store, principal: human } = interfaceProject(project);
+      const hostedTemplateId = cursorConfiguration?.projects?.[project.id]?.roles?.templateSessionId;
       const principal = { ...human, role: 'coordinator', deviceId: 'cloud-scheduler', agentId: `scheduler:${project.id}`,
         bindings: { ...config.bindings }, creationTemplates: config.sessionTemplates || [] };
       const limit = Number.isSafeInteger(config.maxConcurrentTasks) && config.maxConcurrentTasks > 0 ? config.maxConcurrentTasks : 2;
       for (let task of await store.projectTasks(principal)) {
         if (stopping) break;
         try {
+        let hosted;
+        if (task.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(task.conversationId), null, task.cursorDelegation);
         if (task.stage === 'dispatched') {
           const binding = await store.registeredBinding(human, task.sessionId);
+          if (binding?.deviceId === 'cloud-cursor:' + project.id) hosted = await cursorRolesFor(project);
           const current = binding && await store.taskRecord(human, { id: task.sessionId, generation: binding.generation }, task.taskId);
+          if (hosted && current && await hosted.owns(task.sessionId)) await hosted.pump(current.session, current.id);
           if (current && !current.busy && ['accepted', 'closed', 'finished', 'cancelled'].includes(current.stage)) await store.updateProjectTask(principal, task.taskId, { stage: 'completed' });
           continue;
         }
         if (task.stage === 'queued') {
-            const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id]);
+            const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id] &&
+              (!task.cursorDelegation || id === task.cursorDelegation.templateSessionId && id === hostedTemplateId));
             const templateSessionId = templates.find(id => {
+              if (hostedTemplateId === id) return true;
               const presence = interfacePresence.get(presenceKey(principal.repositoryId, id));
               return presence && cloudSessionPresence(presence.lastHeartbeatAt) !== 'offline';
             });
             if (!templateSessionId) { await store.updateProjectTask(principal, task.taskId, { error: 'WAITING_DEVICE' }); continue; }
+            if (templateSessionId === hostedTemplateId) hosted = await cursorRolesFor(project);
             task = await store.updateProjectTask(principal, task.taskId, { stage: 'creating', templateSessionId, error: null }, { reserveLimit: limit });
             if (task.stage === 'queued') continue;
         }
+        if (!hosted && hostedTemplateId && task.templateSessionId === hostedTemplateId) hosted = await cursorRolesFor(project);
         if (task.stage === 'creating') {
           if (task.creationId && task.sessionId) task = await store.updateProjectTask(principal, task.taskId, { stage: 'starting' });
           else {
@@ -1428,6 +1664,12 @@ export async function startCloudServer({
         }
         if (task.stage !== 'starting') continue;
         const creation = (await store.sessionCreations(human)).find(item => item.id === task.creationId);
+        if (hosted?.templateSessionId === task.templateSessionId && creation?.state === 'pending') {
+          await hosted.reserveExecutor({ id: creation.id, sessionId: creation.sessionId, taskId: task.taskId });
+          // Registration reserves a logical cloud workspace, not an online VM.
+          // The next pass dispatches through the original approved-task gate.
+          continue;
+        }
         if (creation?.state === 'failed') {
           const retries = task.creationRetries || 0;
           if (retries >= 2) {
@@ -1459,6 +1701,7 @@ export async function startCloudServer({
           text: JSON.stringify({ v: 1, taskId: task.taskId, text: task.text, acceptance: task.acceptance, nodeIds: task.nodeIds, mainVersion: task.mainVersion }),
           nodeIds: task.nodeIds, mainVersion: task.mainVersion }), interfaceWorkflow);
         await store.updateProjectTask(principal, task.taskId, { stage: 'dispatched', dispatch: result, error: null });
+        if (hosted?.templateSessionId === task.templateSessionId) await hosted.pump({ id: task.sessionId, generation: binding.generation }, task.taskId);
         } catch (cause) {
           await store.updateProjectTask(principal, task.taskId, { error: cause.code || 'SCHEDULING_FAILED',
             ...(['FORBIDDEN', 'INVALID_ARGUMENT', 'CONFLICT'].includes(cause.code) ? { stage: 'failed' } : {}) });
@@ -2098,6 +2341,18 @@ export async function startCloudServer({
     try {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const route = url.pathname;
+      const roleMcp = route.match(/^\/api\/workbench\/projects\/([a-z0-9-]{1,64})\/api\/cursor-role-mcp$/);
+      if (roleMcp) {
+        // Scoped native bearer authority only; do not apply browser cookie or
+        // device pairing fallback before the purpose-built MCP authorization.
+        const project = projectById(roleMcp[1]);
+        if (!project) protocolFail('NOT_FOUND', 'Project is unavailable');
+        // Native callbacks cannot initialize templates or acquire the store
+        // initialization lock. The Coordinator scheduler owns that lifecycle.
+        const hosted = initializedCursorRoles.get(project.id);
+        if (!hosted) protocolFail('UNAVAILABLE', 'Cursor roles are not configured');
+        return hosted.mcp(req, res);
+      }
       if (route === '/api/v2/heartbeat') {
         if (!interfaceAuth) protocolFail('INVALID_ARGUMENT', 'Interface v2 is not configured');
         if (req.method !== 'POST') protocolFail('INVALID_ARGUMENT', 'Use POST');
@@ -2243,6 +2498,12 @@ export async function startCloudServer({
           try { input = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { protocolFail('INVALID_ARGUMENT', 'Invalid JSON'); }
           if (typeof input?.id === 'string' && input.id.length <= 128) id = input.id;
           validateMessage(input);
+          const ciTaskHeader = req.headers['x-context-guard-ci-task'];
+          const ciEvidenceHeader = req.headers['x-context-guard-ci-evidence'];
+          if (ciTaskHeader !== undefined && (!req.headers['x-context-guard-ci-session'] ||
+              !['object.read', 'object.put', 'ci.result'].includes(input.type))) protocolFail('FORBIDDEN', 'CI task expectation requires delegated CI');
+          if (ciEvidenceHeader !== undefined && (ciTaskHeader === undefined || !req.headers['x-context-guard-ci-session'] ||
+              input.type !== 'ci.result')) protocolFail('FORBIDDEN', 'Host evidence requires a scoped CI result');
           if (input.type === 'auth.open') {
             const opened = loginResult(await interfaceAuth.open(input, String(req.socket.remoteAddress)));
             return send(res, 200, { id, ok: true, data: opened.data }, { 'X-Context-Guard-Credential': opened.credential });
@@ -2260,6 +2521,17 @@ export async function startCloudServer({
             principal = await authorizeCiReceiver({ principal, ciSessionId: req.headers['x-context-guard-ci-session'], message: input,
               templates: configuredMemory?.projects?.[repository?.projectId]?.coordinator?.sessionTemplates || [],
               receivers: configuredMemory?.projects?.[repository?.projectId]?.coordinator?.ciReceivers, store: interfaceStorage(principal).store });
+            if (ciTaskHeader !== undefined) {
+              const count = req.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'x-context-guard-ci-task').length;
+              if (count !== 1) protocolFail('INVALID_ARGUMENT', 'Ambiguous CI task expectation');
+              principal = { ...principal, ciTaskExpectation: parseCursorCiTaskHeader(ciTaskHeader) };
+            }
+            if (ciEvidenceHeader !== undefined) {
+              const count = req.rawHeaders.filter((value, index) => index % 2 === 0 && value.toLowerCase() === 'x-context-guard-ci-evidence').length;
+              if (count !== 1 || typeof ciTaskHeader !== 'string' || typeof ciEvidenceHeader !== 'string' ||
+                  ciEvidenceHeader.length + ciTaskHeader.length > 12288) protocolFail('INVALID_ARGUMENT', 'Ambiguous or oversized CI host evidence expectation');
+              principal = { ...principal, ciHostEvidence: parseCursorCiEvidenceHeader(ciEvidenceHeader) };
+            }
           }
           if (input.type === 'sync.heartbeat') return send(res, 200, await receiveHeartbeat(principal, input));
           if (input.type === 'main.structure.patch') {
@@ -2299,6 +2571,7 @@ export async function startCloudServer({
           }
           const reply = await store.handle(principal, input, {
             blobs,
+            authorize: authorizeCiTransaction,
             allowMigration: principal.role === 'device',
             workbenchRead: async (identity, message) => {
               const repository = interfaceConfig.repositories.find(item => item.repositoryId === identity.repositoryId);
@@ -2325,7 +2598,10 @@ export async function startCloudServer({
             verifyBinding: (identity, payload) => identity.role === 'device' || identity.bindings?.[payload.sessionId] === payload.worktreeId,
             workflow: interfaceWorkflow,
           });
-          return send(res, 200, reply);
+          return send(res, 200, reply, {
+            ...(principal.ciTaskExpectation ? { 'X-Context-Guard-CI-Task-Authorized': digest(canonical(principal.ciTaskExpectation)) } : {}),
+            ...(principal.ciHostEvidence ? { 'X-Context-Guard-CI-Evidence-Authorized': digest(canonical(principal.ciHostEvidence)) } : {}),
+          });
         } catch (error) { return send(res, error.status || 503, errorReply(id, error)); }
       }
       const passwordLoginRequest = route === '/auth/login' && req.method === 'POST';
@@ -2948,10 +3224,10 @@ export async function startCloudServer({
     stateDir: path.join(dataDir, 'integration-gateway'), command: integrationCommand,
     authorizeProject: authorizeIntegrationProject,
     logger: ({ code, idHash, phase, causeCode, durationMs }) => console.warn('Context Guard integration failure', { code, idHash, phase, causeCode, durationMs }),
-    state: async scope => {
+    state: async (scope, { actor }) => {
       const project = await integrationProject(scope.projectId);
-      await requireManualConversation(project, scope.conversationId);
-      return coordinatorPublicState(project, scope.conversationId);
+      await requireIntegrationConversation(project, scope.conversationId, actor);
+      return integrationPublicState(project, scope.conversationId, actor);
     } });
   const heartbeat = setInterval(() => {
     for (const client of workbenchClients) if (!client.res.destroyed) client.res.write(': heartbeat\n\n');

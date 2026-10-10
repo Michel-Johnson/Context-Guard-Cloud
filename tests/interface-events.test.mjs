@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { hash } from '../scripts/shared/io.mjs';
@@ -250,6 +251,23 @@ test('IF-046: real local backend shares Cloud sync across Sessions and rejects m
   // resolveProject exposes mainRef, not the CLI inventory's nested main.ref.
   const creationStore = new ProtocolStore(path.join(directory, 'cloud', 'interface-v2', hash('123')));
   const creationHuman = { repositoryId: '123', deviceId: 'browser', agentId: 'human', role: 'human' };
+  // The current backend requires exactly one configured native template.
+  // Register it through the real operator route; only provision is simulated.
+  const templateSessionId = randomUUID(), configDir = path.join(directory, 'native-config'), environmentFile = path.join(directory, 'native-environment.json');
+  await fs.mkdir(configDir); await fs.writeFile(environmentFile, '{}');
+  await fs.appendFile(path.join(ctx, 'sessions.jsonl'), JSON.stringify({ session_id: templateSessionId,
+    event: 'session-start', platform: 'claude', worktree_root: root }) + '\n');
+  const template = await request(local.state, '/api/session', { method: 'POST', body: { sessionId: templateSessionId, worktreeRoot: root } });
+  assert.equal(template.cloudBinding.status, 'ready');
+  await request(local.state, '/api/claude-runtime', { method: 'POST', body: { sessionId: templateSessionId, config: {
+    command: process.execPath, root, configDir, environmentFile, name: 'Synthetic creation template',
+    model: 'synthetic-only', role: 'executor', allowSessionCreation: true,
+  } } });
+  const templateRuntime = new ClaudeRuntime(path.join(project.sharedDir, 'claude-runtime'));
+  const templateStatus = await templateRuntime.status(templateSessionId);
+  assert.equal(templateStatus.configured, true); assert.equal(templateStatus.status, 'stopped'); assert.equal(templateStatus.role, 'executor');
+  await assert.rejects(fs.stat(path.join(project.sharedDir, 'claude-runtime', templateSessionId, 'deliveries')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(project.sharedDir, 'cursor-runtime', templateSessionId, 'session.json')), { code: 'ENOENT' });
   const creationCalls = []; let createdSessionId = '';
   const originalStatus = ClaudeRuntime.prototype.status;
   const creationStatusProbe = t.mock.method(ClaudeRuntime.prototype, 'status', async function (sessionId) {
@@ -267,7 +285,7 @@ test('IF-046: real local backend shares Cloud sync across Sessions and rejects m
     })}\n`);
     return { sessionId: input.sessionId, root: childRoot, state: 'prepared' };
   });
-  const creation = await creationStore.requestSessionCreation(creationHuman, { operationId: 'backend-main-ref', templateSessionId: 's', name: 'Creation probe' });
+  const creation = await creationStore.requestSessionCreation(creationHuman, { operationId: 'backend-main-ref', templateSessionId, name: 'Creation probe' });
   await waitFor(async () => (await creationStore.sessionCreations(creationHuman))
     .find(item => item.id === creation.id)?.state === 'registered');
   assert.ok(creationCalls.length > 0);

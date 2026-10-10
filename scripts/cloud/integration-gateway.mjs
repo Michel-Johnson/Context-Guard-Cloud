@@ -6,7 +6,7 @@ import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.
 import { MapError } from '../shared/map-model.mjs';
 import { recoveryScope } from './slack-recovery.mjs';
 
-export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind',
+export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind', 'conversation.cursor',
   'conversation.state', 'conversation.submit', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
@@ -154,8 +154,16 @@ export function validateIntegrationConfig(config) {
       map.userIds.some(id => typeof id !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(id)) || new Set(map.userIds).size !== map.userIds.length)) {
     fail('INVALID_INTEGRATION_CONFIG', 'Map 项目需要默认模型项目和明确授权的 Slack 用户');
   }
+  if (config.cursorExecution !== undefined && (!object(config.cursorExecution) || Object.keys(config.cursorExecution).length > 100 ||
+      Object.entries(config.cursorExecution).some(([id, grant]) => !identifier(id) || !object(grant) ||
+        Object.keys(grant).some(key => !['templateSessionId', 'userIds'].includes(key)) || !identifier(grant.templateSessionId) ||
+        !Array.isArray(grant.userIds) || !grant.userIds.length || grant.userIds.length > 100 ||
+        grant.userIds.some(value => !/^[UW][A-Z0-9]{1,31}$/.test(value)) || new Set(grant.userIds).size !== grant.userIds.length ||
+        !config.projectIds.includes(id) && !grant.userIds.every(value => map?.userIds.includes(value))))) {
+    fail('INVALID_INTEGRATION_CONFIG', 'Cursor 执行须明确指定已开放或 Map 用户可访问的项目、模板与 Slack 用户');
+  }
   return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790,
-    actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => type !== 'recovery.preflight') };
+    actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor'].includes(type)) };
 }
 
 export function integrationActor(config, { teamId, userId }) {
@@ -172,7 +180,7 @@ export function validateIntegrationCommand(config, input) {
     if (!identifier(input.projectId) || !config.projectIds.includes(input.projectId) &&
         !config.mapProjects?.userIds.includes(actor.userId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
-  if (['conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (['conversation.cursor', 'conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
   if (input.type === 'recovery.preflight') {
@@ -260,7 +268,7 @@ export async function startIntegrationGateway({ config, command, state, authoriz
   const execute = async (input, actor) => {
     // Revalidate before replaying receipts too: deletion/revocation must not
     // return old private results through an otherwise valid transport ID.
-    if (input.projectId) await authorizeProject?.(input.projectId, actor);
+    if (input.projectId) await authorizeProject?.(input.projectId, actor, input);
     if (readOnly.has(input.type)) return command(input, { actor, operationId: input.id });
     const recovery = input.type === 'recovery.preflight' ? recoveryScope(input.payload, actor, input.projectId)
       : input.type === 'conversation.submit' && input.payload.recovery ? recoveryScope(input.payload.recovery.scope, actor, input.projectId) : null;

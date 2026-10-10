@@ -17,6 +17,7 @@ import { CoordinatorModelSettings } from '../../../scripts/cloud/coordinator-mod
 import { coordinatorStep } from '../../../scripts/cloud/coordinator-model.mjs';
 import { coordinatorTools, createCoordinatorExecutor } from '../../../scripts/cloud/coordinator-tools.mjs';
 import { hash } from '../../../scripts/shared/io.mjs';
+import { configuration as slackConfiguration } from '../src/main.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
@@ -316,7 +317,7 @@ test('plugin lockfile is portable outside the developer registry', async () => {
   }
 });
 const project = { id: 'lab', name: 'Lab', version: 'v1', map: { id: 'T0', title: 'Root', children: [{ id: 'login', title: '登录', todos: [{ id: 'TD1', title: 'refresh', status: 'pending' }], bugs: [], memories: [{ text: '现有记忆' }], children: [] }] }, sessions: [{ id: 'session-1', status: 'running' }] };
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-'));
   const store = await new Store(directory).open(), calls = [], sent = [];
   const receive = store.receive.bind(store);
@@ -337,11 +338,69 @@ async function fixture(t) {
   } };
   const io = { async post(input) { sent.push(input); return String(100 + sent.length) + '.001'; }, async update(...args) { sent.push({ update: args }); }, async call(method, input) { if (['conversations.history', 'conversations.replies'].includes(method)) return { messages: [] }; sent.push({ method, input }); if (method === 'conversations.open') return { channel: { id: 'D000001' } }; if (method === 'conversations.info') return { channel: { user, id: input.channel } }; if (method === 'conversations.members') return { members: [user] }; if (method === 'users.info') return { user: { id: input.user, is_bot: false } }; return {}; },
     async download() { return { filename: 'screen.png', mimeType: 'image/png', base64: 'aGVsbG8=' }; }, async uploadPrompt(input) { sent.push({ export: input }); } };
-  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} } });
+  const plugin = new SlackPlugin({ store, gateway, io, teamId, cloudOrigin: 'https://map.example.com', botUserId: bot, collectMs: 0, maxCollectMs: 0, logger: { warn() {}, error() {} }, ...options });
   t.after(async () => { await plugin.stop(); await fs.rm(directory, { recursive: true, force: true }); });
   return { plugin, store, gateway, io, calls, sent, directory };
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
+
+test('Cursor offer defaults to silence despite project permission and retained historical cards', async t => {
+  const f = await fixture(t);
+  f.gateway.command = async () => ({ status: 'idle', messages: [], approvals: [], cursorAvailable: true });
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    if (target === 'COTHER') await f.store.update(state => { state.threads[key].mirrored['cursor-execution'] = { ts: 'old-card', hash: 'old-content' }; });
+    await f.plugin.mirror(key);
+  }
+  assert.deepEqual(f.sent, [], 'No unsolicited posts or updates in historical threads');
+  const preserved = f.store.data.threads[threadKey(teamId, 'COTHER', '123.001')].mirrored['cursor-execution'];
+  assert.deepEqual(preserved, { ts: 'old-card', hash: 'old-content' });
+});
+
+test('Cursor offer is channel scoped, idempotent and does not create or approve tasks', async t => {
+  const f = await fixture(t, { cursorOfferChannels: [channel] });
+  f.gateway.command = async type => {
+    f.calls.push({ type });
+    assert.equal(type, 'conversation.state', 'Offer rendering cannot submit a task or approval');
+    return { status: 'idle', messages: [], approvals: [], cursorAvailable: true };
+  };
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+  }
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].channel, channel);
+  assert.match(JSON.stringify(f.sent[0].blocks), /enable_cursor/);
+  assert.equal(f.calls.length, 6);
+  assert.ok(f.calls.every(item => item.type === 'conversation.state'), 'Only read-only state polling, no task or approval commands');
+});
+
+test('Cursor enable rejects stale buttons outside the configured channel before calling the gateway', async t => {
+  const f = await fixture(t, { cursorOfferChannels: [channel] });
+  for (const target of [channel, 'COTHER', 'DPRIVATE']) {
+    const key = threadKey(teamId, target, '123.001');
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    if (target !== channel) await assert.rejects(f.plugin.enableCursor('stale-'+target, user, { key }), { code: 'FORBIDDEN' });
+  }
+  assert.deepEqual(f.calls, []); assert.deepEqual(f.sent, []);
+  await f.plugin.enableCursor('test-enable', user, { key: threadKey(teamId, channel, '123.001') });
+  assert.deepEqual(f.calls.map(item => item.type), ['conversation.cursor']);
+  assert.equal(f.sent.length, 1); assert.equal(f.sent[0].channel, channel);
+});
+
+test('Cursor offer configuration is explicit, copied and rejects wildcard or private-message scope', async t => {
+  const env = { SLACK_APP_TOKEN: 'test-app', SLACK_BOT_TOKEN: 'test-bot', CONTEXT_GUARD_GATEWAY_TOKEN: 'test-gateway',
+    CONTEXT_GUARD_CLOUD_ORIGIN: 'https://map.example.com' };
+  assert.deepEqual(slackConfiguration(env).cursorOfferChannels, []);
+  assert.deepEqual(slackConfiguration({ ...env, CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS: 'C000001,G000002' }).cursorOfferChannels, ['C000001', 'G000002']);
+  const channels = [channel], f = await fixture(t, { cursorOfferChannels: channels });
+  channels.push('COTHER'); assert.deepEqual(f.plugin.cursorOfferChannels, [channel]);
+  for (const invalid of [['*'], ['DPRIVATE'], [channel, channel], 'C000001', [null], [' C000001'], Array.from({length: 21}, (_, i) => 'C'+i)]) {
+    assert.throws(() => new SlackPlugin({ ...f.plugin, cursorOfferChannels: invalid }), TypeError);
+  }
+});
 
 async function projectSwitchFixture(t, dm = 'D000001') {
   const f = await fixture(t), key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';
@@ -1212,7 +1271,7 @@ function nativeQuestionProjection(questions, { text = '', answered = [], attachm
   for (const index of answered) state.answers[initial.questions[index].id] = { text: `answer-${index}`, requestId: `answer-request-${index}` };
   return publicMessages(state).find(message => message.role === 'assistant');
 }
-const blockText = blocks => blocks.map(block => block.text?.text || '').join('\n\n');
+const blockText = blocks => blocks.map(block => block.text?.text || block.elements?.map(element => element.text?.text || '').join('\n') || '').join('\n\n');
 const occurrences = (text, value) => text.split(value).length - 1;
 
 test('Slack question-only render uses the real public ask_user projection without duplicated clarification', () => {
@@ -1234,7 +1293,7 @@ test('Slack question render preserves real multiple mixed and all-answered publi
     for (const question of questions) assert.equal(occurrences(text, question.question), 1);
     assert.ok(text.indexOf(questions[0].question) < text.indexOf(questions[1].question));
     assert.equal(occurrences(text, '直接在这个线程回复'), questions.length - answered.length);
-    assert.equal(text.includes('可参考：'), answered.length < questions.length);
+    assert.equal(blocks.some(block => block.elements?.some(element => element.action_id?.startsWith('answer_choice:'))), answered.length < questions.length);
     if (answered.length === 2) assert.equal(text, plainText(message.text), 'All answered history keeps the original joined body rather than empty blocks');
     if (!answered.length) assert.ok(text.indexOf('文章页') < text.indexOf(questions[1].question), 'Options stay attached to their question');
   }
@@ -1262,7 +1321,7 @@ test('Slack question render preserves attachment node links and approval control
   const original = structuredClone(message), blocks = messageBlocks(message, 'thread', context);
   assert.equal(occurrences(blockText(blocks), message.text), 1);
   assert.ok(blocks.some(block => block.type === 'context' && block.elements[0].text.includes('evidence.txt')));
-  assert.equal(blocks.find(block => block.type === 'actions').elements[0].url, 'https://map.example.com/projects/lab?relation=N1');
+  assert.ok(blocks.some(block => block.elements?.some(element => element.url === 'https://map.example.com/projects/lab?relation=N1')));
   assert.deepEqual(message, original);
   const approval = approvalBlocks({ id: 'p1', version: 'v1', text: '已对齐需求', acceptance: '可验收' }, 'thread');
   assert.deepEqual(approval.find(block => block.type === 'actions').elements.map(element => element.action_id), ['approve_brief', 'reject_brief']);
@@ -2322,32 +2381,51 @@ test('dormant thread slots cannot postpone an already-due live conversation', as
 test('an unrelated slow read-reaction cannot block a ready Coordinator answer', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const originalCommand = f.gateway.command, originalCall = f.io.call;
-  let release, entered;
+  let release, entered, reactionSettled = false;
   const held = new Promise(resolve => { release = resolve; }), began = new Promise(resolve => { entered = resolve; });
+  await f.store.receive('slow-reaction', { type: 'events_api', body: { event: event({ text: `<@${bot}> 当前问题` }) } });
+  // Prepare the existing input/submit through the real journal. The guard
+  // below measures mirroring a ready answer, not first-input history/fsync.
+  await f.plugin.runEntry('slow-reaction', f.store.data.inbox['slow-reaction']);
+  assert.equal(f.store.data.inbox['slow-reaction'].status, 'done');
+  assert.equal(f.store.data.inbox['slow-reaction'].attempts, 0);
+  assert.equal(f.store.data.inbox['slow-reaction'].error, undefined);
+  assert.equal(Object.values(f.store.data.inbox).filter(item => item.status === 'pending').length, 0);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1);
+  assert.equal(submits[0].payload.inputs.length, 1);
+  const inputId = submits[0].payload.inputs[0].id;
+  assert.ok(inputId);
+  const bindings = Object.values(f.store.data.threads);
+  assert.equal(bindings.length, 1);
+  assert.ok(bindings[0].ownRequests.includes(inputId));
+  assert.equal(bindings[0].awaitingReplyId, inputId);
+  assert.equal(bindings[0].nextPoll, 0);
+  assert.equal(f.sent.filter(item => item.text?.includes('准备好的实际答案')).length, 0);
   f.io.call = async (method, input) => {
-    if (method === 'reactions.add') { entered(); await held; return {}; }
+    if (method === 'reactions.add') { entered(); await held; reactionSettled = true; return {}; }
     return originalCall(method, input);
   };
   f.gateway.command = async (type, args) => {
     if (type === 'conversation.state') {
-      const submit = f.calls.find(call => call.type === 'conversation.submit');
-      return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: [submit.id],
-        messages: [{ id: 'ready-reply', requestId: submit.id, role: 'assistant', text: '准备好的实际答案' }], approvals: [] };
+      return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: [inputId],
+        messages: [{ id: 'ready-reply', requestId: inputId, role: 'assistant', text: '准备好的实际答案' }], approvals: [] };
     }
     return originalCommand(type, args);
   };
-  await f.store.receive('slow-reaction', { type: 'events_api', body: { event: event({ text: `<@${bot}> 当前问题` }) } });
   f.plugin.stopped = false;
   // A prior independent read reaction is already in flight; native merged
   // inputs themselves no longer add an acknowledgement before deciding.
   f.plugin.readReaction(event({ ts: '122.001' }));
-  const tick = f.plugin.tick();
-  let timer;
+  let tick, timer;
   try {
     await began;
+    tick = f.plugin.tick();
     const finished = await Promise.race([tick.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })]);
     assert.equal(finished, true, 'Message cycle must finish while the reaction remains held');
-    assert.match(f.sent.find(item => item.channel).text, /准备好的实际答案/);
+    assert.equal(f.sent.filter(item => item.channel && item.text?.includes('准备好的实际答案')).length, 1);
+    assert.equal(reactionSettled, false, 'The complete tick must finish before the unrelated reaction is released');
+    assert.equal(f.plugin.reactions.size, 1);
   } finally { clearTimeout(timer); release(); await tick; await f.plugin.stop(); }
 });
 test('live replies are prioritized with bounded state reads and fair dormant progress', async t => {
@@ -2684,7 +2762,7 @@ test('natural thread reply answers the pending question with a pinned identity, 
   assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].answerTo, 'q1');
   assert.equal(f.calls.find(input => input.type === 'conversation.submit').payload.inputs[0].text, `<@${bot}> 先修复刷新逻辑`);
   assert.equal(f.sent.some(input => input.method === 'views.open'), false);
-  assert.equal(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['a', 'b'] }] }, key).some(block => block.type === 'actions'), false);
+  assert.equal(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['a', 'b'] }] }, key).some(block => block.type === 'actions'), true);
   assert.match(JSON.stringify(messageBlocks({ questions: [{ id: 'q1', text: '问你', options: ['只改刷新', '完整登录'] }] }, key)), /只改刷新/);
 });
 test('BUSY retry without an initial question cannot become the answer to a later question', async t => {
@@ -2702,6 +2780,31 @@ test('BUSY retry without an initial question cannot become the answer to a later
   await f.plugin.message('original', event());
   const submits = f.calls.filter(input => input.type === 'conversation.submit');
   assert.deepEqual(submits[0].payload, submits[1].payload); assert.equal(submits[0].id, submits[1].id);
+});
+
+test('选择按钮绑定当前真人问题，重复点击只提交一次，过期和跨用户不提交', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'choice-chat', userId: user, ownRequests: [] });
+  const question = { id: 'q1', text: '回答范围？', options: ['当前文章', '全站文章'], answer: null };
+  const message = { id: 'choice-message', role: 'assistant', text: '', questions: [question] };
+  const gateway = f.gateway.command;
+  f.gateway.command = async (type, input) => {
+    if (type === 'conversation.state') return { status: 'waiting-for-user', messages: [message] };
+    if (type === 'conversation.submit') question.answer = { text: input.payload.text, requestId: input.id };
+    return gateway(type, input);
+  };
+  await f.plugin.mirror(key);
+  const ts = f.store.data.threads[key].mirrored[message.id].ts;
+  const body = { type: 'block_actions', user: { id: user }, channel: { id: channel }, message: { ts },
+    actions: [{ action_id: 'answer_choice:1', value: JSON.stringify({ key, questionId: 'q1', optionIndex: 1 }) }] };
+  await f.plugin.process('choice-first', { type: 'interactive', body });
+  await f.plugin.process('choice-repeat', { type: 'interactive', body });
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1); assert.equal(submits[0].payload.text, '全站文章');
+  assert.equal(submits[0].payload.answerTo, 'q1');
+  await assert.rejects(f.plugin.process('choice-other-user', { type: 'interactive', body: { ...body, user: { id: 'UOTHER' } } }), { code: 'FORBIDDEN' });
+  await assert.rejects(f.plugin.process('choice-old-card', { type: 'interactive', body: { ...body, message: { ts: 'old' } } }), { code: 'CONFLICT' });
+  assert.equal(f.calls.filter(call => call.type === 'conversation.submit').length, 1);
 });
 test('message shortcut retains its original thread project after the channel mapping changes', async t => {
   const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
@@ -2933,7 +3036,7 @@ test('Failed stream preview stays in its original slot and failure marking survi
     assert.equal(stream.ts, ts); assert.ok(stream.failedHash); assert.equal(stream.consumedBy, undefined);
     assert.equal(thread.liveStream.failedHash, stream.failedHash);
     assert.equal(f.sent.filter(call => call.channel).length, 2, 'One original preview and the unchanged idempotent failure notice');
-    assert.ok(f.sent.find(call => call.text?.includes('当前失败：MODEL_INVALID_RESPONSE')));
+    assert.ok(f.sent.find(call => call.text?.includes('处理已停止')));
   }
 });
 

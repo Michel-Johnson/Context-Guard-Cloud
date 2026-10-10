@@ -125,7 +125,8 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, targetNodeI
         const block = message.content.find(block => block.type === 'tool_result');
         if (block) {
           const result = JSON.parse(block.content);
-          if (result.kind === 'project-map-read') return { stop: 'end_turn', content: [{ type: 'text', text: JSON.stringify(result.node) }] };
+          // 原始节点仍留在工具回执中供权限/内容断言；普通答复不能倾倒 JSON 与内部标识。
+          if (result.kind === 'project-map-read') return { stop: 'end_turn', content: [{ type: 'text', text: '已读取目标模块。' }] };
           if (result.projects) assert.equal(result.total, result.projects.length, '目录工具提供权威总数，不从展示行估算');
           if (result.projects && request.messages.some(m => typeof m.content === 'string' && m.content.includes('切换到另一个项目'))) {
             return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'switch-project', name: 'switch_project', input: {
@@ -186,7 +187,7 @@ async function fixture(t, { enabled = true, visionProvider, nodeIds, targetNodeI
           ...(text === 'prepare-new-bug' ? { kind: 'bug' } : {}),
         } }] };
       }
-      return { stop: 'end_turn', content: [{ type: 'text', text: `Fixture response${text ? ': ' + text : ''}` }] };
+      return { stop: 'end_turn', content: [{ type: 'text', text: text.startsWith('[服务器工作流事件') ? '确认结果已收到。' : `Fixture response${text ? ': ' + text : ''}` }] };
     }; return { model: 'fixture-model', next: async request => {
       const result = await next(request);
       // Controlled provider follows the new first-round wire protocol. Business
@@ -415,6 +416,7 @@ test('频道跨项目读取按需下降，不换绑定、不写 Main，并重查
     return { state, result, value: JSON.parse(result.content) };
   };
   const root = await read('cross-root');
+  assert.equal(root.state.messages.at(-1).text, '已读取目标模块。');
   assert.equal(root.value.project.id, readTarget.projectId); assert.equal(root.value.node.id, 'N-target');
   assert.match(root.value.node.memoryDocument, /TARGET_ROOT_MEMORY/);
   assert.deepEqual(root.value.node.children.map(({ id, title }) => ({ id, title })), [{ id: 'N-target-child', title: '目标模块' }]);
@@ -897,9 +899,9 @@ async function confirmBinding(f, conversation, kind = 'todo', { project = projec
   assert.fail('确认通知未收口');
 }
 async function prepared(f, conversation, name, id) {
-  if (['prepare-new', 'prepare-stale', 'prepare-new-bug'].includes(name)) {
-    const kind = name === 'prepare-new-bug' ? 'bug' : 'todo', state = (await f.browser(conversation)).body;
-    if (state.focus?.kind !== kind || !state.approvals.some(item => item.kind === 'binding-proposal' && item.decision === 'approved')) {
+  if (['prepare-new', 'prepare-stale', 'prepare-new-bug', 'prepare-bug'].includes(name)) {
+    const kind = ['prepare-new-bug', 'prepare-bug'].includes(name) ? 'bug' : 'todo', state = (await f.browser(conversation)).body;
+    if (state.focus?.kind !== kind || !state.approvals.some(item => item.kind === 'binding-proposal' && item.decision === 'approved' && item.itemKind === kind)) {
       await confirmBinding(f, conversation, kind);
     }
   }
@@ -1090,9 +1092,9 @@ for (const scope of ['automatic-chat', 'main', 'legacy', 'session']) test(`Autom
   if (scope === 'session') bindingsBefore['123'] = (await readJSON(path.join(f.directory, 'interface-v2', hash('123'), 'protocol-v2.json'), {})).bindings;
   const mounted = await f.browser(id, { human: true, body: { id: 'mount-focus', text: 'mount-focus-node' } });
   assert.equal(mounted.status, 202, JSON.stringify(mounted.body));
-  let final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId);
+  let final = await f.wait(id, state => state.status === 'waiting-for-user' && !state.activeTurnId && state.acceptedRequestIds.includes('mount-focus'));
   const action = final.messages.flatMap(message => message.actions || []).find(value => value.kind === 'binding-proposal');
-  assert.equal(action?.node.id, 'N1');
+  assert.equal(action?.node.id, 'N1', JSON.stringify(final));
   assert.equal(final.conversations.find(value => value.id === id).nodeId, undefined);
   const reviewed = await f.browser(id, { human: true, suffix: '/binding-review', body: {
     id: 'confirm-focus', proposalId: action.id, version: action.version, decision: 'approved' } });

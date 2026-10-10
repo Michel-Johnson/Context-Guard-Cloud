@@ -6,14 +6,17 @@ import { SlackFeedback } from './feedback.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
-function modelFailureText(code, ownsFeedback, outgoing) {
+function modelFailureText(code, ownsFeedback, outgoing, message) {
   const owned = 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。';
   const legacy = `Coordinator 当前失败：${code || 'UNKNOWN'}。请在工作台查看并重试；不会显示假成功。`;
-  if (code !== 'MODEL_HTTP_402') return ownsFeedback ? owned : legacy;
-  const current = '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。';
+  const current = code === 'MODEL_HTTP_402'
+    ? '模型服务返回 HTTP 402，请检查账户可用额度或选择已配置模型。原消息与操作回执已保留，不会自动换模型。'
+    : message === '自动恢复未成功，原消息与已完成操作已保留。'
+      ? message : '处理已停止，原消息与已完成操作已保留。';
   if (!outgoing) return current;
   // 升级不改旧通知或原未知发送；复用原编号与已经冻结的显示内容。
-  const text = [current, owned, legacy].find(value => outgoing.hash === digest({ text: value }));
+  const text = [current, owned, legacy, '处理已停止，原消息与已完成操作已保留。', '自动恢复未成功，原消息与已完成操作已保留。']
+    .find(value => outgoing.hash === digest({ text: value }));
   if (!text) throw Object.assign(new Error('Original error notice cannot be verified'), { code: 'DELIVERY_UNCERTAIN' });
   return text;
 }
@@ -74,7 +77,11 @@ function safeEnvelope(type, body) {
 function contextFrom(binding, userId, id) { return { id, userId, projectId: binding.projectId, conversationId: binding.conversationId }; }
 
 export class SlackPlugin {
-  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console }) {
+  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [] }) {
+    if (!Array.isArray(cursorOfferChannels) || cursorOfferChannels.length > 20 ||
+        cursorOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
+        new Set(cursorOfferChannels).size !== cursorOfferChannels.length) throw new TypeError('Configure explicit Cursor offer channel IDs');
+    this.cursorOfferChannels = Object.freeze([...cursorOfferChannels]);
     this.store = store; this.gateway = gateway; this.io = io; this.teamId = teamId; this.cloudOrigin = new URL(cloudOrigin).origin; this.botUserId = botUserId;
     this.pollMs = Math.max(1000, pollMs); this.logger = logger; this.projects = new Map(); this.maps = new Map(); this.stopped = true; this.active = null;
     this.collectMs = collectMs; this.maxCollectMs = maxCollectMs;
@@ -425,7 +432,7 @@ export class SlackPlugin {
       this.feedback.drain();
       if (this.store.data.inbox[id]?.status === 'attention' && this.feedback.valid(id) && !error.silent) {
         await this.io.post({ id: operationId(id, 'intake-failed'), channel: event.channel, threadTs: event.thread_ts || event.ts,
-          text: 'Coordinator 暂时无法处理这条消息，请稍后重试。原消息仍保留。' }).catch(() => {});
+          text: '自动恢复未成功，原消息已保留。' }).catch(() => {});
       }
       if (!transient && !error.silent && !mergedFailure) await this.reportError(id, entry.envelope.body, error).catch(() => {});
     }
@@ -490,9 +497,14 @@ export class SlackPlugin {
       }
       else if (action.action_id === 'reject_brief') await this.review(id, userId, value, 'rejected', '用户要求继续讨论并修改 brief');
       else if (action.action_id === 'answer_question') await this.answer(id, userId, value);
+      else if (/^answer_choice:\d$/u.test(action.action_id)) {
+        if (Number(action.action_id.split(':')[1]) !== value.optionIndex) throw Object.assign(new Error('选项已经改变'), { code: 'INVALID_ARGUMENT' });
+        await this.answerChoice(id, body, userId, value);
+      }
       else if (action.action_id === 'approve_brief') await this.review(id, userId, value, 'approved', '用户在 Slack 中确认 brief');
       else if (action.action_id === 'approve_binding') await this.reviewBinding(id, userId, value, 'approved');
       else if (action.action_id === 'reject_binding') await this.reviewBinding(id, userId, value, 'rejected');
+      else if (action.action_id === 'enable_cursor') await this.enableCursor(id, userId, value);
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
@@ -1047,7 +1059,7 @@ export class SlackPlugin {
       let question;
       if (binding.pendingQuestionId) {
         const state = await this.command('conversation.state', binding, event.user, operationId(id, 'reply-context'));
-        question = (state.messages || []).flatMap(message => message.questions || []).find(question => question.id === binding.pendingQuestionId && !question.answer);
+        question = (state.messages || []).flatMap(message => message.questions || []).find(question => question.id === binding.pendingQuestionId && !question.answer && !question.superseded);
       }
       replyContext = { answerTo: question?.id || null };
       await this.store.update(state => { state.inbox[id] ||= { status: 'done', attempts: 0, at: Date.now(), next: 0 }; state.inbox[id].replyContext = replyContext; });
@@ -1249,17 +1261,54 @@ export class SlackPlugin {
     await this.command('conversation.submit', binding, userId, requestId, { text: value.text, answerTo: value.questionId, followup: 'steer' });
     await this.store.update(state => { state.threads[value.key].awaitingReplyId = requestId; state.threads[value.key].nextPoll = 0; });
   }
+  async answerChoice(id, body, userId, value) {
+    const binding = this.store.data.threads[value.key];
+    if (!binding || binding.userId !== userId || body.channel?.id !== binding.channel) {
+      throw Object.assign(new Error('只能回答自己的当前问题'), { code: 'FORBIDDEN' });
+    }
+    const state = await this.command('conversation.state', binding, userId, operationId(id, 'choice-state'));
+    const message = (state.messages || []).find(message => message.questions?.some(question => question.id === value.questionId));
+    const question = message?.questions.find(question => question.id === value.questionId);
+    if (!question || question.superseded || !Number.isSafeInteger(value.optionIndex) || value.optionIndex < 0 || value.optionIndex >= (question.options?.length || 0) ||
+        binding.mirrored?.[message.id]?.ts !== body.message?.ts) {
+      throw Object.assign(new Error('问题或选项已过期，请查看当前问题'), { code: 'CONFLICT' });
+    }
+    const text = question.options[value.optionIndex];
+    const requestId = operationId(`${value.key}:${userId}:${question.id}`, 'choice-answer');
+    if (question.answer) {
+      if (question.answer.requestId === requestId && question.answer.text === text) return;
+      throw Object.assign(new Error('这个问题已经回答'), { code: 'ALREADY_ANSWERED' });
+    }
+    if (binding.pendingQuestionId !== question.id) throw Object.assign(new Error('问题已不是当前待答项'), { code: 'CONFLICT' });
+    await this.command('conversation.submit', binding, userId, requestId, { text, answerTo: question.id, followup: 'steer' });
+    await this.store.update(data => {
+      const current = data.threads[value.key];
+      if (!current.ownRequests.includes(requestId)) current.ownRequests.push(requestId);
+      current.awaitingReplyId = requestId; current.nextPoll = 0;
+    });
+  }
   async review(id, userId, value, decision, reason) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const result = await this.command('brief.review', binding, userId, operationId(id, 'review'), { proposalId: value.proposalId, decision, reason, version: value.version });
-    const confirmed = 'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
+    const automatic = result.executionMode === 'automatic';
+    const confirmed = automatic ? 'brief 已确认，已进入 Cursor 执行队列。Plan 和结果会回到这个线程；排队不代表执行完成。' :
+      'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
     await this.io.post({ id: operationId(id, 'review-result'), channel: binding.channel, threadTs: binding.threadTs, text: decision === 'approved' ? confirmed : 'brief 已退回。直接在这个线程告诉我你想怎么修改。',
-      ...(decision === 'approved' ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
+      ...(decision === 'approved' && !automatic ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     if (decision === 'approved' && result.itemId && result.nodeId) await this.store.update(state => {
       const thread = state.threads[value.key]; thread.watchedItems ||= {};
       thread.watchedItems[result.itemId] ||= { nodeId: result.nodeId, kind: result.kind || 'todo', status: null }; thread.nextItemPoll = 0;
     });
+    return result;
+  }
+  async enableCursor(id, userId, value) {
+    const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
+    if (!this.cursorOfferChannels.includes(binding.channel)) throw Object.assign(new Error('Cursor 启用入口仅在指定测试频道开放。'), { code: 'FORBIDDEN' });
+    const result = await this.command('conversation.cursor', binding, userId, operationId(id, 'enable-cursor'), { expectedMode: 'manual' });
+    await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
+    await this.io.post({ id: operationId(id, 'cursor-enabled'), channel: binding.channel, threadTs: binding.threadTs,
+      text: '已启用当前对话的 Cursor 执行能力。请继续说明任务；每份 brief 仍需确认，启用本身没有派发任务。' });
     return result;
   }
   async reviewBinding(id, userId, value, decision) {
@@ -1508,33 +1557,47 @@ export class SlackPlugin {
         const id = `binding:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
         if (prior?.hash === hash || approval.pending === false && !prior) continue;
         const text = approval.pending ? 'Coordinator：请确认需求的主节点' :
-          approval.decision === 'approved' ? '已确认绑定到' + approval.node.title : approval.decision === 'superseded' ? '已有新的绑定建议' : '暂不绑定，继续讨论';
-        const blocks = approval.pending ? bindingBlocks(approval, key) : [section(text)];
+          approval.decision === 'approved' ? '已确认绑定到' + (approval.node.label || approval.node.title) : approval.decision === 'superseded' ? '已有新的绑定建议' : '暂不绑定，继续讨论';
+        const blocks = approval.pending ? bindingBlocks(approval, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId }) : [section(text)];
         const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
           await this.io.post({ id: operationId(`${key}:${id}`, 'binding-card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
         await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
         continue;
       }
-      if (approval.manual !== true) continue;
+      if (approval.manual !== true && !(approval.projectTask && approval.executionProvider === 'cursor')) continue;
       const id = `approval:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
       if (prior?.hash === hash) continue;
       if (approval.pending === false && !prior) continue;
       const resolved = approval.pending === false;
       const text = approval.stale ? '主节点已改绑，这份需求说明已过期，请重新整理。' :
         resolved ? `brief 已${approval.decision === 'approved' ? '确认' : '退回'}` : 'Coordinator：等待人工确认 brief';
-      const blocks = resolved ? [section(text), ...(approval.decision === 'approved' ? [{ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key, proposalId: approval.id }) }] }] : [])] : approvalBlocks(approval, key);
+      const blocks = resolved ? [section(text), ...(approval.decision === 'approved' && approval.manual === true ? [{ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key, proposalId: approval.id }) }] }] : [])] : approvalBlocks(approval, key);
       const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) : await this.io.post({ id: operationId(`${key}:${id}`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
       await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
       if (resolved && approval.decision === 'approved' && approval.itemId && approval.nodeId) await this.store.update(data => {
         const thread = data.threads[key]; thread.watchedItems ||= {}; thread.watchedItems[approval.itemId] ||= { nodeId: approval.nodeId, kind: approval.kind || 'todo', status: null };
       });
     }
+    // Execution permission is not consent to advertise in every saved thread.
+    // Preserve old cards outside this explicit operator-owned UI scope silently.
+    if (this.cursorOfferChannels.includes(binding.channel) && (state.cursorAvailable || this.store.data.threads[key].mirrored['cursor-execution'])) {
+      const active = state.executionProvider === 'cursor', text = active ? '已启用当前对话的 Cursor 执行能力，任务仍须确认 brief。' :
+        state.cursorAvailable ? '可以在当前对话启用 Cursor。启用不批准任务，也不会另开聊天。' : '当前对话未获得 Cursor 执行权限，请联系项目管理员。';
+      const blocks = [section(text), ...(!active && state.cursorAvailable ? [{ type: 'actions', elements: [{ type: 'button', action_id: 'enable_cursor',
+        text: { type: 'plain_text', text: '在当前对话启用 Cursor' }, value: JSON.stringify({ key }) }] }] : [])];
+      const content = digest(blocks), prior = this.store.data.threads[key].mirrored['cursor-execution'];
+      if (prior?.hash !== content) {
+        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
+          await this.io.post({ id: operationId(`${key}:cursor-execution`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
+        await this.store.update(data => { data.threads[key].mirrored['cursor-execution'] = { ts, hash: content }; });
+      }
+    }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);
     const ownsFeedback = state.participationRequestIds?.some(id => this.feedback.valid(this.store.data.reactionInputs?.[id]?.inboxId));
     if (state.status === 'error' && (ownsFeedback || !['pending', 'silent'].includes(state.participationDecision))) {
       const id = operationId(`${key}:${state.activeTurnId}:${state.error?.code}`, 'error');
       await this.io.post({ id, channel: binding.channel, threadTs: binding.threadTs,
-        text: modelFailureText(state.error?.code, ownsFeedback, this.store.data.outgoing[id]) });
+        text: modelFailureText(state.error?.code, ownsFeedback, this.store.data.outgoing[id], state.error?.message) });
     }
     // 模型结束不等于 Slack 送达。只用当前批次之后已发送的正式回答/卡片作证据，
     // 续写时回答仍归最初请求，不能仅匹配最后一条补充的 requestId。
@@ -1563,7 +1626,7 @@ export class SlackPlugin {
       }
       catch (error) { this.logger.warn('Slack 完成状态保留', { code: error.code || 'FEEDBACK_JOURNAL_ERROR' }); }
     }
-    const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer);
+    const openQuestions = messages.flatMap(message => message.questions || []).filter(question => !question.answer && !question.superseded);
     await this.store.updateThread(key, (thread, data) => {
       thread.status = state.status;
       if (lastRequestId) thread.lastStateRequestId = lastRequestId;

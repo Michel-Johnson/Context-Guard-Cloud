@@ -16,6 +16,81 @@ import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 
 const execFileAsync = promisify(execFile);
 
+test('Cloud CI HTTP reads only the active handoff versions and its own evidence', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-ci-http-read-scope-'));
+  const repositoryId = '123', projectId = 'context-guard', dataDir = path.join(directory, 'cloud');
+  const cloud = await startCloudServer({ dataDir, port: 0, browserToken: 'synthetic-browser', browserPasswordHash: await createWorkbenchPasswordHash('test-only'),
+    protocolConfig: { repositories: [{ slug: 'example/repo', repositoryId, projectId }] },
+    memoryConfig: { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic-only', projects: {
+      [projectId]: { token: 'synthetic-only', coordinator: { enabled: false, ciReceivers: {
+        ci: { executorSessionId: 'developer', worktreeId: 'ci-worktree' },
+      } } },
+    } },
+  });
+  const device = new DeviceConnection({ directory: path.join(directory, 'device'), origin: cloud.url, allowLoopback: true });
+  t.after(async () => { await device.close(); await cloud.close(); }); // Preserve the isolated files; never clean user directories.
+  await device.connect({ v: 2, id: 'connect', type: 'auth.open', payload: { repository: 'https://github.com/example/repo', password: 'test-only', clientId: 'ci-scope-device' } });
+  const bind = async (id, worktreeId) => device.send({ v: 2, id: 'bind-' + id, type: 'session.bind', payload: { sessionId: id, worktreeId, agentId: id, expectedBindingVersion: '' } });
+  const developer = await bind('developer', 'dev-worktree'); await bind('ci', 'ci-worktree');
+  const session = developer.session, sourceSha = 'a'.repeat(40);
+  const store = new ProtocolStore(path.join(dataDir, 'interface-v2', createHash('sha256').update(repositoryId).digest('hex')));
+  const human = { repositoryId, deviceId: 'browser', agentId: 'human', role: 'human' };
+  const binding = await store.registeredBinding(human, session.id);
+  const executor = { repositoryId, deviceId: binding.deviceId, agentId: session.id, role: 'device' };
+  const coordinator = { ...executor, deviceId: 'coordinator', agentId: 'coordinator', role: 'coordinator', bindings: { developer: binding.worktreeId } };
+  let sequence = 0;
+  // Preconditions use the real protocol reducers and approvals, only inside
+  // this owned synthetic fixture. No production receipts or model are created.
+  const send = async (principal, type, payload, options) => (await store.handle(principal, { v: 2, id: 'setup-' + ++sequence, type, session, payload }, options)).data;
+  const brief = await send(coordinator, 'brief.submit', { taskId: 'active-task', text: 'Verify isolated fixture' });
+  await send(coordinator, 'review.request', { taskId: 'active-task', kind: 'brief', ref: brief.ref, version: brief.version });
+  await send(human, 'review.result', { kind: 'brief', ref: brief.ref, version: brief.version, decision: 'approved', reason: 'Synthetic test precondition' });
+  await send(coordinator, 'task.assign', { taskId: 'active-task', briefRef: brief.ref, briefVersion: brief.version, sessionId: session.id, nodeIds: ['T0'], mainVersion: 'main-1' }, { workflow: { verifyRouting: () => true } });
+  const put = (ref, kind, content, baseVersion = '') => send(executor, 'object.put', { ref, kind, content, baseVersion });
+  const plan = await put('plan', 'plan', { steps: ['Verify'] });
+  await send(executor, 'task.report', { taskId: 'active-task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } });
+  await send(coordinator, 'review.request', { taskId: 'active-task', kind: 'plan', ref: plan.ref, version: plan.version, requirementsRef: brief.ref, requirementsVersion: brief.version, rulesVersion: 'rules-1' });
+  await send(coordinator, 'review.result', { kind: 'plan', ref: plan.ref, version: plan.version, decision: 'approved', reason: 'Synthetic test plan' });
+  const oldTodo = await put('checks', 'ciTodo', { items: [{ id: 'old-CI', title: 'Old version' }] });
+  const todo = await put('checks', 'ciTodo', { items: [{ id: 'CI-1', title: 'Current version' }] }, oldTodo.version);
+  const unit = await put('unit', 'evidence', { fixture: 'assigned unit evidence' });
+  const experience = await put('experience', 'experience', { fixture: 'not part of the CI request' });
+  const unrelated = await put('other-task-private', 'plan', { fixture: 'outside this task' });
+  const foreignEvidence = await put('ci:other-ci:result', 'evidence', { fixture: 'foreign Tester' });
+  const forgedOwnPlan = await put('ci:ci:plan', 'plan', { fixture: 'namespace alone does not grant plan reads' });
+  await send(executor, 'task.report', { taskId: 'active-task', stage: 'handoff', data: { sourceSha, ciTodoRef: todo.ref, unitTestRefs: [unit.ref], experienceRefs: [experience.ref] } });
+  await send(coordinator, 'ci.request', { taskId: 'active-task', sourceSha, ciTodoRef: todo.ref, unitTestRefs: [unit.ref] });
+  const credential = JSON.parse(await fs.readFile(device.file, 'utf8')).credential;
+  const request = async (type, payload, target = session) => {
+    const response = await fetch(cloud.url + '/api/v2/messages', { method: 'POST', headers: { 'Content-Type': 'application/json',
+      Authorization: `Bearer ${credential}`, 'X-Context-Guard-CI-Session': 'ci' },
+      body: JSON.stringify({ v: 2, id: 'http-' + ++sequence, type, session: target, payload }) });
+    return { status: response.status, body: await response.json() };
+  };
+  const own = await request('object.put', { kind: 'evidence', ref: 'ci:ci:result', baseVersion: '', content: { fixture: 'own test output' } });
+  assert.equal(own.status, 200, JSON.stringify(own.body));
+  const newerTodo = await put(todo.ref, 'ciTodo', { items: [{ id: 'later-CI', title: 'Not the assigned revision' }] }, todo.version);
+  const beforeReads = await fs.readFile(store.file, 'utf8');
+  for (const payload of [unrelated, oldTodo, newerTodo, experience, foreignEvidence, forgedOwnPlan, { ref: '__proto__', version: todo.version }]) {
+    const result = await request('object.read', { ref: payload.ref, version: payload.version });
+    assert.equal(result.status, 403, JSON.stringify(result.body)); assert.equal(result.body.error.code, 'FORBIDDEN');
+    assert.equal(await fs.readFile(store.file, 'utf8'), beforeReads, 'rejected reads must not mutate task/objects/receipts');
+  }
+  for (const [payload, expected] of [[todo, { items: [{ id: 'CI-1', title: 'Current version' }] }],
+    [unit, { fixture: 'assigned unit evidence' }], [own.body.data, { fixture: 'own test output' }]]) {
+    const result = await request('object.read', { ref: payload.ref, version: payload.version });
+    assert.equal(result.status, 200, JSON.stringify(result.body));
+    assert.deepEqual(result.body.data, { ref: payload.ref, version: payload.version, kind: payload === todo ? 'ciTodo' : 'evidence', content: expected });
+  }
+  assert.equal(await fs.readFile(store.file, 'utf8'), beforeReads, 'successful observations also leave the authoritative state unchanged');
+  const task = await store.taskRecord(coordinator, session, 'active-task');
+  await send(coordinator, 'task.control', { taskId: task.id, action: 'cancel', expectedVersion: task.version, data: { reason: 'End isolated testing scope' } });
+  for (const payload of [todo, own.body.data]) {
+    const result = await request('object.read', { ref: payload.ref, version: payload.version });
+    assert.equal(result.status, 403); assert.equal(result.body.error.code, 'FORBIDDEN', 'the old CI request cannot grant reads after the task leaves testing');
+  }
+});
+
 test('developer Main CLI still reads Main; apply is forbidden even when allowlisted', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-developer-main-cli-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

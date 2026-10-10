@@ -10,12 +10,17 @@ import { chromium } from 'playwright';
 import { createWorkbenchPasswordHash, startCloudServer } from '../scripts/cloud/server.mjs';
 import { completeSessionMemory, memoryPublicationStatus } from '../scripts/cloud/memory.mjs';
 const { startServer } = await skillImport('scripts/workbench/server.mjs');
+const { ensureNamedProxy } = await skillImport('scripts/workbench/named.mjs');
 const { resolveProject } = await skillImport('scripts/workbench/project.mjs');
 const { sessionMemoryDir } = await skillImport('scripts/workbench/memory.mjs');
 import { atomicWrite, encode, pause } from '../scripts/shared/io.mjs';
 
 const output = path.resolve(process.argv[2] || `output/playwright/browser-ci/session-sync-${Date.now()}-${randomUUID()}`);
 const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'context-guard-session-sync-browser-'));
+const namedDirectory = path.join(sandbox, 'named');
+// This acceptance owns its device proxy; never reuse a personal/global proxy.
+process.env.CONTEXT_GUARD_NAMED_STATE_DIR = namedDirectory;
+process.env.CONTEXT_GUARD_NAMED_PORT = '0';
 const root = path.join(sandbox, 'project');
 const ctx = path.join(root, '.codex/context');
 const sessionId = 'browser-session-sync';
@@ -39,7 +44,53 @@ const request = async (url, options = {}) => {
   assert.ok(response.ok, `${response.status}: ${JSON.stringify(body)}`);
   return body;
 };
-let cloud, local, browser, localPage, cloudPage, passed = false;
+let cloud, local, browser, localPage, cloudPage, fixtureProxy, proxyStartupAttempted = false, passed = false, bodyFailure;
+
+async function stopFixtureProxy() {
+  const stateFile = path.join(namedDirectory, 'proxy.json');
+  if (!proxyStartupAttempted) return;
+  assert.ok(fixtureProxy, 'proxy startup unresolved; preserve fixture rather than guess an owner');
+  const state = fixtureProxy;
+  assert.match(state.base, /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.ok(Number.isInteger(state.pid) && state.pid > 0);
+  assert.ok(typeof state.adminToken === 'string' && state.adminToken);
+  const deadline = Date.now() + 12000;
+  let stopRequested = false;
+  for (;;) {
+    let alive = true, released = false;
+    try { process.kill(state.pid, 0); }
+    catch (error) { if (error.code === 'ESRCH') alive = false; else throw error; }
+    try {
+      const current = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      for (const field of ['instance', 'pid', 'base', 'adminToken']) {
+        assert.ok(current[field] === state[field], 'cleanup must not adopt a replaced fixture proxy');
+      }
+    } catch (error) { if (error.code === 'ENOENT') released = true; else throw error; }
+    if (!alive && released) return;
+    if (alive && !stopRequested) {
+      // A missing state file alone is not proof that the original PID exited.
+      // Only the original ready receipt may authorize a management request.
+      const health = await fetch(state.base + '/__cg_proxy/health', {
+        redirect: 'error', signal: AbortSignal.timeout(1000),
+      }).catch(() => null);
+      if (health) {
+        assert.equal(health.status, 200);
+        const identity = await health.json();
+        assert.equal(identity.kind, 'context-guard-named');
+        assert.equal(identity.instance, state.instance, 'only this fixture proxy may be stopped');
+        stopRequested = true;
+        const response = await fetch(state.base + '/__cg_proxy/stop', {
+          method: 'POST', headers: { Authorization: `Bearer ${state.adminToken}`, Connection: 'close' },
+          redirect: 'error', signal: AbortSignal.timeout(3000),
+        });
+        await response.arrayBuffer();
+        assert.equal(response.status, 202);
+      }
+    }
+    assert.ok(Date.now() < deadline, 'fixture proxy must exit and release its state before acceptance passes');
+    await pause(25);
+  }
+}
 
 try {
   await fs.mkdir(ctx, { recursive: true });
@@ -102,6 +153,8 @@ try {
   assert.equal(publication.sourceCommit, sourceCommit);
 
   const delivered = [];
+  proxyStartupAttempted = true;
+  fixtureProxy = Object.freeze(await ensureNamedProxy({ dir: namedDirectory, port: 0 }));
   local = await startServer({ root, port: 0, messageQueue: async input => delivered.push(input), repositoryLookup: async () => ({ repositoryId: '123', slug: 'example/repo' }) });
   await request(new URL('/api/v2/messages', local.state.url), {
     method: 'POST', headers: headers(local.humanToken),
@@ -198,8 +251,10 @@ try {
   await fs.mkdir(output, { recursive: true });
   await localPage.screenshot({ path: path.join(output, 'local.png'), fullPage: true });
   await cloudPage.screenshot({ path: path.join(output, 'cloud.png'), fullPage: true });
-  await fs.writeFile(path.join(output, 'result.json'), encode({ passed: true, checks: ['no-manual-session-assignment-control', 'local-to-cloud', 'cloud-to-local', 'local-disk-persistence', 'refresh-persistence', 'main-isolation', 'server-timestamps'] }));
   passed = true;
+} catch (error) {
+  bodyFailure = error;
+  throw error;
 } finally {
   if (!passed) {
     await fs.mkdir(output, { recursive: true }).catch(() => {});
@@ -218,11 +273,22 @@ try {
     await localPage?.screenshot({ path: path.join(output, 'local-failure.png'), fullPage: true }).catch(() => {});
     await cloudPage?.screenshot({ path: path.join(output, 'cloud-failure.png'), fullPage: true }).catch(() => {});
   }
-  await browser?.close().catch(() => {});
-  await local?.close().catch(() => {});
-  await cloud?.close().catch(() => {});
+  const cleanupFailures = [];
+  for (const close of [() => browser?.close(), () => local?.close(), stopFixtureProxy, () => cloud?.close()]) {
+    try { await close(); } catch (error) { cleanupFailures.push(error); }
+  }
+  if (cleanupFailures.length) {
+    try {
+      await fs.mkdir(output, { recursive: true });
+      await fs.writeFile(path.join(output, 'result.json'), encode({ passed: false, phase: 'cleanup',
+        failures: cleanupFailures.length, retainedFixture: true }));
+    } catch (error) { cleanupFailures.push(error); }
+    throw new AggregateError([...(bodyFailure ? [bodyFailure] : []), ...cleanupFailures],
+      'Browser acceptance cleanup failed; fixture retained');
+  }
   // Windows can briefly retain directory handles after browser/server shutdown.
   await fs.rm(sandbox, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
 
+await fs.writeFile(path.join(output, 'result.json'), encode({ passed: true, checks: ['no-manual-session-assignment-control', 'local-to-cloud', 'cloud-to-local', 'local-disk-persistence', 'refresh-persistence', 'main-isolation', 'server-timestamps', 'owned-proxy-process-exit-and-state-release'] }));
 console.log(`Session sync browser artifacts: ${output}`);

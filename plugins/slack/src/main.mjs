@@ -17,6 +17,7 @@ export function configuration(env = process.env) {
   return { appToken: env.SLACK_APP_TOKEN, botToken: env.SLACK_BOT_TOKEN, gatewayToken: env.CONTEXT_GUARD_GATEWAY_TOKEN,
     gatewayUrl: env.CONTEXT_GUARD_GATEWAY_URL || 'http://127.0.0.1:8790', cloudOrigin: env.CONTEXT_GUARD_CLOUD_ORIGIN,
     directory: env.CONTEXT_GUARD_SLACK_STATE_DIR || path.join(os.homedir(), '.local', 'state', 'context-guard-slack'), teamId,
+    cursorOfferChannels: env.CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS ? env.CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS.split(',') : [],
     ...(env.CONTEXT_GUARD_SLACK_OPERATOR_DIR ? { operatorDirectory: env.CONTEXT_GUARD_SLACK_OPERATOR_DIR } : {}) };
 }
 async function lock(directory) {
@@ -48,7 +49,8 @@ export async function start(config = configuration()) {
     if (authentication.team_id !== config.teamId || !authentication.user_id) throw new Error('Slack token is not installed in Jerry Family');
     const gateway = new Gateway({ url: config.gatewayUrl, token: config.gatewayToken, teamId: config.teamId });
     const io = new SlackIO({ client, store, botUserId: authentication.user_id, botToken: config.botToken });
-    plugin = new SlackPlugin({ store, gateway, io, teamId: config.teamId, cloudOrigin: config.cloudOrigin, botUserId: authentication.user_id });
+    plugin = new SlackPlugin({ store, gateway, io, teamId: config.teamId, cloudOrigin: config.cloudOrigin, botUserId: authentication.user_id,
+      cursorOfferChannels: config.cursorOfferChannels });
     if (config.operatorDirectory) {
       await operatorDirectory(config.operatorDirectory, process.getgid());
       const sourceHash = await recoverySourceHash();

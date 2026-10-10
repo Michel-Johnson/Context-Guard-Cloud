@@ -34,7 +34,7 @@ test('TODO 和 Bug 建议不改变归属，人类确认后只绑定一个主节�
     assert.equal(proposal.reason, '需求');
     assert.equal((await f.make().approvals(f.conversationId)).find(item => item.id === proposal.id).reason, proposal.reason);
     assert.equal((await f.conversations.get(f.conversationId)).kind, kind === 'todo' ? undefined : 'todo');
-    assert.equal(proposal.pathText, '项目：目标\n└─ 工程：工程边界\n  └─ 测试：回归');
+    assert.equal(proposal.pathText, '项目 → 工程 → 测试');
     assert.doesNotMatch(proposal.pathText, /ROOT|ENGINEERING|TESTING/);
     const result = await f.bindings.review(f.review(proposal), f.context);
     assert.equal(result.decision, 'approved');
@@ -43,6 +43,17 @@ test('TODO 和 Bug 建议不改变归属，人类确认后只绑定一个主节�
     assert.equal(focus.nodeId, 'TESTING'); assert.equal(focus.kind, kind); assert.equal(focus.nodeIds, undefined);
   }
   assert.equal(JSON.stringify(f.snapshot), original, '绑定不写 Main 或创建执行 Session');
+});
+
+test('旧绑定卡片只更新展示路径，不改已保存版本或审批内容', async t => {
+  const f = await fixture(t), proposal = await f.propose('legacy-view');
+  const stored = await f.bindings.state();
+  stored.proposals[proposal.id].pathText = '项目\n└─ 工程\n  └─ 测试';
+  await fs.writeFile(f.bindings.file, JSON.stringify(stored));
+  const before = await fs.readFile(f.bindings.file, 'utf8');
+  const displayed = (await f.bindings.approvals(f.conversationId))[0];
+  assert.equal(displayed.pathText, '项目 → 工程 → 测试'); assert.equal(displayed.version, proposal.version);
+  assert.equal(await fs.readFile(f.bindings.file, 'utf8'), before);
 });
 
 test('拒绝、冒用身份、过期版本和被替换的建议均不能绑定', async t => {
@@ -54,6 +65,64 @@ test('拒绝、冒用身份、过期版本和被替换的建议均不能绑定',
   await assert.rejects(f.bindings.review(f.review(first), f.context), { code: 'CONFLICT' });
   await f.bindings.review(f.review(second, 'rejected'), f.context);
   assert.equal((await f.conversations.get(f.conversationId)).nodeId, undefined);
+});
+
+test('裸确认只有宿主锁定当前具体候选时才生效，冒用和过期仍被拒绝', async t => {
+  const f = await fixture(t), proposal = await f.propose('bare-confirm');
+  assert.equal(bindingReplyDecision('确认'), null);
+  assert.equal(bindingReplyDecision('确认', { allowBareConfirmation: true }), 'approved');
+  assert.equal(bindingReplyDecision('旧消息：“确认”', { allowBareConfirmation: true }), null);
+  assert.equal(await f.bindings.naturalReview('确认', { id: 'no-reference', ...f.context }), null);
+  assert.equal(await f.bindings.naturalReview('确认', { id: 'wrong-actor', ...f.context,
+    actor: { kind: 'human', sessionId: 'other' }, reference: proposal, allowBareConfirmation: true }), null);
+  const result = await f.bindings.naturalReview('确认', { id: 'current-confirm', ...f.context, reference: proposal, allowBareConfirmation: true });
+  assert.equal(result.decision, 'approved');
+  assert.equal((await f.conversations.get(f.conversationId)).nodeId, 'TESTING');
+});
+
+test('相同候选已有有效确认时复用审批，不再次要求确认或改变焦点', async t => {
+  const f = await fixture(t), first = await f.propose('one');
+  await f.bindings.review(f.review(first), f.context);
+  const before = await f.conversations.get(f.conversationId);
+  const repeated = await f.propose('same-candidate-new-operation');
+  assert.equal(repeated.pending, false); assert.equal(repeated.decision, 'approved');
+  assert.equal(repeated.id, first.id);
+  assert.deepEqual(await f.conversations.get(f.conversationId), before);
+  assert.equal((await f.bindings.approvals(f.conversationId)).length, 1);
+  f.snapshot.version = 'unrelated-main-update';
+  const revisedReason = await f.bindings.propose({ mainVersion: f.snapshot.version, nodeId: 'TESTING', kind: 'todo',
+    title: '完善测试', description: '新的说明，但归属未变' }, { operationId: 'same-scope-new-reason', ...f.context });
+  assert.equal(revisedReason.id, first.id); assert.equal(revisedReason.pending, false);
+  await f.bindings.withStableFocus(f.conversationId, () => true);
+  f.snapshot.memory.map.root.children[0].children[0].purpose = '改变后的职责';
+  await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => assert.fail('失效绑定不得进入brief')), { code: 'APPROVAL_REQUIRED' });
+});
+
+test('会话能力锁不批准任务，未确认的焦点仍不能准备 brief', async t => {
+  const f = await fixture(t), before = await f.conversations.get(f.conversationId);
+  let focusActions = 0;
+  await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => { focusActions++; }), { code: 'APPROVAL_REQUIRED' });
+  assert.equal(focusActions, 0);
+  assert.deepEqual(await f.bindings.withStableConversation(f.conversationId, current => current), before);
+  assert.deepEqual(await f.conversations.get(f.conversationId), before);
+  assert.deepEqual(await f.bindings.state(), { proposals: {}, reviews: {}, pending: {} });
+
+  // 复用同一绑定锁，待提出的建议不能插入能力切换期间。
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const held = f.bindings.withStableConversation(f.conversationId, async current => {
+    entered(); await gate;
+    assert.deepEqual(await f.bindings.state(), { proposals: {}, reviews: {}, pending: {} });
+    return current;
+  });
+  await started;
+  const proposed = f.propose('after-capability-lock');
+  release();
+  assert.deepEqual(await held, before);
+  assert.equal((await proposed).pending, true);
+  await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => { focusActions++; }), { code: 'APPROVAL_REQUIRED' });
+  assert.equal(focusActions, 0);
 });
 
 test('绑定后的失回可恢复，但旧确认不能覆盖后来人工改绑', async t => {
