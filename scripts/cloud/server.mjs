@@ -811,6 +811,7 @@ export async function startCloudServer({
   const coordinatorFor = async (project, conversationId = 'legacy') => {
     const key = `${project.id}:${conversationId}`, epoch = cursorModeEpochs.get(key) || 0;
     const assertCurrentEpoch = () => {
+      if (stopping) throw new MapError('SERVER_CLOSING', 'Coordinator is shutting down', 503);
       if (cursorTransitions.has(key) || (cursorModeEpochs.get(key) || 0) !== epoch) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
     };
     assertCurrentEpoch();
@@ -1716,13 +1717,15 @@ export async function startCloudServer({
   };
   const recoverInterruptedTasks = async project => {
     const config = configuredMemory?.projects?.[project.id]?.coordinator;
-    if (!config?.enabled) return;
+    if (stopping || !config?.enabled) return;
     const { store, principal } = interfaceProject(project);
     for (const id of Object.keys(config.bindings || {})) {
       const binding = await store.registeredBinding(principal, id);
+      if (stopping) return;
       if (!binding) continue;
       const session = { id, generation: binding.generation };
       for (const task of await store.workflowTasks(principal, session)) {
+        if (stopping) return;
         if (task.stage !== 'interrupted' || !task.busy) continue;
         const messageId = `auto-resume-startup:${digest(JSON.stringify([project.id, id, session.generation, task.id, task.version]))}`;
         await store.handle(principal, { v: 2, id: messageId, type: 'task.control', session,
@@ -2190,6 +2193,7 @@ export async function startCloudServer({
   }) || (() => {});
   let automaticPublicationRunning = null;
   let stopping = false;
+  const coordinatorStartup = [];
   const publishMergedSessions = async ({ afterCurrent = false } = {}) => {
     if (stopping || !configuredMemory) return;
     if (automaticPublicationRunning) {
@@ -3264,14 +3268,18 @@ export async function startCloudServer({
   }
   for (const project of registry.projects) {
     if (configuredMemory?.projects?.[project.id]?.coordinator?.enabled) {
-      void recoverInterruptedTasks(project).catch(cause => console.error(`[context-guard] interrupted-task recovery deferred: ${cause.message}`));
-      void conversationsFor(project).list().then(async items => {
-      const services = await Promise.all(items.map(item => coordinatorFor(project, item.id)));
-      // Start the first inbox pump immediately. This is what discovers durable
-      // interrupted tasks after a Cloud restart; the interval remains as the
-      // liveness fallback for later events.
-      await Promise.all(services.map(service => service.inbox.pump()));
-      }).catch(cause => console.error(`[context-guard] coordinator startup deferred: ${cause.message}`));
+      coordinatorStartup.push(recoverInterruptedTasks(project).catch(cause => console.error(`[context-guard] interrupted-task recovery deferred: ${cause.message}`)));
+      coordinatorStartup.push(conversationsFor(project).list().then(async items => {
+        if (stopping) return;
+        const services = await Promise.all(items.map(item => coordinatorFor(project, item.id)));
+        if (stopping) return;
+        // Start the first inbox pump immediately. This is what discovers durable
+        // interrupted tasks after a Cloud restart; the interval remains as the
+        // liveness fallback for later events.
+        await Promise.all(services.map(service => service.inbox.pump()));
+      }).catch(cause => {
+        if (!(stopping && cause.code === 'SERVER_CLOSING')) console.error(`[context-guard] coordinator startup deferred: ${cause.message}`);
+      }));
     }
   }
   let closing;
@@ -3286,6 +3294,9 @@ export async function startCloudServer({
     clearTimeout(initialPublication);
     const coordinatorShutdown = (async () => {
       await integrationShutdown;
+      // A delayed registry read can create services after a Map snapshot.
+      // Retire startup ownership before capturing the instances to drain.
+      await Promise.all(coordinatorStartup);
       await Promise.all([...cursorServices.values()].map(service => service.close()));
       await Promise.all([...coordinators.values()].map(async pending => {
         const service = await pending.catch(() => null);
