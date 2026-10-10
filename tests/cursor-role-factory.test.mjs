@@ -613,6 +613,79 @@ test('Conflicting or incomplete TODO mappings fail before workflow reads or anot
     assert.equal(tester.state, 'reserved'); assert.equal(tester.invocations.length, 0);
   });
 });
+
+test('Legacy rejected independent CI create recovers once on the same Agent after exact vendor absence', async t => {
+  const f = await ciFixture(t, {ciTodoItems:[{todoId:'CI-1',testId:ciPolicy.checks[0].testId,argv:ciPolicy.checks[0].argv}]}), before = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  const create = f.provider.create, getAgent = f.provider.getAgent;
+  f.provider.create = async input => {f.calls.push({method:'create',input});throw Object.assign(new Error('Old coarse rejection without status'), {code:'CURSOR_HTTP_ERROR'});};
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'),{code:'CURSOR_HTTP_ERROR'});
+  const failed = JSON.parse(await fs.readFile(f.file,'utf8')), original = failed.invocations[0];
+  const leaseFile = path.join(f.directory,'roles','capabilities','operations',hash(original.id)+'.json'), oldLease = JSON.parse(await fs.readFile(leaseFile,'utf8'));
+  f.provider.create = create;
+  let absentReads=0;
+  f.provider.getAgent = async id => {if(id===failed.nativeAgentId&&!f.runs.has(id)){absentReads++;throw Object.assign(new Error('Not found'),{code:'CURSOR_NOT_FOUND',httpStatus:404});}return getAgent(id);};
+  const [a,b] = await Promise.all([f.factory.pump(f.reserved.session,'task'),f.factory.pump(f.reserved.session,'task')]);
+  assert.equal(a.id,b.id);assert.equal(a.scope.createAttempt,1);assert.notEqual(a.token,original.token);
+  assert.equal(a.scope.nativeAgentId,failed.nativeAgentId);assert.deepEqual(a.scope.actor,original.scope.actor);assert.deepEqual(a.scope.session,original.scope.session);
+  assert.equal(a.scope.sourceSha,handoffSha);assert.equal(a.scope.ciPolicyHash,original.scope.ciPolicyHash);assert.equal(absentReads,1);
+  assert.equal(f.calls.length,4);assert.equal(f.calls.at(-1).method,'create');assert.equal(f.calls.at(-1).input.agentId,failed.nativeAgentId);
+  const retained = JSON.parse(await fs.readFile(f.file,'utf8'));
+  assert.equal(retained.invocations.length,2);assert.deepEqual(retained.invocations[0],original);assert.deepEqual(retained.commands,failed.commands);
+  assert.deepEqual(JSON.parse(await fs.readFile(leaseFile,'utf8')),oldLease);await assert.rejects(f.factory.channel.context(original.token),{code:'ROLE_EXPIRED'});
+  assert.notEqual((await f.factory.channel.context(a.token)).writePrefix,f.factory.channel.prefix(original.scope));
+  assert.deepEqual(await f.store.taskRecord(f.human,f.reserved.session,'task'),before,'No new approval, source or business result');
+  const reopened=new CursorRoleFactory(f.options);assert.equal((await reopened.pump(f.reserved.session,'task')).id,a.id);assert.equal(f.calls.length,4);
+  const p=await ciProposal(f);assert.equal(p.invocation.id,a.id);
+  await f.factory.channel.exchange(p.invocation.token,p.input);await reopened.pump(f.reserved.session,'task');
+  const completed=await f.store.taskRecord(f.human,f.reserved.session,'task');
+  assert.equal(completed.stage,'awaiting-merge');assert.equal(completed.ci.verdict,'passed');assert.equal(completed.acceptanceReview,undefined);
+  assert.equal(completed.sourceSha,before.sourceSha);assert.deepEqual(completed.references,before.references);assert.deepEqual(completed.planReview,before.planReview);
+  assert.equal(f.calls.length,4);assert.deepEqual(JSON.parse(await fs.readFile(f.file,'utf8')).invocations[0],original);
+});
+
+test('Legacy CI create recovery refuses visible or unverified vendor state and revoked original authority', async t => {
+  for(const kind of ['exists','read-timeout','wrong-404','source-revoked','revoked-during-read','new-diagnostic','uncertain','second-failure']) await t.test(kind,async child=>{
+    const f=await ciFixture(child), create=f.provider.create;
+    f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Rejected fixture'),{code:'CURSOR_HTTP_ERROR',...(kind==='new-diagnostic'?{httpStatus:400,providerErrorCode:'validation_error'}:{}),...(kind==='uncertain'?{deliveryUncertain:true}:{})});};
+    await assert.rejects(f.factory.pump(f.reserved.session,'task'));
+    if(kind==='source-revoked')f.setAllowed(false);
+    f.provider.getAgent=async()=>{if(kind==='exists')return {id:'existing-native-agent',latestRunId:'foreign'};if(kind==='revoked-during-read')f.setAllowed(false);throw Object.assign(new Error('Read boundary'),{code:kind==='read-timeout'?'CURSOR_TIMEOUT':'CURSOR_NOT_FOUND',httpStatus:kind==='wrong-404'?403:404});};
+    if(kind!=='second-failure')f.provider.create=create;
+    if(kind==='second-failure'){await assert.rejects(f.factory.pump(f.reserved.session,'task'));assert.equal(f.calls.length,4);await assert.rejects(f.factory.pump(f.reserved.session,'task'));assert.equal(f.calls.length,4);}
+    else {await assert.rejects(f.factory.pump(f.reserved.session,'task'));assert.equal(f.calls.length,3);}
+    const task=await f.store.taskRecord(f.human,f.reserved.session,'task');assert.equal(task.stage,'testing');assert.equal(task.ci,undefined);assert.equal(task.acceptanceReview,undefined);
+  });
+});
+
+test('Legacy CI create recovery rejects invalid scopes and never renews a prepared expired lease', async t => {
+  const f=await ciFixture(t),create=f.provider.create;
+  f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Legacy rejection'),{code:'CURSOR_HTTP_ERROR'});};
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'));
+  const actor=JSON.parse(await fs.readFile(f.file,'utf8')),original=actor.invocations[0];
+  for(const createAttempt of [0,-1,2,1.5,null,'1'])await assert.rejects(f.factory.channel.issue({operationId:'invalid-create-'+String(createAttempt),scope:{...original.scope,createAttempt}}),{code:'INVALID_ARGUMENT'});
+  await assert.rejects(f.factory.channel.issue({operationId:'plan-create-attempt',scope:{...f.invocation.scope,phase:'plan',plan:undefined,createAttempt:1}}),{code:'INVALID_ARGUMENT'});
+  await assert.rejects(f.factory.channel.issue({operationId:'execution-create-attempt',scope:{...f.invocation.scope,createAttempt:1}}),{code:'INVALID_ARGUMENT'});
+  f.provider.create=create;f.provider.getAgent=async()=>{throw Object.assign(new Error('Absent'),{code:'CURSOR_NOT_FOUND',httpStatus:404});};
+  const authorize=f.factory.authorizeSource;
+  f.factory.authorizeSource=async input=>await authorize(input)&&!(input.actor.invocations.at(-1)?.scope.createAttempt===1);
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'),{code:'CURSOR_ROLE_CONFLICT'});
+  const prepared=JSON.parse(await fs.readFile(f.file,'utf8')).invocations.at(-1);assert.equal(prepared.state,'prepared');assert.equal(prepared.scope.createAttempt,1);
+  const leaseFile=path.join(f.directory,'roles','capabilities','operations',hash(prepared.id)+'.json'),lease=JSON.parse(await fs.readFile(leaseFile,'utf8'));
+  f.factory.authorizeSource=authorize;f.factory.channel.now=()=>lease.expiresAt;
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'),{code:'ROLE_EXPIRED'});assert.equal(f.calls.length,3);
+  assert.deepEqual(JSON.parse(await fs.readFile(leaseFile,'utf8')),lease);assert.deepEqual(JSON.parse(await fs.readFile(f.file,'utf8')).invocations[0],original);
+  assert.equal((await f.store.taskRecord(f.human,f.reserved.session,'task')).stage,'testing');
+});
+
+test('Rejected native CI create stores only safe status and documented code with its original failure receipt', async t => {
+  const f=await ciFixture(t);
+  f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Do not save provider text'),{code:'CURSOR_HTTP_ERROR',httpStatus:400,providerErrorCode:'validation_error',details:'fixture-private-diagnostic'});};
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'),{code:'CURSOR_HTTP_ERROR'});
+  const actor=JSON.parse(await fs.readFile(f.file,'utf8')),i=actor.invocations.at(-1);
+  assert.equal(i.error,'CURSOR_HTTP_ERROR');assert.equal(i.httpStatus,400);assert.equal(i.providerErrorCode,'validation_error');assert.equal(i.runId,undefined);
+  assert.equal(JSON.stringify(actor).includes('fixture-private-diagnostic'),false);assert.equal(JSON.stringify(actor).includes('Do not save provider text'),false);
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'),{code:'CURSOR_ROLE_FAILED'});assert.equal(f.calls.length,3);
+});
 test('Independent Cursor CI original proposal reaches the original task only with native observation AND declared exact-source workflow facts', async t => {
   const f = await ciFixture(t), p = await ciProposal(f);
   assert.notEqual(p.invocation.scope.nativeAgentId, f.invocation.scope.nativeAgentId);

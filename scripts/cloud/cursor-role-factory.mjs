@@ -4,7 +4,7 @@ import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.
 import { canonical } from '../shared/protocol.mjs';
 import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
 import { CursorRoleChannel, CURSOR_PLAN_CONTINUATIONS } from './cursor-role-channel.mjs';
-import { cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
+import { cursorFailureDiagnostic, cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
 import { CursorGitProof, cursorApprovedPaths } from './cursor-git-proof.mjs';
 import { cursorProofCommand, verifyCursorNativeProof } from './cursor-native-proof.mjs';
 import { validateCursorCiPolicy, cursorCiRequirements, cursorCiOutcome, cursorCiCoverage } from './cursor-ci-policy.mjs';
@@ -175,12 +175,13 @@ export class CursorRoleFactory {
     try { this.requireActor(state, executor); this.requireActor(state, actor); return true; } catch { return false; }
   }
 
-  scope(actor, task, phase, attempt = 0) {
+  scope(actor, task, phase, attempt = 0, createAttempt = 0) {
     const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
     return { projectId: this.projectId, repositoryId: this.repositoryId, ownerId: this.ownerId, session, actor: actor.session,
       worktreeId: actor.kind === 'ci' ? actor.executorWorktreeId : actor.worktreeId, actorWorktreeId: actor.worktreeId,
       nativeAgentId: actor.nativeAgentId, taskId: task.id, phase,
       ...(attempt ? { attempt } : {}),
+      ...(createAttempt ? { createAttempt } : {}),
       ...(this.ciPolicyHash ? { ciPolicyHash: this.ciPolicyHash } : {}),
       sourceSha: phase === 'plan' ? actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
   }
@@ -408,17 +409,26 @@ export class CursorRoleFactory {
     let task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
     const baseScope = this.scope(actor, task, phase);
     let invocation = actor.invocations.findLast(item => {
-      const { attempt, ...base } = item.scope;
+      const { attempt, createAttempt, ...base } = item.scope;
       return canonical(base) === canonical(baseScope);
     });
-    let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0) : baseScope;
+    let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0, invocation.scope.createAttempt || 0) : baseScope;
     let operationId = hash(canonical(scope));
     if (invocation) {
       if (invocation.id !== operationId || canonical(invocation.scope) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the exact original invocation authority');
       // A lost follow-up confirmation has no client Run ID. Do not POST again
       // or adopt the Agent's unrelated latest Run to make the ledger look ready.
       if (['dispatching', 'unknown'].includes(invocation.state)) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Preserve the original invocation and inspect its native result');
-      if (invocation.state === 'confirmed') {
+      // Recover the pre-diagnostic CI rejection once. Same client Agent ID,
+      // explicit vendor absence, fresh lease, and the old receipt preserved.
+      if (phase === 'ci' && invocation.state === 'failed' && !invocation.runId && invocation.error === 'CURSOR_HTTP_ERROR' &&
+          invocation.httpStatus === undefined && !scope.createAttempt && !actor.invocations.some(item => item.runId)) {
+        await this.requireMissingAgent(actor.nativeAgentId);
+        task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
+        await this.channel.revoke(invocation.token);
+        scope = this.scope(actor, task, phase, 0, 1); operationId = hash(canonical(scope)); invocation = null;
+      }
+      if (invocation?.state === 'confirmed') {
         if (phase !== 'plan') return invocation;
         const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
         if (run.agentId !== actor.nativeAgentId || run.id !== invocation.runId) fail('CURSOR_ROLE_CONFLICT', 'Observe only the exact saved Plan Run');
@@ -436,7 +446,8 @@ export class CursorRoleFactory {
       }
       if (invocation && invocation.state !== 'prepared') fail('CURSOR_ROLE_FAILED', 'The saved invocation failed or was stopped; preserve its receipt rather than silently retrying');
     }
-    const previous = invocation ? actor.invocations.at(-2) : actor.invocations.at(-1);
+    if (invocation && scope.createAttempt) await this.requireMissingAgent(actor.nativeAgentId);
+    const previous = scope.createAttempt ? null : invocation ? actor.invocations.at(-2) : actor.invocations.at(-1);
     if (previous) {
       const run = await this.provider.getRun(actor.nativeAgentId, previous.runId);
       if (run.agentId !== actor.nativeAgentId || run.id !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'Preserve the previous saved native Run');
@@ -455,7 +466,7 @@ export class CursorRoleFactory {
     // check, not in a second authoritative task state machine or native status.
     await this.store.transaction(async state => {
       task = await this.authorizeLaunch(state, actor, taskId, phase);
-      if (canonical(this.scope(actor, task, phase, scope.attempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
+      if (canonical(this.scope(actor, task, phase, scope.attempt || 0, scope.createAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
       state.cursorRoleLaunches ||= {};
       state.cursorRoleLaunches[hash(canonical([this.repositoryId, operationId]))] = { scopeHash: operationId, taskVersion: task.version,
         briefReview: task.briefReview, planReview: task.planReview || null, state: 'authorized' };
@@ -467,7 +478,7 @@ export class CursorRoleFactory {
       // create an unchecked authorization window before the network side effect.
       await this.store.transaction(async state => {
         const current = await this.authorizeLaunch(state, actor, taskId, phase);
-        if (canonical(this.scope(actor, current, phase, scope.attempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Original task or source changed before native dispatch');
+        if (canonical(this.scope(actor, current, phase, scope.attempt || 0, scope.createAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Original task or source changed before native dispatch');
       }, { readOnly: true });
       // Read the current operation, not issue()'s earlier snapshot. Release the
       // lease lock before POST, so native MCP discovery cannot deadlock on it.
@@ -488,10 +499,17 @@ export class CursorRoleFactory {
       return invocation;
     } catch (cause) {
       invocation.state = cause.deliveryUncertain ? 'unknown' : invocation.runId ? 'invalidated' : 'failed';
-      invocation.error = String(cause.code || 'CURSOR_ROLE_FAILED').slice(0, 100); await atomicWrite(file, encode(actor));
+      invocation.error = String(cause.code || 'CURSOR_ROLE_FAILED').slice(0, 100);
+      Object.assign(invocation, cursorFailureDiagnostic(cause)); await atomicWrite(file, encode(actor));
       if (!cause.deliveryUncertain) await this.channel.revoke(lease.token);
       throw cause;
     }
+  }
+
+  async requireMissingAgent(nativeAgentId) {
+    try { await this.provider.getAgent(nativeAgentId); }
+    catch (cause) { if (cause.code === 'CURSOR_NOT_FOUND' && cause.httpStatus === 404) return; throw cause; }
+    fail('CURSOR_ROLE_CONFLICT', 'The saved Cursor Agent exists; never replay its create or adopt an unrelated Run');
   }
 
   async pump(session, taskId) {
