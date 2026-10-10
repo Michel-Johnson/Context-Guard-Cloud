@@ -12,12 +12,12 @@ import { hash } from '../scripts/shared/io.mjs';
 const templateId = '11111111-1111-4111-8111-111111111111', sourceSha = 'a'.repeat(40), handoffSha = 'b'.repeat(40);
 // ProtocolStore, approvals, bindings, durable intents and role channel are real.
 // The native provider is a controlled dependency, not real Cursor execution.
-async function fixture(t, { gitProof, ciPolicy } = {}) {
+async function fixture(t, { gitProof, ciPolicy, runStatus = 'FINISHED' } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-cursor-factory-'));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const store = new ProtocolStore(path.join(directory, 'protocol')), calls = [], runs = new Map();
   let count = 0, allowed = true, uncertain = '';
-  const createRun = agentId => { const run = { id: 'run-' + ++count, agentId, status: 'FINISHED' }; runs.set(agentId, run); return run; };
+  const createRun = agentId => { const run = { id: 'run-' + ++count, agentId, status: runStatus }; runs.set(agentId, run); return run; };
   const provider = {
     create: async input => { calls.push({ method: 'create', input }); const run = createRun(input.agentId);
       if (uncertain === 'create') throw Object.assign(new Error('Synthetic lost confirmation'), { code: 'CURSOR_TRANSPORT_ERROR', deliveryUncertain: true });
@@ -68,6 +68,7 @@ async function fixture(t, { gitProof, ciPolicy } = {}) {
     await send(coordinator, session, 'review.request', { taskId: 'task', kind: 'plan', ...plan, requirementsRef: (await store.taskRecord(coordinator, session, 'task')).brief.ref,
       requirementsVersion: (await store.taskRecord(coordinator, session, 'task')).brief.version, rulesVersion: 'rules' });
     await send(coordinator, session, 'review.result', { kind: 'plan', ...plan, decision: 'approved', reason: 'Reviewed exact synthetic Plan' });
+    runs.get(invocation.scope.nativeAgentId).status = 'FINISHED';
     return plan;
   };
   return { directory, store, calls, runs, provider, factory, options, human, coordinator, project, reserve, assign, send, approvePlan,
@@ -94,7 +95,7 @@ test('Hosted Cursor reserves an independent logical child before any native Run;
 });
 
 test('Hosted Cursor launches Plan then approved execution on the same Agent and rotates task capabilities', async t => {
-  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  const f = await fixture(t, { runStatus: 'RUNNING' }), reserved = await f.assign(await f.reserve());
   const invocation = await f.factory.pump(reserved.session, 'task');
   assert.equal(f.calls.length, 1); assert.equal(f.calls[0].method, 'create');
   assert.equal(f.calls[0].input.mode, 'plan'); assert.equal(f.calls[0].input.startingRef, sourceSha);
@@ -113,6 +114,161 @@ test('Hosted Cursor launches Plan then approved execution on the same Agent and 
   const reopened = new CursorRoleFactory(f.options);
   assert.equal((await reopened.resolveReceiver(executing.scope)).runId, executing.runId);
   await reopened.pump(reserved.session, 'task'); assert.equal(f.calls.length, 2);
+});
+
+test('Terminal Cursor Plan continues the original unfinished task with fresh authority, never renewing its expired lease', async t => {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  let now = Date.now(); f.factory.channel.now = () => now;
+  const original = await f.factory.pump(reserved.session, 'task');
+  const oldRef = f.factory.channel.prefix(original.scope) + 'plan';
+  await f.factory.channel.exchange(original.token, { id: 'draft-only', type: 'object.put', payload: {
+    kind: 'plan', ref: oldRef, baseVersion: '', content: { steps: ['Draft did not report Plan readiness'] },
+  } });
+  const leaseFile = path.join(f.directory, 'roles', 'capabilities', 'operations', hash(original.id) + '.json');
+  const oldLease = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  now += 3600001;
+  const next = await f.factory.pump(reserved.session, 'task');
+  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].method, 'followUp');
+  assert.equal(f.calls[1].agentId, original.scope.nativeAgentId);
+  assert.notEqual(next.runId, original.runId); assert.notEqual(next.id, original.id); assert.notEqual(next.token, original.token);
+  assert.deepEqual(next.scope.session, original.scope.session); assert.equal(next.scope.taskId, 'task');
+  assert.equal(next.scope.attempt, 1); assert.equal(next.scope.sourceSha, sourceSha);
+  const retained = JSON.parse(await fs.readFile(leaseFile, 'utf8'));
+  assert.equal(retained.expiresAt, oldLease.expiresAt); assert.equal(retained.token, oldLease.token); assert.equal(retained.state, 'revoked');
+  await assert.rejects(f.factory.channel.context(original.token), { code: 'ROLE_EXPIRED' });
+  const context = await f.factory.channel.context(next.token);
+  assert.equal(context.stage, 'assigned'); assert.notEqual(context.writePrefix, f.factory.channel.prefix(original.scope));
+  await assert.rejects(f.factory.channel.exchange(next.token, { id: 'old-draft', type: 'object.put', payload: {
+    kind: 'plan', ref: oldRef, baseVersion: '', content: { steps: ['Must not overwrite the prior attempt'] },
+  } }), { code: 'ROLE_FORBIDDEN' });
+  const plan = (await f.factory.channel.exchange(next.token, { id: 'new-plan', type: 'object.put', payload: {
+    kind: 'plan', ref: context.writePrefix + 'plan', baseVersion: '', content: { steps: ['Implement', 'Test'], paths: ['src/fixture.mjs'] },
+  } })).data;
+  await f.factory.channel.exchange(next.token, { id: 'plan-ready', type: 'task.report', payload: { taskId: 'task', stage: 'planReady',
+    data: { planRef: plan.ref, planVersion: plan.version, sourceSha } } });
+  const task = await f.store.taskRecord(f.coordinator, reserved.session, 'task');
+  assert.equal(task.stage, 'plan-ready'); assert.equal(task.planReview, undefined);
+  assert.equal(await f.factory.pump(reserved.session, 'task'), null, 'The native model cannot approve its own Plan');
+  assert.equal((await f.store.projectTasks(f.human))[0].review.id, 'human-approval');
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.length, 2); assert.equal(actor.invocations[0].runId, original.runId);
+});
+
+test('Terminal Cursor Plan concurrent pumps and host restart preserve one confirmed continuation', async t => {
+  const f = await fixture(t, { runStatus: 'RUNNING' }), reserved = await f.assign(await f.reserve());
+  const original = await f.factory.pump(reserved.session, 'task');
+  assert.equal((await f.factory.pump(reserved.session, 'task')).id, original.id); assert.equal(f.calls.length, 1);
+  f.runs.get(original.scope.nativeAgentId).status = 'FINISHED';
+  const [a, b] = await Promise.all([f.factory.pump(reserved.session, 'task'), f.factory.pump(reserved.session, 'task')]);
+  assert.equal(a.id, b.id); assert.equal(a.scope.attempt, 1); assert.equal(f.calls.length, 2);
+  const reopened = new CursorRoleFactory(f.options);
+  assert.equal((await reopened.pump(reserved.session, 'task')).id, a.id); assert.equal(f.calls.length, 2);
+  assert.equal((await reopened.resolveReceiver(a.scope)).runId, a.runId);
+  assert.equal(await reopened.resolveReceiver(original.scope), null);
+});
+
+test('Terminal Cursor Plan uncertain continuation is retained, never repeated or replaced with another Agent', async t => {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  await f.factory.pump(reserved.session, 'task'); f.setUncertain('followUp');
+  await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_TRANSPORT_ERROR' });
+  const reopened = new CursorRoleFactory(f.options);
+  await assert.rejects(reopened.pump(reserved.session, 'task'), { code: 'CURSOR_ACCEPTANCE_UNKNOWN' });
+  assert.equal(f.calls.filter(call => call.method === 'create').length, 1);
+  assert.equal(f.calls.filter(call => call.method === 'followUp').length, 1);
+  assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
+});
+
+test('Terminal Cursor Plan observes exact native identity and original approval before any continuation', async t => {
+  for (const scenario of ['ERROR', 'EXPIRED', 'RUNNING', 'CANCELLED', 'unknown-status', 'foreign-run', 'foreign-latest', 'read-timeout', 'source-revoked']) await t.test(scenario, async child => {
+    const f = await fixture(child), reserved = await f.assign(await f.reserve());
+    const original = await f.factory.pump(reserved.session, 'task');
+    if (['ERROR', 'EXPIRED', 'RUNNING', 'CANCELLED', 'unknown-status'].includes(scenario)) f.runs.get(original.scope.nativeAgentId).status = scenario;
+    if (scenario === 'foreign-run') f.provider.getRun = async () => ({ ...original.run, id: 'another-run' });
+    if (scenario === 'foreign-latest') f.provider.getAgent = async () => ({ id: original.scope.nativeAgentId, latestRunId: 'another-run' });
+    if (scenario === 'read-timeout') f.provider.getRun = async () => { throw Object.assign(new Error('Synthetic read timeout'), { code: 'CURSOR_TIMEOUT' }); };
+    if (scenario === 'source-revoked') f.setAllowed(false);
+    const denied = ['foreign-run', 'foreign-latest', 'read-timeout', 'source-revoked'].includes(scenario);
+    if (denied) await assert.rejects(f.factory.pump(reserved.session, 'task'));
+    else {
+      const next = await f.factory.pump(reserved.session, 'task');
+      assert.equal(next.id === original.id, !['ERROR', 'EXPIRED'].includes(scenario));
+    }
+    assert.equal(f.calls.length, ['ERROR', 'EXPIRED'].includes(scenario) ? 2 : 1);
+    assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
+  });
+});
+
+test('Terminal Cursor Plan bounds model attempts and rejects malformed or other-phase attempt scopes', async t => {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  const original = await f.factory.pump(reserved.session, 'task');
+  for (const attempt of [0, -1, 3, 1.5, null, '1']) await assert.rejects(f.factory.channel.issue({
+    operationId: 'invalid-attempt-' + String(attempt), scope: { ...original.scope, attempt },
+  }), { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(f.factory.channel.issue({ operationId: 'ci-attempt', scope: { ...original.scope, phase: 'ci', attempt: 1,
+    actor: { id: '77777777-7777-4777-8777-777777777777', generation: 1 }, actorWorktreeId: 'independent-ci',
+  } }), { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(f.factory.channel.issue({ operationId: 'execution-attempt', scope: { ...original.scope, phase: 'execution', attempt: 1,
+    plan: { ref: 'approved-plan', version: 'approved-version' },
+  } }), { code: 'INVALID_ARGUMENT' });
+  assert.equal((await f.factory.pump(reserved.session, 'task')).scope.attempt, 1);
+  assert.equal((await f.factory.pump(reserved.session, 'task')).scope.attempt, 2);
+  await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_PLAN_CONTINUATION_LIMIT' });
+  assert.equal(f.calls.length, 3); assert.equal(f.calls.filter(call => call.method === 'create').length, 1);
+  assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'assigned');
+});
+
+test('Terminal Cursor Plan reports arriving during native observation win without another Run or lease rotation', async t => {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  const original = await f.factory.pump(reserved.session, 'task');
+  const object = (await f.factory.channel.exchange(original.token, { id: 'before-observation-plan', type: 'object.put', payload: {
+    kind: 'plan', ref: f.factory.channel.prefix(original.scope) + 'plan', baseVersion: '', content: { steps: ['Report is in flight'] },
+  } })).data;
+  const getRun = f.provider.getRun;
+  f.provider.getRun = async (agentId, runId) => {
+    await f.factory.channel.exchange(original.token, { id: 'observed-plan-ready', type: 'task.report', payload: { taskId: 'task', stage: 'planReady',
+      data: { planRef: object.ref, planVersion: object.version, sourceSha } } });
+    return getRun(agentId, runId);
+  };
+  await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  assert.equal(f.calls.length, 1);
+  assert.equal((await f.store.taskRecord(f.coordinator, reserved.session, 'task')).stage, 'plan-ready');
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.length, 1);
+  assert.equal(JSON.parse(await fs.readFile(path.join(f.directory, 'roles', 'capabilities', 'operations', hash(original.id) + '.json'), 'utf8')).state, 'active');
+});
+
+test('Terminal Cursor Plan source, approval and binding revocation during native reads prevent continuation', async t => {
+  for (const scenario of ['source', 'approval', 'binding']) await t.test(scenario, async child => {
+    const f = await fixture(child), reserved = await f.assign(await f.reserve());
+    const original = await f.factory.pump(reserved.session, 'task'), getAgent = f.provider.getAgent;
+    f.provider.getAgent = async id => {
+      if (scenario === 'source') f.setAllowed(false);
+      else await f.store.transaction(state => {
+        if (scenario === 'approval') Object.values(state.projectTasks)[0].review.decision = 'rejected';
+        else state.bindings[hash(canonical(['123', reserved.session.id]))].generation++;
+      });
+      return getAgent(id);
+    };
+    await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+    assert.equal(f.calls.length, 1);
+    assert.equal(JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8')).invocations.length, 1);
+    assert.equal(original.scope.attempt, undefined);
+  });
+});
+
+test('Terminal Cursor Plan prepared lease expiry cannot start a native Run when host dispatch resumes', async t => {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  f.factory.authorizeSource = async ({ actor }) => actor.invocations.at(-1)?.state !== 'prepared';
+  await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  assert.equal(f.calls.length, 0);
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8'));
+  const prepared = actor.invocations[0]; assert.equal(prepared.state, 'prepared');
+  const file = path.join(f.directory, 'roles', 'capabilities', 'operations', hash(prepared.id) + '.json');
+  const lease = JSON.parse(await fs.readFile(file, 'utf8'));
+  const reopened = new CursorRoleFactory(f.options); reopened.channel.now = () => lease.expiresAt + 1;
+  await assert.rejects(reopened.pump(reserved.session, 'task'), { code: 'ROLE_EXPIRED' });
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), lease, 'Expiry replay never renews the operation');
 });
 
 test('Hosted Cursor denies a reservation without the exact approved project task and preserves unrelated bindings', async t => {

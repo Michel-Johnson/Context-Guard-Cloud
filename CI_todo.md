@@ -2006,3 +2006,13 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 首版 `db6a77a4399d1caca374c65b3c36c9c5fd356b9a` 完整 `npm test` exit0，907 项中 905 通过、2 既有跳过，246144.879166ms；独立关闭 4/4、原挂载 4/4、原工具回执 1/1。该版 PR73 CI 全绿，但独立审核随后发现初始化与自己的 Inbox 消费循环等待，因此没有合并或部署；这些通过结果不能替代后续修订验收。
 - [x] 精准正式反例先经真实 HTTP 证明 Main 已就绪，再等待 Main 两个缓存校验完成，避免兄弟任务失败提前解环；首版新增目标 0/1、exit1，1833.6975ms，实际形成初始化等待 Inbox 关闭、Inbox 等待同一初始化。清理 escape 仅在失败后释放，不进入成功 Oracle。
 - [x] 最小补修将所有状态、输入信号和代次异步检查移到 Inbox 安装之前；之后同步安装、kick 和返回，没有未完成初始化的监听窗口。补修后的完整关闭测试 5/5、exit0，1473.093125ms；不改变通用 Inbox 关闭等待或业务工具回执。新字节完整测试、独立审核和准确 CI/部署仍待。
+
+## CURSOR-TERMINAL-PLAN-01 · 原生终态但原任务没有 Plan 的接续
+
+- 根因：原 factory 将同一 Task/阶段的已确认 invocation 永久复用；即使准确厂商 Run 已结束、原任务仍为 assigned 且凭据过期，调度也不会发送后续 Run。厂商 FINISHED 不能冒充原 Plan 回执。
+- [x] 最小 Plan-only 补修：只对准确 saved Run 的 FINISHED/ERROR/EXPIRED，核验同一 Agent 的最新 Run、当前人审/绑定/来源并重新检查任务后，创建同任务的有界 attempt。复用原 Agent、不新建业务任务；旧 invocation/期限/失败保留，旧权限撤销，新 attempt 使用新凭据和草稿命名空间。最多两次自动接续；运行中、未知状态、原生 CANCELLED、发送确认未知及授权变化不重发。执行/独立 CI 其他阶段的重试没有包含在本项。
+- [x] 过期 prepared 操作在任何厂商 POST 前拒绝，不续租或默默重建身份。原任务在观察途中报告 Plan 时，保留真实 Plan 结果、不旋转旧权限、不发送新 Run；新的模型仍不能自审 Plan。
+- [x] 新核心目标旧实现 14 项中 4 通过、10 失败，exit1，2980.090459ms。首个补修 13/14，另一个失败是负例使用非法字符串 content，Core 按正确优先级先拒绝；改为合法对象以测试命名空间隔离，不放宽校验或预期拒绝。随后初始 factory/channel/HTTP 107/107，exit0，51058.600209ms。
+- [x] 最终增加观察竞态、撤权和过期 prepared 目标，完整 factory/channel/HTTP 113/113，exit0，50848.463709ms，无失败/取消/跳过。正式真实 HTTP、ProtocolStore 和能力存储，厂商/Git/批准为控制边界；Node24.18.0，基于 Main `337bb349a6aaf4430539d276bc1c7aa38ef84486`、固定 Core2.4.2/UI1.5.2 的当前修订工作树。
+- [ ] 准确新修订完整测试、独立 Tester、安全/Required、正常合并及 Main 门禁；生产保留正在使用的 native-json 实验制品，必须独立测试兼容组合，不把正式新包结果套给旧实验。
+- [ ] 在原生原任务/原 Agent 观察一次真实后续 Run、合法 Plan、原 Coordinator 审核、任务产物和独立 Tester；本地两路径和总体三路径业务闭环仍未验收。不得以模拟回归或单一连接状态提前标记完成。

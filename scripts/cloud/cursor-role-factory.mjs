@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { canonical } from '../shared/protocol.mjs';
 import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
-import { CursorRoleChannel } from './cursor-role-channel.mjs';
+import { CursorRoleChannel, CURSOR_PLAN_CONTINUATIONS } from './cursor-role-channel.mjs';
 import { cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
 import { CursorGitProof, cursorApprovedPaths } from './cursor-git-proof.mjs';
 import { cursorProofCommand, verifyCursorNativeProof } from './cursor-native-proof.mjs';
@@ -175,11 +175,12 @@ export class CursorRoleFactory {
     try { this.requireActor(state, executor); this.requireActor(state, actor); return true; } catch { return false; }
   }
 
-  scope(actor, task, phase) {
+  scope(actor, task, phase, attempt = 0) {
     const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
     return { projectId: this.projectId, repositoryId: this.repositoryId, ownerId: this.ownerId, session, actor: actor.session,
       worktreeId: actor.kind === 'ci' ? actor.executorWorktreeId : actor.worktreeId, actorWorktreeId: actor.worktreeId,
       nativeAgentId: actor.nativeAgentId, taskId: task.id, phase,
+      ...(attempt ? { attempt } : {}),
       ...(this.ciPolicyHash ? { ciPolicyHash: this.ciPolicyHash } : {}),
       sourceSha: phase === 'plan' ? actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
   }
@@ -193,7 +194,9 @@ export class CursorRoleFactory {
 
   prompt(scope, actor) {
     const common = `You are the ${scope.phase === 'ci' ? 'independent Tester' : 'Executor'} of the original Context Guard Coordinator task ${scope.taskId}. Never start a separate user chat, approve a requirement or Plan, or write Main. Use context_guard_context, then context_guard_exchange object.read for immutable references. When testPolicy is present, include its fixed todoId/testId/argv mapping in your Plan and CI TODO; never invent coverage. Identity is fixed by MCP, never include Session/principal fields. Use the returned writePrefix and stable message IDs. If ROLE_UNAVAILABLE appears during native startup, retry the SAME MCP operation, do not create a new task. Source revision: ${scope.sourceSha}.`;
-    if (scope.phase === 'plan') return common + ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance, then task.report stage:planReady with planRef/planVersion and the specified sourceSha. Stop after that; Coordinator must review the exact Plan before implementation.';
+    if (scope.phase === 'plan') return common +
+      (scope.attempt ? ` The previous saved Run terminated without submitting the original Task Plan. This is continuation ${scope.attempt} on the SAME Agent and Task, not a new task or an approval. Read current context and tools/list again; use the NEW returned writePrefix and never reuse an old draft ref or capability.` : '') +
+      ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance. First object.put requires payload {kind:"plan",ref:<writePrefix plus suffix>,baseVersion:"",content:<Plan object>}; do not omit baseVersion or send null. Use the exact returned ref/version in task.report payload {taskId:<original task>,stage:"planReady",data:{planRef:<ref>,planVersion:<version>,sourceSha:<specified source SHA>}}. Stop after that; Coordinator must review the exact Plan before implementation.';
     if (scope.phase === 'ci') return common + ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A proof-pending response saves only that original CI proposal: end this Run for host verification, never replace the ID or claim acceptance. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.' +
       (this.ciPolicy ? ' Execute each exact host command once with run_terminal_cmd (not backgrounded), keeping its nonce and actual result. Never alter business source or command argv. Preserve failed reproduction evidence and use the fixed todoId/testId mapping. Commands: ' + JSON.stringify(actor.commands.map(({ todoId, testId, command }) => ({ todoId, testId, command }))) : '');
     return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit and push only your own Cursor branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. A proof-pending response saves only that original proposal: stop this Run so the host can verify it, do not send a replacement ID or claim completion. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
@@ -403,23 +406,46 @@ export class CursorRoleFactory {
 
   async launch(file, actor, taskId, phase) {
     let task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
-    const scope = this.scope(actor, task, phase), operationId = hash(canonical(scope));
-    let invocation = actor.invocations.find(item => item.id === operationId);
+    const baseScope = this.scope(actor, task, phase);
+    let invocation = actor.invocations.findLast(item => {
+      const { attempt, ...base } = item.scope;
+      return canonical(base) === canonical(baseScope);
+    });
+    let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0) : baseScope;
+    let operationId = hash(canonical(scope));
     if (invocation) {
+      if (invocation.id !== operationId || canonical(invocation.scope) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the exact original invocation authority');
       // A lost follow-up confirmation has no client Run ID. Do not POST again
       // or adopt the Agent's unrelated latest Run to make the ledger look ready.
       if (['dispatching', 'unknown'].includes(invocation.state)) fail('CURSOR_ACCEPTANCE_UNKNOWN', 'Preserve the original invocation and inspect its native result');
-      if (invocation.state === 'confirmed') return invocation;
-      if (invocation.state !== 'prepared') fail('CURSOR_ROLE_FAILED', 'The saved invocation failed or was stopped; preserve its receipt rather than silently retrying');
+      if (invocation.state === 'confirmed') {
+        if (phase !== 'plan') return invocation;
+        const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
+        if (run.agentId !== actor.nativeAgentId || run.id !== invocation.runId) fail('CURSOR_ROLE_CONFLICT', 'Observe only the exact saved Plan Run');
+        // A live/unknown status or external cancellation is not an automatic
+        // retry signal. Native read failure also cannot authorize a new POST.
+        if (!['FINISHED', 'ERROR', 'EXPIRED'].includes(run.status)) return invocation;
+        if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== invocation.runId) fail('CURSOR_ROLE_CONFLICT', 'Never continue an Agent used outside this task');
+        const attempt = (scope.attempt || 0) + 1;
+        if (attempt > CURSOR_PLAN_CONTINUATIONS) fail('CURSOR_PLAN_CONTINUATION_LIMIT', 'Preserve the unfinished Plan and failed attempts; automatic continuation budget is exhausted');
+        // The model may have reported Plan readiness during the observer read.
+        // Recheck authority before rotating its token or creating retry intent.
+        task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
+        scope = this.scope(actor, task, phase, attempt); operationId = hash(canonical(scope));
+        invocation = null;
+      }
+      if (invocation && invocation.state !== 'prepared') fail('CURSOR_ROLE_FAILED', 'The saved invocation failed or was stopped; preserve its receipt rather than silently retrying');
     }
     const previous = invocation ? actor.invocations.at(-2) : actor.invocations.at(-1);
     if (previous) {
       const run = await this.provider.getRun(actor.nativeAgentId, previous.runId);
+      if (run.agentId !== actor.nativeAgentId || run.id !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'Preserve the previous saved native Run');
       if (!cursorRunTerminal(run)) fail('CURSOR_ROLE_BUSY', 'Wait for the current native Run');
       if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'The native Agent was used outside the saved task');
       await this.channel.revoke(previous.token);
     }
     const lease = await this.channel.issue({ operationId, scope });
+    if (lease.state === 'revoked' || !Number.isSafeInteger(lease.expiresAt) || this.channel.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Do not dispatch with an old expired or revoked operation lease');
     if (!invocation) {
       invocation = { id: operationId, scope, token: lease.token, state: 'prepared', mode: phase === 'plan' ? 'plan' : 'agent' };
       actor.invocations.push(invocation); await atomicWrite(file, encode(actor));
@@ -428,7 +454,7 @@ export class CursorRoleFactory {
     // check, not in a second authoritative task state machine or native status.
     await this.store.transaction(async state => {
       task = await this.authorizeLaunch(state, actor, taskId, phase);
-      if (canonical(this.scope(actor, task, phase)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
+      if (canonical(this.scope(actor, task, phase, scope.attempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
       state.cursorRoleLaunches ||= {};
       state.cursorRoleLaunches[hash(canonical([this.repositoryId, operationId]))] = { scopeHash: operationId, taskVersion: task.version,
         briefReview: task.briefReview, planReview: task.planReview || null, state: 'authorized' };
