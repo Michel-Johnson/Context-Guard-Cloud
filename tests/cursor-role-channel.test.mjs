@@ -8,7 +8,7 @@ import http from 'node:http';
 import { CursorRoleChannel } from '../scripts/cloud/cursor-role-channel.mjs';
 import { createCursorRoleMcpHandler } from '../scripts/cloud/cursor-role-mcp.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
-import { canonical } from '../scripts/shared/protocol.mjs';
+import { canonical, ProtocolError } from '../scripts/shared/protocol.mjs';
 import { scopedObjectKey } from '../scripts/shared/protocol-workflow.mjs';
 import { hash } from '../scripts/shared/io.mjs';
 
@@ -450,4 +450,172 @@ test('Cursor role MCP rejects browser authority, foreign projects, malformed tra
   assert.equal(tooLarge.status, 413);
   await f.channel.revoke(lease.token);
   assert.equal((await mcp.request(lease.token, input)).status, 401);
+});
+
+// Discovery is the native client's contract, not a second authorization layer.
+// Compare its phase-specific fields to the shared wire contract and exercise
+// malformed/corrected requests over real HTTP and the durable original task.
+test('Cursor role MCP discovery describes each phase-specific wire payload without selecting task identity', async t => {
+  const f = await fixture(t), planLease = await f.issue('plan');
+  const inspect = async (f, lease, kinds, reports) => {
+    const mcp = await mcpFixture(t, f);
+    await mcp.initialize(lease.token); await mcp.initialized(lease.token);
+    const list = await mcp.request(lease.token, { jsonrpc: '2.0', id: 'discovery', method: 'tools/list' });
+    assert.equal(list.status, 200);
+    assert.deepEqual(list.body.result.tools.map(tool => tool.name), ['context_guard_context', 'context_guard_exchange']);
+    const schema = list.body.result.tools[1].inputSchema;
+    assert.equal(schema.additionalProperties, false);
+    assert.deepEqual(schema.required, ['id', 'type', 'payload']);
+    assert.equal(schema.properties.id.maxLength, 128);
+    assert.deepEqual(Object.keys(schema.properties), ['id', 'type', 'payload']);
+    assert.equal(schema.oneOf.length, 3, 'Each allowed type has its own payload schema');
+    const payload = type => schema.oneOf.find(branch => branch.properties.type.const === type).properties.payload;
+    const read = payload('object.read'), put = payload('object.put');
+    assert.deepEqual(read.required, ['ref', 'version']);
+    assert.equal(read.additionalProperties, false);
+    assert.equal(read.properties.ref.maxLength, 128);
+    assert.equal(read.properties.version.maxLength, 4096);
+    assert.deepEqual(put.required, ['kind', 'ref', 'baseVersion', 'content']);
+    assert.equal(put.additionalProperties, false);
+    assert.deepEqual(put.properties.kind.enum, kinds);
+    assert.deepEqual(put.properties.baseVersion.type, 'string');
+    assert.equal(put.properties.baseVersion.maxLength, 4096);
+    assert.equal(put.properties.baseVersion.minLength ?? 0, 0, 'First write accepts an explicit empty version');
+    assert.match(put.properties.baseVersion.description, /empty string/);
+    assert.equal(put.properties.content.type, 'object');
+    assert.equal(put.properties.content.additionalProperties, true, 'Plan content is not a new rigid wire schema');
+    if (reports) {
+      const report = payload('task.report');
+      assert.deepEqual(report.oneOf.map(branch => branch.properties.stage.const), reports);
+      for (const branch of report.oneOf) {
+        assert.deepEqual(branch.required, ['taskId', 'stage', 'data']);
+        assert.equal(branch.additionalProperties, false);
+        assert.equal(branch.properties.data.additionalProperties, false);
+      }
+      const data = stage => report.oneOf.find(branch => branch.properties.stage.const === stage).properties.data;
+      if (reports.includes('planReady')) {
+        assert.deepEqual(data('planReady').required, ['planRef', 'planVersion', 'sourceSha']);
+        assert.equal(data('planReady').properties.planVersion.maxLength, 4096);
+        assert.equal(data('planReady').properties.sourceSha.pattern, '^[a-f0-9]{40}$');
+      } else {
+        assert.deepEqual(data('progress').required, ['seq', 'summary']);
+        assert.equal(data('progress').properties.seq.minimum, 0);
+        assert.equal(data('progress').properties.summary.maxLength, 2000);
+        assert.deepEqual(data('handoff').required, ['sourceSha', 'ciTodoRef', 'unitTestRefs', 'experienceRefs']);
+        assert.equal(data('handoff').properties.unitTestRefs.maxItems, 100);
+      }
+    } else {
+      const ci = payload('ci.result');
+      assert.deepEqual(ci.required, ['taskId', 'sourceSha', 'verdict', 'checks']);
+      assert.equal(ci.additionalProperties, false);
+      assert.equal(ci.properties.checks.minItems, 1);
+      assert.equal(ci.properties.checks.maxItems, 100);
+      const check = ci.properties.checks.items;
+      assert.deepEqual(check.required, ['testId', 'todoId', 'status', 'evidenceRef']);
+      assert.equal(check.additionalProperties, false);
+      assert.deepEqual(check.if, { properties: { status: { const: 'failed' } }, required: ['status'] });
+      assert.deepEqual(check.then, { required: ['reproductionRef'] });
+    }
+    assert.equal(JSON.stringify(schema).includes(lease.token), false);
+    assert.equal(JSON.stringify(schema).includes(executorId), false, 'Discovery never embeds a business Session');
+  };
+  await inspect(f, planLease, ['plan'], ['planReady']);
+  const executionFixture = await fixture(t), { execution } = await executionFixture.prepareExecution();
+  await inspect(executionFixture, execution, ['evidence', 'ciTodo', 'experience'], ['progress', 'handoff']);
+  const ciFixture = await fixture(t), { ci } = await ciFixture.prepareCi();
+  await inspect(ciFixture, ci, ['evidence'], null);
+});
+
+test('Cursor role MCP reports actionable wire errors and accepts correction without mutating or approving the task', async t => {
+  const f = await fixture(t), lease = await f.issue('plan'), mcp = await mcpFixture(t, f);
+  await mcp.initialize(lease.token); await mcp.initialized(lease.token);
+  const exchange = args => mcp.request(lease.token, { jsonrpc: '2.0', id: 'rpc', method: 'tools/call',
+    params: { name: 'context_guard_exchange', arguments: args } });
+  const put = { id: 'correctable-plan', type: 'object.put', payload: { kind: 'plan', ref: f.own('plan', 'mcp-correction'), baseVersion: '', content: { steps: ['Implement', 'Test'] } } };
+  const before = await f.store.transaction(state => state, { readOnly: true });
+  const omitted = structuredClone(put); delete omitted.payload.baseVersion;
+  const invalid = [
+    [omitted, 'payload.baseVersion'],
+    [{ ...put, payload: { ...put.payload, baseVersion: null } }, 'payload.baseVersion'],
+    [{ ...put, payload: { ...put.payload, content: 'private plan text must not be echoed' } }, 'payload.content'],
+    [{ id: 'bad-report', type: 'task.report', payload: { taskId: 'task', stage: 'planReady', data: { planRef: put.payload.ref } } }, 'payload.data.planVersion'],
+    [{ id: 'bad-read', type: 'object.read', payload: { ref: f.brief.ref, version: null } }, 'payload.version'],
+  ];
+  for (const [request, field] of invalid) {
+    const response = await exchange(request);
+    assert.equal(response.status, 200);
+    assert.equal(response.body.result.isError, true);
+    const value = JSON.parse(response.body.result.content[0].text);
+    assert.equal(value.error.code, 'INVALID_ARGUMENT');
+    assert.equal(value.error.field, field);
+    assert.match(value.error.message, /tools\/list/);
+    assert.deepEqual(response.body.result.structuredContent, value);
+    assert.equal(JSON.stringify(response.body).includes('private plan text'), false);
+    assert.deepEqual(await f.store.transaction(state => state, { readOnly: true }), before, 'Malformed calls save no object, task mutation or retry receipt');
+  }
+  const planResponse = await exchange(put), plan = planResponse.body.result.structuredContent.data;
+  assert.equal(planResponse.body.result.isError, undefined);
+  assert.equal((await f.task()).stage, 'assigned');
+  assert.deepEqual(await exchange(put), planResponse, 'Corrected first write is replay-safe');
+  const ready = { id: 'correctable-ready', type: 'task.report', payload: { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } } };
+  assert.equal((await exchange(ready)).body.result.structuredContent.data.stage, 'plan-ready');
+  assert.equal((await f.task()).planReview, undefined, 'A corrected native Plan remains subject to Coordinator review');
+});
+
+test('Cursor role MCP wire hints never echo unknown error paths or private provider errors', async t => {
+  const f = await fixture(t), lease = await f.issue('plan'), mcp = await mcpFixture(t, f);
+  await mcp.initialize(lease.token); await mcp.initialized(lease.token);
+  const before = await f.store.transaction(state => state, { readOnly: true });
+  // Only this failure boundary is synthetic; the authenticated HTTP lifecycle
+  // and durable task are real. A provider error must not become model context.
+  for (const code of ['INVALID_ARGUMENT', 'ROLE_UNAVAILABLE']) {
+    f.channel.exchange = async () => { throw code === 'INVALID_ARGUMENT'
+      ? new ProtocolError(code, 'Invalid payload.private-secret-value', { token: 'private-secret-value' })
+      : Object.assign(new Error('Invalid payload.private-secret-value'), { code, details: { token: 'private-secret-value' } }); };
+    const response = await mcp.request(lease.token, { jsonrpc: '2.0', id: 'secret', method: 'tools/call', params: {
+      name: 'context_guard_exchange', arguments: { id: 'secret-error', type: 'object.read', payload: { ref: 'brief', version: 'version' } },
+    } });
+    assert.equal(response.body.result.isError, true);
+    const error = JSON.parse(response.body.result.content[0].text).error;
+    assert.equal(error.code, code);
+    assert.equal(error.field, undefined);
+    assert.equal(JSON.stringify(response.body).includes('private-secret-value'), false);
+    assert.deepEqual(response.body.result.structuredContent, { error });
+    assert.deepEqual(await f.store.transaction(state => state, { readOnly: true }), before);
+  }
+});
+
+test('Cursor role MCP execution and CI wire hints retain role denials and failed reproduction requirements', async t => {
+  for (const phase of ['execution', 'ci']) {
+    const f = await fixture(t);
+    const prepared = phase === 'execution' ? await f.prepareExecution() : await f.prepareCi();
+    const lease = prepared[phase], mcp = await mcpFixture(t, f);
+    await mcp.initialize(lease.token); await mcp.initialized(lease.token);
+    const exchange = args => mcp.request(lease.token, { jsonrpc: '2.0', id: 'rpc', method: 'tools/call',
+      params: { name: 'context_guard_exchange', arguments: args } });
+    const before = await f.store.transaction(state => state, { readOnly: true });
+    const invalid = phase === 'execution' ? [
+      [{ id: 'progress', type: 'task.report', payload: { taskId: 'task', stage: 'progress', data: { seq: -1, summary: 'progress' } } }, 'payload.data.seq'],
+      [{ id: 'handoff', type: 'task.report', payload: { taskId: 'task', stage: 'handoff', data: { sourceSha: resultSha, ciTodoRef: 'todo', unitTestRefs: [] } } }, 'payload.data.experienceRefs'],
+    ] : [
+      [{ id: 'failed', type: 'ci.result', payload: { taskId: 'task', sourceSha: resultSha, verdict: 'failed',
+        checks: [{ todoId: 'todo-1', testId: 'test-1', status: 'failed', evidenceRef: f.own('ci', 'check') }] } }, 'payload.checks[].reproductionRef'],
+      [{ id: 'missing-test', type: 'ci.result', payload: { taskId: 'task', sourceSha: resultSha, verdict: 'incomplete',
+        checks: [{ todoId: 'todo-1', status: 'incomplete', evidenceRef: f.own('ci', 'check') }] } }, 'payload.checks[].testId'],
+    ];
+    for (const [request, field] of invalid) {
+      const response = await exchange(request);
+      assert.equal(response.status, 200);
+      const error = response.body.result.structuredContent.error;
+      assert.equal(response.body.result.isError, true);
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.equal(error.field, field);
+      assert.match(error.message, /tools\/list/);
+    }
+    // A well-formed write in a forbidden namespace is NOT a formatting error.
+    const denied = await exchange({ id: 'cross-task', type: 'object.put', payload: { kind: 'evidence', ref: 'another-task-evidence', baseVersion: '', content: {} } });
+    assert.equal(denied.body.result.structuredContent.error.code, 'ROLE_FORBIDDEN');
+    assert.equal(denied.body.result.structuredContent.error.field, undefined);
+    assert.deepEqual(await f.store.transaction(state => state, { readOnly: true }), before, 'Bad fields and scope denials do not mutate evidence, receipts or stages');
+  }
 });
