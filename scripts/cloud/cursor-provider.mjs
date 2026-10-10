@@ -10,6 +10,31 @@ const prompt = text => {
   return { text };
 };
 const terminal = new Set(['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED']);
+// Public Cursor OpenAPI codes; never expose arbitrary messages or details.
+const providerErrorCodes = new Set(['unauthorized', 'api_key_not_found', 'plan_required', 'role_forbidden', 'feature_unavailable',
+  'integration_not_connected', 'validation_error', 'missing_body', 'invalid_model', 'invalid_branch_name', 'repository_required',
+  'repository_access', 'pr_resolution_failed', 'artifact_not_found', 'service_account_required', 'agent_not_found', 'run_not_found',
+  'environment_not_found', 'build_not_found', 'team_admin_required', 'environment_name_conflict', 'duplicate_json_key', 'agent_busy',
+  'agent_archived', 'agent_id_conflict', 'run_not_cancellable', 'rate_limit_exceeded', 'usage_limit_exceeded', 'stream_expired',
+  'stream_unavailable', 'invalid_last_event_id', 'client_cancelled', 'not_implemented', 'upstream_error', 'internal_error']);
+export function cursorFailureDiagnostic(cause) {
+  if (!Number.isSafeInteger(cause?.httpStatus) || cause.httpStatus < 400 || cause.httpStatus > 599) return {};
+  return { httpStatus: cause.httpStatus, providerErrorCode: providerErrorCodes.has(cause.providerErrorCode) ? cause.providerErrorCode : 'unknown' };
+}
+async function rejectionCode(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return 'unknown';
+  try {
+    let bytes = 0; const chunks = [];
+    for (;;) {
+      const chunk = await reader.read(); if (chunk.done) break;
+      bytes += chunk.value.length; if (bytes > 16384) return 'unknown'; chunks.push(Buffer.from(chunk.value));
+    }
+    const code = JSON.parse(Buffer.concat(chunks).toString('utf8'))?.error?.code;
+    return providerErrorCodes.has(code) ? code : 'unknown';
+  } catch { return 'unknown'; }
+  finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
 export const cursorRunTerminal = run => terminal.has(run?.status);
 export function validateCursorSource({ repositoryUrl, startingRef, model } = {}) {
   if (typeof repositoryUrl !== 'string' || !/^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(repositoryUrl) ||
@@ -58,11 +83,12 @@ export class CursorCloudProvider {
         headers: { Authorization: this.authorization, Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}) },
         ...(body ? { body: JSON.stringify(body) } : {}) });
       if (!response.ok) {
-        await response.body?.cancel();
+        const providerErrorCode = await rejectionCode(response);
         const code = response.status === 401 || response.status === 403 ? 'CURSOR_AUTH_REQUIRED'
           : response.status === 409 ? 'CURSOR_CONFLICT' : response.status === 429 ? 'CURSOR_RATE_LIMITED'
             : response.status === 404 ? 'CURSOR_NOT_FOUND' : response.status === 410 ? 'CURSOR_STREAM_EXPIRED' : 'CURSOR_HTTP_ERROR';
-        fail(code, `Cursor API returned HTTP ${response.status}`, method !== 'GET' && response.status >= 500);
+        throw Object.assign(new Error(`Cursor API returned HTTP ${response.status}`), { code, httpStatus: response.status, providerErrorCode,
+          ...(method !== 'GET' && response.status >= 500 ? { deliveryUncertain: true } : {}) });
       }
       reader = response.body?.getReader();
       if (!reader) fail('CURSOR_PROTOCOL_ERROR', 'Cursor API returned an empty body', method !== 'GET');
