@@ -55,6 +55,28 @@ test('Cursor REST marks malformed successful writes as uncertain', async t => {
   await assert.rejects(provider.followUp(agentId, 'first'), cause => cause.code === 'CURSOR_PROTOCOL_ERROR' && cause.deliveryUncertain === true);
 });
 
+test('Cursor REST preserves safe HTTP failure diagnostics without provider messages or unknown codes', async t => {
+  for (const [status, code] of [[400, 'validation_error'], [402, 'usage_limit_exceeded'], [404, 'agent_not_found'], [503, 'upstream_error'], [400, 'private-provider-token-fixture']]) await t.test(String(status) + ':' + code, async child => {
+    const provider = await fixture(child, (_req, res) => respond(res, { error: { code, message: 'private-provider-token-fixture', details: { credential: 'fixture-secret' } } }, status));
+    await assert.rejects(provider.create({ agentId, repositoryUrl: 'https://github.com/example/lab', startingRef: 'a'.repeat(40), text: 'Approved test' }), cause => {
+      assert.equal(cause.httpStatus, status);
+      assert.equal(cause.providerErrorCode, code === 'private-provider-token-fixture' ? 'unknown' : code);
+      assert.equal(cause.deliveryUncertain === true, status >= 500);
+      assert.equal(JSON.stringify(cause).includes('fixture-secret'), false);
+      assert.equal(JSON.stringify(cause).includes('private-provider-token-fixture'), false);
+      assert.equal(cause.message, `Cursor API returned HTTP ${status}`);
+      return true;
+    });
+  });
+});
+
+test('Cursor REST error diagnostics are bounded and malformed bodies cannot hide the HTTP rejection', async t => {
+  for (const body of ['not-json', JSON.stringify({error:{code:'validation_error',message:'x'.repeat(20000)}})]) await t.test(body.slice(0, 12), async child => {
+    const provider = await fixture(child, (_req, res) => {res.writeHead(400, {'Content-Type':'application/json'});res.end(body);});
+    await assert.rejects(provider.followUp(agentId, 'Approved test'), cause => cause.code === 'CURSOR_HTTP_ERROR' && cause.httpStatus === 400 && cause.providerErrorCode === 'unknown' && !cause.deliveryUncertain);
+  });
+});
+
 test('Coordinator can start Cursor in Plan mode and replace scoped MCP credentials only on the approved execution Run', async t => {
   const requests = [];
   const provider = await fixture(t, async (req, res) => {
