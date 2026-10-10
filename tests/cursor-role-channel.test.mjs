@@ -499,6 +499,29 @@ test('Cursor role MCP discovery describes each phase-specific wire payload witho
     assert.match(put.properties.baseVersion.description, /empty string/);
     assert.equal(put.properties.content.type, 'object');
     assert.equal(put.properties.content.additionalProperties, true, 'Plan content is not a new rigid wire schema');
+    if (kinds.includes('ciTodo')) {
+      assert.deepEqual(put.allOf[0].if, { properties: { kind: { const: 'ciTodo' } }, required: ['kind'] });
+      const content = put.allOf[0].then.properties.content, items = content.properties.items;
+      assert.deepEqual(content.required, ['items']); assert.equal(items.minItems, 1); assert.equal(items.maxItems, undefined);
+      assert.deepEqual(items.items.required, ['id']);
+      assert.deepEqual(items.items.dependentRequired, { testId: ['argv'], argv: ['testId'] });
+      assert.match(items.items.properties.id.description, /testPolicy.checks\[\].todoId/);
+      assert.match(items.items.properties.id.description, /number is only a display label/);
+      assert.equal(items.items.properties.argv.maxItems, 40); assert.equal(items.items.properties.argv.items.maxLength, 2000);
+      assert.equal(new RegExp(items.items.properties.argv.items.pattern).test(' '), true, 'Arguments are not silently trimmed or rejected for whitespace');
+      assert.equal(new RegExp(items.items.properties.argv.items.pattern).test('\n'), false, 'Control characters remain forbidden');
+      const beforeTask = await f.task(), ref = f.own('execution', 'discovery-legacy-todo');
+      const written = await mcp.request(lease.token, { jsonrpc: '2.0', id: 'legacy-write', method: 'tools/call', params: {
+        name: 'context_guard_exchange', arguments: { id: 'discovery-legacy-write', type: 'object.put', payload: {
+          kind: 'ciTodo', ref, baseVersion: '', content: { items: [{ id: 'legacy-check', title: 'No private test policy configured' }] },
+        } },
+      } });
+      assert.equal(written.status, 200); assert.equal(written.body.result.isError, undefined);
+      const saved = written.body.result.structuredContent.data;
+      const read = await f.channel.exchange(lease.token, { id: 'discovery-legacy-read', type: 'object.read', payload: { ref, version: saved.version } });
+      assert.deepEqual(read.data.content.items, [{ id: 'legacy-check', title: 'No private test policy configured' }]);
+      assert.deepEqual(await f.task(), beforeTask, 'Discoverable legacy writes do not approve or advance the original task');
+    } else assert.equal(put.allOf, undefined, 'Plan/evidence phases gain no CI TODO requirement');
     if (reports) {
       const report = payload('task.report');
       assert.deepEqual(report.oneOf.map(branch => branch.properties.stage.const), reports);

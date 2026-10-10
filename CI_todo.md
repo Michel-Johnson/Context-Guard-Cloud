@@ -2027,3 +2027,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 两个同类 MCP 正式目标使用真实 HTTP，并让受控服务器每次返回不同秒的 Date；角色租期时钟不变，不使用睡眠。准确 Node18.20.8 修前两个目标均失败，exit1，1090.355958ms；22 项发现中 20 项因窄选择未执行。修后两个目标通过，exit0，1588.78975ms，同样 20 项未选择。
 - [x] 最小测试修正只比较准确 HTTP 状态、完整业务正文及稳定 content-type/cache-control/mcp-session-id，另检查 no-store；明确断言 Date 确实不同。批准、任务/对象持久状态和重启重放断言保留；产品源码、模型、授权与协议不变。
 - [ ] 最终准确全量、独立 Tester、PR Required 和 Main 全量；保留全部原失败，生产 native-json 组合仅同步此测试修订后按准确源码/运行时证据交付，真实三路径业务验收仍未完成。
+
+## CURSOR-CI-TODO-IDENTITY-01 · 已广告清单字段与启动/结果校验不一致
+
+- 原生 Executor 按固定策略交付 todoId/testId/argv、未写 id；Cloud 启动与 Core ci.result 只认 id，独立 Tester 保持 reserved、没有 Run。厂商终态及专用检查通过不代表原任务完成。
+- 共享只读解析由 Skill Core 2.4.3 正式发布，本仓库固定 URL/SRI 消费；既存 alias 须完整准确映射，canonical id-only 保持兼容。双编号冲突、半映射、重复和私有策略 argv/testId 不符拒绝，不改原不可变对象或批准。
+- 新写提示明确 canonical id；格式发现不把私有策略 20 项上限强加给无策略清单，testId/argv 成对，argv 不隐式 trim。命令合法不等于授权或通过。
+- [ ] 准确新字节全量、独立 Review、安全/Required、合并后固定制品及当前 native-json 实验兼容组合；旧 Core 或单个 helper 通过不替代原流程回传。
+- [ ] 原 Task/Tester/源码上真正启动、执行、提交并接受 CI 结果，旧 TODO 版本及原回执保留。专用检查通过但整个 workflow 失败时必须如实失败，不改机器门禁制造绿色；三路径业务验收仍待。

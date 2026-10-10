@@ -1,4 +1,5 @@
 import { cursorTrustedChecks } from './cursor-git-proof.mjs';
+import { readCiTodoItems } from '../shared/protocol-workflow.mjs';
 
 const fail = message => { throw Object.assign(new Error(message), { code: 'SOURCE_UNVERIFIED' }); };
 const label = value => typeof value === 'string' && !!value.trim() && value.length <= 128 && !/[\x00-\x1f]/.test(value);
@@ -35,6 +36,9 @@ export function cursorCiOutcome(facts, name) {
 }
 
 export function cursorCiCoverage(policy, items) {
-  if (!Array.isArray(items) || items.length !== policy.checks.length || new Set(items.map(item => item?.id)).size !== items.length ||
-      items.some(item => !policy.checks.some(check => check.todoId === item?.id))) fail('The original CI TODOs do not match the explicitly authorized test policy');
+  let parsed;
+  try { parsed = readCiTodoItems(items); }
+  catch { fail('The original CI TODOs do not match the explicitly authorized test policy'); }
+  if (parsed.length !== policy.checks.length || parsed.some(item => !policy.checks.some(check => check.todoId === item.id &&
+      (item.testId === undefined || item.testId === check.testId && JSON.stringify(item.argv) === JSON.stringify(check.argv))))) fail('The original CI TODOs do not match the explicitly authorized test policy');
 }
