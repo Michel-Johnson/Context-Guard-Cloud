@@ -984,6 +984,31 @@ const brief = version => ({ text: 'Correct token renewal', acceptance: 'Expired 
 const review = (proposal, decision = 'approved') => ({ proposalId: proposal.id, version: proposal.version, decision, reason: 'Human reviewed this exact brief' });
 const context = (operationId = 'review-first') => ({ operationId, conversationId: 'chat-fixture', actor });
 
+test('取消派发只在可信服务确认任务释放后复用，审核提交前再次核验', async t => {
+  const f = await manualFixture(t), original = await f.readMain();
+  original.document.root.children[0].bugs[0].dispatch = { session_id: 'old-session', task_id: 'old-task', status: 'cancelled' };
+  const binding = { nodeId: 'LOGIN', kind: 'bug', bindingApproval: 'confirmed-login' };
+  let released = true, checks = 0;
+  const options = { ...f.options, readMain: async () => structuredClone(original), readBinding: async () => binding };
+  const input = { ...brief(original.version), itemId: 'B1', nodeId: 'LOGIN', kind: 'bug' };
+  const unverified = new CoordinatorManualBriefs(options);
+  await assert.rejects(unverified.prepare(input, context('unknown')), { code: 'EXECUTION_NOT_RELEASED' });
+  const service = new CoordinatorManualBriefs({ ...options, canReuseCancelledExecution: async (item, routing) => {
+    checks++; assert.equal(item.dispatch.task_id, 'old-task'); assert.equal(routing.itemId, 'B1'); return released;
+  } });
+  const proposal = await service.prepare(input, context('cancelled'));
+  assert.equal(proposal.pending, true); assert.equal(checks, 1); assert.equal(f.commits, 0);
+  assert.ok((await service.prepare(input, context('cancelled'))).pending); assert.equal(checks, 1, '幂等读取不制造新提案');
+  released = false;
+  await assert.rejects(service.review(review(proposal), context('reject-live')), { code: 'EXECUTION_NOT_RELEASED' });
+  assert.equal(f.commits, 0);
+  original.document.root.children[0].bugs[0].dispatch.status = 'running';
+  await assert.rejects(service.prepare(input, context('running')), { code: 'ACTIVE_EXECUTION' });
+  original.document.root.children[0].bugs[0].status = 'processing';
+  await assert.rejects(service.prepare(input, context('busy')), { code: 'ACTIVE_EXECUTION' });
+  assert.equal(f.commits, 0);
+});
+
 test('新 TODO 和 Bug 只在已确认主节点形成 brief，审批后各存一份正确类型的事项', async t => {
   for (const kind of ['todo', 'bug']) {
     const f = await manualFixture(t);

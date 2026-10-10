@@ -91,9 +91,10 @@ export function manualExecutionPrompt({ projectId, proposal, document, version, 
 // Proposals are conversational state, not a second Task system. Approval uses
 // the same Main CAS callback as the workbench and never creates an Agent Session.
 export class CoordinatorManualBriefs {
-  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null }) {
+  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null, canReuseCancelledExecution = null }) {
     if (!path.isAbsolute(directory || '') || !identifier(projectId) || typeof readMain !== 'function' || typeof commitMain !== 'function') throw new Error('Manual brief storage and Main services are required');
-    Object.assign(this, { projectId, readMain, commitMain, mapOnly, readBinding, readCommitReceipt });
+    if (canReuseCancelledExecution !== null && typeof canReuseCancelledExecution !== 'function') throw new Error('Execution verification must be a function');
+    Object.assign(this, { projectId, readMain, commitMain, mapOnly, readBinding, readCommitReceipt, canReuseCancelledExecution });
     this.file = path.join(directory, 'manual-briefs.json');
   }
   async state() { return readJSON(this.file, { proposals: {}, operations: {}, reviews: {} }); }
@@ -113,6 +114,16 @@ export class CoordinatorManualBriefs {
       proposal.review.notified = true;
       await atomicWrite(this.file, encode(state));
     });
+  }
+  async assertReusable(item, routing) {
+    if (item.status === 'processing') fail('ACTIVE_EXECUTION', '该事项正在执行，不能转入人工执行。', 409);
+    if (['done', 'resolved', 'unfixable'].includes(item.status)) fail('CONFLICT', '该事项已结束，请先核对原事项状态。', 409);
+    if (!item.dispatch?.session_id) return;
+    if (item.dispatch.status !== 'cancelled') fail('ACTIVE_EXECUTION', '该事项仍有执行任务，不能转入人工执行。', 409);
+    // Map 中的取消标签不足以释放任务；可信服务须核对取消回执及执行槽。
+    if (!this.canReuseCancelledExecution || await this.canReuseCancelledExecution(item, routing) !== true) {
+      fail('EXECUTION_NOT_RELEASED', '旧派发已取消，但尚不能确认执行任务已释放。', 409);
+    }
   }
   async prepare(input, { operationId, conversationId, actor } = {}) {
     if (!identifier(operationId) || !identifier(conversationId)) fail('INVALID_ARGUMENT', 'Provide stable proposal and conversation IDs');
@@ -139,7 +150,7 @@ export class CoordinatorManualBriefs {
         const matches = (index.get(value.nodeId).node[value.kind === 'bug' ? 'bugs' : 'todos'] || []).filter(item => item.id === value.itemId);
         if (matches.length !== 1) fail('CONFLICT', 'The TODO/Bug is missing or ambiguous', 409);
         const item = matches[0];
-        if (item.dispatch?.session_id || item.status === 'processing' || ['done', 'resolved', 'unfixable'].includes(item.status)) fail('ACTIVE_EXECUTION', 'Choose an open item without an automatic execution assignment', 409);
+        await this.assertReusable(item, value);
         identity = workItemIdentity(item);
       }
       const proposal = { id, fingerprint, projectId: this.projectId, conversationId, operationId, ...value,
@@ -188,6 +199,7 @@ export class CoordinatorManualBriefs {
           const field = proposal.kind === 'bug' ? 'bugs' : 'todos', list = node[field] || [];
           const matches = list.filter(item => item.id === proposal.itemId);
           if (proposal.itemIdentity && (matches.length !== 1 || workItemIdentity(matches[0]) !== proposal.itemIdentity)) fail('VERSION_CONFLICT', 'Work item identity changed after the brief', 409);
+          if (proposal.itemIdentity) await this.assertReusable(matches[0], proposal);
           if (!proposal.itemIdentity && matches.length) fail('CONFLICT', 'New TODO identity is already in use', 409);
           const approval = { proposalId: proposal.id, version: proposal.version, mainVersion: proposal.mainVersion,
             text: proposal.text, acceptance: proposal.acceptance, actor: structuredClone(actor), approvedAt, executionMode: 'manual', ready: true };
@@ -212,6 +224,13 @@ export class CoordinatorManualBriefs {
           if (binding?.bindingApproval !== proposal.bindingApproval || binding.nodeId !== proposal.nodeId || binding.kind !== proposal.kind) {
             fail('VERSION_CONFLICT', '主节点已改绑，原操作未确认提交；保留回执记录，不向旧节点写入。', 409);
           }
+        }
+        if (!receipt && proposal.itemIdentity) {
+          const snapshot = await this.readMain();
+          const node = entries(snapshotDocument(snapshot).root).get(proposal.nodeId)?.node;
+          const item = node?.[proposal.kind === 'bug' ? 'bugs' : 'todos']?.find(value => value.id === proposal.itemId);
+          if (!item || workItemIdentity(item) !== proposal.itemIdentity) fail('VERSION_CONFLICT', 'Work item identity changed before commit', 409);
+          await this.assertReusable(item, proposal);
         }
         try {
           receipt ||= await this.commitMain(request, intent.actor);
