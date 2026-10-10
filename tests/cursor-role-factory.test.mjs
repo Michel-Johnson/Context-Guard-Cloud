@@ -662,7 +662,7 @@ test('Legacy CI create recovery rejects invalid scopes and never renews a prepar
   f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Legacy rejection'),{code:'CURSOR_HTTP_ERROR'});};
   await assert.rejects(f.factory.pump(f.reserved.session,'task'));
   const actor=JSON.parse(await fs.readFile(f.file,'utf8')),original=actor.invocations[0];
-  for(const createAttempt of [0,-1,2,1.5,null,'1'])await assert.rejects(f.factory.channel.issue({operationId:'invalid-create-'+String(createAttempt),scope:{...original.scope,createAttempt}}),{code:'INVALID_ARGUMENT'});
+  for(const createAttempt of [0,-1,3,1.5,null,'1'])await assert.rejects(f.factory.channel.issue({operationId:'invalid-create-'+String(createAttempt),scope:{...original.scope,createAttempt}}),{code:'INVALID_ARGUMENT'});
   await assert.rejects(f.factory.channel.issue({operationId:'plan-create-attempt',scope:{...f.invocation.scope,phase:'plan',plan:undefined,createAttempt:1}}),{code:'INVALID_ARGUMENT'});
   await assert.rejects(f.factory.channel.issue({operationId:'execution-create-attempt',scope:{...f.invocation.scope,createAttempt:1}}),{code:'INVALID_ARGUMENT'});
   f.provider.create=create;f.provider.getAgent=async()=>{throw Object.assign(new Error('Absent'),{code:'CURSOR_NOT_FOUND',httpStatus:404});};
@@ -677,6 +677,51 @@ test('Legacy CI create recovery rejects invalid scopes and never renews a prepar
   assert.equal((await f.store.taskRecord(f.human,f.reserved.session,'task')).stage,'testing');
 });
 
+async function sourceRejectedCi(t) {
+  const f=await ciFixture(t),create=f.provider.create,getAgent=f.provider.getAgent;let rejects=0;
+  f.provider.create=async input=>{f.calls.push({method:'create',input});rejects++;throw Object.assign(new Error('Controlled create refusal'),{code:'CURSOR_HTTP_ERROR',...(rejects>1?{httpStatus:400,providerErrorCode:'validation_error'}:{})});};
+  f.provider.getAgent=async id=>{if(!f.runs.has(id))throw Object.assign(new Error('Absent'),{code:'CURSOR_NOT_FOUND',httpStatus:404});return getAgent(id);};
+  await assert.rejects(f.factory.pump(f.reserved.session,'task'));await assert.rejects(f.factory.pump(f.reserved.session,'task'));
+  f.provider.create=create;f.sourceProof={repository:'example/repo',sourceSha:handoffSha,branch:'cursor/task',number:25};
+  f.factory.gitProof.sourcePullRequest=async()=>structuredClone(f.sourceProof);
+  return f;
+}
+test('Exact source PR availability recovers the original rejected Tester once without losing CI gates',async t=>{
+  const f=await sourceRejectedCi(t),old=JSON.parse(await fs.readFile(f.file,'utf8')),before=await f.store.taskRecord(f.human,f.reserved.session,'task');
+  const invocation=await f.factory.pump(f.reserved.session,'task');assert.equal(invocation.scope.createAttempt,2);assert.equal(f.calls.length,5);
+  assert.equal(invocation.scope.nativeAgentId,old.nativeAgentId);assert.deepEqual(invocation.sourceAvailability,f.sourceProof);
+  assert.deepEqual(JSON.parse(await fs.readFile(f.file,'utf8')).invocations.slice(0,2),old.invocations);
+  assert.deepEqual(await f.store.taskRecord(f.human,f.reserved.session,'task'),before);
+  const p=await ciProposal(f);await f.factory.channel.exchange(p.invocation.token,p.input);await f.factory.pump(f.reserved.session,'task');
+  const task=await f.store.taskRecord(f.human,f.reserved.session,'task');assert.equal(task.ci.verdict,'passed');assert.equal(task.stage,'awaiting-merge');assert.equal(task.acceptanceReview,undefined);
+  assert.deepEqual(task.planReview,before.planReview);assert.deepEqual(task.references,before.references);assert.equal(f.calls.length,5);
+});
+test('Exact source PR final read refuses a migrated original Executor before native create',async t=>{
+  const f=await sourceRejectedCi(t);let reads=0;
+  f.factory.gitProof.sourcePullRequest=async()=>{
+    if(++reads===2){
+      const binding=await f.store.registeredBinding(f.human,f.reserved.session.id);
+      await f.store.handle(f.factory.principal(f.reserved.session.id),{v:2,id:'source-proof-executor-migration',type:'session.bind',payload:{
+        sessionId:f.reserved.session.id,agentId:f.reserved.session.id,worktreeId:'another-owned-tree',expectedBindingVersion:binding.version,
+      }},{verifyBinding:()=>true,allowMigration:true});
+    }
+    return structuredClone(f.sourceProof);
+  };
+  let rejection;try{await f.factory.pump(f.reserved.session,'task');}catch(error){rejection=error;}
+  assert.equal(reads,2);assert.equal(f.calls.length,4,'Do not create a native Run after the original Executor binding changed');
+  assert.equal(rejection?.code,'CURSOR_ROLE_CONFLICT');
+});
+test('Exact source PR recovery refuses missing proof, drift, revoked authority and another failed retry',async t=>{
+  for(const kind of ['missing','wrong-source','foreign-repo','changed-pr','revoked','exists','second-failure'])await t.test(kind,async child=>{
+    const f=await sourceRejectedCi(child);let reads=0;
+    f.factory.gitProof.sourcePullRequest=async()=>{reads++;if(kind==='missing')throw Object.assign(new Error('No PR'),{code:'SOURCE_UNVERIFIED'});if(kind==='revoked')f.setAllowed(false);return {...f.sourceProof,...(kind==='wrong-source'?{sourceSha:baseSha}:{}),...(kind==='foreign-repo'?{repository:'other/repo'}:{}),...(kind==='changed-pr'&&reads>1?{number:26}:{})};};
+    if(kind==='exists')f.provider.getAgent=async()=>({id:'visible-agent'});
+    if(kind==='second-failure')f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Still rejected'),{code:'CURSOR_HTTP_ERROR',httpStatus:400,providerErrorCode:'validation_error'});};
+    await assert.rejects(f.factory.pump(f.reserved.session,'task'));assert.equal(f.calls.length,kind==='second-failure'?5:4);
+    await assert.rejects(f.factory.pump(f.reserved.session,'task'));assert.equal(f.calls.length,kind==='second-failure'?5:4);
+    const task=await f.store.taskRecord(f.human,f.reserved.session,'task');assert.equal(task.stage,'testing');assert.equal(task.ci,undefined);assert.equal(task.acceptanceReview,undefined);
+  });
+});
 test('Rejected native CI create stores only safe status and documented code with its original failure receipt', async t => {
   const f=await ciFixture(t);
   f.provider.create=async input=>{f.calls.push({method:'create',input});throw Object.assign(new Error('Do not save provider text'),{code:'CURSOR_HTTP_ERROR',httpStatus:400,providerErrorCode:'validation_error',details:'fixture-private-diagnostic'});};

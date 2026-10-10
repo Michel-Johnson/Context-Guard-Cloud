@@ -91,6 +91,27 @@ export class CursorGitProof {
     });
   }
 
+  async sourcePullRequest({ sourceSha, branch }) {
+    if (!sha.test(sourceSha || '') || !relative(branch) || !branch.startsWith('cursor/')) fail('Pin the original independent test source and native branch');
+    return this.withReader(async get => {
+      const checkHead = async () => {
+        const head = await get('branches/' + encodeURIComponent(branch));
+        if (head.name !== branch || head.commit?.sha !== sourceSha) fail('The original source branch changed');
+      };
+      const matches = pr => positive(pr?.number) && pr.state === 'open' && pr.head?.sha === sourceSha && pr.head?.ref === branch &&
+        pr.head?.repo?.full_name?.toLowerCase() === this.repository.toLowerCase() && pr.base?.repo?.full_name?.toLowerCase() === this.repository.toLowerCase();
+      await checkHead();
+      const list = await get(`commits/${sourceSha}/pulls?per_page=100`);
+      if (!Array.isArray(list) || list.length >= 100) fail('The complete original source PR list is unavailable');
+      const candidates = list.filter(matches);
+      if (candidates.length !== 1) fail('Require one open same-repository PR at the original source SHA');
+      const current = await get('pulls/' + candidates[0].number);
+      if (!matches(current) || current.number !== candidates[0].number) fail('The original source PR changed during verification');
+      await checkHead();
+      return { repository: this.repository, sourceSha, branch, number: current.number };
+    });
+  }
+
   async trustedChecks({ sourceSha, branch, requiredChecks }) {
     if (!sha.test(sourceSha || '') || !relative(branch)) fail('Use an exact source and its verified branch');
     requiredChecks = cursorTrustedChecks(requiredChecks);

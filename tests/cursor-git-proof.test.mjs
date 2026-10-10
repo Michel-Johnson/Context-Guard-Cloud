@@ -4,6 +4,22 @@ import assert from 'node:assert/strict';
 import { CursorGitProof } from '../scripts/cloud/cursor-git-proof.mjs';
 
 const baseSha = 'a'.repeat(40), sourceSha = 'b'.repeat(40), branch = 'cursor/task-one';
+test('Cursor create source PR proof pins same repository, exact branch head and open PR without writes', async t => {
+  for (const kind of ['valid','absent','closed','fork','base-repo','sha','branch','duplicate','moved','pagination']) await t.test(kind,async()=>{
+    const calls=[],pr={number:25,state:'open',head:{sha:sourceSha,ref:branch,repo:{full_name:'example/repo'}},base:{repo:{full_name:'example/repo'}}};
+    if(kind==='closed')pr.state='closed';if(kind==='fork')pr.head.repo.full_name='other/repo';if(kind==='base-repo')pr.base.repo.full_name='other/repo';
+    if(kind==='sha')pr.head.sha=baseSha;if(kind==='branch')pr.head.ref='other';let heads=0;
+    const verifier=new CursorGitProof({repository:'example/repo',fetch:async(url,options)=>{
+      calls.push({url,options});assert.equal(options.method||'GET','GET');assert.equal(new URL(url).origin,'https://api.github.com');
+      const value=url.includes('/branches/')?{name:branch,commit:{sha:kind==='moved'&&++heads>1?baseSha:sourceSha}}:
+        url.includes('/commits/')?kind==='absent'?[]:kind==='duplicate'?[pr,{...pr,number:26}]:[pr]:pr;
+      return new Response(JSON.stringify(value),{headers:kind==='pagination'?{Link:'<https://api.github.com/next>; rel="next"'}:{}});
+    }});
+    if(kind==='valid')assert.deepEqual(await verifier.sourcePullRequest({sourceSha,branch}),{repository:'example/repo',sourceSha,branch,number:25});
+    else await assert.rejects(verifier.sourcePullRequest({sourceSha,branch}),{code:'SOURCE_UNVERIFIED'});
+    assert.ok(calls.every(x=>x.url.startsWith('https://api.github.com/repos/example/repo/')));
+  });
+});
 function fixture(change) {
   const calls = [], data = {
     head: { name: branch, commit: { sha: sourceSha } }, commit: { sha: sourceSha, parents: [{ sha: baseSha }], files: [{ filename: 'src/fixture.mjs' }] },
