@@ -1687,12 +1687,11 @@ try {
   assert.equal(await coordinator.getByRole('button',{name:'发送',exact:true}).getAttribute('title'),'发送','the icon-only send control keeps an accessible label');
   assert.equal(await coordinator.getByLabel('发送给 Coordinator').inputValue(),'','question answers work while the main composer is empty');
   await coordinator.getByLabel('回答：要上传什么？').fill('保留我的补充');
-  await coordinator.getByRole('button',{name:'网站构建产物',exact:true}).click();
-  assert.equal(submissions.length,0,'the first option click only selects it');
-  assert.equal(await coordinator.getByRole('button',{name:'网站构建产物',exact:true}).getAttribute('aria-pressed'),'true');
   assert.equal(await coordinator.getByRole('button',{name:'提交回答',exact:true}).count(),0,'questions have no separate submit-answer button');
   const readsBeforeCardAnswer=coordinatorReads.length;
   await coordinator.getByRole('button',{name:'网站构建产物',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('.coordinator-answer-compose textarea')?.disabled===true);
+  assert.equal(submissions.length,1,'one click submits the selected option and existing free-text supplement');
   await coordinator.locator('.coordinator-planning').waitFor({state:'visible'});
   assert.equal(await coordinator.locator('.coordinator-message.user').last().evaluate(node=>node.nextElementSibling?.className),'coordinator-planning','card-answer shimmer sits below the new user message');
   assert.equal(await coordinator.locator('.coordinator-typing').getAttribute('aria-hidden'),'false','card answers start the same working state as free-form messages');

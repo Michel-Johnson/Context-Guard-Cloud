@@ -34,6 +34,201 @@ async function submit(service, text, options = {}) {
 }
 const streamed = snapshots => snapshots.map(state => state.streaming?.text || '').filter(Boolean);
 
+test('格式错误自动恢复两次内成功，原始输入不变且坏正文不展示', async t => {
+  let calls = 0;
+  const f = await fixture(t, async request => {
+    calls++;
+    assert.ok(JSON.stringify(request.messages).includes('你好'));
+    if (calls === 1) return answer('缺少接话声明');
+    if (calls === 2) return answer('[CG_REPLY]\n' + '长'.repeat(61));
+    return answer('[CG_REPLY]\n你好，想讨论什么？');
+  }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '你好'); await f.service.close();
+  const state = await f.service.state(), privateState = await f.service.readConversation();
+  assert.equal(calls, 3); assert.equal(state.status, 'waiting-for-user');
+  assert.equal(state.messages.filter(message => message.role === 'assistant').at(-1).text, '你好，想讨论什么？');
+  assert.ok(streamed(f.snapshots).every(text => !text.includes('缺少接话声明') && !text.includes('长')));
+  assert.deepEqual(privateState.performance.models.filter(item => item.errorCode).map(item => item.diagnostic.validationCode),
+    ['PARTICIPATION_HEADER_INVALID', 'REPLY_PARAGRAPH_LONG']);
+});
+for (const [code, recovered] of [['MODEL_HTTP_503', true], ['MODEL_HTTP_401', false], ['MODEL_HTTP_402', false]])
+test(`供应商 ${code} 的恢复边界：临时失败恢复，权限或支付错误不盲重试`, async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => {
+    if (++calls === 1) throw Object.assign(new Error('private-provider-body'), { code });
+    return answer('[CG_REPLY]\n已收到。');
+  }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '你好'); await f.service.close();
+  const state = await f.service.state(); assert.equal(calls, recovered ? 2 : 1);
+  assert.equal(state.status, recovered ? 'waiting-for-user' : 'error');
+  assert.ok(!JSON.stringify(state).includes('private-provider-body')); assert.deepEqual(f.writes, []);
+});
+
+test('连续格式失败只尝试三次，不执行工具或声称成功', async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => { calls++; return answer('未声明接话'); }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '请处理'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(calls, 3); assert.equal(state.status, 'error'); assert.deepEqual(f.writes, []);
+  assert.deepEqual(streamed(f.snapshots), []);
+});
+test('一次提出两个问题时整份工具响应被拒绝，纠正后只保存一个问题', async t => {
+  let calls = 0, executed = 0;
+  const f = await fixture(t, async () => {
+    calls++;
+    const content = (calls === 1 ? ['形态？', '范围？'] : ['回答范围是什么？']).map((question, index) =>
+      ({ type: 'tool_use', id: 'question-' + index, name: 'reply_ask_user', input: { question, options: ['当前文章', '全站文章'] } }));
+    return { stop: 'tool_use', content };
+  }, { tools: [{ name: 'ask_user' }], execute: async () => { executed++; return { saved: true }; },
+    maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '继续讨论'); await f.service.close();
+  const state = await f.service.state();
+  assert.equal(calls, 2); assert.equal(executed, 1);
+  assert.equal(state.messages.flatMap(message => message.questions || []).length, 1);
+});
+test('普通问候不能只用表情，纠正后继续文字而不执行原表情', async t => {
+  let calls = 0, executed = 0;
+  const f = await fixture(t, async () => ++calls === 1 ? { stop: 'tool_use', content: [
+    { type: 'tool_use', id: 'reaction', name: 'reply_react_to_user', input: { emoji: 'wave', replyComplete: true } },
+  ] } : answer('[CG_REPLY]\n你好，想讨论什么？'), { tools: [{ name: 'react_to_user' }],
+    execute: async () => { executed++; return {}; }, maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '你好'); await f.service.close();
+  assert.equal(calls, 2); assert.equal(executed, 0); assert.equal((await f.service.state()).status, 'waiting-for-user');
+});
+test('本轮已执行写入的回执在后续回复重试中保留，不重复写入', async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => ++calls === 1 ? { stop: 'tool_use', content: [
+    { type: 'tool_use', id: 'one-write', name: 'reply_write', input: { id: 'value' } },
+  ] } : calls === 2 ? answer('长'.repeat(61)) : answer('已保存。'),
+  { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '请保存'); await f.service.close();
+  assert.equal(calls, 3); assert.equal(f.writes.length, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+});
+
+test('回复重试生成新的工具ID也复用同轮相同写入回执', async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => {
+    calls++;
+    if (calls === 1 || calls === 3) return { stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'write-' + calls, name: calls === 1 ? 'reply_write' : 'write', input: calls === 1
+        ? { id: 'one-value', details: { first: 1, second: 2 } } : { details: { second: 2, first: 1 }, id: 'one-value' } },
+    ] };
+    return answer(calls === 2 ? '长'.repeat(61) : '已保存。');
+  }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '请保存'); await f.service.close();
+  assert.equal(f.writes.length, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  const state = await f.service.readConversation();
+  assert.ok(Object.values(state.toolReceipts).some(item => item.replayedFrom));
+});
+
+test('选项标签的内部编号在展示和工具执行前被拒绝', async t => {
+  let calls = 0, saved = 0;
+  const f = await fixture(t, async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'choice-' + ++calls,
+    name: 'reply_ask_user', input: { question: '挂载到哪里？', options: [calls === 1 ? '```text\nNCM1234567890\n```' : '阅读助手', '暂不绑定'] } }] }),
+  { tools: [{ name: 'ask_user' }], context: async () => ({ internalIds: ['NCM1234567890'] }), validateReplies: true,
+    maxModelRetries: 2, retryDelayMs: 0, execute: async () => { saved++; return {}; } });
+  await submit(f.service, '请给执行提示，先用按钮确定范围'); await f.service.close();
+  assert.equal(calls, 2); assert.equal(saved, 1);
+  assert.ok(!(JSON.stringify((await f.service.state()).messages).includes('NCM1234567890')));
+});
+
+test('新问题替代旧问题：历史保留，不虚构答案，过期答题被拒绝', async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => ++calls < 3 ? { stop: 'tool_use', content: [{ type: 'tool_use', id: 'q-' + calls,
+    name: 'ask_user', input: { question: calls === 1 ? '文章内还是独立页？' : '当前文章还是全站？', options: ['前者', '后者'] } }] } : answer('已记录。'),
+  { tools: [{ name: 'ask_user' }], execute: async () => ({}) });
+  await f.service.submit({ id: 'first', text: '讨论形态' }); await f.service.close();
+  const first = (await f.service.state()).messages.flatMap(message => message.questions || [])[0];
+  await f.service.submit({ id: 'second', text: '先换一个问题' }); await f.service.close();
+  const questions = (await f.service.state()).messages.flatMap(message => message.questions || []);
+  assert.equal(questions[0].superseded, true); assert.equal(questions[0].answer, null);
+  assert.equal(questions.filter(question => !question.answer && !question.superseded).length, 1);
+  await assert.rejects(f.service.submit({ id: 'old-answer', text: '前者', answerTo: first.id }), { code: 'CONFLICT' });
+  await f.service.submit({ id: 'current-answer', text: '后者', answerTo: questions[1].id }); await f.service.close();
+  assert.equal((await f.service.state()).messages.flatMap(message => message.questions || [])[1].answer.text, '后者');
+  assert.equal(Object.keys((await f.service.readConversation()).answers).length, 1);
+});
+
+test('长回复纠正不能丢失尚未执行的绑定动作，成功后只保存一次', async t => {
+  let calls = 0, saved = 0;
+  const f = await fixture(t, async () => {
+    calls++;
+    if (calls === 2) return answer('[CG_REPLY]\n建议绑定到阅读助手。');
+    return { stop: 'tool_use', content: [{ type: 'text', text: '[CG_REPLY]\n' + (calls === 1 ? '长'.repeat(61) : '建议绑定到阅读助手，请确认。') },
+      { type: 'tool_use', id: 'mount-' + calls, name: 'reply_mount_conversation', input: {} }] };
+  }, { tools: [{ name: 'mount_conversation' }], validateReplies: true, maxModelRetries: 2, retryDelayMs: 0,
+    execute: async () => { saved++; return { kind: 'binding-proposal', pending: true }; } });
+  await submit(f.service, '给博客增加阅读助手'); await f.service.close();
+  assert.equal(calls, 3); assert.equal(saved, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+});
+
+test('完整人工brief审批卡成功后直接等待确认，不追加模型复述', async t => {
+  let calls = 0;
+  const f = await fixture(t, async () => {
+    calls++; return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'brief', name: 'reply_prepare_task', input: {} }] };
+  }, { tools: [{ name: 'prepare_task' }], validateReplies: true,
+    execute: async () => ({ manual: true, pending: true, requiresHumanApproval: true }) });
+  await submit(f.service, '整理需求'); await f.service.close();
+  assert.equal(calls, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.ok(Object.values((await f.service.readConversation()).toolReceipts).some(item => item.result.manual));
+});
+
+test('审批确认通知不是用户索要详情，模型收到专门的短回执约束', async t => {
+  const f = await fixture(t, async request => {
+    assert.match(request.system, /服务器确认回执/);
+    assert.match(request.system, /不重新输出brief或执行提示/);
+    return answer('已保存需求，执行提示可从卡片导出。');
+  }, { validateReplies: true });
+  await f.service.submit({ id: 'review-notice', text: '人工已确认brief，可导出完整执行提示。' }, { source: 'workflow' });
+  await f.service.close();
+  assert.equal((await f.service.state()).status, 'waiting-for-user');
+});
+
+test('真实SSE解析中的接话标记错误保留原因并自动恢复，而非被回调边界吞掉', async t => {
+  let attempts = 0;
+  const model = new CoordinatorModel({ baseUrl: 'https://model.invalid', model: 'test-model', token: 'synthetic-test-token', fetch: async () => {
+    const text = ++attempts === 1 ? '未声明接话' : '[CG_REPLY]\n你好。';
+    const events = [
+      { type: 'message_start', message: { model: 'test-model', usage: { input_tokens: 1 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 3 } },
+      { type: 'message_stop' },
+    ];
+    return new Response(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join(''), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const f = await fixture(t, () => {}, { model, maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '你好'); await f.service.close();
+  assert.equal(attempts, 2); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal((await f.service.readConversation()).performance.models[0].diagnostic.validationCode, 'PARTICIPATION_HEADER_INVALID');
+});
+
+for (const [scenario, validationCode] of [['invalid-json', 'TOOL_INVALID'], ['array-input', 'TOOL_INVALID'], ['truncated', 'MISSING_TERMINAL']])
+test(`真实SSE ${scenario} 自动恢复，非法参数或截断不执行工具`, async t => {
+  let attempts = 0;
+  const model = new CoordinatorModel({ baseUrl: 'https://model.invalid', model: 'test-model', token: 'synthetic-test-token', fetch: async () => {
+    const first = ++attempts === 1;
+    const events = first ? [
+      { type: 'message_start', message: { model: 'test-model' } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'bad', name: 'reply_write', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: scenario === 'array-input' ? '[]' : scenario === 'invalid-json' ? '{' : '{}' } },
+      ...(scenario === 'truncated' ? [] : [{ type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } }, { type: 'message_stop' }]),
+    ] : [
+      { type: 'message_start', message: { model: 'test-model' } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '[CG_REPLY]\n已收到。' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } }, { type: 'message_stop' },
+    ];
+    return new Response(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join(''), { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  const f = await fixture(t, () => {}, { model, maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
+  await submit(f.service, '请处理'); await f.service.close();
+  assert.equal(attempts, 2); assert.deepEqual(f.writes, []); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal((await f.service.readConversation()).performance.models[0].diagnostic.validationCode, validationCode);
+});
+
 for (const name of ['ask_user', 'mount_conversation', 'show_model_menu']) test(`接话别名 ${name} 执行后等待人类，不追加模型总结`, async t => {
   let calls = 0;
   const input = name === 'ask_user' ? { question: '绑定到主页模块，可以吗？', options: ['可以', '暂不绑定'] } : {};

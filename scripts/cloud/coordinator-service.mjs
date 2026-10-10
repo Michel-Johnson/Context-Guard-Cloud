@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
-import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools } from './coordinator-model.mjs';
+import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools, coordinatorFailureDiagnostic, recoverableModelFailure } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
@@ -30,7 +30,8 @@ function settleFailedSlackGeneration(state, journal) {
       Object.values(journal.interrupts).some(item => item.turnId === state.activeTurnId && !state.resumedInterrupts?.includes(item.id))) return false;
   // 没有未决工具时，新的人类输入可开始新轮。原失败与回执不删除、不重跑。
   (state.failedTurns ||= []).push({ turnId: state.activeTurnId,
-    requestIds: state.activeRequestIds || [state.activeTurnId], code: state.error.code, at: new Date().toISOString() });
+    requestIds: state.activeRequestIds || [state.activeTurnId], code: state.error.code, at: new Date().toISOString(),
+    ...(state.performance ? { performance: structuredClone(state.performance) } : {}) });
   captureInterruptedText(state);
   retainInterruptedOutput(state, { superseded: true });
   state.streaming = null;
@@ -66,10 +67,19 @@ export function coordinatorCompactBoundary(messages, through = 0, { humanOnly = 
   return boundary > through ? boundary : 0;
 }
 export const coordinatorCanAutoResume = (state, maxRetries = 2) => !!state?.activeTurnId &&
-  state.status === 'error' && ['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(state.error?.code) &&
+  state.status === 'error' && (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(state.error?.code) || state.error?.recoverable === true) &&
   !(state.operatorRecovery && !state.operatorRecovery.initialAccepted) &&
   (state.modelRetries || 0) < maxRetries;
 
+function currentQuestionBoundary(state) {
+  for (let index = state.messages.length - 2; index >= 0; index--) {
+    const message = state.messages[index], replies = state.messages[index + 1]?.content;
+    if (message.role !== 'assistant' || message.superseded || !Array.isArray(message.content) || !Array.isArray(replies)) continue;
+    if (message.content.some(block => block.type === 'tool_use' && ['ask_user', 'mount_conversation', 'prepare_task'].includes(businessToolName(block.name)) &&
+        replies.some(reply => reply.type === 'tool_result' && reply.tool_use_id === block.id && !reply.is_error))) return index;
+  }
+  return -1;
+}
 function questionsAt(state, index) {
   const message = state.messages[index], replies = state.messages[index + 1]?.content;
   if (message.role !== 'assistant' || !Array.isArray(message.content) || !Array.isArray(replies)) return [];
@@ -79,7 +89,9 @@ function questionsAt(state, index) {
       const id = 'question-' + hash(`${index}:${block.id}`);
       const reply = replies.find(item => item.type === 'tool_result' && item.tool_use_id === block.id && !item.is_error);
       let result = {}; try { result = JSON.parse(reply?.content || '{}'); } catch {}
-      return { id, text: block.input.question, options: block.input.options || [], nodes: result.nodes || [], answer: state.answers?.[id] || null };
+      const answer = state.answers?.[id] || null;
+      return { id, text: block.input.question, options: block.input.options || [], nodes: result.nodes || [], answer,
+        ...(!answer && (message.superseded || index < currentQuestionBoundary(state)) ? { superseded: true } : {}) };
     });
 }
 
@@ -355,7 +367,7 @@ export class CoordinatorMapIntake {
 // provider work runs outside the request and outside ProtocolStore transactions.
 export class CoordinatorService {
   constructor({ directory, model, system, tools, execute, context = null, maxSteps = 12, maxModelRetries = 2, retryDelayMs = 250,
-    compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, onStateChange = null,
+    compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, validateReplies = false, onStateChange = null,
     textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null }) {
     if (!Number.isSafeInteger(compactMinTurns) || compactMinTurns < 1) throw error('INVALID_ARGUMENT', 'Compaction requires a positive completed-turn interval');
     if (onStateChange !== null && typeof onStateChange !== 'function') throw error('INVALID_ARGUMENT', 'State observer must be a function');
@@ -372,6 +384,7 @@ export class CoordinatorService {
     this.compactAtTokens = compactAtTokens; this.compactMinTurns = compactMinTurns; this.compacting = null; this.compactionRequested = false;
     this.namespace = namespace;
     this.completePresentations = completePresentations;
+    this.validateReplies = validateReplies;
     this.visionModel = visionModel; this.resolveAttachment = resolveAttachment;
     this.onStateChange = onStateChange;
     this.beforeAcceptHumanInput = beforeAcceptHumanInput;
@@ -406,7 +419,7 @@ export class CoordinatorService {
     const participationInput = mergedParticipationInput(state);
     const participationDecision = participationInput ? state.slackParticipation?.requestId === participationInput.requestId
       ? state.slackParticipation.decision : 'pending' : null;
-    return { status: state.status, error: state.error || null, activeTurnId: state.activeTurnId || null,
+    return { status: state.status, error: state.error ? { code: state.error.code, message: state.error.message } : null, activeTurnId: state.activeTurnId || null,
       participationDecision,
       participationRequestIds: participationInput?.serverContext.participation.inputs.map(input => input.id) || [],
       acceptedRequestIds: [...new Set([...Object.keys(state.requests || {}), ...Object.keys(inputs.requests)])].slice(-100),
@@ -626,6 +639,7 @@ export class CoordinatorService {
           if (answerTo !== undefined) {
             question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
             if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.superseded) throw error('CONFLICT', 'This question has been replaced');
             if (question.answer || Object.values(journal.requests).some(item => item.answerTo === answerTo)) throw error('ALREADY_ANSWERED', 'This question already has an answer');
           }
           if (Object.values(journal.requests).filter(item => item.revision > (state.consumedInputRevision || 0)).length >= 100) throw error('BUSY', 'Follow-up capacity reached; retry the original ID');
@@ -690,6 +704,7 @@ export class CoordinatorService {
             if (!isHumanSource(source) || typeof answerTo !== 'string') throw error('INVALID_INPUT', 'Only human replies can answer a question');
             question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === answerTo);
             if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.superseded) throw error('CONFLICT', 'This question has been replaced');
             if (question.answer) throw error('ALREADY_ANSWERED', 'This question already has an answer');
             (state.answers ||= {})[answerTo] = { text, requestId: id };
           }
@@ -721,6 +736,7 @@ export class CoordinatorService {
           state.activeContext = nextContext;
           state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs: contextCompletedAt - contextStartedAt };
           state.activeTurnId = id; state.steps = 0; state.modelRetries = 0;
+          delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
           state.activeRequestIds = [id];
           state.partialText = '';
           delete state.partialOutputId;
@@ -796,6 +812,7 @@ export class CoordinatorService {
           if (input.answerTo !== undefined) {
             question = state.messages.flatMap((_, index) => questionsAt(state, index)).find(item => item.id === input.answerTo);
             if (!question) throw error('NOT_FOUND', 'Question does not belong to this conversation');
+            if (question.superseded) throw error('CONFLICT', 'This question has been replaced');
             if (question.answer || answered.has(input.answerTo)) throw error('ALREADY_ANSWERED', 'This question already has an answer');
             answered.add(input.answerTo);
           }
@@ -860,6 +877,7 @@ export class CoordinatorService {
         state.activeModelRoute = route; state.activeContext = nextContext;
         state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs };
         state.activeTurnId = first.id; state.steps = 0; state.modelRetries = 0;
+        delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
         if (operatorRecovery) state.operatorRecovery = { id: operatorRecovery, initialAttempted: false, initialAccepted: false };
         else delete state.operatorRecovery;
         state.partialText = ''; delete state.partialOutputId; delete state.partialResponseIndex;
@@ -1104,7 +1122,7 @@ export class CoordinatorService {
                 this.modelAbort = null; // A started business tool must save its receipt.
                 return this.execute(...args);
               },
-              completePresentations: this.completePresentations,
+              completePresentations: this.completePresentations, validateReplies: this.validateReplies,
               onModelAccepted: value => {
                 if (value.operatorRecovery && !value.operatorRecovery.initialAccepted) value.operatorRecovery.initialAccepted = true;
               },
@@ -1119,6 +1137,9 @@ export class CoordinatorService {
                 await save(state);
               } });
             state.modelRetries = 0;
+            delete state.modelRepairCode;
+            delete state.modelRepairText;
+            delete state.modelRepairTools;
             if (Number.isSafeInteger(state.lastInputTokens) && state.lastInputTokens < this.compactAtTokens) delete state.compactionError;
           } catch (cause) {
             if (['MODEL_INTERRUPTED', 'MODEL_STEERED'].includes(cause.code)) {
@@ -1142,9 +1163,12 @@ export class CoordinatorService {
               if (this.steerSettleMs) await new Promise(resolve => setTimeout(resolve, this.steerSettleMs));
               continue;
             }
-            if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE'].includes(cause.code) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
+            if (recoverableModelFailure(cause) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
                 !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
               state.modelRetries = (state.modelRetries || 0) + 1;
+              state.modelRepairCode = coordinatorFailureDiagnostic(cause)?.validationCode || null;
+              state.modelRepairText = typeof cause.repairText === 'string' ? cause.repairText : null;
+              state.modelRepairTools = Array.isArray(cause.repairTools) ? cause.repairTools : state.modelRepairTools || [];
               state.steps--; state.streaming = null; state.activity = null;
               state.activeTiming.modelRetryAt = new Date().toISOString();
               await save(state);
@@ -1171,7 +1195,9 @@ export class CoordinatorService {
         }
         if (!this.stopping && state.activeTurnId && state.status !== 'interrupted') throw error('STEP_LIMIT', 'Coordinator stopped at its bounded tool-call limit');
       } catch (cause) {
-        state.status = 'error'; state.activity = null; state.error = { code: cause.code || 'COORDINATOR_FAILED', message: '协调器已暂停；保留原对话与工具回执，可重试或检查配置。' };
+        state.status = 'error'; state.activity = null; state.error = { code: cause.code || 'COORDINATOR_FAILED',
+          recoverable: recoverableModelFailure(cause), diagnostic: coordinatorFailureDiagnostic(cause),
+          message: (state.modelRetries || 0) > 0 ? '自动恢复未成功，原消息与已完成操作已保留。' : '处理已停止，原消息与已完成操作已保留。' };
         await save(state);
       }
       if (state.status === 'interrupted') { state.streaming = null; state.activity = null; await save(state); }
