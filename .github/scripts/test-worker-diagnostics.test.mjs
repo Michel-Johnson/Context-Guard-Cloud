@@ -63,7 +63,7 @@ test('CI diagnostics preserve discovery, minimum-runtime-only activation and ori
   assert.match(minimum, /runner\.temp.*cloud-node18-diagnostics\/\*\.jsonl/);
   assert.match(minimum, /retention-days: 1/);
   assert.match(workflow, /contents: read/);
-  assert.match(workflow, /needs: \[security, test, minimum-runtime, slack, browser, package\]/);
+  assert.match(workflow, /needs: \[impact, security, test, minimum-runtime, slack, browser, package\]/);
   assert.doesNotMatch(workflow, /continue-on-error|pull_request_target/);
   for (const match of workflow.matchAll(/uses:\s*([^\s#]+)/g)) assert.match(match[1], /@[a-f0-9]{40}$/);
 });

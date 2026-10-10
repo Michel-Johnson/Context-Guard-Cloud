@@ -1965,6 +1965,8 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 最终 SHA256：规则 `b54c4bf6dcb89ee8de9392ca8572246cc97492fcbfb5a90171632a5debd26344`；选择器 `f101ed1d762fa5d1807a8fcf799aa34909c6e37be2c9dfe19e4a3fccb6afb37c`（提交前仅去除文件尾部多余空行，原受测逻辑未改）；测试 `90849a0d07e76b94f0bf83197aa0fb5773c58de65d49e137a60239ccbac160f9`；守卫 `54223f4ad325580316efa52972b91e344e0037cbb49498e4b153c17b7e075fe0`；工作流 `d4ef60f394acb9609cd994aa5955717a34558bbdaefccdf2d4781cb100d58aba`。
 - [ ] 独立 Tester：按准确修订验证文档 PR 有意跳过、Slack 选中 Cloud 集成而非浏览器、未知路径与关键变更全量、Main/标签全量；分析失败/取消、所选任务异常 skipped、缺失输出和安全失败均不能通过 Required。核 rename/delete 的真实差异，检查分支保护继续要求同名 Required。Root 自检不冒充独立测试，本轮不调用 subagent。
 - [ ] 交付：尚未提交、推送或远端运行；此修复自身改变 CI，因此首次 PR 必须跑完整门禁，不能用轻量结果代替。之后用准确提交的文档与 Slack 变更核对 artifact/summary 的实际选择；不为验证制造生产用户消息或修改业务数据。
+- [x] 发布整合：PR70 保留 Main a3b9404 的全部功能，唯一台账追加冲突两边保留；整合 head b4a3e05 相对 Main 仍9个 CI/说明文件。准确远端 run38039076550 的 impact/security/browser/package/slack 通过，Node22和18均897通过/1失败/2既有跳过，Required正确拒绝。唯一失败为旧诊断测试硬编码六个 Required 依赖，遗漏新增 impact；不跳过、不重跑原失败流水线。
+- [x] 最小兼容返工：只把诊断测试依赖断言更新为准确七项，保留原六项、发现清单、诊断仅最低运行时启用、15分钟期限、并发2与Action pins。原失败目标 Node22.18.0 actual856911 exit0，1/1、0失败/跳过/取消，130.7727ms；未运行其他诊断目标或本地全量。后续新提交须经完整远端 CI，不以旧897通过称新的 Required 已通过。
 
 # CURSOR-SLACK-OFFER-01 · 提示范围纠正
 
