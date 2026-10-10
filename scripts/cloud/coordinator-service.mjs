@@ -211,10 +211,27 @@ export class CoordinatorConversations {
       const state = await this.state();
       const item = state.chats?.[id];
       if (!item) throw error('NOT_FOUND', 'Only an independent chat can bind a plugin');
+      if (item.cursorExecution) throw error('FORBIDDEN', 'An explicit Cursor grant cannot be removed by plugin binding');
       item.executionMode = executionMode;
       await atomicWrite(this.file, encode(state));
     });
     return this.get(id);
+  }
+  async enableCursor(id, { operationId, expectedMode, grant }) {
+    return withFileLock(this.file + '.lock', async () => {
+      const state = await this.state(), item = state.chats?.[id];
+      if (!item) throw error('FORBIDDEN', 'Enable Cursor only in the original registered chat');
+      const fingerprint = hash(encode({ expectedMode, grant }));
+      if (item.cursorExecution?.operationId === operationId) {
+        if (item.cursorExecution.fingerprint !== fingerprint) throw error('ID_REUSED', 'Cursor enable request changed');
+        return { conversationId: id, executionMode: 'automatic' };
+      }
+      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution) throw error('CONFLICT', 'Conversation execution mode changed');
+      item.executionMode = 'automatic';
+      item.cursorExecution = { ...structuredClone(grant), operationId, fingerprint, enabledAt: new Date().toISOString() };
+      await atomicWrite(this.file, encode(state));
+      return { conversationId: id, executionMode: 'automatic' };
+    });
   }
   async setFocus(id, { nodeId, kind, itemId, title, expectedFocus, bindingApproval }) {
     if (typeof nodeId !== 'string' || !nodeId || !['todo', 'bug', 'idea'].includes(kind)) {
@@ -379,7 +396,15 @@ export class CoordinatorService {
     // loop. A streamed state save must never overwrite a newly accepted input.
     this.inputFile = path.join(directory, 'input-journal.json');
     this.mountFile = path.join(directory, 'mount-reviews.json');
-    this.model = model; this.system = system; this.tools = tools; this.execute = execute; this.context = context;
+    this.model = model; this.system = system; this.tools = tools; this.context = context;
+    this.executingTools = 0;
+    this.execute = async (...args) => {
+      // Ordinary shutdown finishes the current durable tool step. A mode
+      // retirement, unlike shutdown, must reject every late old-mode tool.
+      if (this.retired) throw error('UNAVAILABLE', 'Coordinator execution mode was retired');
+      this.executingTools++;
+      try { return await execute(...args); } finally { this.executingTools--; }
+    };
     this.maxSteps = maxSteps; this.maxModelRetries = maxModelRetries; this.retryDelayMs = retryDelayMs; this.simulated = simulated; this.running = null;
     this.compactAtTokens = compactAtTokens; this.compactMinTurns = compactMinTurns; this.compacting = null; this.compactionRequested = false;
     this.namespace = namespace;
@@ -613,6 +638,7 @@ export class CoordinatorService {
     for (;;) {
       let finishingRunner;
       await withFileLock(this.file + '.submit.lock', async () => {
+        if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
         const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
         const journal = await this.inputJournal();
         if (state.batches?.[id] || journal.batches?.[id]) throw error('ID_REUSED', 'This identity belongs to an accepted batch');
@@ -780,6 +806,7 @@ export class CoordinatorService {
     for (;;) {
       let finishingRunner;
       await withFileLock(this.file + '.submit.lock', async () => {
+        if (this.stopping) throw error('UNAVAILABLE', 'Coordinator is shutting down');
         const state = await this.readConversation({ messages: [], requests: {}, status: 'idle', toolReceipts: {} });
         const journal = await this.inputJournal();
         const previous = state.batches?.[id] || journal.batches?.[id];
@@ -1205,6 +1232,20 @@ export class CoordinatorService {
       this.modelAbort = null;
       return state.status === 'waiting-for-user' && !state.activeTurnId &&
         Number.isSafeInteger(state.lastInputTokens) && state.lastInputTokens >= this.compactAtTokens;
+    });
+  }
+  async retireIdle(commit) {
+    return withFileLock(this.file + '.submit.lock', async () => {
+      const state = await this.readConversation({ messages: [], status: 'idle', toolReceipts: {} }), journal = await this.inputJournal();
+      if (this.stopping || this.running || this.compacting || this.compactionRequested || this.executingTools ||
+          state.activeTurnId || state.pending || !['idle', 'waiting-for-user'].includes(state.status) ||
+          Object.values(journal.requests).some(item => item.revision > (state.consumedInputRevision || 0))) {
+        throw error('COORDINATOR_BUSY', 'Resolve the original turn and pending input before enabling Cursor');
+      }
+      // Lock order is submit -> binding -> registry. Drain only after release.
+      // An uncertain commit leaves this old instance retired, never revived.
+      this.retired = true; this.stopping = true;
+      return commit();
     });
   }
   async close({ stop = false } = {}) {

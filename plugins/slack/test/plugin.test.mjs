@@ -2322,32 +2322,51 @@ test('dormant thread slots cannot postpone an already-due live conversation', as
 test('an unrelated slow read-reaction cannot block a ready Coordinator answer', async t => {
   const f = await fixture(t); await f.store.update(state => { state.channels[channel] = 'lab'; });
   const originalCommand = f.gateway.command, originalCall = f.io.call;
-  let release, entered;
+  let release, entered, reactionSettled = false;
   const held = new Promise(resolve => { release = resolve; }), began = new Promise(resolve => { entered = resolve; });
+  await f.store.receive('slow-reaction', { type: 'events_api', body: { event: event({ text: `<@${bot}> 当前问题` }) } });
+  // Prepare the existing input/submit through the real journal. The guard
+  // below measures mirroring a ready answer, not first-input history/fsync.
+  await f.plugin.runEntry('slow-reaction', f.store.data.inbox['slow-reaction']);
+  assert.equal(f.store.data.inbox['slow-reaction'].status, 'done');
+  assert.equal(f.store.data.inbox['slow-reaction'].attempts, 0);
+  assert.equal(f.store.data.inbox['slow-reaction'].error, undefined);
+  assert.equal(Object.values(f.store.data.inbox).filter(item => item.status === 'pending').length, 0);
+  const submits = f.calls.filter(call => call.type === 'conversation.submit');
+  assert.equal(submits.length, 1);
+  assert.equal(submits[0].payload.inputs.length, 1);
+  const inputId = submits[0].payload.inputs[0].id;
+  assert.ok(inputId);
+  const bindings = Object.values(f.store.data.threads);
+  assert.equal(bindings.length, 1);
+  assert.ok(bindings[0].ownRequests.includes(inputId));
+  assert.equal(bindings[0].awaitingReplyId, inputId);
+  assert.equal(bindings[0].nextPoll, 0);
+  assert.equal(f.sent.filter(item => item.text?.includes('准备好的实际答案')).length, 0);
   f.io.call = async (method, input) => {
-    if (method === 'reactions.add') { entered(); await held; return {}; }
+    if (method === 'reactions.add') { entered(); await held; reactionSettled = true; return {}; }
     return originalCall(method, input);
   };
   f.gateway.command = async (type, args) => {
     if (type === 'conversation.state') {
-      const submit = f.calls.find(call => call.type === 'conversation.submit');
-      return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: [submit.id],
-        messages: [{ id: 'ready-reply', requestId: submit.id, role: 'assistant', text: '准备好的实际答案' }], approvals: [] };
+      return { status: 'waiting-for-user', activeTurnId: null, acceptedRequestIds: [inputId],
+        messages: [{ id: 'ready-reply', requestId: inputId, role: 'assistant', text: '准备好的实际答案' }], approvals: [] };
     }
     return originalCommand(type, args);
   };
-  await f.store.receive('slow-reaction', { type: 'events_api', body: { event: event({ text: `<@${bot}> 当前问题` }) } });
   f.plugin.stopped = false;
   // A prior independent read reaction is already in flight; native merged
   // inputs themselves no longer add an acknowledgement before deciding.
   f.plugin.readReaction(event({ ts: '122.001' }));
-  const tick = f.plugin.tick();
-  let timer;
+  let tick, timer;
   try {
     await began;
+    tick = f.plugin.tick();
     const finished = await Promise.race([tick.then(() => true), new Promise(resolve => { timer = setTimeout(() => resolve(false), 1000); })]);
     assert.equal(finished, true, 'Message cycle must finish while the reaction remains held');
-    assert.match(f.sent.find(item => item.channel).text, /准备好的实际答案/);
+    assert.equal(f.sent.filter(item => item.channel && item.text?.includes('准备好的实际答案')).length, 1);
+    assert.equal(reactionSettled, false, 'The complete tick must finish before the unrelated reaction is released');
+    assert.equal(f.plugin.reactions.size, 1);
   } finally { clearTimeout(timer); release(); await tick; await f.plugin.stop(); }
 });
 test('live replies are prioritized with bounded state reads and fair dormant progress', async t => {

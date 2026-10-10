@@ -28,9 +28,12 @@ export class CoordinatorBindings {
     Object.assign(this, { readMain, conversations, nodeIds });
   }
   async state() { return readJSON(this.file, { proposals: {}, reviews: {}, pending: {} }); }
+  async withStableConversation(conversationId, action) {
+    return withFileLock(this.file + '.lock', async () => action(await this.conversations.get(conversationId)));
+  }
   async withStableFocus(conversationId, action) {
-    return withFileLock(this.file + '.lock', async () => {
-      const current = await this.conversations.get(conversationId), state = await this.state();
+    return this.withStableConversation(conversationId, async current => {
+      const state = await this.state();
       const approved = Object.values(state.proposals).find(proposal => current.bindingApproval === 'binding-confirm:' + proposal.id);
       if (!approved || approved.conversationId !== conversationId || approved.review?.decision !== 'approved' ||
           approved.input.nodeId !== current.nodeId || approved.input.kind !== current.kind) fail('APPROVAL_REQUIRED', '请先确认当前需求的主节点');

@@ -98,6 +98,33 @@ test('相同候选已有有效确认时复用审批，不再次要求确认或�
   await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => assert.fail('失效绑定不得进入brief')), { code: 'APPROVAL_REQUIRED' });
 });
 
+test('会话能力锁不批准任务，未确认的焦点仍不能准备 brief', async t => {
+  const f = await fixture(t), before = await f.conversations.get(f.conversationId);
+  let focusActions = 0;
+  await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => { focusActions++; }), { code: 'APPROVAL_REQUIRED' });
+  assert.equal(focusActions, 0);
+  assert.deepEqual(await f.bindings.withStableConversation(f.conversationId, current => current), before);
+  assert.deepEqual(await f.conversations.get(f.conversationId), before);
+  assert.deepEqual(await f.bindings.state(), { proposals: {}, reviews: {}, pending: {} });
+
+  // 复用同一绑定锁，待提出的建议不能插入能力切换期间。
+  let entered, release;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const held = f.bindings.withStableConversation(f.conversationId, async current => {
+    entered(); await gate;
+    assert.deepEqual(await f.bindings.state(), { proposals: {}, reviews: {}, pending: {} });
+    return current;
+  });
+  await started;
+  const proposed = f.propose('after-capability-lock');
+  release();
+  assert.deepEqual(await held, before);
+  assert.equal((await proposed).pending, true);
+  await assert.rejects(f.bindings.withStableFocus(f.conversationId, () => { focusActions++; }), { code: 'APPROVAL_REQUIRED' });
+  assert.equal(focusActions, 0);
+});
+
 test('绑定后的失回可恢复，但旧确认不能覆盖后来人工改绑', async t => {
   const f = await fixture(t), proposal = await f.propose('lost-ack');
   const save = f.conversations.setFocus.bind(f.conversations); let failed = false;

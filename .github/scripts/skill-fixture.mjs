@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 
-const fixtureUrl = /^https:\/\/github\.com\/Michel-Johnson\/Context-Guard-Skill\/releases\/download\/split-fixture-([a-f0-9]{40})\/michelj-context-guard-(0\.(?:5\.0|6\.[0135]|7\.[01]))\.tgz$/;
+const fixtureUrl = /^https:\/\/github\.com\/Michel-Johnson\/Context-Guard-Skill\/releases\/download\/split-fixture-([a-f0-9]{40})\/michelj-context-guard-(0\.(?:5\.0|6\.[0135]|7\.[01]|11\.0))\.tgz$/;
+const cursorFixtureCommit = 'dababe445976a2504bc8d02ccc747056bcde30a0';
 
 // A released fixture is distinct from the Cloud service's runtime dependencies.
 // Exact URL identity and npm's SHA-512 lock prevent silent source substitution.
@@ -8,6 +9,7 @@ export function validateSkillFixture(configured, locked, installed) {
   assert.equal(typeof configured, 'string', 'Skill fixture dependency must be configured');
   const match = fixtureUrl.exec(configured);
   assert.ok(match && match[0] === configured, 'Skill fixture must use the approved repository and split-fixture-<40-char SHA> release URL');
+  if (match[2] === '0.11.0') assert.equal(match[1], cursorFixtureCommit, 'Cursor fixture must identify the reviewed, CI-validated source commit');
   assert.equal(locked?.resolved, configured, 'Skill fixture lock must resolve the exact configured release URL');
   assert.equal(locked?.version, match[2], 'Skill fixture lock must identify the exact approved release version');
   const integrity = /^sha512-([A-Za-z0-9+/]{86}==)$/.exec(locked?.integrity || '');

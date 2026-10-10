@@ -53,6 +53,14 @@
     }
   ],
   "productFiles": [
+    "tests/cursor-owning-backend.test.mjs",
+    "tests/cursor-ci-task-authority.test.mjs",
+    "tests/cursor-git-proof.test.mjs",
+    "tests/cursor-stream.test.mjs",
+    "tests/cursor-native-proof.test.mjs",
+    "tests/cursor-role-http.test.mjs",
+    "tests/cursor-role-factory.test.mjs",
+    "tests/cursor-role-channel.test.mjs",
     "tests/coordinator-dialogue-live-browser.mjs",
     "tests/coordinator-binding.test.mjs",
     "tests/merged-participation-independent.test.mjs",

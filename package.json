@@ -29,12 +29,12 @@
     "build:runtime": "node scripts/build-runtime.mjs"
   },
   "devDependencies": {
-    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-98ed9287178806a80409d9a59dbf01cefe55a52a/michelj-context-guard-0.7.1.tgz",
+    "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-dababe445976a2504bc8d02ccc747056bcde30a0/michelj-context-guard-0.11.0.tgz",
     "marked": "15.0.12",
     "playwright": "1.62.1"
   },
   "dependencies": {
-    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.4.0/michelj-context-guard-core-2.4.0.tgz",
-    "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.5.0/michelj-context-guard-workbench-1.5.0.tgz"
+    "@michelj/context-guard-core": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v2.4.1/michelj-context-guard-core-2.4.1.tgz",
+    "@michelj/context-guard-workbench": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v1.5.1/michelj-context-guard-workbench-1.5.1.tgz"
   }
 }
