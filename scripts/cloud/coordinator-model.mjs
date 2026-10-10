@@ -666,10 +666,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
-    // 回复纠正可换调用ID；相同展示也复用本轮回执。读取仍取当前状态，
-    // 不重放未知或失败写入，不跨输入版本去重。
-    if (!receipt && (name === 'show_nodes' || (state.modelRetries || 0) > 0 || state.modelRepairCode) && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
-      'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu'].includes(name)) {
+    // 回复纠正可换调用ID，已完成写入复用本轮成功回执。
+    // 新读取重新授权取当前状态；节点卡片仅在展示层去重。
+    if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
+      'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu', 'show_nodes'].includes(name)) {
       const businessFingerprint = hash(canonical({ name, input: call.input }));
       const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
         item.businessFingerprint === businessFingerprint);
