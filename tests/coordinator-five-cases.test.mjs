@@ -78,6 +78,16 @@ test('一次问题只能在问答入口出现，正文重复问句纠正后不�
   assert.equal(state.messages.filter(message => message.role === 'assistant').length, 1);
   assert.equal(state.messages.flatMap(message => message.questions || []).length, 1);
 });
+test('重复提问纠正后可省略不必要的问答，不强制模型把已删问题补回来', async t => {
+  let rounds = 0, executions = 0;
+  const service = await fixture(t, async () => ++rounds === 1
+    ? { stop: 'tool_use', content: [{ type: 'text', text: '现在准备吗？' },
+      { type: 'tool_use', id: 'ask', name: 'ask_user', input: { question: '现在准备吗？' } }] }
+    : reply('已绑定，按你的要求暂不创建事项。'), async () => { executions++; return {}; });
+  const state = await run(service, 'confirm', '确认');
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(rounds, 2); assert.equal(executions, 0);
+  assert.equal(state.messages.at(-1).text, '已绑定，按你的要求暂不创建事项。');
+});
 for (const code of ['ACTIVE_EXECUTION', 'EXECUTION_NOT_RELEASED']) test(`${code}是明确业务拒绝，保留绑定回执并继续聊天`, async t => {
   let rounds = 0, attempts = 0;
   const receipt = { id: 'binding-notice:synthetic:approved', text: '绑定已保存，可以继续讨论。' };

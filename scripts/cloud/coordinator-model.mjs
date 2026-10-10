@@ -557,7 +557,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         const calls = next.content.filter(block => block.type === 'tool_use');
         const repairTools = [...new Set(calls.map(call => businessToolName(call.name)).filter(name => ['mount_conversation', 'prepare_task', 'ask_user'].includes(name)))];
         const questions = calls.filter(call => businessToolName(call.name) === 'ask_user');
-        if (questions.length > 1) throw invalidReply('MULTIPLE_QUESTIONS', '', repairTools);
+        if (questions.length > 1) throw invalidReply('MULTIPLE_QUESTIONS', '', repairTools.filter(name => name !== 'ask_user'));
         const internalIds = new Set(state.activeContext?.internalIds || []);
         for (const receipt of Object.values(state.toolReceipts)) {
           const visit = value => {
@@ -577,7 +577,12 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           .flatMap(message => message.content || []).filter(block => block.type === 'text')
           .map(block => block.text || '');
         const rejected = coordinatorTurnReplyIssue(text, calls.map(call => ({ ...call, name: businessToolName(call.name) })), { ...options, previousTexts });
-        if (rejected) throw invalidReply(rejected.issue, rejected.text, repairTools.length ? repairTools : state.modelRepairTools);
+        if (rejected) {
+          const required = repairTools.length ? repairTools : state.modelRepairTools || [];
+          // 重复问题可直接省略；审批工具仍须恢复，不能用文字冒充审批卡。
+          throw invalidReply(rejected.issue, rejected.text,
+            rejected.issue === 'MULTIPLE_QUESTIONS' ? required.filter(name => name !== 'ask_user') : required);
+        }
         if (state.modelRepairTools?.some(name => !calls.some(call => businessToolName(call.name) === name))) {
           throw invalidReply('RECOVERY_TOOL_OMITTED', text, state.modelRepairTools);
         }
