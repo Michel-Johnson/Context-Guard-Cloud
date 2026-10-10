@@ -11,6 +11,47 @@ concurrency:
   group: cloud-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
+  impact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full: ${{ steps.select.outputs.full }}
+      test: ${{ steps.select.outputs.test }}
+      minimum_runtime: ${{ steps.select.outputs.minimum_runtime }}
+      slack: ${{ steps.select.outputs.slack }}
+      browser: ${{ steps.select.outputs.browser }}
+      package: ${{ steps.select.outputs.package }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: 验证影响规则与工作流门禁
+        run: |
+          node .github/scripts/verify-workflows.mjs
+          node --test .github/scripts/ci-impact.test.mjs
+      - name: 选择受影响检查，未知范围回退全量
+        id: select
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || '' }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          node .github/scripts/ci-impact.mjs
+          --event "$CI_EVENT" --base "$CI_BASE" --head "$CI_HEAD"
+          --output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+          --plan "$RUNNER_TEMP/ci-impact-plan.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: cloud-ci-impact-plan
+          path: ${{ runner.temp }}/ci-impact-plan.json
+          if-no-files-found: error
+          retention-days: 14
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -32,7 +73,8 @@ jobs:
       - run: node .github/scripts/security-scan.mjs ci
       - run: npm run security:test
   test:
-    needs: security
+    needs: [impact, security]
+    if: needs.impact.outputs.test == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -48,7 +90,8 @@ jobs:
       - run: npm run build:runtime
       - run: npm test
   minimum-runtime:
-    needs: security
+    needs: [impact, security]
+    if: needs.impact.outputs.minimum_runtime == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -73,7 +116,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
   slack:
-    needs: security
+    needs: [impact, security]
+    if: needs.impact.outputs.slack == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -87,7 +131,8 @@ jobs:
       - run: npm ci --prefix plugins/slack --ignore-scripts --no-audit --no-fund
       - run: npm run test:slack
   browser:
-    needs: security
+    needs: [impact, security]
+    if: needs.impact.outputs.browser == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -125,7 +170,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
   package:
-    needs: security
+    needs: [impact, security]
+    if: needs.impact.outputs.package == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -155,10 +201,16 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [security, test, minimum-runtime, slack, browser, package]
+    needs: [impact, security, test, minimum-runtime, slack, browser, package]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22'
+          package-manager-cache: false
       - env:
           JOB_RESULTS: ${{ toJSON(needs) }}
-        run: |
-          node -e 'const jobs=JSON.parse(process.env.JOB_RESULTS); if(Object.keys(jobs).length!==6 || Object.values(jobs).some(job=>job.result!=="success")) process.exit(1)'
+        run: node .github/scripts/ci-impact.mjs --check-required true
