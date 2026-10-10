@@ -115,6 +115,23 @@ for (const code of ['ACTIVE_EXECUTION', 'EXECUTION_NOT_RELEASED']) test(`${code}
   state = await run(service, 'followup', '先继续讨论');
   assert.equal(state.status, 'waiting-for-user'); assert.equal(attempts, 1);
 });
+test('可以删掉多余问题，但必须恢复被拒输出中的审批工具，不能用文字伪报已准备', async t => {
+  let rounds = 0, prepared = 0;
+  const input = { taskId: 'task', text: '修复', acceptance: '可用', nodeIds: ['TESTS'], mainVersion: 'v1' };
+  const service = await fixture(t, async () => {
+    rounds++;
+    if (rounds === 1) return { stop: 'tool_use', content: [{ type: 'text', text: '是否准备？' },
+      { type: 'tool_use', id: 'ask', name: 'ask_user', input: { question: '是否准备？' } },
+      { type: 'tool_use', id: 'prepare', name: 'prepare_task', input }] };
+    if (rounds === 2) return reply('已准备，等你审批。');
+    if (rounds === 3) return call('prepare_task', input, 'corrected-prepare');
+    return reply('已准备，等你审批。');
+  }, async name => { assert.equal(name, 'prepare_task'); prepared++; return { prepared: true }; });
+  const state = await run(service);
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(prepared, 1); assert.equal(rounds, 4);
+  assert.equal(state.messages.flatMap(message => message.questions || []).length, 0);
+  assert.equal((await service.readConversation()).performance.models[1].diagnostic.validationCode, 'RECOVERY_TOOL_OMITTED');
+});
 test('绑定回执在模型最终失败时仍可读取，重读不重复，用户文字不能伪造', async t => {
   const receipt = { id: 'binding-notice:synthetic:approved', text: '绑定已保存，可以继续讨论。' };
   const service = await fixture(t, async () => { throw Object.assign(new Error('transport'), { code: 'MODEL_TIMEOUT' }); },
