@@ -356,9 +356,12 @@ for (const change of ['native', 'expiry']) test(`Cursor permissions recheck ${ch
   assert.equal(state.objects[scopedObjectKey(f.executor, f.session, request.payload.ref)], undefined);
 });
 
-async function mcpFixture(t, f, projectId = 'project') {
+async function mcpFixture(t, f, projectId = 'project', { responseDate } = {}) {
   let handler;
-  const server = http.createServer((req, res) => handler(req, res));
+  const server = http.createServer((req, res) => {
+    if (responseDate) res.setHeader('Date', responseDate());
+    return handler(req, res);
+  });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const endpoint = `http://127.0.0.1:${server.address().port}/cursor-role-mcp`;
   handler = createCursorRoleMcpHandler({ channel: f.channel, projectId, endpoint, allowLoopback: true });
@@ -378,10 +381,20 @@ async function mcpFixture(t, f, projectId = 'project') {
   return { request, initialize, initialized };
 }
 
+function assertMcpReplay(actual, expected) {
+  assert.equal(actual.status, expected.status);
+  assert.deepEqual(actual.body, expected.body, 'Stable message ID replays the exact durable business receipt');
+  for (const name of ['content-type', 'cache-control', 'mcp-session-id']) assert.equal(actual.headers.get(name), expected.headers.get(name));
+  assert.equal(actual.headers.get('cache-control'), 'no-store');
+}
+
 test('Cursor role MCP real HTTP discovery can precede native confirmation; task tools require active delegation', async t => {
   const f = await fixture(t), scope = { ...f.base, phase: 'plan' };
   const lease = await f.channel.issue({ operationId: 'native-create', scope });
-  const mcp = await mcpFixture(t, f);
+  // HTTP Date is request time, not part of the durable operation receipt.
+  // Force distinct seconds without sleeping or changing the role lease clock.
+  let responseSequence = 0;
+  const mcp = await mcpFixture(t, f, 'project', { responseDate: () => new Date(1700000000000 + ++responseSequence * 1000).toUTCString() });
   assert.equal((await mcp.request(lease.token, { jsonrpc: '2.0', id: 'early', method: 'tools/list' })).status, 400);
   const init = await mcp.initialize(lease.token);
   assert.equal(init.status, 200);
@@ -410,7 +423,9 @@ test('Cursor role MCP real HTTP discovery can precede native confirmation; task 
   const report = { id: 'mcp-ready', type: 'task.report', payload: { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } } };
   const first = await exchange(report);
   assert.equal(first.body.result.structuredContent.data.stage, 'plan-ready');
-  assert.deepEqual(await exchange(report), first);
+  const replay = await exchange(report);
+  assert.notEqual(replay.headers.get('date'), first.headers.get('date'), 'The fixture deterministically crosses HTTP response seconds');
+  assertMcpReplay(replay, first);
   assert.deepEqual((await f.task()).plan, plan);
   assert.equal((await f.task()).planReview, undefined, 'native MCP cannot approve its own Plan');
   // Lifecycle is persisted with the capability, not just in HTTP process RAM.
@@ -527,7 +542,9 @@ test('Cursor role MCP discovery describes each phase-specific wire payload witho
 });
 
 test('Cursor role MCP reports actionable wire errors and accepts correction without mutating or approving the task', async t => {
-  const f = await fixture(t), lease = await f.issue('plan'), mcp = await mcpFixture(t, f);
+  const f = await fixture(t), lease = await f.issue('plan');
+  let responseSequence = 0;
+  const mcp = await mcpFixture(t, f, 'project', { responseDate: () => new Date(1700000000000 + ++responseSequence * 1000).toUTCString() });
   await mcp.initialize(lease.token); await mcp.initialized(lease.token);
   const exchange = args => mcp.request(lease.token, { jsonrpc: '2.0', id: 'rpc', method: 'tools/call',
     params: { name: 'context_guard_exchange', arguments: args } });
@@ -556,7 +573,9 @@ test('Cursor role MCP reports actionable wire errors and accepts correction with
   const planResponse = await exchange(put), plan = planResponse.body.result.structuredContent.data;
   assert.equal(planResponse.body.result.isError, undefined);
   assert.equal((await f.task()).stage, 'assigned');
-  assert.deepEqual(await exchange(put), planResponse, 'Corrected first write is replay-safe');
+  const replay = await exchange(put);
+  assert.notEqual(replay.headers.get('date'), planResponse.headers.get('date'));
+  assertMcpReplay(replay, planResponse);
   const ready = { id: 'correctable-ready', type: 'task.report', payload: { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha } } };
   assert.equal((await exchange(ready)).body.result.structuredContent.data.stage, 'plan-ready');
   assert.equal((await f.task()).planReview, undefined, 'A corrected native Plan remains subject to Coordinator review');

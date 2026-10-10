@@ -2019,3 +2019,11 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 首版准确 `69d3393` 全量 exit0，946 项中 944 通过、2 既有跳过，205852.34925ms；独立审核仍发现 prepared 接续可绕过原生取消，以及授权等待中租期到期后仍 POST 两项 P1。保持 PR74 Draft，未合并或部署，旧全绿不覆盖新反例。
 - [x] 两项独立反例转为正式目标并增加原凭据撤销：首版新增目标 0/4、exit1，1092.082916ms；补修后同目标 4/4、exit0，1130.193042ms。prepared 接续重新核验 FINISHED/ERROR/EXPIRED 白名单；先持久保存发送意图，再复核原任务和当前 operation 租期/撤权，释放能力锁后在 POST 前再次同步查时钟。避免持锁发送阻塞原生 MCP 发现，不续租、复制批准或丢弃原失败记录。
 - [x] 补充能力锁清理期间到期、发送意图保存后撤权；最终 factory/channel/HTTP 119/119、exit0，52324.03925ms。原独立两项精准探针原样复验 2/2、exit0，642.157542ms。实际 Core/任务/磁盘/HTTP，厂商与审批为受控替身；不是原生 Cursor 完成任务，新的全量、独立 Tester 和准确 Required 仍须匹配最终修订。
+
+## CURSOR-MCP-REPLAY-01 · 幂等回执误比较 HTTP 响应时间
+
+- 现场：PR74 head `ccff21d` Required 全绿并合并为 `ef8e491`，但准确 Main run38075549715 的 Node18.20.8 在 MCP Plan 回报重放断言失败，Required 正确阻断部署。原任务仍无 Plan，本轮没有生产写入；不重跑该失败流水线掩盖问题。
+- 根因：测试比较包含 Headers 的整个 HTTP 响应，Date 在两次请求跨秒时理应不同；CI 实际两份业务回执完全相同。Node24 的 Headers 比较没有复现该失败，不能把其通过当 Node18 的修复证据。
+- [x] 两个同类 MCP 正式目标使用真实 HTTP，并让受控服务器每次返回不同秒的 Date；角色租期时钟不变，不使用睡眠。准确 Node18.20.8 修前两个目标均失败，exit1，1090.355958ms；22 项发现中 20 项因窄选择未执行。修后两个目标通过，exit0，1588.78975ms，同样 20 项未选择。
+- [x] 最小测试修正只比较准确 HTTP 状态、完整业务正文及稳定 content-type/cache-control/mcp-session-id，另检查 no-store；明确断言 Date 确实不同。批准、任务/对象持久状态和重启重放断言保留；产品源码、模型、授权与协议不变。
+- [ ] 最终准确全量、独立 Tester、PR Required 和 Main 全量；保留全部原失败，生产 native-json 组合仅同步此测试修订后按准确源码/运行时证据交付，真实三路径业务验收仍未完成。
