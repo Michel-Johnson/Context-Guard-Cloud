@@ -6,6 +6,21 @@ import { activeMentions } from './mentions.mjs';
 
 export const digest = value => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export const threadKey = (team, channel, ts) => `${team}:${channel}:${ts}`;
+export function routedThreadKey(state, team, event) {
+  let key = threadKey(team, event.channel, event.thread_ts || event.ts);
+  const visited = new Set();
+  for (;;) {
+    if (visited.has(key)) throw Object.assign(new Error('项目切换路径出现循环'), { code: 'CONFLICT' });
+    visited.add(key);
+    const route = state.projectRoutes?.[digest([key, event.user])];
+    if (!route || Number(event.ts) <= Number(route.afterTs)) return key;
+    const target = state.threads[key = route.targetKey];
+    if (!target || target.channel !== event.channel || target.userId !== event.user ||
+        !event.channel?.startsWith('D') && target.threadTs !== (event.thread_ts || event.ts)) {
+      throw Object.assign(new Error('项目切换记录与当前用户或线程不一致'), { code: 'CONFLICT' });
+    }
+  }
+}
 const empty = () => ({ version: 1, inbox: {}, threads: {}, channels: {}, preferences: {}, drafts: {}, outgoing: {} });
 const durableThread = ({ nextPoll, nextItemPoll, ...thread }) => thread;
 
@@ -87,7 +102,7 @@ export class Store {
       const event = envelope.type === 'events_api' && envelope.body?.event;
       if (event && ['message', 'app_mention'].includes(event.type) && !event.bot_id && !event.bot_profile && !event.hidden && (!event.subtype || event.subtype === 'file_share')) {
         const now = Date.now(), direct = event.channel_type === 'im' || event.channel?.startsWith('D');
-        const projectId = direct ? state.preferences[event.user] : state.threads[threadKey(envelope.body.team_id, event.channel, event.thread_ts || event.ts)]?.projectId || state.channels[event.channel];
+        const projectId = direct ? state.preferences[event.user] : state.threads[routedThreadKey(state, envelope.body.team_id, event)]?.projectId || state.channels[event.channel];
         // Freeze the project and receiver set into the collection lane. Different
         // people and receiver sets never borrow each other's authorization.
         const contextLane = digest([envelope.body.team_id, event.channel, event.user, projectId || null, event.thread_ts || null]);

@@ -66,13 +66,23 @@ export function plainText(source, { partial = false } = {}) {
 // Keep short paragraphs and code together. Oversize units split at lines,
 // then words; the final fallback protects UTF-16 pairs and never drops text.
 export function plainChunks(source, limit = 2800, options) {
-  const value = plainText(source, options) || '—', chunks = [];
-  const codeRanges = lexer(String(source || ''), { gfm: true }).filter(token => token.type === 'code')
+  const value = (options?.rendered ? String(source || '') : plainText(source, options)) || '—', chunks = [];
+  const measure = options?.measure || (text => text.length);
+  if (!Number.isSafeInteger(limit) || limit < 1 || typeof measure !== 'function') throw new RangeError('Use a positive chunk budget');
+  const codeRanges = (options?.rendered ? [] : lexer(String(source || ''), { gfm: true })).filter(token => token.type === 'code')
     .map(token => { const start = value.indexOf(token.text); return { start, end: start + token.text.length }; })
-    .filter(range => range.start >= 0 && range.end - range.start <= limit);
+    .filter(range => range.start >= 0 && measure(value.slice(range.start, range.end)) <= limit);
   let offset = 0;
   while (offset < value.length) {
     let end = Math.min(value.length, offset + limit);
+    if (measure(value.slice(offset, end)) > limit) {
+      let low = offset, high = end;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (measure(value.slice(offset, middle)) <= limit) low = middle; else high = middle - 1;
+      }
+      end = low;
+    }
     if (end < value.length) {
       const code = codeRanges.find(range => range.start < end && range.end > end && range.start > offset);
       if (code) end = code.start;
@@ -83,6 +93,7 @@ export function plainChunks(source, limit = 2800, options) {
       }
       if (/^[\uDC00-\uDFFF]$/.test(value[end]) && /^[\uD800-\uDBFF]$/.test(value[end - 1])) end--;
     }
+    if (end <= offset) throw new RangeError('Chunk budget cannot fit one character');
     chunks.push(value.slice(offset, end)); offset = end;
   }
   return chunks;
