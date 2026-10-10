@@ -1848,3 +1848,22 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 开发：只给新的402失败明确账户额度提示，其他错误/重试预算/保留输入不变；沿原发送编号核对已经冻结的通知hash，旧通知和原未知发送不重写。不能核对的原记录保持DELIVERY_UNCERTAIN，不用新提示掩盖。
 - [x] 开发者模块验证：唯一4目标actuale36c2a退出0，4/4、0失败/跳过/取消，369.9242ms；另补原未知发送精确平台核对的唯一新增目标actuale4d748退出0，1/1、0失败/跳过/取消，269.1948ms。产品代码从首批起未改，旧已过目标不重复跑；最终准确测试字节由Required核验。真实SlackIO与替身平台发送、重复/重启零额外写、两种旧提示保留、已知unknown仅核对原消息、未知hash原样保留及现有失败流；不调用供应商或真实Slack，不冒称线上真人已验。
 - [ ] 独立Tester与准确Required/发布/真人验收；本轮不调用subagent，余额不可用仍是外部条件，不以提示修复称模型可用。
+
+## SLACK-THREAD-402-01 · 供应商明确失败不再永久占用旧线程（2026-10-10）
+
+- [x] 原因确认：两条既有 thread 输入在原文字轮次 HTTP 402 失败后收到 COORDINATOR_BUSY，最终八次重试耗尽；原会话均无 pending 响应、未消费输入或未处理停止。新模型设置不改变原失败轮的固定路由；原结清函数只允许合并格式 MODEL_INVALID_RESPONSE，因而后来新消息不能接续。运行数据、原消息与凭据不进入 Git。
+- [x] Executor 最小修复：沿原 submit 锁和失败结清函数，仅允许既有 Slack 402 失败在没有上述未决状态时由新用户消息接续；兼容没有 merged 元数据的旧线程。保留失败轮、原输入指纹、全部历史和已确认工具回执；新轮沿原选择器使用当前模型，不自动重跑旧轮，不重置 attention 或重试计数，不更改权限、停止或未知结果保护，不恢复暂停的 operator 恢复专项。
+- [x] 开发后唯一集中自检：基线 Main `789b1970399dc481e2e5c4deb687882e60d7a309` 加三文件工作树；Node22.18.0，6 个顶层目标、含子用例 16/16 通过，0 失败/跳过/取消，测试进程 1501.0518ms。命令：`node --test --test-reporter=spec --test-name-pattern "^(Slack 402|402 失败后的新|无控制头的失败|Human feedback can correct|Coordinator offers explicit retry)" tests/cloud-coordinator.test.mjs tests/slack-merged-participation.test.mjs`。真实隔离插件/HTTP/持久化，模型和 Slack IO 为替身；不是独立 Tester 或线上真人验收。
+- 准确受测 SHA256：`scripts/cloud/coordinator-service.mjs` 为 `95b67e99fdd470398140d69b06b104c540dd26cf88e8a3b0f403e649af5fb913`；`tests/cloud-coordinator.test.mjs` 为 `1a9cc2de857e6af18ce0f822f21fa0b4d48dd2cad57c39104d69968a7f3d882e`；`tests/slack-merged-participation.test.mjs` 为 `f83be1f96686a6226c6f340e6adcee0439573001717707a99aec7b497ebf27f7`。
+- [ ] Tester：核对最终准确修订后验证旧格式与合并输入、新轮使用当前模型、重启及同 ID 重放零额外调用、旧工具回执不重跑；pending 工具、未消费输入、停止、未知失败及非 Slack 来源仍拒绝。独立测试不得用开发者结果代替；不调用 subagent。
+- [ ] 交付与真实验收：尚未提交、合并或发布。发布后在原 thread 发送一条新的只读用户查询，确认新输入和回复在原绑定下闭合；保留旧失败和 attention，不重放其原任务，也不以健康检查或其他频道成功作为验收。
+
+## SLACK-THREAD-PROJECT-SWITCH-01 · 明确绑定请求可在原线程完成（2026-10-10）
+
+- [x] 用户截图 Bad Case：已能查询授权目录，但明确说“绑定到某项目”仍被引导宿主操作。源码根因是模型目录、执行校验和宿主路由同时只支持私聊，不是目标名称未识别。
+- [x] 最小扩展原交接：可信 Slack 用户在频道/群组可调用 switch_project；复用实时目标授权、人工独立对话、原消息指纹和动作回执，只持久保存当前用户在原 thread 的路由。核对频道成员，切换保存后短句确认；不新发频道根消息，不改频道关联、其他线程、其他用户或私聊偏好，不迁移仓库/Session/权限/旧历史。收集与处理共用路由，交接前已收集但未提交的新消息沿已验证结果接续；未知提交不重写。
+- [x] Executor 开发后集中自检：Node22.18.0，基线 Main `789b1970399dc481e2e5c4deb687882e60d7a309` 加当前工作树。首批 actual `bc969b` 28 项中 27 通过、1 失败，测试进程 7540.3883ms；失败为固定文案“总数直接使用工具 total”被精简两字，保持原测试与合同，恢复两字后只复验原失败目标 actual `5c6956`，1/1 通过、466.5724ms。两批均 0 跳过/取消，首次失败保留，不拼成一次 28/28。
+- 首批命令：`node --test --test-reporter=spec --test-name-pattern "^(自然切换|切换后旧线程|项目新线程|并发应用同一项目|切换请求已完成|切换应用前|自然项目切换拒绝|项目查询和切换|频道与群组自然绑定|频道 thread|真实 Cloud 项目工具|真实插件与 Cloud 在原频道|频道和私聊按当前用户|Slack 项目查询与切换|项目查询目录与执行层|缺少可信频道时)" plugins/slack/test/plugin.test.mjs tests/slack-cloud.test.mjs tests/cloud-coordinator.test.mjs tests/merged-participation-independent.test.mjs`；复验命令：`node --test --test-reporter=spec --test-name-pattern "^Slack 项目查询与切换能力分别开放，旧拒绝历史不妨碍当前目录查询$" tests/cloud-coordinator.test.mjs`。
+- 最终产品 SHA256：tools `885bed764f42c8088756114cc0d1d08b94c1e53441f6035dab9f92b367d181fd`；prefix `6afa1ac0da989b31650332daa98fa2f995c1cdd2b231b42c85e6a8a693a2b020`（首批后仅恢复两字）；plugin `1a9dd7292299e87eab960b510f9ce6080e2936fbd40a8a36dc77eba6309ac23a`；store `d47310e908d4287f876565db3d7c4fcd5af38ce13bd8bf69dd0872322ca9f386`。最终测试 SHA256：plugin test `d24bd948ebd0dabec83658af932b042b0b426c15360493963a3ccc9f42ebd951`；slack-cloud `d603190034fd762fbc8130c48fc04aab3ddb95523e8e5b9e07da96a759051b6f`；cloud-coordinator `2c96b63ccd3c877f370e8d54d883bdecbdf6656bfc042c77f75b1e7ced11883c`；independent `e94255027dc76ffe96494bd2b5a1ce1b121a0d3158e6641cc8840f534decff97`。前一项 402 修复保留，不用本批结果替换其原受测修订。
+- [ ] Tester：按最终准确提交独立验证原 thread 绑定、私聊兼容、用户/线程隔离、交接前后消息、重启/重复去重、成员退出、目标撤权和晚到旧路由拒绝；模型及平台 IO 替身不冒充自然语言意图或原生 Slack 验收。本轮不调用 subagent、不跑全量/付费模型。
+- [ ] 正常交付与上线后验收：当前未提交、合并或部署。真实已授权原线程中确认明确绑定请求和后续只读查询均闭合；同名/引用不误切换、不改变整个频道。保留已有消息、失败和回执，不用其他项目或频道的成功替代。

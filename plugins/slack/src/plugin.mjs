@@ -1,4 +1,4 @@
-import { digest, threadKey } from './store.mjs';
+import { digest, threadKey, routedThreadKey } from './store.mjs';
 import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
@@ -727,18 +727,7 @@ export class SlackPlugin {
     }
   }
   routedThreadKey(event) {
-    let key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
-    if (!event.channel?.startsWith('D')) return key;
-    const visited = new Set();
-    for (;;) {
-      if (visited.has(key)) throw Object.assign(new Error('项目切换路径出现循环'), { code: 'CONFLICT' });
-      visited.add(key);
-      const route = this.store.data.projectRoutes?.[digest([key, event.user])];
-      if (!route || Number(event.ts) <= Number(route.afterTs)) return key;
-      const target = this.store.data.threads[route.targetKey];
-      if (!target || target.channel !== event.channel || target.userId !== event.user) throw Object.assign(new Error('项目切换记录与私聊不一致'), { code: 'CONFLICT' });
-      key = route.targetKey;
-    }
+    return routedThreadKey(this.store.data, this.teamId, event);
   }
   async applyProjectSwitch(key, message, messages, snapshot) {
     const action = message.actions?.find(action => action.kind === 'project-switch');
@@ -748,7 +737,7 @@ export class SlackPlugin {
     const input = this.store.data.reactionInputs?.[action.requestId], original = input && this.store.data.inbox[input.inboxId];
     const event = original?.projectResume?.event || original?.envelope?.body?.event;
     const source = messages.find(item => item.role === 'user' && item.requestId === action.requestId);
-    if (!binding?.channel.startsWith('D') || actor?.channelId !== binding.channel || actor.kind !== 'human' || actor.integration !== 'slack' ||
+    if (!/^[DCG][A-Z0-9]{1,31}$/.test(binding?.channel || '') || actor?.channelId !== binding.channel || actor.kind !== 'human' || actor.integration !== 'slack' ||
         actor.teamId !== this.teamId || actor.sessionId !== `slack:${this.teamId}:${actor.userId}` ||
         message.source !== 'slack' || message.requestId !== action.requestId || message.actor?.sessionId !== actor.sessionId ||
         source?.source !== 'slack' || source.actor?.sessionId !== actor.sessionId || source.actor?.channelId !== binding.channel ||
@@ -760,39 +749,52 @@ export class SlackPlugin {
         action.status !== 'pending' || !action.actionId || !action.projectId || !action.conversationId) {
       return { status: 'rejected', error: 'UNVERIFIED_INPUT' };
     }
+    const direct = binding.channel.startsWith('D'), routeKey = digest([key, actor.userId]);
     const id = `project-switch-${digest([key, action.actionId])}`, fingerprint = digest(action);
     let record = this.store.data.projectSwitches?.[id];
     if (record && record.fingerprint !== fingerprint) throw Object.assign(new Error('项目切换回执内容改变'), { code: 'ID_REUSED' });
     if (!record) {
       await this.store.update(state => {
         state.projectSwitches ||= {};
-        state.projectSwitches[id] ||= { id, fingerprint, status: 'pending', expectedPreference: state.preferences[actor.userId], action };
+        state.projectSwitches[id] ||= { id, fingerprint, status: 'pending',
+          ...(direct ? { expectedPreference: state.preferences[actor.userId] } : { expectedRoute: digest(state.projectRoutes?.[routeKey] || null) }), action };
       });
       record = this.store.data.projectSwitches[id];
     }
     if (record.status !== 'pending') return record;
     try {
-      if (this.store.data.preferences[actor.userId] !== record.expectedPreference || record.expectedPreference !== binding.projectId) {
+      if (direct && (this.store.data.preferences[actor.userId] !== record.expectedPreference || record.expectedPreference !== binding.projectId)) {
         throw Object.assign(new Error('私聊已选择另一个项目'), { code: 'CONFLICT' });
+      }
+      if (!direct && (this.store.data.projectRoutes?.[routeKey] || record.expectedRoute !== digest(null))) {
+        throw Object.assign(new Error('本线程项目已切换'), { code: 'CONFLICT' });
       }
       const target = (await this.loadProjects(actor.userId, id)).find(project => project.id === action.projectId);
       if (!target) throw Object.assign(new Error('目标项目已不可用'), { code: 'NOT_FOUND' });
-      const info = await this.io.call('conversations.info', { channel: binding.channel });
-      if (info.channel?.user !== actor.userId) throw Object.assign(new Error('只能切换自己的私聊'), { code: 'FORBIDDEN' });
+      if (direct) {
+        const info = await this.io.call('conversations.info', { channel: binding.channel });
+        if (info.channel?.user !== actor.userId) throw Object.assign(new Error('只能切换自己的私聊'), { code: 'FORBIDDEN' });
+      } else if (!(await this.channelMembers(binding.channel)).includes(actor.userId)) {
+        throw Object.assign(new Error('只能切换自己所在频道的线程'), { code: 'FORBIDDEN' });
+      }
       const targetBinding = { channel: binding.channel, userId: actor.userId, projectId: target.id, conversationId: action.conversationId };
       await this.command('conversation.state', targetBinding, actor.userId, operationId(id, 'target-state'));
-      const root = await this.io.post({ id: operationId(id, 'root'), channel: binding.channel, text: `${target.name || '项目'} · 项目对话` });
-      const targetKey = threadKey(this.teamId, binding.channel, root);
+      const root = direct ? await this.io.post({ id: operationId(id, 'root'), channel: binding.channel, text: `${target.name || '项目'} · 项目对话` }) : binding.threadTs;
+      const targetKey = threadKey(this.teamId, binding.channel, direct ? root : `switch-${digest([key, action.actionId])}`);
       await this.store.update(state => {
         if (state.projectSwitches[id].status === 'applied') return;
-        if (state.preferences[actor.userId] !== record.expectedPreference) throw Object.assign(new Error('切换期间项目选择改变'), { code: 'CONFLICT' });
+        if (direct ? state.preferences[actor.userId] !== record.expectedPreference : digest(state.projectRoutes?.[routeKey] || null) !== record.expectedRoute) {
+          throw Object.assign(new Error('切换期间项目选择改变'), { code: 'CONFLICT' });
+        }
         state.threads[targetKey] ||= { ...targetBinding, threadTs: root, mirrored: {}, cursor: null, ownRequests: [], at: Date.now(),
           projectSwitch: id, ...(target.mapNodeId ? { mapNodeId: target.mapNodeId } : {}) };
         state.projectRoutes ||= {};
-        state.projectRoutes[digest([key, actor.userId])] = { targetKey, afterTs: input.timestamp, actionId: action.actionId };
-        state.preferences[actor.userId] = target.id;
-        state.directThreads ||= {};
-        state.directThreads[digest([this.teamId, binding.channel, actor.userId, target.id])] = targetKey;
+        state.projectRoutes[routeKey] = { targetKey, afterTs: input.timestamp, actionId: action.actionId };
+        if (direct) {
+          state.preferences[actor.userId] = target.id;
+          state.directThreads ||= {};
+          state.directThreads[digest([this.teamId, binding.channel, actor.userId, target.id])] = targetKey;
+        }
         Object.assign(state.projectSwitches[id], { status: 'applied', name: target.name, targetKey, root });
       });
       return this.store.data.projectSwitches[id];
@@ -818,7 +820,9 @@ export class SlackPlugin {
     if (existing) {
       if (!direct) {
         const project = (await this.loadProjects(event.user, id)).find(project => project.id === existing.projectId);
-        if (!project || project.private) throw Object.assign(new Error('此项目无法在该频道访问，请在私聊重新选择'), { code: 'FORBIDDEN' });
+        if (!project || project.private && !(existing.projectSwitch && existing.userId === event.user)) {
+          throw Object.assign(new Error('此项目无法在当前线程访问'), { code: 'FORBIDDEN' });
+        }
       }
       if (expectedProjectId && existing.projectId !== expectedProjectId) throw Object.assign(new Error('Thread project changed after the relevance decision'), { code: 'CONFLICT', silent: true });
       return [key, existing];
@@ -966,9 +970,9 @@ export class SlackPlugin {
     if (text.length > 8000 && !synthetic) throw Object.assign(new Error('每批消息正文最多 8000 字符'), { code: 'RELEVANCE_INPUT_LIMIT', silent: !direct && !explicit });
     const inputIds = events.map(item => events.length === 1 ? operationId(id, 'submit') : operationId(envelopeId('events_api', { team_id: this.teamId, event: item }), 'submit'));
     const batchInputs = events.map((item, index) => ({ id: inputIds[index], text: String(item.text || '') }));
-    if (!recovery && direct && !synthetic) {
+    if (!recovery && !synthetic) {
       const currentKey = event.thread_ts ? this.routedThreadKey(event) :
-        this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])];
+        direct ? this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])] : this.routedThreadKey(event);
       const observedSwitch = this.eventStreams.get(currentKey)?.latest?.messages?.some(message =>
         message.actions?.some(action => action.kind === 'project-switch'));
       const pendingSwitch = Object.values(this.store.data.projectSwitches || {}).some(record =>
@@ -983,6 +987,10 @@ export class SlackPlugin {
       const existing = this.store.data.threads[existingKey];
       const projectId = existing?.projectId || (direct ? this.store.data.preferences[event.user] : this.store.data.channels[event.channel]);
       if (!projectId) { if (direct || explicit) await this.chooseProject(id, event); return; }
+      // 收集后才完成的交接只重定向该原用户的新输入；不改已有业务回执。
+      const switched = existing?.projectSwitch && this.store.data.projectSwitches?.[existing.projectSwitch];
+      if (!direct && switched?.status === 'applied' && switched.action.actor.userId === event.user &&
+          expectedProjectId === switched.action.sourceProjectId) expectedProjectId = projectId;
       if (expectedProjectId && projectId !== expectedProjectId) throw Object.assign(new Error('Project changed after accepting this message batch'), { code: 'CONFLICT', silent: true });
       let participation = this.store.data.inbox[id]?.participation;
       const legacy = !participation && this.store.data.inbox[id]?.relevance;
@@ -1349,7 +1357,7 @@ export class SlackPlugin {
         const switched = await this.applyProjectSwitch(key, message, messages, state);
         if (switched) {
           if (switched.announced) continue;
-          const text = switched.status === 'applied' ? `已切换到 ${switched.name}。后续消息会使用该项目的独立上下文，原项目记录保留。` :
+          const text = switched.status === 'applied' ? binding.channel.startsWith('D') ? `已切换到 ${switched.name}。` : `已绑定到 ${switched.name}，后续在本线程继续。` :
             '项目没有切换：选择已改变、目标不可用或来源无法验证。请重新说要切换到哪个项目。';
           let resultSlot = switched.resultSlot;
           if (!resultSlot) {
