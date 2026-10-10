@@ -440,6 +440,7 @@ export class CursorRoleFactory {
     if (previous) {
       const run = await this.provider.getRun(actor.nativeAgentId, previous.runId);
       if (run.agentId !== actor.nativeAgentId || run.id !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'Preserve the previous saved native Run');
+      if (phase === 'plan' && scope.attempt && !['FINISHED', 'ERROR', 'EXPIRED'].includes(run.status)) fail('CURSOR_ROLE_CONFLICT', 'Do not resume a prepared Plan after cancellation or a changed native status');
       if (!cursorRunTerminal(run)) fail('CURSOR_ROLE_BUSY', 'Wait for the current native Run');
       if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'The native Agent was used outside the saved task');
       await this.channel.revoke(previous.token);
@@ -459,12 +460,23 @@ export class CursorRoleFactory {
       state.cursorRoleLaunches[hash(canonical([this.repositoryId, operationId]))] = { scopeHash: operationId, taskVersion: task.version,
         briefReview: task.briefReview, planReview: task.planReview || null, state: 'authorized' };
     });
-    // Final current-state check before a network side effect. A concurrent
-    // revocation AFTER this boundary invalidates all callbacks, not time travel.
-    await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
     invocation.state = 'dispatching'; await atomicWrite(file, encode(actor));
     const mcpServers = [{ name: 'context_guard', type: 'http', url: this.endpoint, headers: { Authorization: 'Bearer ' + lease.token } }];
     try {
+      // Save intent before the final authority read: disk persistence must not
+      // create an unchecked authorization window before the network side effect.
+      await this.store.transaction(async state => {
+        const current = await this.authorizeLaunch(state, actor, taskId, phase);
+        if (canonical(this.scope(actor, current, phase, scope.attempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Original task or source changed before native dispatch');
+      }, { readOnly: true });
+      // Read the current operation, not issue()'s earlier snapshot. Release the
+      // lease lock before POST, so native MCP discovery cannot deadlock on it.
+      // Check the clock again after lock cleanup, with no await before POST.
+      const expiresAt = await this.channel.withLease(lease.token, current => {
+        if (canonical(current.scope) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Dispatch only the exact original scoped operation');
+        return current.expiresAt;
+      }, { active: false });
+      if (this.channel.now() >= expiresAt) fail('ROLE_EXPIRED', 'Do not dispatch after the original operation expires');
       const run = previous ? await this.provider.followUp(actor.nativeAgentId, this.prompt(scope, actor), { mode: invocation.mode, mcpServers })
         : (await this.provider.create({ agentId: actor.nativeAgentId, repositoryUrl: this.repositoryUrl, startingRef: scope.sourceSha,
           name: phase === 'ci' ? 'Context Guard independent Tester' : 'Context Guard Executor', text: this.prompt(scope, actor), mode: invocation.mode, mcpServers,

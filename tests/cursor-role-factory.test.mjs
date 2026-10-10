@@ -271,6 +271,75 @@ test('Terminal Cursor Plan prepared lease expiry cannot start a native Run when 
   assert.deepEqual(JSON.parse(await fs.readFile(file, 'utf8')), lease, 'Expiry replay never renews the operation');
 });
 
+async function preparedPlanContinuation(t) {
+  const f = await fixture(t), reserved = await f.assign(await f.reserve());
+  let now = 1700000000000; f.factory.channel.now = () => now;
+  const original = await f.factory.pump(reserved.session, 'task');
+  f.factory.authorizeSource = async ({ actor }) => !(actor.invocations.at(-1)?.scope.attempt === 1 && actor.invocations.at(-1)?.state === 'prepared');
+  await assert.rejects(f.factory.pump(reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8'));
+  const prepared = actor.invocations.at(-1);
+  assert.equal(prepared.scope.attempt, 1); assert.equal(prepared.state, 'prepared'); assert.equal(f.calls.length, 1);
+  return { ...f, reserved, original, prepared, setClock: value => { now = value; } };
+}
+
+test('Terminal Cursor Plan prepared continuation retains cancellation without any follow-up POST', async t => {
+  const f = await preparedPlanContinuation(t);
+  f.runs.get(f.original.scope.nativeAgentId).status = 'CANCELLED'; f.factory.authorizeSource = async () => true;
+  await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  assert.deepEqual(f.calls.map(call => call.method), ['create']);
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.length, 2); assert.deepEqual(actor.invocations.at(-1), f.prepared);
+  assert.equal((await f.store.taskRecord(f.coordinator, f.reserved.session, 'task')).stage, 'assigned');
+});
+
+test('Terminal Cursor Plan prepared continuation checks current lease after final authority await', async t => {
+  for (const scenario of ['expired', 'revoked']) await t.test(scenario, async child => {
+    const f = await preparedPlanContinuation(child);
+    const file = path.join(f.directory, 'roles', 'capabilities', 'operations', hash(f.prepared.id) + '.json');
+    const lease = JSON.parse(await fs.readFile(file, 'utf8')); let checks = 0;
+    f.factory.authorizeSource = async ({ actor }) => {
+      // The second authority await follows issue() and its initial lease check.
+      if (actor.invocations.at(-1)?.scope.attempt === 1 && ++checks === 2) {
+        if (scenario === 'expired') f.setClock(lease.expiresAt + 1);
+        else await f.factory.channel.revoke(f.prepared.token);
+      }
+      return true;
+    };
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'ROLE_EXPIRED' });
+    assert.deepEqual(f.calls.map(call => call.method), ['create'], 'No POST may precede the expiry/revocation failure');
+    const retained = JSON.parse(await fs.readFile(file, 'utf8'));
+    assert.equal(retained.expiresAt, lease.expiresAt); assert.equal(retained.token, lease.token);
+    assert.equal(retained.state, 'revoked');
+    const actor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+    assert.equal(actor.invocations.length, 2); assert.equal(actor.invocations.at(-1).state, 'failed');
+    assert.equal(actor.invocations.at(-1).runId, undefined);
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_FAILED' });
+    assert.equal(f.calls.length, 1);
+  });
+});
+
+test('Terminal Cursor Plan lease cannot expire during final lock cleanup before POST', async t => {
+  const f = await preparedPlanContinuation(t); f.factory.authorizeSource = async () => true;
+  const withLease = f.factory.channel.withLease.bind(f.factory.channel);
+  f.factory.channel.withLease = async (...args) => {
+    const expiresAt = await withLease(...args); f.setClock(expiresAt + 1); return expiresAt;
+  };
+  await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'ROLE_EXPIRED' });
+  assert.deepEqual(f.calls.map(call => call.method), ['create']);
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.at(-1).state, 'failed'); assert.equal(actor.invocations.at(-1).runId, undefined);
+});
+
+test('Terminal Cursor Plan rechecks source authority after dispatch intent is saved', async t => {
+  const f = await preparedPlanContinuation(t);
+  f.factory.authorizeSource = async ({ actor }) => actor.invocations.at(-1)?.state !== 'dispatching';
+  await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+  assert.deepEqual(f.calls.map(call => call.method), ['create']);
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+  assert.equal(actor.invocations.at(-1).state, 'failed'); assert.equal(actor.invocations.at(-1).runId, undefined);
+});
+
 test('Hosted Cursor denies a reservation without the exact approved project task and preserves unrelated bindings', async t => {
   const f = await fixture(t), request = await f.reserve(false);
   const before = await f.store.transaction(value => value, { readOnly: true });

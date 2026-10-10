@@ -2016,3 +2016,6 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 最终增加观察竞态、撤权和过期 prepared 目标，完整 factory/channel/HTTP 113/113，exit0，50848.463709ms，无失败/取消/跳过。正式真实 HTTP、ProtocolStore 和能力存储，厂商/Git/批准为控制边界；Node24.18.0，基于 Main `337bb349a6aaf4430539d276bc1c7aa38ef84486`、固定 Core2.4.2/UI1.5.2 的当前修订工作树。
 - [ ] 准确新修订完整测试、独立 Tester、安全/Required、正常合并及 Main 门禁；生产保留正在使用的 native-json 实验制品，必须独立测试兼容组合，不把正式新包结果套给旧实验。
 - [ ] 在原生原任务/原 Agent 观察一次真实后续 Run、合法 Plan、原 Coordinator 审核、任务产物和独立 Tester；本地两路径和总体三路径业务闭环仍未验收。不得以模拟回归或单一连接状态提前标记完成。
+- [x] 首版准确 `69d3393` 全量 exit0，946 项中 944 通过、2 既有跳过，205852.34925ms；独立审核仍发现 prepared 接续可绕过原生取消，以及授权等待中租期到期后仍 POST 两项 P1。保持 PR74 Draft，未合并或部署，旧全绿不覆盖新反例。
+- [x] 两项独立反例转为正式目标并增加原凭据撤销：首版新增目标 0/4、exit1，1092.082916ms；补修后同目标 4/4、exit0，1130.193042ms。prepared 接续重新核验 FINISHED/ERROR/EXPIRED 白名单；先持久保存发送意图，再复核原任务和当前 operation 租期/撤权，释放能力锁后在 POST 前再次同步查时钟。避免持锁发送阻塞原生 MCP 发现，不续租、复制批准或丢弃原失败记录。
+- [x] 补充能力锁清理期间到期、发送意图保存后撤权；最终 factory/channel/HTTP 119/119、exit0，52324.03925ms。原独立两项精准探针原样复验 2/2、exit0，642.157542ms。实际 Core/任务/磁盘/HTTP，厂商与审批为受控替身；不是原生 Cursor 完成任务，新的全量、独立 Tester 和准确 Required 仍须匹配最终修订。
