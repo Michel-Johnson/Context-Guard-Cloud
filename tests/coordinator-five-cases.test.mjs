@@ -73,11 +73,20 @@ test('两次相同展示回执保留，公开卡片只有一张；新轮允许�
     : call('show_nodes', { message: '原事项已读。', nodeIds: ['TESTS'] }, 'show-' + rounds),
   async (name, input) => { executions++; return { kind: 'node-references', message: input.message, nodes: [{ id: 'TESTS', title: '测试' }] }; });
   let state = await run(service);
-  assert.equal(executions, 1); assert.equal(state.messages.flatMap(message => message.actions || []).length, 1);
+  assert.equal(executions, 2); assert.equal(state.messages.flatMap(message => message.actions || []).length, 1);
   const stored = await service.readConversation();
-  assert.equal(Object.keys(stored.toolReceipts).length, 2); assert.ok(Object.values(stored.toolReceipts).some(receipt => receipt.replayedFrom));
+  assert.equal(Object.keys(stored.toolReceipts).length, 2); assert.ok(Object.values(stored.toolReceipts).every(receipt => !receipt.replayedFrom));
   state = await run(service, 'second');
-  assert.equal(executions, 2); assert.equal(state.messages.flatMap(message => message.actions || []).length, 2);
+  assert.equal(executions, 4); assert.equal(state.messages.flatMap(message => message.actions || []).length, 2);
+});
+test('同轮节点资料改变时重新授权读取并显示新名称，不复用旧展示资料', async t => {
+  let rounds = 0, reads = 0;
+  const service = await fixture(t, async () => ++rounds === 3 ? reply('已核对最新资料。')
+    : call('show_nodes', { message: '节点资料。', nodeIds: ['TESTS'] }, 'show-' + rounds),
+  async () => ({ kind: 'node-references', message: '节点资料。', nodes: [{ id: 'TESTS', title: ++reads === 1 ? '旧名称' : '新名称' }] }));
+  const state = await run(service);
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(reads, 2);
+  assert.deepEqual(state.messages.flatMap(message => message.actions || []).map(action => action.nodes[0].title), ['旧名称', '新名称']);
 });
 test('一次问题只能在问答入口出现，正文重复问句纠正后不重复业务写入', async t => {
   let rounds = 0, asked = 0;
