@@ -233,7 +233,7 @@ export class CoordinatorConversations {
       const state = await this.state();
       const item = state.chats?.[id];
       if (!item) throw error('NOT_FOUND', 'Only an independent chat can bind a plugin');
-      if (item.cursorExecution) throw error('FORBIDDEN', 'An explicit Cursor grant cannot be removed by plugin binding');
+      if (item.cursorExecution || item.zcodeExecution) throw error('FORBIDDEN', 'An explicit execution grant cannot be removed by plugin binding');
       item.executionMode = executionMode;
       await atomicWrite(this.file, encode(state));
     });
@@ -248,11 +248,27 @@ export class CoordinatorConversations {
         if (item.cursorExecution.fingerprint !== fingerprint) throw error('ID_REUSED', 'Cursor enable request changed');
         return { conversationId: id, executionMode: 'automatic' };
       }
-      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution) throw error('CONFLICT', 'Conversation execution mode changed');
+      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution || item.zcodeExecution) throw error('CONFLICT', 'Conversation execution mode changed');
       item.executionMode = 'automatic';
       item.cursorExecution = { ...structuredClone(grant), operationId, fingerprint, enabledAt: new Date().toISOString() };
       await atomicWrite(this.file, encode(state));
       return { conversationId: id, executionMode: 'automatic' };
+    });
+  }
+  async enableZCode(id, { operationId, expectedMode, grant }) {
+    return withFileLock(this.file + '.lock', async () => {
+      const state = await this.state(), item = state.chats?.[id];
+      if (!item) throw error('FORBIDDEN', 'Enable ZCode only in the original registered chat');
+      const fingerprint = hash(encode({ expectedMode, grant }));
+      if (item.zcodeExecution?.operationId === operationId) {
+        if (item.zcodeExecution.fingerprint !== fingerprint) throw error('ID_REUSED', 'ZCode enable request changed');
+        return { conversationId: id, executionMode: 'automatic', executionProvider: 'zcode' };
+      }
+      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution || item.zcodeExecution) throw error('CONFLICT', 'Conversation execution mode changed');
+      item.executionMode = 'automatic';
+      item.zcodeExecution = { ...structuredClone(grant), operationId, fingerprint, enabledAt: new Date().toISOString() };
+      await atomicWrite(this.file, encode(state));
+      return { conversationId: id, executionMode: 'automatic', executionProvider: 'zcode' };
     });
   }
   async setFocus(id, { nodeId, kind, itemId, title, expectedFocus, bindingApproval }) {

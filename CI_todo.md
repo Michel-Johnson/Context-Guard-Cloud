@@ -1,5 +1,10 @@
 # Cloud 验证台账
 
+## ZCODE-CLOUD-20261011 · Coordinator 派发本地 ZCode
+
+- [ ] 独立 Tester 在隔离项目用真实 Slack/浏览器、真实本地设备验收：仅授权人能启用已注册 ZCode 模板；启用不派任务，brief 获人确认后才固定模板派发；Plan 审核、回执、独立 Tester 与原线程闭环。
+- [ ] 同一编号重放只交付一次；撤权、模板代次/工作树不匹配、设备离线和 Cloud 重启时保留队列且不越权；核精确发布版本与固定 Workbench 1.5.3 包，不能以受控网关/模型替身代替真实链路。
+
 ## CURSOR-CI-SOURCE-AVAILABILITY-01 · 原准确 SHA 的厂商创建前提
 
 - 原恢复上线后实际收到 HTTP400/validation_error，无 Run；请求形状、约3KiB提示和原提交一致。Cursor 技术支持对同类拒绝说明：未在默认分支或同仓库 PR 的提交 SHA 会被拒绝，公开 schema 未列此限制。目标提交确实不在默认 main 且没有关联 PR；已正常建立同仓库草稿 PR，源码不变、不合并。此线索仍需真实原生恢复成功验证，不将推断记作已解决。
