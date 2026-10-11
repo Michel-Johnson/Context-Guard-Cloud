@@ -1775,7 +1775,10 @@ export async function startCloudServer({
           const binding = await store.registeredBinding(human, task.sessionId);
           if (binding?.deviceId === 'cloud-cursor:' + project.id) hosted = await cursorRolesFor(project);
           const current = binding && await store.taskRecord(human, { id: task.sessionId, generation: binding.generation }, task.taskId);
-          if (hosted && current && await hosted.owns(task.sessionId)) await hosted.pump(current.session, current.id);
+          if (hosted && current && await hosted.owns(task.sessionId)) {
+            const progress = await hosted.pump(current.session, current.id);
+            await hosted.clearRecoveredError(principal, task, progress);
+          }
           if (current && !current.busy && ['accepted', 'closed', 'finished', 'cancelled'].includes(current.stage)) await store.updateProjectTask(principal, task.taskId, { stage: 'completed' });
           continue;
         }

@@ -7,7 +7,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/server.mjs';
-import { cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
+import { CursorRoleFactory, cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
 import { CursorGitProof } from '../scripts/cloud/cursor-git-proof.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { canonical } from '../scripts/shared/protocol.mjs';
@@ -196,10 +196,51 @@ async function fixture(t, { enabled = true, mismatchedRepository = false, mixed 
       body: JSON.stringify({ id, teamId: 'TTEST', userId, ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
     return { status: response.status, body: await response.json() };
   };
-  return { directory, store, human, nativeCalls, gitCalls, commands, config, integrationConfig, gateway, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
+  return { directory, store, human, nativeCalls, gitCalls, provider, runs, commands, config, integrationConfig, gateway, endpoint, request, post, poll, prepare, approve, mcp, openMcp, call, context, memoryFile,
     releaseModel, modelEntered: () => enteredModel,
     url: cloud.url, integrationUrl: cloud.integrationUrl };
 }
+
+test('Real hosted scheduler retires a recovered source error but preserves its original Task and native Run', async t => {
+  const retirements = [], realClear = CursorRoleFactory.prototype.clearRecoveredError;
+  // Observe, never replace, the actual scheduler/transaction result.
+  t.mock.method(CursorRoleFactory.prototype, 'clearRecoveredError', async function(principal, observed, progress) {
+    const cleared = await realClear.call(this, principal, observed, progress);
+    retirements.push({ cleared, role: principal.role, repositoryMatches: principal.repositoryId === this.repositoryId,
+      oldError: observed.error, progressState: progress?.state, nativeState: progress?.nativeState });
+    return cleared;
+  });
+  const f = await fixture(t), proposal = await f.prepare();
+  await f.approve(proposal);
+  await f.poll(() => f.nativeCalls.length > 0);
+  const nativeAgentId = f.nativeCalls[0].input.agentId;
+  f.runs.get(nativeAgentId).status = 'RUNNING';
+  const authorization = f.nativeCalls[0].input.mcpServers[0].headers.Authorization;
+  await f.openMcp(authorization);
+  const ready = await f.context(authorization);
+  assert.equal(ready.taskId, taskId); assert.equal(ready.phase, 'plan');
+  const project = (await f.store.projectTasks(f.human))[0];
+  const bound = await f.store.registeredBinding(f.human, project.sessionId);
+  const session = { id: project.sessionId, generation: bound.generation };
+  const taskBefore = await f.store.taskRecord(f.human, session, taskId);
+  // Capture the confirmed delegation, not the provider call's early intent.
+  // Mutation during dispatch correctly invalidates the native receipt; that
+  // requires explicit recovery rather than clearing a stale error.
+  const original = await fs.readFile(f.memoryFile, 'utf8');
+  const memory = JSON.parse(original); memory.main.version = 'unverified-main';
+  await fs.writeFile(f.memoryFile, JSON.stringify(memory));
+  await f.poll(async () => (await f.store.projectTasks(f.human))[0].error === 'CURSOR_ROLE_CONFLICT');
+  assert.equal(f.nativeCalls.length, 1, 'source failure must not repeat native execution');
+  await fs.writeFile(f.memoryFile, original);
+  try { await f.poll(async () => (await f.store.projectTasks(f.human))[0].error === null); }
+  catch { assert.fail(JSON.stringify({ message: 'Original scheduler error did not retire', retirements,
+    lastError: (await f.store.projectTasks(f.human))[0].error, nativeCalls: f.nativeCalls.length,
+    sourceStillSaved: (await fs.readFile(f.memoryFile, 'utf8')) === original })); }
+  const recovered = (await f.store.projectTasks(f.human))[0];
+  assert.equal(recovered.sessionId, project.sessionId); assert.equal(recovered.stage, 'dispatched');
+  assert.deepEqual(await f.store.taskRecord(f.human, session, taskId), taskBefore);
+  assert.equal(f.nativeCalls.length, 1, 'metadata recovery never starts a new Run');
+});
 
 test('Private registered Cursor project stays hidden from other workspace users before and after enable', async t => {
   const f = await fixture(t, { slack: true, privateProject: true });

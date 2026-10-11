@@ -738,6 +738,59 @@ test('Rework does not resend uncertain native acceptance or dispatch after acces
     }
   });
 });
+
+test('Successful original Cursor pump clears only its observed scheduling error without changing task approval or native calls', async t => {
+  const f = await fixture(t, { runStatus: 'RUNNING' }), reserved = await f.assign(await f.reserve());
+  await f.store.updateProjectTask(f.coordinator, 'task', { error: 'CURSOR_ROLE_CONFLICT' });
+  const observed = (await f.store.projectTasks(f.coordinator))[0];
+  const progress = await f.factory.pump(reserved.session, 'task');
+  const before = await f.store.taskRecord(f.coordinator, reserved.session, 'task');
+  const actor = JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8'));
+  assert.equal(await f.factory.clearRecoveredError(f.coordinator, observed, progress), true);
+  assert.equal((await f.store.projectTasks(f.coordinator))[0].error, null);
+  assert.deepEqual(await f.store.taskRecord(f.coordinator, reserved.session, 'task'), before);
+  assert.deepEqual(JSON.parse(await fs.readFile(f.factory.executorFile(reserved.session.id), 'utf8')), actor);
+  assert.equal(await f.factory.clearRecoveredError(f.coordinator, observed, progress), false);
+  assert.equal(f.calls.length, 1, 'clearing metadata never calls or retries the vendor');
+});
+
+test('Recovered scheduling error clearing retains newer errors, revoked authority and uncertain native outcomes', async t => {
+  for (const scenario of ['new-error', 'new-observation', 'revoked', 'unknown', 'stopping', 'invalidated', 'unapproved-principal']) await t.test(scenario, async t => {
+    const f = await fixture(t, { runStatus: 'RUNNING' }), reserved = await f.assign(await f.reserve());
+    await f.store.updateProjectTask(f.coordinator, 'task', { error: 'CURSOR_ROLE_CONFLICT' });
+    const observed = (await f.store.projectTasks(f.coordinator))[0];
+    let progress = await f.factory.pump(reserved.session, 'task'), principal = f.coordinator;
+    if (scenario === 'new-error') await f.store.updateProjectTask(f.coordinator, 'task', { error: 'CURSOR_ACCEPTANCE_UNKNOWN' });
+    if (scenario === 'new-observation') observed.updatedAt = '1970-01-01T00:00:00.000Z';
+    if (scenario === 'revoked') f.setAllowed(false);
+    if (['unknown', 'stopping', 'invalidated'].includes(scenario)) progress = { state: scenario };
+    if (scenario === 'unapproved-principal') principal = f.human;
+    const before = (await f.store.projectTasks(f.coordinator))[0];
+    assert.equal(await f.factory.clearRecoveredError(principal, observed, progress), false);
+    assert.deepEqual((await f.store.projectTasks(f.coordinator))[0], before);
+    assert.equal(f.calls.length, 1);
+  });
+});
+
+test('Verified CI receipt clears stale transport error while a truthful failed verdict stays failed', async t => {
+  for (const failed of [false, true]) await t.test(failed ? 'failed verdict retained' : 'passed still waits for human', async t => {
+    const f = await ciFixture(t, { nativeFailed: failed, machineFailed: failed });
+    const p = await ciProposal(f, failed ? { verdict: 'failed', status: 'failed', reproduction: true } : {});
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    await f.store.updateProjectTask(f.coordinator, 'task', { error: 'CURSOR_ROLE_CONFLICT' });
+    const observed = (await f.store.projectTasks(f.coordinator))[0];
+    const progress = await f.factory.pump(f.reserved.session, 'task');
+    assert.deepEqual(progress, { state: 'ci-accepted' });
+    const before = await f.store.taskRecord(f.coordinator, f.reserved.session, 'task');
+    assert.equal(await f.factory.clearRecoveredError(f.coordinator, observed, progress), true);
+    assert.equal((await f.store.projectTasks(f.coordinator))[0].error, null);
+    assert.equal(before.stage, failed ? 'ci-failed' : 'awaiting-merge');
+    assert.equal(before.ci.verdict, failed ? 'failed' : 'passed');
+    assert.equal(before.acceptanceReview, undefined);
+    assert.deepEqual(await f.store.taskRecord(f.coordinator, f.reserved.session, 'task'), before);
+    assert.equal(f.calls.length, 3);
+  });
+});
 test('A verified CI contradiction can request one original Tester correction without rewriting its proposal or accepting its verdict', async t => {
   const f = await ciFixture(t, { aggregateFailed: true }), p = await ciProposal(f);
   await f.factory.channel.exchange(p.invocation.token, p.input);

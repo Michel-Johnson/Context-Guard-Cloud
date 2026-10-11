@@ -635,6 +635,7 @@ export class CursorRoleFactory {
       }
       task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
       if (task.stage === 'testing') return result;
+      if (['ci-failed', 'awaiting-merge', 'acceptance-rejected', 'accepted', 'closed'].includes(task.stage)) return { state: 'ci-accepted' };
     }
     if (task.stage === 'awaiting-ci') return this.reserveCi(session, taskId);
     const phase = ['assigned', 'plan-rejected', 'rework'].includes(task.stage) ? 'plan' : task.stage === 'executing' ? 'execution' : task.stage === 'testing' ? 'ci' : null;
@@ -645,6 +646,24 @@ export class CursorRoleFactory {
       const actor = await readJSON(file, null);
       if (!actor) fail('CURSOR_ROLE_CONFLICT', 'Reserve the independent receiver before CI dispatch');
       return this.launch(file, actor, taskId, phase);
+    });
+  }
+
+  // The successful pump is not a verdict or human acceptance. Retire only its
+  // previously observed scheduling error, atomically, without hiding a newer
+  // error or an uncertain native stop/dispatch.
+  async clearRecoveredError(principal, observed, progress) {
+    if (principal?.role !== 'coordinator' || principal.repositoryId !== this.repositoryId || !observed?.error ||
+        !progress || !['confirmed', 'proof-pending', 'ci-accepted', 'handoff-accepted'].includes(progress.state) && progress.nativeState !== 'reserved') return false;
+    const actor = await readJSON(this.executorFile(observed.sessionId), null);
+    if (!actor) return false;
+    return this.store.transaction(async state => {
+      const current = Object.values(state.projectTasks || {}).find(item => item.repositoryId === this.repositoryId && item.taskId === observed.taskId);
+      if (!current || current.stage !== 'dispatched' || current.sessionId !== observed.sessionId ||
+          current.error !== observed.error || current.updatedAt !== observed.updatedAt) return false;
+      const task = this.currentTask(state, actor, observed.taskId);
+      if (!await this.authorizeSource({ state, actor: structuredClone(actor), task: structuredClone(task) })) return false;
+      current.error = null; current.updatedAt = new Date().toISOString(); return true;
     });
   }
 
