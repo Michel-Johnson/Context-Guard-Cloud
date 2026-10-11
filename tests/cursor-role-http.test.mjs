@@ -10,6 +10,7 @@ import { startCloudServer, createWorkbenchPasswordHash } from '../scripts/cloud/
 import { cursorTemplateWorktree } from '../scripts/cloud/cursor-role-factory.mjs';
 import { CursorGitProof } from '../scripts/cloud/cursor-git-proof.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
+import { canonical } from '../scripts/shared/protocol.mjs';
 import { INTEGRATION_COMMANDS } from '../scripts/cloud/integration-gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store, threadKey } from '../plugins/slack/src/store.mjs';
@@ -565,6 +566,54 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   const legacy = await f.request('/api/workbench/projects/context-guard/api/cursor-chat');
   assert.equal(legacy.body.sessions.length, 0, 'Role execution never creates a standalone Cursor chat');
 });
+
+for (const scenario of ['unrelated work item', 'changed requirement', 'missing Main history', 'current permission revoked', 'template binding revoked']) {
+  test('Original Cursor Task scope: ' + scenario, async t => {
+    const f = await fixture(t), proposal = await f.prepare();
+    await f.approve(proposal);
+    await f.poll(state => state.projectTasks?.some(task => task.stage === 'dispatched') && f.nativeCalls.length === 1);
+    const authorization = f.nativeCalls[0].input.mcpServers[0].headers.Authorization;
+    await f.openMcp(authorization);
+    const context = await f.context(authorization);
+    const before = await f.store.taskRecord(f.human, context.session, taskId);
+    const memory = JSON.parse(await fs.readFile(f.memoryFile, 'utf8'));
+    if (scenario === 'current permission revoked') {
+      // Keep the same version: current ACL checks must still apply even when
+      // the immutable-context comparison takes its unchanged-version path.
+      memory.main.memory.map.root.access = [{ agentId: context.session.id, allow: 'none' }];
+    } else if (scenario === 'template binding revoked') {
+      await f.store.transaction(state => {
+        const binding = Object.values(state.bindings).find(value => value.agentId === templateId);
+        binding.worktreeId = 'revoked-template-tree';
+      });
+    } else {
+      memory.history.push({ scope: 'main', snapshot: structuredClone(memory.main) });
+      memory.main.version = 'main-2'; memory.revision += 1;
+      if (scenario === 'unrelated work item') memory.main.memory.map.root.todos = [
+        { id: 'other-task', title: 'Different Session work', sessions: ['other-executor'] },
+      ];
+      if (scenario === 'changed requirement') memory.main.memory.map.root.purpose = 'Changed approved requirement';
+      if (scenario === 'missing Main history') memory.history = [];
+    }
+    await fs.writeFile(f.memoryFile, JSON.stringify(memory));
+    const response = await f.call(authorization, 'context_guard_context', {});
+    if (scenario === 'unrelated work item') {
+      assert.equal(response.isError, undefined, JSON.stringify(response));
+      assert.deepEqual(response.structuredContent.session, context.session);
+      assert.equal(response.structuredContent.taskId, taskId);
+    } else {
+      assert.equal(response.isError, true, JSON.stringify(response));
+      assert.equal(JSON.parse(response.content[0].text).error.code, 'ROLE_UNAVAILABLE');
+      assert.deepEqual(response.structuredContent, JSON.parse(response.content[0].text), 'MCP returns only the standard safe error, not Task data');
+      assert.deepEqual(Object.keys(response.structuredContent), ['error']);
+    }
+    const after = await f.store.taskRecord(f.human, context.session, taskId);
+    for (const field of ['assignment', 'brief', 'briefReview', 'session', 'id', 'sourceSha']) {
+      assert.equal(canonical(after[field]), canonical(before[field]), field + ' must not be rewritten');
+    }
+    assert.equal(f.nativeCalls.length, 1, 'Scope verification does not create or continue another native Run');
+  });
+}
 
 test('Hosted MCP cannot initialize a template through browser, unknown credential or disabled Coordinator requests', async t => {
   const f = await fixture(t, { enabled: false });
