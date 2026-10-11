@@ -14,6 +14,8 @@ const sha = /^[a-f0-9]{40}$/;
 const fail = (code, message) => { throw Object.assign(new Error(message), { code, status: code === 'INVALID_CURSOR_ROLES' ? 400 : code === 'CURSOR_ROLE_CONFLICT' ? 409 : 503 }); };
 const bindingKey = (repositoryId, id) => hash(canonical([repositoryId, id]));
 const taskKey = (repositoryId, session, id) => scopedObjectKey({ repositoryId }, session, 'task:' + id);
+// Private verifier signal, not a model-selected recovery request or public error payload.
+const ciResultMismatch = Symbol('verified-ci-result-mismatch');
 export const cursorTemplateWorktree = id => `cursor-cloud-template:${id}`;
 
 // A hosted receiver for the existing Coordinator scheduler. Reservations are
@@ -176,13 +178,14 @@ export class CursorRoleFactory {
     try { this.requireActor(state, executor); this.requireActor(state, actor); return true; } catch { return false; }
   }
 
-  scope(actor, task, phase, attempt = 0, createAttempt = 0) {
+  scope(actor, task, phase, attempt = 0, createAttempt = 0, ciAttempt = 0) {
     const session = actor.kind === 'ci' ? actor.executorSession : actor.session;
     return { projectId: this.projectId, repositoryId: this.repositoryId, ownerId: this.ownerId, session, actor: actor.session,
       worktreeId: actor.kind === 'ci' ? actor.executorWorktreeId : actor.worktreeId, actorWorktreeId: actor.worktreeId,
       nativeAgentId: actor.nativeAgentId, taskId: task.id, phase,
       ...(attempt ? { attempt } : {}),
       ...(createAttempt ? { createAttempt } : {}),
+      ...(ciAttempt ? { ciAttempt } : {}),
       ...(this.ciPolicyHash ? { ciPolicyHash: this.ciPolicyHash } : {}),
       sourceSha: phase === 'plan' ? actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
   }
@@ -199,7 +202,9 @@ export class CursorRoleFactory {
     if (scope.phase === 'plan') return common +
       (scope.attempt ? ` The previous saved Run terminated without submitting the original Task Plan. This is continuation ${scope.attempt} on the SAME Agent and Task, not a new task or an approval. Read current context and tools/list again; use the NEW returned writePrefix and never reuse an old draft ref or capability.` : '') +
       ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance. First object.put requires payload {kind:"plan",ref:<writePrefix plus suffix>,baseVersion:"",content:<Plan object>}; do not omit baseVersion or send null. Use the exact returned ref/version in task.report payload {taskId:<original task>,stage:"planReady",data:{planRef:<ref>,planVersion:<version>,sourceSha:<specified source SHA>}}. Stop after that; Coordinator must review the exact Plan before implementation.';
-    if (scope.phase === 'ci') return common + ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A proof-pending response saves only that original CI proposal: end this Run for host verification, never replace the ID or claim acceptance. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.' +
+    if (scope.phase === 'ci') return common +
+      (scope.ciAttempt ? ' CI result correction: the original saved proposal contradicted verified native execution or trusted workflow facts. Continue the SAME Agent, Task and source; this is not approval or a new task. Preserve old evidence and use the NEW writePrefix and new stable message IDs. Read each current testPolicy machineStatus; a passing native command does not override a failed workflow. For every failed check, write own reproduction evidence describing the actual native result and the trusted machineStatus. Submit only your own truthful result, never infer user acceptance.' : '') +
+      ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A proof-pending response saves only that original CI proposal: end this Run for host verification, never replace the ID or claim acceptance. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.' +
       (this.ciPolicy ? ' Execute each exact host command once with run_terminal_cmd (not backgrounded), keeping its nonce and actual result. Never alter business source or command argv. Preserve failed reproduction evidence and use the fixed todoId/testId mapping. Commands: ' + JSON.stringify(actor.commands.map(({ todoId, testId, command }) => ({ todoId, testId, command }))) : '');
     return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit and push only your own Cursor branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. A proof-pending response saves only that original proposal: stop this Run so the host can verify it, do not send a replacement ID or claim completion. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
   }
@@ -298,7 +303,12 @@ export class CursorRoleFactory {
       return { ...proposal, status };
     });
     const verdict = expected.some(check => check.status === 'incomplete') ? 'incomplete' : expected.some(check => check.status === 'failed') ? 'failed' : 'passed';
-    if (canonical(expected) !== canonical(snapshot.input.payload.checks) || snapshot.input.payload.verdict !== verdict) fail('SOURCE_UNVERIFIED', 'The CI proposal contradicts actual execution or declared workflow coverage');
+    if (canonical(expected) !== canonical(snapshot.input.payload.checks) || snapshot.input.payload.verdict !== verdict) {
+      const cause = Object.assign(new Error('The CI proposal contradicts actual execution or declared workflow coverage'), { code: 'SOURCE_UNVERIFIED' });
+      Object.defineProperty(cause, ciResultMismatch, { value: { invocationId: invocation.id, runId: invocation.runId,
+        fingerprint: pending.fingerprint, facts } });
+      throw cause;
+    }
     const completed = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
     if (completed.agentId !== actor.nativeAgentId || completed.id !== invocation.runId || completed.status !== 'FINISHED' ||
         (await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== invocation.runId) fail('SOURCE_UNVERIFIED', 'The native CI identity changed during verification');
@@ -324,6 +334,49 @@ export class CursorRoleFactory {
   handoffIdentity(snapshot) {
     const { verified, ...identity } = snapshot;
     return hash(canonical(identity));
+  }
+
+  // Explicit host recovery for a proven contradiction. This is not an MCP tool:
+  // a model cannot request new credentials, create attempts or replace its result.
+  // Unknown delivery is still GET-only, and a correction is bounded to one Run.
+  async continueCiResult(session, taskId, expectedRunId) {
+    if (!this.ciPolicy || typeof expectedRunId !== 'string' || !expectedRunId || expectedRunId.length > 200 || /[\x00-\x1f]/.test(expectedRunId))
+      fail('CURSOR_ROLE_CONFLICT', 'Use the exact saved CI Run and trusted policy');
+    const executor = await readJSON(this.executorFile(session.id), null);
+    if (!executor || canonical(executor.session) !== canonical(session)) fail('CURSOR_ROLE_CONFLICT', 'Use the original Executor binding');
+    const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
+    const file = this.ciFile(session, taskId, task.sourceSha), actor = await readJSON(file, null), original = actor?.invocations.at(-1);
+    if (!actor || actor.kind !== 'ci') fail('CURSOR_ROLE_CONFLICT', 'Use the existing independent Tester');
+    if (original?.scope.ciAttempt) {
+      if (actor.ciCorrection?.previousRunId !== expectedRunId) fail('CURSOR_ROLE_CONFLICT', 'Recovery belongs to another original CI Run');
+      return withFileLock(file + '.lock', async () => {
+        const latest = await readJSON(file, null);
+        await this.store.transaction(state => this.authorizeLaunch(state, latest, taskId, 'ci'), { readOnly: true });
+        return this.launch(file, latest, taskId, 'ci');
+      });
+    }
+    if (!original?.ciProposal || original.ciProposal.proof || original.state !== 'confirmed' || original.runId !== expectedRunId)
+      fail('CURSOR_ROLE_CONFLICT', 'Only the original confirmed, unaccepted CI proposal can be corrected');
+    let feedback;
+    try { return await this.verifyCi(file); }
+    catch (cause) { feedback = cause[ciResultMismatch]; if (!feedback) throw cause; }
+    return withFileLock(file + '.lock', async () => {
+      const latest = await readJSON(file, null), owned = latest?.invocations.at(-1);
+      if (!owned || owned.id !== feedback.invocationId || owned.runId !== expectedRunId || owned.state !== 'confirmed' ||
+          owned.ciProposal?.fingerprint !== feedback.fingerprint || owned.ciProposal.proof)
+        fail('CURSOR_ROLE_CONFLICT', 'The original CI proposal changed before correction');
+      const run = await this.provider.getRun(latest.nativeAgentId, expectedRunId);
+      if (run.id !== expectedRunId || run.agentId !== latest.nativeAgentId || run.status !== 'FINISHED' ||
+          (await this.provider.getAgent(latest.nativeAgentId)).latestRunId !== expectedRunId)
+        fail('CURSOR_ROLE_CONFLICT', 'Never correct a cancelled, live or unrelated native Run');
+      const current = await this.channel.hostCiSnapshot(owned, owned.ciProposal.snapshot.input);
+      if (this.handoffIdentity(current) !== feedback.fingerprint) fail('SOURCE_UNVERIFIED', 'Original CI evidence changed before correction');
+      await this.store.transaction(state => this.authorizeLaunch(state, latest, taskId, 'ci'), { readOnly: true });
+      latest.ciCorrection = { previousId: owned.id, previousRunId: expectedRunId, fingerprint: feedback.fingerprint };
+      latest.machineFacts = feedback.facts;
+      await atomicWrite(file, encode(latest));
+      return this.launch(file, latest, taskId, 'ci');
+    });
   }
 
   async deferHandoff(token, snapshot) {
@@ -410,10 +463,10 @@ export class CursorRoleFactory {
     let task = await this.store.transaction(state => this.authorizeLaunch(state, actor, taskId, phase), { readOnly: true });
     const baseScope = this.scope(actor, task, phase);
     let invocation = actor.invocations.findLast(item => {
-      const { attempt, createAttempt, ...base } = item.scope;
+      const { attempt, createAttempt, ciAttempt, ...base } = item.scope;
       return canonical(base) === canonical(baseScope);
     });
-    let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0, invocation.scope.createAttempt || 0) : baseScope;
+    let scope = invocation ? this.scope(actor, task, phase, invocation.scope.attempt || 0, invocation.scope.createAttempt || 0, invocation.scope.ciAttempt || 0) : baseScope;
     let operationId = hash(canonical(scope));
     let sourceAvailability;
     if (invocation) {
@@ -434,7 +487,12 @@ export class CursorRoleFactory {
         scope = this.scope(actor, task, phase, 0, sourceRejection ? 2 : 1); operationId = hash(canonical(scope)); invocation = null;
       }
       if (invocation?.state === 'confirmed') {
-        if (phase !== 'plan') return invocation;
+        if (phase === 'ci' && !scope.ciAttempt && actor.ciCorrection?.previousId === invocation.id && actor.ciCorrection.previousRunId === invocation.runId &&
+            actor.ciCorrection.fingerprint === invocation.ciProposal?.fingerprint) {
+          scope = this.scope(actor, task, phase, 0, 0, 1); operationId = hash(canonical(scope)); invocation = null;
+        } else if (phase !== 'plan') return invocation;
+      }
+      if (invocation?.state === 'confirmed') {
         const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
         if (run.agentId !== actor.nativeAgentId || run.id !== invocation.runId) fail('CURSOR_ROLE_CONFLICT', 'Observe only the exact saved Plan Run');
         // A live/unknown status or external cancellation is not an automatic
@@ -457,9 +515,13 @@ export class CursorRoleFactory {
       const run = await this.provider.getRun(actor.nativeAgentId, previous.runId);
       if (run.agentId !== actor.nativeAgentId || run.id !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'Preserve the previous saved native Run');
       if (phase === 'plan' && scope.attempt && !['FINISHED', 'ERROR', 'EXPIRED'].includes(run.status)) fail('CURSOR_ROLE_CONFLICT', 'Do not resume a prepared Plan after cancellation or a changed native status');
+      if (scope.ciAttempt && (run.status !== 'FINISHED' || previous.state !== 'confirmed' || previous.scope.phase !== 'ci' ||
+          actor.ciCorrection?.previousId !== previous.id || actor.ciCorrection.previousRunId !== previous.runId ||
+          actor.ciCorrection.fingerprint !== previous.ciProposal?.fingerprint))
+        fail('CURSOR_ROLE_CONFLICT', 'Correction requires the original verified contradiction and finished Run');
       if (!cursorRunTerminal(run)) fail('CURSOR_ROLE_BUSY', 'Wait for the current native Run');
       if ((await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== previous.runId) fail('CURSOR_ROLE_CONFLICT', 'The native Agent was used outside the saved task');
-      await this.channel.revoke(previous.token);
+      if (!scope.ciAttempt) await this.channel.revoke(previous.token);
     }
     const lease = await this.channel.issue({ operationId, scope });
     if (lease.state === 'revoked' || !Number.isSafeInteger(lease.expiresAt) || this.channel.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Do not dispatch with an old expired or revoked operation lease');
@@ -468,11 +530,15 @@ export class CursorRoleFactory {
         ...(sourceAvailability ? { sourceAvailability } : {}) };
       actor.invocations.push(invocation); await atomicWrite(file, encode(actor));
     }
+    // Persist the fresh, dormant correction before retiring the old token.
+    // A crash before persistence leaves the original proposal verifiable; after
+    // persistence the saved prepared operation is resumed, never recreated.
+    if (scope.ciAttempt && previous) await this.channel.revoke(previous.token);
     // Persist the authorization tuple in the SAME transaction as the task
     // check, not in a second authoritative task state machine or native status.
     await this.store.transaction(async state => {
       task = await this.authorizeLaunch(state, actor, taskId, phase);
-      if (canonical(this.scope(actor, task, phase, scope.attempt || 0, scope.createAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
+      if (canonical(this.scope(actor, task, phase, scope.attempt || 0, scope.createAttempt || 0, scope.ciAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Plan or source changed before native dispatch');
       state.cursorRoleLaunches ||= {};
       state.cursorRoleLaunches[hash(canonical([this.repositoryId, operationId]))] = { scopeHash: operationId, taskVersion: task.version,
         briefReview: task.briefReview, planReview: task.planReview || null, state: 'authorized' };
@@ -482,11 +548,17 @@ export class CursorRoleFactory {
     try {
       if (scope.createAttempt === 2 && canonical(await this.ciSourceAvailability(actor)) !== canonical(invocation.sourceAvailability))
         fail('SOURCE_UNVERIFIED', 'The source PR precondition changed before native dispatch');
+      if (scope.ciAttempt) {
+        const prior = await this.provider.getRun(actor.nativeAgentId, actor.ciCorrection.previousRunId);
+        if (prior.id !== actor.ciCorrection.previousRunId || prior.agentId !== actor.nativeAgentId || prior.status !== 'FINISHED' ||
+            (await this.provider.getAgent(actor.nativeAgentId)).latestRunId !== prior.id)
+          fail('CURSOR_ROLE_CONFLICT', 'Original CI Run changed before correction dispatch');
+      }
       // Save intent before the final authority read: disk persistence must not
       // create an unchecked authorization window before the network side effect.
       await this.store.transaction(async state => {
         const current = await this.authorizeLaunch(state, actor, taskId, phase);
-        if (canonical(this.scope(actor, current, phase, scope.attempt || 0, scope.createAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Original task or source changed before native dispatch');
+        if (canonical(this.scope(actor, current, phase, scope.attempt || 0, scope.createAttempt || 0, scope.ciAttempt || 0)) !== canonical(scope)) fail('CURSOR_ROLE_CONFLICT', 'Original task or source changed before native dispatch');
       }, { readOnly: true });
       // Read the current operation, not issue()'s earlier snapshot. Release the
       // lease lock before POST, so native MCP discovery cannot deadlock on it.
@@ -549,7 +621,13 @@ export class CursorRoleFactory {
     }
     const ciFile = this.ciFile(session, taskId, task.sourceSha), ci = await readJSON(ciFile, null);
     if (ci?.invocations.at(-1)?.ciProposal) {
-      const result = await this.verifyCi(ciFile);
+      let result;
+      try { result = await this.verifyCi(ciFile); }
+      catch (cause) {
+        const original = ci.invocations.at(-1);
+        if (!cause[ciResultMismatch] || original.scope.ciAttempt) throw cause;
+        return this.continueCiResult(session, taskId, original.runId);
+      }
       task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
       if (task.stage === 'testing') return result;
     }
