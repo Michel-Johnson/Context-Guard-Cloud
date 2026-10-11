@@ -472,10 +472,13 @@ function reactionOnlyContinuation(state, turnId, input) {
     for (let offset = 0; offset < calls.length; offset++) {
       const call = calls[offset], reply = results.content[offset];
       const operationId = `coordinator:${hash(`${turnId}:${call.id}`)}`, receipt = state.toolReceipts[operationId];
+      const original = receipt?.replayedFrom && currentReactionReceipts(state, turnId, active.actor)
+        .find(([id, item]) => id === receipt.replayedFrom && id === item.result.actionId &&
+          canonical(item.result) === canonical(receipt.result));
       if (businessToolName(call.name) !== 'react_to_user' || !receipt || receipt.isError ||
           receipt.fingerprint !== hash(JSON.stringify({ name: call.name, input: call.input })) ||
           receipt.result?.kind !== 'slack-reaction' || receipt.result.status !== 'intent' ||
-          receipt.result.actionId !== operationId || receipt.result.emoji !== call.input?.emoji ||
+          (receipt.result.actionId !== operationId && !original) || receipt.result.emoji !== call.input?.emoji ||
           receipt.result.requestId !== active.id || !receipt.result.actor || hash(JSON.stringify(receipt.result.actor)) !== actorHash ||
           reply.type !== 'tool_result' || reply.tool_use_id !== call.id || reply.is_error ||
           reply.content !== JSON.stringify(receipt.result)) return false;
@@ -737,19 +740,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
-    // 新原生调用 ID 不代表新表情；同输入、代次和操作者复用原意图。
+    // 新原生调用 ID 仍重查当前权限；仅动作 ID 复用原意图。
     // 原生工具配对仍保存新的调用 ID，不借用失败、旧输入或未授权回执。
     const reactionReceipts = trustedSlackInput ? currentReactionReceipts(state, turnId, slackActor) : [];
-    if (!receipt && name === 'react_to_user' && executableTools.some(tool => tool.name === name) &&
+    const repeatedReaction = !receipt && name === 'react_to_user' && executableTools.some(tool => tool.name === name) &&
         !changed.steered && !changed.interrupted && !failed && !transferred &&
         Object.keys(call.input).every(key => ['emoji', 'replyComplete'].includes(key)) &&
-        (call.input.replyComplete === undefined || typeof call.input.replyComplete === 'boolean')) {
-      const completed = reactionReceipts.find(([, item]) => item.result.emoji === call.input.emoji);
-      if (completed) {
-        receipt = { ...completed[1], fingerprint, replayedFrom: completed[0] };
-        state.toolReceipts[operationId] = receipt; await save(state);
-      }
-    }
+        (call.input.replyComplete === undefined || typeof call.input.replyComplete === 'boolean')
+      ? reactionReceipts.find(([id, item]) => id === item.result.actionId && item.result.emoji === call.input.emoji) : null;
     // 回复纠正可换调用ID，已完成写入复用本轮成功回执。
     // 新读取重新授权取当前状态；节点卡片仅在展示层去重。
     if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['react_to_user', 'list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
@@ -768,7 +766,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else if (!executableTools.some(tool => tool.name === name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
       // 两个不同表情的额度属于原用户消息，不因 Steer 版本或重放记录重置。
-      else if (name === 'react_to_user' && new Set(Object.values(state.toolReceipts).filter(item =>
+      else if (name === 'react_to_user' && !repeatedReaction && new Set(Object.values(state.toolReceipts).filter(item =>
         !item.isError && item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id)
         .map(item => item.result.emoji)).size >= 2) {
         receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
@@ -779,14 +777,19 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         try {
           // Model settings use the integration's identifier alphabet, while
           // the original native tool receipt keeps its unchanged identity.
-          const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}` : operationId,
+          const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}`
+            : repeatedReaction ? repeatedReaction[0] : operationId,
             ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(readProjectTools.includes(name) ? { source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id }
               : ['select_text_model', 'switch_project'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
                 ...(name === 'switch_project' ? { requestId: state.activeInput.id } : {}) } : {}) });
-          receipt = { fingerprint, result: name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
-            ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result };
+          const scopedResult = name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
+            ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result;
+          if (repeatedReaction && canonical(scopedResult) !== canonical(repeatedReaction[1].result)) {
+            throw problem('TOOL_ID_REUSED', 'Reauthorized reaction differs from its original intent');
+          }
+          receipt = { fingerprint, result: scopedResult, ...(repeatedReaction ? { replayedFrom: repeatedReaction[0] } : {}) };
         }
         catch (error) {
           errorCode = error.code || 'TOOL_FAILED';
