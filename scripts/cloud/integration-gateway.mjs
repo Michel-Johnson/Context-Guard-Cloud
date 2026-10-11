@@ -5,9 +5,10 @@ import { timingSafeEqual } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { MapError } from '../shared/map-model.mjs';
 import { recoveryScope } from './slack-recovery.mjs';
+import { validateDiscussionBots } from './slack-bot-identity.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind', 'conversation.cursor', 'conversation.zcode',
-  'conversation.state', 'conversation.submit', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
@@ -140,6 +141,7 @@ export async function classifyIntegrationMessage(model, { overview, input, actor
 }
 
 export function validateIntegrationConfig(config) {
+  validateDiscussionBots(config?.discussionBots);
   if (!object(config) || !['127.0.0.1', '::1'].includes(config.host ?? '127.0.0.1') ||
       !Number.isInteger(config.port ?? 8790) || (config.port ?? 8790) < 0 || (config.port ?? 8790) > 65535 ||
       typeof config.token !== 'string' || Buffer.byteLength(config.token) < 32 || !/^T[A-Z0-9]{1,31}$/.test(config.teamId || '') ||
@@ -174,21 +176,36 @@ export function validateIntegrationConfig(config) {
     actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor', 'conversation.zcode'].includes(type)) };
 }
 
-export function integrationActor(config, { teamId, userId }) {
+export function integrationActor(config, { teamId, userId, botId, channelId }) {
   if (teamId !== config.teamId || typeof userId !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(userId)) fail('FORBIDDEN', 'Workspace or user is not authorized', 403);
+  const grant = config.discussionBots?.find(x => x.userId === userId);
+  if (grant || botId !== undefined) {
+    if (!grant || grant.botId !== botId || !grant.channelIds.includes(channelId)) fail('FORBIDDEN', 'Bot身份不能回落为真人身份', 403);
+    return { kind: 'bot', sessionId: `slack-bot:${teamId}:${userId}`, integration: 'slack', teamId, userId, botId, channelId };
+  }
   return { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
 }
 
 export function validateIntegrationCommand(config, input) {
-  if (!object(input) || Object.keys(input).some(key => !['id', 'teamId', 'userId', 'projectId', 'conversationId', 'type', 'payload'].includes(key)) ||
+  if (!object(input) || Object.keys(input).some(key => !['id', 'teamId', 'userId', 'botId', 'channelId', 'projectId', 'conversationId', 'type', 'payload'].includes(key)) ||
       !identifier(input.id) || !INTEGRATION_COMMANDS.includes(input.type) || !object(input.payload ?? {})) fail('INVALID_ARGUMENT', 'Invalid integration command');
-  const actor = integrationActor(config, input);
+  let actor = integrationActor(config, input);
+  const botGrant = config.discussionBots?.find(x => x.userId === input.userId);
+  if (input.botId !== undefined || botGrant) {
+    if (!botGrant || botGrant.botId !== input.botId || !botGrant.channelIds.includes(input.channelId) ||
+        !botGrant.projectIds.includes(input.projectId) || !['conversation.state', 'conversation.discuss'].includes(input.type)) {
+      fail('FORBIDDEN', 'Bot讨论范围不含该操作、项目或频道', 403);
+    }
+    actor = { kind: 'bot', sessionId: `slack-bot:${input.teamId}:${input.userId}`, integration: 'slack',
+      teamId: input.teamId, userId: input.userId, botId: input.botId, channelId: input.channelId };
+  } else if (input.channelId !== undefined) fail('INVALID_ARGUMENT', 'Bot channel metadata requires an authorized Bot');
   if (!config.actions.includes(input.type)) fail('FORBIDDEN', 'Integration action is not enabled', 403);
   if (input.type !== 'project.list' || input.projectId !== undefined) {
     if (!identifier(input.projectId) || !config.projectIds.includes(input.projectId) &&
         !config.mapProjects?.userIds.includes(actor.userId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
-  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (input.type === 'conversation.discuss' && (actor.kind !== 'bot' || Object.keys(input.payload || {}).some(k => !['inputs', 'participation', 'history'].includes(k)))) fail('FORBIDDEN', 'Bot讨论仅接受原始讨论输入', 403);
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
   if (input.type === 'recovery.preflight') {
@@ -216,7 +233,7 @@ export function validateIntegrationCommand(config, input) {
     actor.channelId = input.payload.slackChannelId;
   }
   if (Object.hasOwn(input.payload || {}, 'history')) {
-    if (input.type !== 'conversation.submit' || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', 'Only a verified Slack input batch may supply reference history');
+    if (!['conversation.submit', 'conversation.discuss'].includes(input.type) || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', 'Only a verified Slack input batch may supply reference history');
     validateSlackHistory(input.payload.history, { projectId: input.projectId });
   }
   if (input.type === 'models.state' && Object.keys(input.payload || {}).length || input.type === 'models.select' &&
@@ -225,7 +242,7 @@ export function validateIntegrationCommand(config, input) {
         typeof input.payload.baseVersion !== 'string' || !/^[a-f0-9]{64}$/.test(input.payload.baseVersion))) {
     fail('INVALID_ARGUMENT', 'Select only a configured project model at its observed settings version');
   }
-  if (input.type === 'conversation.submit' && input.payload?.inputs !== undefined) {
+  if (['conversation.submit', 'conversation.discuss'].includes(input.type) && input.payload?.inputs !== undefined) {
     const batch = input.payload.inputs;
     if (!Array.isArray(batch) || !batch.length || batch.length > 20 ||
         batch.some(item => !object(item) || Object.keys(item).some(key => !['id', 'text', 'attachments', 'answerTo'].includes(key)) ||
@@ -235,7 +252,7 @@ export function validateIntegrationCommand(config, input) {
     }
   }
   if (Object.hasOwn(input.payload || {}, 'participation')) {
-    if (input.type !== 'conversation.submit' || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', '接话参考只接受原始 Slack 批次');
+    if (!['conversation.submit', 'conversation.discuss'].includes(input.type) || !Array.isArray(input.payload.inputs) || input.payload.retry) fail('INVALID_ARGUMENT', '接话参考只接受原始 Slack 批次');
     const participation = relevanceInput(input.payload.participation);
     if (!participation.routing || !participation.inputs || JSON.stringify(participation.inputs) !== JSON.stringify(input.payload.inputs.map(({ id, text }) => ({ id, text }))) ||
         participation.text !== input.payload.inputs.map(entry => entry.text).join('\n\n')) fail('INVALID_ARGUMENT', '接话参考必须匹配原始输入');

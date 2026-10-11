@@ -6,6 +6,7 @@ import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage }
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
 import { coordinatorPresentationKey } from '../shared/coordinator-reply.mjs';
+import { isVerifiedSlackBot, discussionTools } from './slack-bot-identity.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -52,7 +53,7 @@ function attachmentMetadata(item, id) {
 }
 function trustedActor(actor) {
   if (actor === undefined) return undefined;
-  if (!actor || actor.kind !== 'human' || Object.keys(actor).some(key => !['kind', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration', 'channelId'].includes(key)) ||
+  if (!actor || !(actor.kind === 'human' || isVerifiedSlackBot(actor)) || Object.keys(actor).some(key => !['kind', 'botId', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration', 'channelId'].includes(key)) ||
       Object.entries(actor).some(([, value]) => typeof value !== 'string' || !value || value.length > 240)) {
     throw error('INVALID_INPUT', 'Provide verified human actor metadata');
   }
@@ -638,7 +639,8 @@ export class CoordinatorService {
         !Array.isArray(attachments) || attachments.length > COORDINATOR_MAX_ATTACHMENTS || !text.trim() && !attachments.length ||
         attachments.some(item => !item || Object.keys(item).some(key => key !== 'id') || typeof item.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.id)) ||
         new Set(attachments.map(item => item.id)).size !== attachments.length) throw error('INVALID_INPUT', 'Provide a bounded message, attachment references and stable request ID');
-    if (!['human', 'slack', 'workflow'].includes(source)) throw error('INVALID_INPUT', 'Unknown verified message source');
+    if (!['human', 'slack', 'slack-bot', 'workflow'].includes(source)) throw error('INVALID_INPUT', 'Unknown verified message source');
+    if (source === 'slack-bot' ? !isVerifiedSlackBot(actor) : actor?.kind === 'bot') throw error('INVALID_INPUT', 'Bot discussion cannot borrow human identity');
     if (source === 'slack' && (!actor?.teamId || !actor?.userId)) throw error('INVALID_INPUT', 'Slack input requires a verified workspace actor');
     if (attachments.length && !isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can attach files');
     if (attachments.length && !this.resolveAttachment) throw error('ATTACHMENTS_UNAVAILABLE', 'Coordinator attachment storage is not configured');
@@ -825,8 +827,10 @@ export class CoordinatorService {
       throw error('INVALID_INPUT', 'Provide a bounded batch of distinct original human inputs');
     }
     actor = trustedActor(actor);
-    if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can submit a batch');
-    if (history !== undefined && (source !== 'slack' || actor?.integration !== 'slack' || actor.kind !== 'human' ||
+    const botDiscussion = source === 'slack-bot' && isVerifiedSlackBot(actor);
+    if (!isHumanSource(source) && !botDiscussion) throw error('INVALID_INPUT', 'Only verified input can submit a batch');
+    if (botDiscussion && (followup !== 'queue' || expectedTurnId !== undefined || recoveryGuard || operatorRecovery || inputs.some(x => x.answerTo || x.attachments?.length))) throw error('INVALID_INPUT', 'Bot discussion cannot steer, approve or attach files');
+    if (history !== undefined && !botDiscussion && (source !== 'slack' || actor?.integration !== 'slack' || actor.kind !== 'human' ||
         !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
         actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`)) throw error('INVALID_INPUT', 'Reference history requires a gateway-bound Slack operator');
     history = validateSlackHistory(history);
@@ -884,7 +888,7 @@ export class CoordinatorService {
           return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
             serverContext: { ...coordinatorInputContext(nextContext, source), ...(index === 0 && attachHistory ? { history } : {}),
               ...(index === 0 && participation ? { participation } : {}) },
-            content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
+            content: (this.simulated ? source === 'slack-bot' ? '[实验：Bot讨论输入]\n' : '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
             ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
         });
         const active = steering ? state.messages.filter(message => (state.activeRequestIds || [state.activeTurnId]).includes(message.requestId)) : [];
@@ -1170,7 +1174,7 @@ export class CoordinatorService {
           state.activeTiming ||= {};
           state.activeTiming.modelStartedAt ||= new Date().toISOString();
           await save(state);
-          const prefix = coordinatorPrefix(this.system, state.activeContext, this.tools);
+          const prefix = coordinatorPrefix(this.system, state.activeContext, discussionTools(this.tools, state.activeInput?.actor));
           try {
             const model = this.modelForTurn(state);
             this.modelAbort = generation;

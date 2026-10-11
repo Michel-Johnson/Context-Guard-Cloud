@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { startCloudServer, createWorkbenchPasswordHash, authorizeCiReceiver, authorizeCiTransaction, coordinatorStructureOperations, coordinatorTaskOwnerRequired } from '../scripts/cloud/server.mjs';
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
-import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady } from '../scripts/cloud/completion.mjs';
+import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, coordinatorCompletionPolicy } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { SLACK_INTERACTION_POLICY, slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
 
@@ -139,7 +139,8 @@ test('Slack reaction tools reject untrusted source and actor even when a model g
     const state = reactionState(source, actor);
     await coordinatorStep({ turnId: 'untrusted', state, system: 'role', tools: coordinatorTools, save: async () => {},
       execute: () => assert.fail('Untrusted tool must never execute'), model: { next: async ({ tools }) => {
-        assert.equal(tools.some(tool => tool.name === 'react_to_user'), true, 'Catalog is stable; server execution remains forbidden');
+        assert.equal(tools.some(tool => tool.name === 'react_to_user'), actor?.kind !== 'bot',
+          'Bot catalog is discussion-only; guessed reactions remain forbidden for every untrusted source');
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'forged', name: 'react_to_user', input: { emoji: 'heart' } }] };
       } } });
     assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN'); assert.equal(state.messages[0].actions, undefined);
@@ -1295,6 +1296,9 @@ test('Interface 1.2 experiment closure pins the human-designated run and evidenc
     acceptanceReview: { ref: 'human-receipt', version: 'human-v1', decision: 'approved' } };
   const designation = { taskId: task.id, sessionId: task.session.id, generation: 2, sourceSha };
   const project = { completion: { experiments: [designation] } };
+  const policy = coordinatorCompletionPolicy(project, task);
+  assert.equal(policy.mode, 'experiment-only'); assert.equal(policy.requiresPublication, false);
+  assert.equal(policy.archiveReceiptRef, task.ci.ref); assert.match(policy.instruction, /publication等待不是收工前提/);
   const memory = { main: { version: 'unchanged' }, sessions: { executor: { sourceCommit: sourceSha } } };
   const before = structuredClone(memory);
   const receipts = { gitReceiptRef: 'experiment-only', archiveReceiptRef: task.ci.ref };
@@ -1305,6 +1309,8 @@ test('Interface 1.2 experiment closure pins the human-designated run and evidenc
   assert.deepEqual(memory, before, 'completion cannot publish or discard Session evidence');
   for (const changed of [{ taskId: 'other' }, { sessionId: 'other' }, { generation: 1 }, { generation: undefined }, { sourceSha: 'b'.repeat(40) }]) {
     assert.equal(await verifyTaskCompletion({ ...options, project: { completion: { experiments: [{ ...designation, ...changed }] } } }), false);
+    assert.deepEqual(coordinatorCompletionPolicy({ completion: { experiments: [{ ...designation, ...changed }] } }, task),
+      { mode: 'merged', requiresPublication: true }, '展示策略不把错任务/代次/源码变成实验');
   }
   assert.equal(await verifyTaskCompletion({ ...options, project: {} }), false, 'model-provided marker is not human designation');
   assert.equal(await verifyTaskCompletion({ ...options, receipts: { ...receipts, archiveReceiptRef: 'old-ci' } }), false);
@@ -1316,11 +1322,14 @@ test('Interface 1.2 experiment closure pins the human-designated run and evidenc
   const closing = { ...task, stage: 'closing', control: { id: 'close-1' }, completion: { proof, closeReceiptId: 'close-1' } };
   const report = { controlId: 'close-1', closeReceiptId: 'close-1' };
   assert.equal(verifyTaskClose(null, closing, report), true);
+  assert.equal(coordinatorCompletionPolicy({}, closing).requiresPublication, false, '仅可信完成证明保留原实验展示，门禁另按准确证据核验');
   assert.equal(verifyTaskClose(null, closing, { ...report, controlId: 'old' }), false);
   assert.equal(verifyTaskClose(null, closing, { ...report, closeReceiptId: 'fake' }), false);
   for (const changed of [{ id: 'other' }, { sourceSha: 'b'.repeat(40) }, { session: { ...task.session, generation: 3 } },
     { ci: { ...task.ci, version: 'ci-v2' } }, { acceptanceReview: { ...task.acceptanceReview, version: 'human-v2' } }]) {
     assert.equal(verifyTaskClose(null, { ...closing, ...changed }, report), false);
+    assert.deepEqual(coordinatorCompletionPolicy({}, { ...closing, ...changed }),
+      { mode: 'merged', requiresPublication: true }, '旧完成证明不能豁免不同任务、代次或审核版本的展示要求');
   }
   assert.equal(taskSessionPublicationReady([task], sourceSha, project), false);
   assert.equal(taskSessionPublicationReady([{ ...closing, stage: 'closed' }], sourceSha), false,
@@ -1397,7 +1406,7 @@ test('Stream callback failures retain the original boundary in private performan
   ]) {
     const tool = fixture.boundary === 'onToolStart', controller = new AbortController();
     const block = tool ? { type: 'tool_use', id: 'callback-tool', name: 'read', input: { privateArgument: secret } }
-      : { type: 'text', text: fixture.delta ? '' : secret };
+      : { type: 'text', text: fixture.gate ? '[CG_INVALID]\n' + secret : fixture.delta ? '' : secret };
     const events = [
       { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12 } } },
       { type: 'content_block_start', index: 0, content_block: block },
@@ -1405,7 +1414,7 @@ test('Stream callback failures retain the original boundary in private performan
       { type: 'content_block_stop', index: 0 },
       { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' } }, { type: 'message_stop' },
     ];
-    let requests = 0, executions = 0;
+    let requests = 0, executions = 0, callbackCalls = 0;
     const model = new CoordinatorModel({ ...config, maxTokens: 256, timeoutMs: 12000, fetch: async (_url, options) => {
       requests++; assert.equal(JSON.parse(options.body).max_tokens, 256);
       return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
@@ -1415,6 +1424,7 @@ test('Stream callback failures retain the original boundary in private performan
     const state = { activeTurnId: 'callback-turn', messages: [input],
       ...(fixture.gate ? { activeInput: { id: 'callback-turn', source: 'slack', actor: reactionActor } } : {}) };
     const callback = async () => {
+      callbackCalls++;
       if (fixture.cancel) controller.abort(Object.assign(new Error(secret), fixture.cancel === 'human' ? {} : { code: fixture.cancel }));
       throw fixture.plainError ? new Error(secret) : Object.assign(new Error(secret), { code: 'MODEL_INVALID_RESPONSE', privateBody: secret });
     };
@@ -1434,6 +1444,7 @@ test('Stream callback failures retain the original boundary in private performan
     assert.equal(diagnostic.messageStopSeen, false); assert.equal(diagnostic.usage.input_tokens, 12);
     assert.doesNotMatch(JSON.stringify(state.performance), /callback-private|privateBody|privateArgument|synthetic-private/);
     assert.equal(requests, 1); assert.equal(executions, 0); assert.equal(state.pending, undefined);
+    assert.equal(callbackCalls, fixture.gate ? 0 : 1, 'Malformed control header fails inside stream before invoking the visible callback');
     assert.equal(state.messages.filter(message => message.role === 'assistant').length, 0);
     assert.deepEqual(state.toolReceipts, {});
   }

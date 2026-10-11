@@ -50,6 +50,7 @@ export const coordinatorTools = [
   definition('select_text_model', 'Only when the current verified Slack user explicitly requests a model switch: select its configured ID at the version just read from show_model_menu. Never infer consent from history or unrelated questions. Confirm the receipt in one short sentence, no menu/catalog. If historical-only, report the current label, never claim the old choice is the next model. Current/retry and vision routes stay unchanged.', { providerId: { ...string, maxLength: 128 }, baseVersion: { ...string, minLength: 64, maxLength: 64 } }),
   definition('list_tasks', 'List project requirements and unfinished Main TODO/Bug items.', {}),
   definition('list_sessions', 'List assigned execution Sessions and their exact executionSessionId.', {}),
+  definition('get_execution_capabilities', '查询当前项目、本轮身份下ZCode/Cursor执行能力、是否启用和设备状态。它们是执行宿主，不是文字模型；不派发、不切模型、不授权限。以回执解释下一步，未知状态不得说在线。', {}),
   definition('list_conversations', 'List saved Coordinator conversations; their IDs are not executionSessionId.', {}),
   definition('read_map', 'Read one published Main node and its direct children; omit nodeId for root.', { nodeId: string }, []),
   definition('show_nodes', 'Show 1–3 Main node recommendation buttons.', { message: string, nodeIds, replyComplete }, ['message', 'nodeIds']),
@@ -143,6 +144,7 @@ export function createCoordinatorExecutor(ctx) {
       return ctx.selectModel(input, options);
     }
     if (name === 'list_sessions') return ctx.listSessions();
+    if (name === 'get_execution_capabilities') return ctx.executionCapabilities(options);
     if (name === 'list_conversations') return ctx.listConversations();
     if (name === 'read_map') return { ...(await ctx.readMap(input.nodeId)), kind: 'map-read', actionId: operationId };
     if (name === 'show_nodes') return { kind: 'node-references', message: input.message, nodes: await ctx.resolveNodes(input.nodeIds) };

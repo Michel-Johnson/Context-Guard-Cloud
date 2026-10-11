@@ -3,6 +3,7 @@ import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { SlackFeedback } from './feedback.mjs';
+import { validateDiscussionBots, isSlackBotMessage } from '../../../scripts/cloud/slack-bot-identity.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
@@ -77,7 +78,8 @@ function safeEnvelope(type, body) {
 function contextFrom(binding, userId, id) { return { id, userId, projectId: binding.projectId, conversationId: binding.conversationId }; }
 
 export class SlackPlugin {
-  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [], zcodeOfferChannels = [] }) {
+  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [], zcodeOfferChannels = [], discussionBots = [] }) {
+    this.discussionBots = structuredClone(validateDiscussionBots(discussionBots));
     if (!Array.isArray(cursorOfferChannels) || cursorOfferChannels.length > 20 ||
         cursorOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
         new Set(cursorOfferChannels).size !== cursorOfferChannels.length) throw new TypeError('Configure explicit Cursor offer channel IDs');
@@ -267,7 +269,7 @@ export class SlackPlugin {
   }
   entryLane(item) {
     const event = item.projectResume?.event || item.envelope?.body?.event;
-    if (!isMessage(event)) return null;
+    if (!isMessage(event) && !isSlackBotMessage(event)) return null;
     const batch = item.batchId && this.store.data.messageBatches?.[item.batchId];
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');
     return direct ? `${event.channel}:direct:${event.user}:${batch?.projectId || this.store.data.preferences[event.user] || ''}` :
@@ -450,7 +452,10 @@ export class SlackPlugin {
     if (type === 'events_api') {
       if (body.event?.type === 'app_home_opened') return this.publishHome(userId, id);
       if (body.event?.type === 'link_shared') return this.unfurl(id, body.event);
+      if (['message', 'app_mention'].includes(body.event?.type) && !body.event.hidden && body.event.user !== this.botUserId &&
+          this.discussionBots?.some(x => x.userId === body.event.user)) return this.botMessage(id, body.event);
       if (isMessage(body.event) && body.event.user !== this.botUserId) return this.message(id, body.event, this.store.data.inbox[id]?.requestedProjectId || null);
+      if (isSlackBotMessage(body.event) && body.event.user !== this.botUserId) return this.botMessage(id, body.event);
       return;
     }
     if (type === 'slash_commands') {
@@ -977,6 +982,58 @@ export class SlackPlugin {
       state.inbox[id].routingMetadata = metadata;
     });
     return structuredClone(metadata);
+  }
+  async botMessage(id, event) {
+    const key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts), binding = this.store.data.threads[key];
+    let botId = event.bot_id || event.bot_profile?.id;
+    if (!botId) {
+      const declared = this.discussionBots.find(x => x.userId === event.user);
+      if (!declared) return;
+      const identity = (await this.io.call('users.info', { user: event.user }))?.user;
+      if (identity?.id !== event.user || identity.is_bot !== true || identity.profile?.bot_id && identity.profile.bot_id !== declared.botId) return;
+      botId = declared.botId;
+    }
+    const grant = this.discussionBots.find(x => x.userId === event.user && x.botId === botId && x.channelIds.includes(event.channel) && x.projectIds.includes(binding?.projectId));
+    // 只复用真人已建立的项目线程；Bot不能创建绑定或借真人身份。
+    if (!grant || !binding || event.user === this.botUserId || !/^\d+\.\d+$/.test(event.ts || '') ||
+        typeof event.text !== 'string' || !event.text.trim() || event.text.length > 8000) return;
+    // app_mention与message可对应同一原生消息；运输事件ID不同不代表新输入。
+    const nativeId = operationId(JSON.stringify([this.teamId, event.channel, event.ts, event.user, botId]), 'bot-message');
+    const inputId = operationId(nativeId, 'bot-input');
+    const previousIntent = state => Object.values(state.inbox).find(entry => entry.botDiscussion?.inputId === inputId)?.botDiscussion;
+    let intent = this.store.data.inbox[id]?.botDiscussion || previousIntent(this.store.data);
+    if (!intent) {
+      let anchor = null;
+      const history = await readSlackHistory(this.io, event, { accept: message => {
+        if (isMessage({ ...message, type: 'message' }) && message.user === binding.userId && (!anchor || Number(message.ts) > Number(anchor))) anchor = message.ts;
+        return true;
+      } });
+      if (!anchor) return; // 必须有原生真人输入，不由Bot自己刷新对话预算。
+      const inputs = [{ id: inputId, text: event.text }];
+      const context = history.slice(-6).map(x => ({ speaker: x.speaker, text: x.text.slice(0, 800) }));
+      const routing = await this.mentionRoute(id, event); routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
+      intent = { key, anchor, inputId, submitId: operationId(nativeId, 'bot-submit'), projectId: binding.projectId,
+        conversationId: binding.conversationId, payload: { inputs, participation: { text: event.text, inputs, context, routing } } };
+      const saved = await this.store.update(state => {
+        const current = state.threads[key]; if (!current || current.projectId !== binding.projectId || current.conversationId !== binding.conversationId) return false;
+        const previous = previousIntent(state);
+        if (previous) return structuredClone(previous);
+        const budget = (state.botDiscussionBudgets ||= {})[key];
+        if (budget?.anchor === anchor && budget.count >= 3) return false;
+        state.botDiscussionBudgets[key] = { anchor, count: budget?.anchor === anchor ? budget.count + 1 : 1 };
+        state.inbox[id].botDiscussion = intent;
+        current.ownRequests ||= []; if (!current.ownRequests.includes(inputId)) current.ownRequests.push(inputId);
+        return structuredClone(intent);
+      });
+      if (!saved) return;
+      intent = saved;
+    }
+    if (intent.key !== key || this.store.data.threads[key]?.conversationId !== binding.conversationId ||
+        intent.conversationId && (intent.conversationId !== binding.conversationId || intent.projectId !== binding.projectId)) throw Object.assign(new Error('Bot讨论线程已变化'), { code: 'CONFLICT' });
+    if (intent.payload.inputs[0].text !== event.text) throw Object.assign(new Error('同一Bot消息内容已变化'), { code: 'ID_REUSED' });
+    await this.gateway.command('conversation.discuss', { id: intent.submitId || operationId(id, 'bot-submit'), userId: event.user, botId,
+      channelId: event.channel, projectId: binding.projectId, conversationId: binding.conversationId, payload: intent.payload });
+    await this.store.updateThread(key, current => { current.awaitingReplyId = intent.inputId; current.nextPoll = 0; });
   }
   async message(id, event, expectedProjectId = null, events = [event], recovery = null) {
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');

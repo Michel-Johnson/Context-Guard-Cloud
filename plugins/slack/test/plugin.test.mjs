@@ -1868,9 +1868,38 @@ test('ordinary message with bot mention creates same binding before app_mention 
   const submits = f.calls.filter(call => call.type === 'conversation.submit'); assert.equal(submits[0].id, submits[1].id);
   assert.match(submits[0].id, /^[a-zA-Z0-9_-]+$/); assert.equal(submits[0].userId, user);
 });
-test('untracked channel messages and bots cannot start model turns', async t => {
+test('untracked channel messages and unapproved/self bots cannot start model turns', async t => {
   const f = await fixture(t); await f.plugin.process('E1', { type: 'events_api', body: { event: event({ text: 'normal message' }) } });
   await f.plugin.process('E2', { type: 'events_api', body: { event: event({ bot_id: 'B', user: bot }) } }); assert.equal(f.calls.length, 0);
+});
+
+test('获准Bot进入原线程讨论，重放及双原生事件不重占预算，自消息和未知Bot不接话', async t => {
+  const discussionBots = [{ userId: 'UMICHAEL', botId: 'BMICHAEL', projectIds: ['lab'], channelIds: [channel] }];
+  const f = await fixture(t, { discussionBots }), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: [] });
+  const call = f.io.call;
+  f.io.call = async (method, args) => ['conversations.replies', 'conversations.history'].includes(method)
+    ? { messages: [{ ts: '123.001', user, text: '请michael与Coordinator讨论' }] }
+    : method === 'users.info' && args.user === 'UMICHAEL' ? { user: { id: 'UMICHAEL', is_bot: true, profile: { bot_id: 'BMICHAEL' } } } : call(method, args);
+  const post = (id, extra = {}) => f.plugin.process(id, { type: 'events_api', body: { event: event({ user: 'UMICHAEL', bot_id: 'BMICHAEL',
+    thread_ts: '123.001', ts: `124.${id.replace(/\D/g, '').padStart(3, '0')}`, ...extra }) } });
+  for (const id of ['bot1', 'bot2', 'bot3', 'bot4', 'bot1']) {
+    await f.store.receive(id, { type: 'events_api', body: { team_id: teamId, event: event() } }); await post(id);
+  }
+  const submissions = f.calls.filter(x => x.type === 'conversation.discuss');
+  assert.equal(new Set(submissions.map(x => x.id)).size, 3, '无新真人输入时至多三条讨论，不能无限互回');
+  assert.equal(f.store.data.botDiscussionBudgets[key].count, 3);
+  assert.ok(submissions.every(x => x.userId === 'UMICHAEL' && x.botId === 'BMICHAEL' && x.channelId === channel));
+  await f.store.receive('mention-dual', { type: 'events_api', body: { team_id: teamId, event: event() } });
+  await post('mention-dual', { type: 'app_mention', bot_id: undefined, ts: '124.001' });
+  const duplicate = f.calls.filter(x => x.type === 'conversation.discuss').at(-1);
+  assert.equal(duplicate.id, submissions[0].id); assert.deepEqual(duplicate.payload, submissions[0].payload);
+  assert.equal(f.store.data.botDiscussionBudgets[key].count, 3, '同原生消息的两运输事件冻结同一请求，不多占预算');
+  await assert.rejects(post('mention-dual', { type: 'app_mention', ts: '124.001', text: '修改同一原生消息' }), { code: 'ID_REUSED' });
+  const before = f.calls.length;
+  await post('self', { user: bot }); await post('unknown', { bot_id: 'BOTHER' });
+  assert.equal(f.calls.length, before);
+  assert.equal(f.calls.filter(x => ['conversation.submit', 'conversation.create', 'brief.review'].includes(x.type)).length, 0);
 });
 function projectChoice(f, requestId, projectId = 'lab') {
   const original = f.store.data.inbox[requestId];
