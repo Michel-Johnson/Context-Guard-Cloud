@@ -21,6 +21,97 @@ const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKS
 function reactionState(source = 'slack', actor = reactionActor) {
   return { activeInput: { id: 'original-human-input', source, actor }, messages: [], toolReceipts: {} };
 }
+
+test('Repeated reaction native IDs reuse the same scoped intent and preserve two distinct emoji slots', async () => {
+  let state = reactionState(), executions = 0;
+  const native = createCoordinatorExecutor({});
+  const step = { turnId: 'reaction-dedup', system: 'role', tools: coordinatorTools, save: async () => {},
+    execute: async (...args) => { executions++; return native(...args); } };
+  for (let index = 0; index < 5; index++) {
+    await coordinatorStep({ ...step, state, model: { next: async ({ system }) => {
+      if (index) assert.match(system, /handshake 已受理.*勿重复调用同一表情/s);
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'handshake-' + index,
+        name: 'react_to_user', input: { emoji: 'handshake', ...(index === 3 ? { replyComplete: false } : {}) } }] };
+    } } });
+    state = structuredClone(state); // Pending/native receipt identity survives a process restart.
+    assert.equal(state.messages.at(-1).content[0].is_error, undefined);
+    assert.equal(state.messages.at(-1).content[0].tool_use_id, 'handshake-' + index);
+  }
+  assert.equal(executions, 5, 'Every new native ID rechecks the current executor authorization');
+  assert.equal(new Set(Object.values(state.toolReceipts).map(receipt => receipt.result.actionId)).size, 1);
+  for (const emoji of ['clap', 'wave']) {
+    await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: emoji, name: 'react_to_user', input: { emoji } },
+    ] }) } });
+  }
+  assert.equal(executions, 6, 'The second distinct reaction executes; the third retains the quota error');
+  assert.equal(new Set(Object.values(state.toolReceipts).filter(receipt => !receipt.isError).map(receipt => receipt.result.actionId)).size, 2);
+  assert.equal(state.messages.at(-1).content[0].is_error, true);
+  await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'end_turn',
+    content: [{ type: 'text', text: '收到，谢谢。' }] }) } });
+  assert.equal(state.status, 'waiting-for-user');
+  assert.equal(state.messages.at(-1).content[0].text, '收到，谢谢。');
+});
+
+test('Reaction replay cannot borrow another input actor generation or malformed target', async () => {
+  for (const boundary of ['input', 'actor', 'revision', 'target', 'steer', 'source']) {
+    const state = reactionState(); let executions = 0;
+    const native = createCoordinatorExecutor({}), step = { turnId: 'scoped-reaction', system: 'role', tools: coordinatorTools,
+      save: async () => {}, execute: async (...args) => { executions++; return native(...args); } };
+    const call = (id, input = { emoji: 'handshake' }) => ({ stop: 'tool_use', content: [{ type: 'tool_use', id, name: 'react_to_user', input }] });
+    await coordinatorStep({ ...step, state, model: { next: async () => call('first') } });
+    if (boundary === 'input') state.activeInput.id = 'another-input';
+    if (boundary === 'actor') state.activeInput.actor = { ...reactionActor, userId: 'UOTHER', sessionId: `slack:${reactionActor.teamId}:UOTHER` };
+    if (boundary === 'revision') state.consumedInputRevision = 2;
+    if (boundary === 'source') state.activeInput.source = 'human';
+    await coordinatorStep({ ...step, state, ...(boundary === 'steer' ? { checkpoint: async () => ({ steered: true, interrupted: false }) } : {}),
+      model: { next: async ({ system }) => {
+        if (boundary !== 'target' && boundary !== 'steer') assert.doesNotMatch(system, /handshake 已受理/);
+        return call('second', boundary === 'target' ? { emoji: 'handshake', channel: 'COTHER' } : undefined);
+      } } });
+    const latest = Object.values(state.toolReceipts).at(-1);
+    assert.equal(latest.replayedFrom, undefined, boundary);
+    if (['target', 'steer', 'source'].includes(boundary)) assert.equal(state.messages.at(-1).content[0].is_error, true, boundary);
+    else assert.equal(executions, 2, boundary);
+  }
+});
+
+test('Reaction quota remains bound to the original input across revised generations', async () => {
+  const state = reactionState(), native = createCoordinatorExecutor({}); let executions = 0;
+  const step = { turnId: 'quota-input', state, system: 'role', tools: coordinatorTools, save: async () => {},
+    execute: async (...args) => { executions++; return native(...args); } };
+  for (const [index, emoji] of ['heart', 'wave', 'clap'].entries()) {
+    state.consumedInputRevision = index;
+    await coordinatorStep({ ...step, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'revision-' + index, name: 'react_to_user', input: { emoji } },
+    ] }) } });
+  }
+  assert.equal(executions, 2);
+  assert.equal(state.messages.at(-1).content[0].is_error, true);
+});
+test('Reaction replay rechecks live authorization and retains the rejected native pair after revocation', async () => {
+  const state = reactionState(); let authorized = true, checks = 0;
+  const execute = createCoordinatorExecutor({ authorizeTool: async () => {
+    checks++;
+    if (!authorized) throw Object.assign(new Error('synthetic revoked grant'), { code: 'FORBIDDEN' });
+  } });
+  const step = { turnId: 'revoked-reaction', state, system: 'role', tools: coordinatorTools, save: async () => {}, execute };
+  const model = id => ({ next: async () => ({ stop: 'tool_use', content: [
+    { type: 'tool_use', id, name: 'react_to_user', input: { emoji: 'heart' } },
+  ] }) });
+  await coordinatorStep({ ...step, model: model('authorized') });
+  const original = structuredClone(Object.values(state.toolReceipts)[0]);
+  authorized = false;
+  await coordinatorStep({ ...step, model: model('revoked') });
+  assert.equal(checks, 2);
+  assert.deepEqual(Object.values(state.toolReceipts)[0], original);
+  assert.equal(Object.values(state.toolReceipts).at(-1).replayedFrom, undefined);
+  assert.equal(state.messages.at(-1).content[0].tool_use_id, 'revoked');
+  assert.equal(state.messages.at(-1).content[0].is_error, true);
+  assert.equal(JSON.parse(state.messages.at(-1).content[0].content).error.code, 'FORBIDDEN');
+  assert.doesNotMatch(state.messages.at(-1).content[0].content, /synthetic revoked grant/);
+  assert.equal(state.messages.at(-2).actions, undefined);
+});
 test('Slack reaction intent binds server actor and input and preserves the following text or emoji-only completion', async () => {
   for (const text of ['已收到。', '']) {
     const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
@@ -116,6 +207,33 @@ async function acceptedReaction(state, options = {}) {
   } } });
   return step;
 }
+test('Merged reaction repeated native pairs preserve one intent and authorize only their valid empty completion', async () => {
+  for (const boundary of ['valid', 'origin', 'actor', 'turn', 'revision', 'result']) {
+    let state = mergedReactionState(), checks = 0;
+    const execute = createCoordinatorExecutor({ authorizeTool: async () => { checks++; } });
+    const step = await acceptedReaction(state, { execute });
+    await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'repeated-social', name: 'react_to_user', input: { emoji: 'heart', replyComplete: false } },
+    ] }) } });
+    state = structuredClone(state);
+    assert.equal(checks, 2);
+    const [original, repeated] = Object.values(state.toolReceipts);
+    assert.equal(repeated.result.actionId, original.result.actionId);
+    assert.equal(repeated.replayedFrom, original.result.actionId);
+    assert.equal(state.messages.at(-1).content[0].tool_use_id, 'repeated-social');
+    if (boundary === 'origin') repeated.replayedFrom = 'invented-origin';
+    if (boundary === 'actor') original.result.actor = { ...original.result.actor, userId: 'UOTHER' };
+    if (boundary === 'turn') original.turnId = 'old-turn';
+    if (boundary === 'revision') original.inputRevision = 999;
+    if (boundary === 'result') original.result.emoji = 'wave';
+    const messages = structuredClone(state.messages);
+    const completion = () => coordinatorStep({ ...step, state, execute: () => assert.fail('Completion cannot create another intent'),
+      model: { next: async () => ({ stop: 'end_turn', content: [] }) } });
+    if (boundary === 'valid') {
+      await completion(); assert.equal(state.status, 'waiting-for-user'); assert.deepEqual(state.messages, messages);
+    } else await assert.rejects(completion(), { code: 'MODEL_INVALID_RESPONSE' }, boundary);
+  }
+});
 test('Merged reaction completes only after its native receipt and a valid empty end_turn without empty assistant history', async () => {
   const state = mergedReactionState(), step = await acceptedReaction(state);
   assert.equal(state.status, 'running'); assert.equal(state.messages.length, 3);

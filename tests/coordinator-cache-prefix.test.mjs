@@ -12,6 +12,12 @@ import { hash } from '../scripts/shared/io.mjs';
 import { MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 
 const tools = [{ name: 'read_map', input_schema: { type: 'object', properties: {} } }];
+test('Concise reply policy preserves current goals without adding a classifier or topic checklist', () => {
+  const value = coordinatorPrefix('role', { format: 2, staticText: '', dynamicText: '当前目标：双向同步' }, tools);
+  assert.match(value.system, /先覆盖当前明确目标再精简/);
+  assert.doesNotMatch(value.system, /本地.?Cloud|Cloud.?本地|当前目标：双向同步/);
+  assert.deepEqual(value.tools, tools);
+});
 const answer = { stop: 'end_turn', content: [{ type: 'text', text: '收到' }],
   usage: { input_tokens: 100, cache_read_input_tokens: 1000 } };
 function snapshot(version = 'v1', status = 'pending') {
