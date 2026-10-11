@@ -1019,7 +1019,7 @@ export class SlackPlugin {
       } else if (!participation) {
         // 同一已绑定操作者的续话取实时授权对话，不让平台历史 IO 延迟 Steer。
         // 首次历史、其他操作者及其他原生受众仍读取实际 Slack 上下文。
-        const ownedContinuation = existing?.historyAccepted && existing.userId === event.user &&
+        const ownedContinuation = !direct && existing?.historyAccepted && existing.userId === event.user &&
           !activeMentions(text).some(userId => userId !== this.botUserId);
         const context = existing && (ownedContinuation || direct && (!event.thread_ts || existingKey !== originalKey))
           ? await this.privateConversationContext(id, event, existing) : await this.recentThreadContext(event, id, projectId, existingKey);

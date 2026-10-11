@@ -767,7 +767,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
       else if (!executableTools.some(tool => tool.name === name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
-      else if (name === 'react_to_user' && new Set(reactionReceipts.map(([, item]) => item.result.emoji)).size >= 2) {
+      // 两个不同表情的额度属于原用户消息，不因 Steer 版本或重放记录重置。
+      else if (name === 'react_to_user' && new Set(Object.values(state.toolReceipts).filter(item =>
+        !item.isError && item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id)
+        .map(item => item.result.emoji)).size >= 2) {
         receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
       }
       else {

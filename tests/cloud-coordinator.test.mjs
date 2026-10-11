@@ -74,6 +74,20 @@ test('Reaction replay cannot borrow another input actor generation or malformed 
     else assert.equal(executions, 2, boundary);
   }
 });
+
+test('Reaction quota remains bound to the original input across revised generations', async () => {
+  const state = reactionState(), native = createCoordinatorExecutor({}); let executions = 0;
+  const step = { turnId: 'quota-input', state, system: 'role', tools: coordinatorTools, save: async () => {},
+    execute: async (...args) => { executions++; return native(...args); } };
+  for (const [index, emoji] of ['heart', 'wave', 'clap'].entries()) {
+    state.consumedInputRevision = index;
+    await coordinatorStep({ ...step, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'revision-' + index, name: 'react_to_user', input: { emoji } },
+    ] }) } });
+  }
+  assert.equal(executions, 2);
+  assert.equal(state.messages.at(-1).content[0].is_error, true);
+});
 test('Slack reaction intent binds server actor and input and preserves the following text or emoji-only completion', async () => {
   for (const text of ['已收到。', '']) {
     const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
