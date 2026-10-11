@@ -288,7 +288,55 @@ export class CursorRoleChannel {
   }
 
   async ciSnapshot(token, input) {
-    return this.withLease(token, async lease => {
+    return this.withLease(token, lease => this.#ciSnapshotForLease(lease, input));
+  }
+
+  // Host-only completion of an already saved proposal. This is not MCP
+  // authentication or a lease renewal: the old operation/token stays expired,
+  // and no new capability or native Run is issued. The private invocation,
+  // current bindings/source authorization and verified result are rechecked.
+  async #withHostCi(invocation, input, action) {
+    if (!invocation || invocation.state !== 'confirmed' || invocation.scope?.phase !== 'ci' ||
+        invocation.id !== hash(canonical(invocation.scope)) || !bounded(invocation.runId) ||
+        !invocation.ciProposal?.snapshot || canonical(invocation.ciProposal.snapshot.input) !== canonical(input) ||
+        canonical(invocation.ciProposal.snapshot.scope) !== canonical(invocation.scope) ||
+        invocation.ciProposal.snapshot.runId !== invocation.runId) fail('ROLE_FORBIDDEN', 'Host completion requires the original saved independent CI proposal');
+    const file = path.join(this.directory, 'operations', hash(invocation.id) + '.json');
+    return withFileLock(file + '.lock', async () => {
+      const original = await readJSON(file, null);
+      if (!original || original.format !== 1 || original.token !== invocation.token ||
+          original.scopeHash !== invocation.id || canonical(original.scope) !== canonical(invocation.scope) ||
+          original.runId !== invocation.runId) fail('ROLE_FORBIDDEN', 'Original CI delegation changed');
+      if (original.state === 'revoked') fail('ROLE_EXPIRED', 'Explicitly revoked delegation cannot be completed by the host');
+      if (original.state !== 'active' || !Number.isSafeInteger(original.expiresAt)) fail('ROLE_UNAVAILABLE', 'Original CI receiver was never activated');
+      // A bounded internal transaction window, never saved or exposed to the
+      // native Agent. All public authentication still reads original.expiresAt.
+      return action({ ...original, expiresAt: this.now() + 60000 });
+    });
+  }
+
+  async hostCiSnapshot(invocation, input) {
+    return this.#withHostCi(invocation, input, lease => this.#ciSnapshotForLease(lease, input));
+  }
+
+  async hostCiExchange(invocation, input) {
+    return this.#withHostCi(invocation, input, async lease => {
+      const scope = lease.scope;
+      const message = validateMessage({ v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) });
+      if (message.type !== 'ci.result' || message.payload.taskId !== scope.taskId || message.payload.sourceSha !== scope.sourceSha)
+        fail('ROLE_FORBIDDEN', 'Host completion cannot write evidence, approve or control tasks');
+      return this.store.handle(this.principal(scope), message, {
+        authorize: async (state, principal, message) => {
+          this.task(state, scope, principal);
+          const receiver = await this.receiver(lease, state);
+          if (!receiver.verifiedCi) fail('SOURCE_UNVERIFIED', 'Host completion requires the actual verified native and machine result');
+          this.authorize(state, principal, message, lease, receiver);
+        },
+      });
+    });
+  }
+
+  async #ciSnapshotForLease(lease, input) {
       const scope = lease.scope, principal = this.principal(scope);
       const message = validateMessage({ v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) });
       if (scope.phase !== 'ci' || message.type !== 'ci.result' || message.payload.taskId !== scope.taskId || message.payload.sourceSha !== scope.sourceSha) fail('ROLE_FORBIDDEN', 'Defer only the original independent CI result');
@@ -306,6 +354,5 @@ export class CursorRoleChannel {
           todoVersion: todo.latest, items: todo.versions[todo.latest].content.items,
           references: Object.fromEntries(refs.map(ref => [ref, state.objects[scopedObjectKey(principal, scope.session, ref)].latest])), verified: !!receiver.verifiedCi };
       }, { readOnly: true });
-    });
   }
 }
