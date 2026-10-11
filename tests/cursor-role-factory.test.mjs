@@ -8,6 +8,7 @@ import { CursorRoleFactory, cursorTemplateWorktree } from '../scripts/cloud/curs
 import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { scopedObjectKey } from '../scripts/shared/protocol-workflow.mjs';
 import { canonical } from '../scripts/shared/protocol.mjs';
+import { cursorReworkId } from '../scripts/cloud/cursor-role-channel.mjs';
 import { hash } from '../scripts/shared/io.mjs';
 
 const templateId = '11111111-1111-4111-8111-111111111111', sourceSha = 'a'.repeat(40), handoffSha = 'b'.repeat(40);
@@ -554,14 +555,15 @@ async function ciFixture(t, { nativeFailed = false, machineFailed = false, aggre
     { workflow: { verifyCiReceiver: (state, _p, session) => f.factory.hasCiReceiver(state, session) } });
   const file = f.factory.ciFile(f.reserved.session, 'task', handoffSha);
   const typedObservation = async (agentId, runId) => {
-    const actor = JSON.parse(await fs.readFile(file, 'utf8'));
+    const actor = JSON.parse(await fs.readFile(f.nativeObservationFile || file, 'utf8'));
     assert.equal(actor.nativeAgentId, agentId); assert.equal(actor.invocations.at(-1).runId, runId);
+    const failed = f.nativeFailedOverride ?? nativeFailed;
     const commands = actor.commands.map((spec, index) => ({ event: 'tool_call', data: {
       callId: 'actual-command-' + index, name: 'run_terminal_cmd', status: 'completed', args: { command: spec.command },
       result: { isBackground: false, success: { command: spec.command, stdout: 'CG_CURSOR_PROOF ' + JSON.stringify({
-        format: 1, nonce: spec.nonce, sourceSha: handoffSha, argv: spec.argv, before: { sha: handoffSha, clean: true }, after: { sha: handoffSha, clean: true },
-        exitCode: nativeFailed ? 1 : 0, signal: null, spawnError: null,
-        stdout: `# tests 1\n# pass ${nativeFailed ? 0 : 1}\n# fail ${nativeFailed ? 1 : 0}\n# cancelled 0\n# skipped 0\n# todo 0\n`, stderr: '',
+        format: 1, nonce: spec.nonce, sourceSha: actor.sourceSha, argv: spec.argv, before: { sha: actor.sourceSha, clean: true }, after: { sha: actor.sourceSha, clean: true },
+        exitCode: failed ? 1 : 0, signal: null, spawnError: null,
+        stdout: `# tests 1\n# pass ${failed ? 0 : 1}\n# fail ${failed ? 1 : 0}\n# cancelled 0\n# skipped 0\n# todo 0\n`, stderr: '',
       }) + '\n' } },
     } }));
     return { agentId, runId, complete: true, events: [...commands, { event: 'result', data: { runId, status: 'FINISHED' } }] };
@@ -569,15 +571,173 @@ async function ciFixture(t, { nativeFailed = false, machineFailed = false, aggre
   f.provider.readRunEvents = typedObservation;
   return Object.assign(f, { machine, workflowCalls, file, typedObservation });
 }
-async function ciProposal(f, { verdict = 'passed', status = 'passed', reproduction = false, idPrefix = '' } = {}) {
+async function ciProposal(f, { verdict = 'passed', status = 'passed', reproduction = false, idPrefix = '', revision = handoffSha } = {}) {
   const invocation = await f.factory.pump(f.reserved.session, 'task'), context = await f.factory.channel.context(invocation.token);
   const put = async name => (await f.factory.channel.exchange(invocation.token, { id: idPrefix + 'ci-' + name, type: 'object.put',
-    payload: { kind: 'evidence', ref: context.writePrefix + name, baseVersion: '', content: { sourceSha: handoffSha, observation: 'Controlled provider evidence, not a real vendor test' } } })).data;
+    payload: { kind: 'evidence', ref: context.writePrefix + name, baseVersion: '', content: { sourceSha: revision, observation: 'Controlled provider evidence, not a real vendor test' } } })).data;
   const evidence = await put('evidence'), reproductionRef = reproduction ? (await put('reproduction')).ref : undefined;
-  const input = { id: idPrefix + 'original-ci-result', type: 'ci.result', payload: { taskId: 'task', sourceSha: handoffSha, verdict,
+  const input = { id: idPrefix + 'original-ci-result', type: 'ci.result', payload: { taskId: 'task', sourceSha: revision, verdict,
     checks: [{ todoId: 'CI-1', testId: 'fixed-formal-test', status, evidenceRef: evidence.ref, ...(reproductionRef ? { reproductionRef } : {}) }] } };
   return { invocation, context, input, evidence };
 }
+
+async function reworkFixture(t, { humanRejection = false } = {}) {
+  const f = await ciFixture(t, { nativeFailed: !humanRejection, machineFailed: !humanRejection });
+  const p = await ciProposal(f, humanRejection ? {} : { verdict: 'failed', status: 'failed', reproduction: true });
+  await f.factory.channel.exchange(p.invocation.token, p.input);
+  await f.factory.pump(f.reserved.session, 'task');
+  let task = await f.store.taskRecord(f.coordinator, f.reserved.session, 'task');
+  if (humanRejection) {
+    await f.send(f.human, f.reserved.session, 'review.result', { kind: 'acceptance', ref: task.ci.ref, version: task.ci.version,
+      decision: 'rejected', reason: 'The agreed empty-search behavior is missing' });
+    task = await f.store.taskRecord(f.coordinator, f.reserved.session, 'task');
+  }
+  assert.equal(task.stage, humanRejection ? 'acceptance-rejected' : 'ci-failed');
+  const beforeExecutor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+  const beforeTester = JSON.parse(await fs.readFile(f.file, 'utf8'));
+  await f.send(f.coordinator, f.reserved.session, 'task.rework', {
+    taskId: 'task', sourceSha: handoffSha, ciResultRef: task.ci.ref,
+    failedTestIds: humanRejection ? [] : ['fixed-formal-test'],
+    reason: humanRejection ? task.acceptanceReview.reason : 'Fix the independently verified failure',
+  });
+  return Object.assign(f, { failedTask: task, oldProposal: p, beforeExecutor, beforeTester });
+}
+
+async function reworkPlan(f) {
+  const next = await f.factory.pump(f.reserved.session, 'task');
+  assert.ok(next, 'Coordinator-approved rework must not silently return null');
+  const context = await f.factory.channel.context(next.token);
+  const plan = (await f.factory.channel.exchange(next.token, { id: context.writePrefix + 'put-plan', type: 'object.put',
+    payload: { kind: 'plan', ref: context.writePrefix + 'plan', baseVersion: '', content: {
+      steps: ['Read original failure evidence', 'Fix and independently retest'], paths: ['src/fixture.mjs'],
+    } } })).data;
+  await f.factory.channel.exchange(next.token, { id: context.writePrefix + 'plan-ready', type: 'task.report',
+    payload: { taskId: 'task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha: handoffSha } } });
+  return { next, context, plan };
+}
+
+test('Coordinator rework returns the original Executor to a new Plan and preserves failed evidence', async t => {
+  for (const humanRejection of [false, true]) await t.test(humanRejection ? 'human rejection' : 'CI failure', async t => {
+    const f = await reworkFixture(t, { humanRejection });
+    const originalFollowUp = f.provider.followUp;
+    f.provider.followUp = async (...args) => { const run = await originalFollowUp(...args); run.status = 'RUNNING'; return run; };
+    const before = f.calls.length;
+    const first = await f.factory.pump(f.reserved.session, 'task');
+    assert.ok(first, 'Coordinator-approved rework must not silently return null');
+    assert.equal(first.scope.phase, 'plan'); assert.equal(first.scope.sourceSha, handoffSha);
+    assert.equal(first.scope.nativeAgentId, f.invocation.scope.nativeAgentId);
+    assert.equal(first.scope.taskId, 'task'); assert.match(first.scope.reworkId, /^[a-f0-9]{64}$/);
+    const reopened = new CursorRoleFactory(f.options);
+    const repeated = await Promise.all([reopened.pump(f.reserved.session, 'task'), f.factory.pump(f.reserved.session, 'task')]);
+    assert.ok(repeated.every(item => item.id === first.id)); assert.equal(f.calls.length, before + 1);
+    assert.equal(f.calls.at(-1).method, 'followUp'); assert.equal(f.calls.at(-1).options.mode, 'plan');
+    assert.match(f.calls.at(-1).text, /immutable CI result\/reproduction/);
+    const context = await f.factory.channel.context(first.token);
+    assert.equal(context.rework.ciResultRef, f.failedTask.ci.ref);
+    assert.deepEqual(context.rework.failedTestIds, humanRejection ? [] : ['fixed-formal-test']);
+    assert.notEqual(context.writePrefix, f.factory.channel.prefix(f.beforeExecutor.invocations[0].scope));
+    for (const ref of context.references.filter(ref => ref.ref !== f.failedTask.plan.ref && ref.ref !== f.failedTask.brief.ref)) {
+      assert.ok((await f.factory.channel.exchange(first.token, { id: hash(context.writePrefix + ref.ref), type: 'object.read', payload: ref })).ok);
+    }
+    await assert.rejects(f.factory.channel.exchange(first.token, { id: 'rework-overwrite', type: 'object.put', payload: {
+      kind: 'plan', ref: f.failedTask.plan.ref, baseVersion: f.failedTask.plan.version, content: { steps: ['Erase old evidence'] },
+    } }), { code: 'ROLE_FORBIDDEN' });
+    const executor = JSON.parse(await fs.readFile(f.factory.executorFile(f.reserved.session.id), 'utf8'));
+    assert.deepEqual(executor.invocations.slice(0, -1), f.beforeExecutor.invocations);
+    assert.deepEqual(JSON.parse(await fs.readFile(f.file, 'utf8')), f.beforeTester);
+    assert.deepEqual((await f.store.taskRecord(f.coordinator, f.reserved.session, 'task')).ci, f.failedTask.ci);
+  });
+});
+
+test('Rework must be reviewed before execution and then uses a fresh independent Tester even for the same SHA', async t => {
+  for (const resultSha of [handoffSha, 'c'.repeat(40)]) await t.test(resultSha === handoffSha ? 'same SHA' : 'new commit SHA', async t => {
+  const f = await reworkFixture(t), { next, context, plan } = await reworkPlan(f);
+  const before = f.calls.length;
+  assert.equal(await f.factory.pump(f.reserved.session, 'task'), null);
+  assert.equal(f.calls.length, before, 'submitted but unapproved Plan never starts implementation');
+  await f.send(f.coordinator, f.reserved.session, 'review.request', { taskId: 'task', kind: 'plan', ...plan,
+    requirementsRef: f.failedTask.brief.ref, requirementsVersion: f.failedTask.brief.version, rulesVersion: 'rules' });
+  await f.send(f.coordinator, f.reserved.session, 'review.result', { kind: 'plan', ...plan, decision: 'approved', reason: 'Reviewed original failure and new scope' });
+  const execution = await f.factory.pump(f.reserved.session, 'task');
+  assert.equal(execution.scope.phase, 'execution'); assert.equal(execution.scope.sourceSha, handoffSha);
+  assert.equal(execution.scope.nativeAgentId, next.scope.nativeAgentId);
+  await assert.rejects(f.factory.channel.context(next.token), { code: 'ROLE_EXPIRED' });
+  const prefix = f.factory.channel.prefix(execution.scope);
+  const put = async (name, kind, content) => (await f.factory.channel.exchange(execution.token, {
+    id: prefix + 'put-' + name, type: 'object.put', payload: { kind, ref: prefix + name, baseVersion: '', content },
+  })).data;
+  const todo = await put('todo', 'ciTodo', { items: [{ id: 'CI-1', title: 'Independent check' }] });
+  const evidence = await put('unit', 'evidence', { observation: 'Rework module validation, vendor controlled' });
+  f.factory.gitProof.verify = async input => ({ repository: 'example/repo', branch: 'cursor/task', baseSha: input.baseSha,
+    sourceSha: input.sourceSha, files: ['src/fixture.mjs'] });
+  await f.factory.channel.exchange(execution.token, { id: prefix + 'handoff', type: 'task.report',
+    payload: { taskId: 'task', stage: 'handoff', data: { sourceSha: resultSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref], experienceRefs: [] } } });
+  const reservation = await f.factory.pump(f.reserved.session, 'task');
+  assert.notEqual(reservation.session.id, f.oldProposal.invocation.scope.actor.id);
+  assert.notEqual(reservation.session.id, f.reserved.session.id);
+  await f.send(f.coordinator, f.reserved.session, 'ci.request', { taskId: 'task', sourceSha: resultSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref] },
+    { workflow: { verifyCiReceiver: (state, _p, session) => f.factory.hasCiReceiver(state, session) } });
+  const tester = await f.factory.pump(f.reserved.session, 'task');
+  assert.equal(tester.scope.reworkId, execution.scope.reworkId);
+  assert.notEqual(tester.scope.nativeAgentId, f.oldProposal.invocation.scope.nativeAgentId);
+  assert.notEqual(tester.scope.nativeAgentId, execution.scope.nativeAgentId);
+  assert.equal(tester.scope.sourceSha, resultSha);
+  assert.equal((await f.store.taskRecord(f.coordinator, f.reserved.session, 'task')).stage, 'testing');
+  f.nativeObservationFile = f.factory.ciFile(f.reserved.session, 'task', resultSha, execution.scope.reworkId);
+  f.nativeFailedOverride = false;
+  for (const check of f.machine) Object.assign(check, { sourceSha: resultSha, conclusion: 'success', runConclusion: 'success', testConclusion: 'success' });
+  const passed = await ciProposal(f, { idPrefix: 'rework-', revision: resultSha });
+  await f.factory.channel.exchange(passed.invocation.token, passed.input);
+  await f.factory.pump(f.reserved.session, 'task');
+  const verified = await f.store.taskRecord(f.coordinator, f.reserved.session, 'task');
+  assert.equal(verified.stage, 'awaiting-merge'); assert.equal(verified.ci.verdict, 'passed');
+  assert.notEqual(verified.ci.ref, f.failedTask.ci.ref);
+  assert.equal(verified.acceptanceReview, undefined, 'technical retest never invents human acceptance');
+  assert.equal(f.calls.filter(call => call.method === 'create').length, 3, 'original Executor, original Tester, rework Tester only');
+  assert.deepEqual(JSON.parse(await fs.readFile(f.file, 'utf8')), f.beforeTester);
+  assert.equal(context.rework.sourceSha, handoffSha);
+  // A later human rejection is a distinct Coordinator decision, not another
+  // retry of the old failure. Its namespace cannot revive the previous lease.
+  await f.send(f.human, f.reserved.session, 'review.result', { kind: 'acceptance', ref: verified.ci.ref, version: verified.ci.version,
+    decision: 'rejected', reason: 'The required interaction is still missing' });
+  await f.send(f.coordinator, f.reserved.session, 'task.rework', { taskId: 'task', sourceSha: resultSha,
+    ciResultRef: verified.ci.ref, failedTestIds: [], reason: 'The required interaction is still missing' });
+  await assert.rejects(f.factory.channel.context(tester.token), { code: 'ROLE_FORBIDDEN' });
+  const second = await f.factory.pump(f.reserved.session, 'task');
+  assert.equal(second.scope.phase, 'plan'); assert.equal(second.scope.sourceSha, resultSha);
+  assert.equal(second.scope.nativeAgentId, next.scope.nativeAgentId);
+  assert.notEqual(second.scope.reworkId, next.scope.reworkId);
+  assert.notEqual(f.factory.channel.prefix(second.scope), context.writePrefix);
+  });
+});
+
+test('Rework does not resend uncertain native acceptance or dispatch after access is revoked', async t => {
+  for (const scenario of ['unknown', 'revoked', 'busy', 'invalid-cycle']) await t.test(scenario, async t => {
+    const f = await reworkFixture(t), before = f.calls.length;
+    if (scenario === 'unknown') {
+      f.setUncertain('followUp');
+      await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_TRANSPORT_ERROR' });
+      await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ACCEPTANCE_UNKNOWN' });
+      assert.equal(f.calls.length, before + 1);
+    } else if (scenario === 'revoked') {
+      f.setAllowed(false); await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_CONFLICT' });
+      assert.equal(f.calls.length, before);
+    } else if (scenario === 'busy') {
+      f.runs.get(f.invocation.scope.nativeAgentId).status = 'RUNNING';
+      await assert.rejects(f.factory.pump(f.reserved.session, 'task'), { code: 'CURSOR_ROLE_BUSY' });
+      assert.equal(f.calls.length, before);
+    } else {
+      const invocation = await f.factory.pump(f.reserved.session, 'task');
+      await assert.rejects(f.factory.channel.issue({ operationId: 'bad-rework-cycle', scope: { ...invocation.scope, reworkId: 'invalid' } }), { code: 'INVALID_ARGUMENT' });
+      const wrong = await f.factory.channel.issue({ operationId: 'wrong-rework-cycle', scope: { ...invocation.scope, reworkId: 'f'.repeat(64) } });
+      await assert.rejects(f.factory.channel.context(wrong.token), { code: 'ROLE_UNAVAILABLE' });
+      const state = await f.store.transaction(value => value, { readOnly: true });
+      const wrongScope = { ...invocation.scope, reworkId: 'f'.repeat(64) };
+      assert.throws(() => f.factory.channel.task(state, wrongScope, f.factory.channel.principal(wrongScope)), { code: 'ROLE_FORBIDDEN' });
+      assert.equal(invocation.scope.reworkId, cursorReworkId(await f.store.taskRecord(f.coordinator, f.reserved.session, 'task')));
+    }
+  });
+});
 test('A verified CI contradiction can request one original Tester correction without rewriting its proposal or accepting its verdict', async t => {
   const f = await ciFixture(t, { aggregateFailed: true }), p = await ciProposal(f);
   await f.factory.channel.exchange(p.invocation.token, p.input);

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { canonical } from '../shared/protocol.mjs';
 import { scopedObjectKey } from '../shared/protocol-workflow.mjs';
-import { CursorRoleChannel, CURSOR_PLAN_CONTINUATIONS } from './cursor-role-channel.mjs';
+import { CursorRoleChannel, CURSOR_PLAN_CONTINUATIONS, cursorReworkId } from './cursor-role-channel.mjs';
 import { cursorFailureDiagnostic, cursorRunTerminal, validateCursorSource } from './cursor-provider.mjs';
 import { CursorGitProof, cursorApprovedPaths } from './cursor-git-proof.mjs';
 import { cursorProofCommand, verifyCursorNativeProof } from './cursor-native-proof.mjs';
@@ -49,8 +49,8 @@ export class CursorRoleFactory {
     if (!uuid.test(id || '') || id === this.templateSessionId) fail('CURSOR_ROLE_CONFLICT', 'Use a reserved child Session, not the template');
     return path.join(this.directory, 'executors', id + '.json');
   }
-  ciFile(session, taskId, sourceSha) { return path.join(this.directory, 'testers', hash(canonical([session, taskId, sourceSha])) + '.json'); }
-  actorFile(scope) { return scope.phase === 'ci' ? this.ciFile(scope.session, scope.taskId, scope.sourceSha) : this.executorFile(scope.session.id); }
+  ciFile(session, taskId, sourceSha, reworkId = '') { return path.join(this.directory, 'testers', hash(canonical([session, taskId, sourceSha, ...(reworkId ? [reworkId] : [])])) + '.json'); }
+  actorFile(scope) { return scope.phase === 'ci' ? this.ciFile(scope.session, scope.taskId, scope.sourceSha, scope.reworkId) : this.executorFile(scope.session.id); }
 
   async initialize() {
     const principal = this.principal(this.templateSessionId), worktreeId = cursorTemplateWorktree(this.templateSessionId);
@@ -137,12 +137,13 @@ export class CursorRoleFactory {
     if (!executor || canonical(executor.session) !== canonical(session)) fail('CURSOR_ROLE_CONFLICT', 'CI requires its registered hosted Executor');
     const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
     if (!['awaiting-ci', 'testing'].includes(task.stage) || !sha.test(task.handoff?.sourceSha || '') || task.handoff.sourceSha !== task.sourceSha) fail('CURSOR_ROLE_CONFLICT', 'Reserve CI only after the verified original handoff');
-    const file = this.ciFile(session, taskId, task.sourceSha);
+    const reworkId = cursorReworkId(task), file = this.ciFile(session, taskId, task.sourceSha, reworkId);
     return withFileLock(file + '.lock', async () => {
       let actor = await readJSON(file, null);
       if (!actor) {
         const nativeAgentId = 'bc-' + randomUUID();
         actor = { format: 1, kind: 'ci', session: { id: randomUUID(), generation: 1 }, executorSession: session, taskId,
+          ...(reworkId ? { reworkId } : {}),
           ciPolicyHash: executor.ciPolicyHash || '',
           approval: executor.approval, templateGeneration: executor.templateGeneration,
           nativeAgentId, executorNativeAgentId: executor.nativeAgentId, worktreeId: 'cursor-cloud:' + nativeAgentId,
@@ -153,13 +154,13 @@ export class CursorRoleFactory {
         });
         await atomicWrite(file, encode(actor));
       }
-      const reply = await this.store.handle(this.principal(actor.session.id, 'ci'), { v: 2, id: 'cursor-ci-reserve:' + hash(canonical([session, taskId, actor.sourceSha])), type: 'session.bind', payload: {
+      const reply = await this.store.handle(this.principal(actor.session.id, 'ci'), { v: 2, id: 'cursor-ci-reserve:' + hash(canonical([session, taskId, actor.sourceSha, ...(reworkId ? [reworkId] : [])])), type: 'session.bind', payload: {
         sessionId: actor.session.id, agentId: actor.session.id, worktreeId: actor.worktreeId, expectedBindingVersion: '',
       } }, {
         verifyBinding: (p, payload) => p.deviceId === this.ownerId && payload.agentId === actor.session.id && payload.worktreeId === actor.worktreeId && actor.worktreeId !== executor.worktreeId && actor.nativeAgentId !== executor.nativeAgentId,
         authorize: state => {
           const current = this.currentTask(state, executor, taskId);
-          if (!['awaiting-ci', 'testing'].includes(current.stage) || current.sourceSha !== actor.sourceSha || canonical(current.handoff) !== canonical(actor.handoff)) fail('CURSOR_ROLE_CONFLICT', 'CI handoff changed during reservation');
+          if (!['awaiting-ci', 'testing'].includes(current.stage) || current.sourceSha !== actor.sourceSha || canonical(current.handoff) !== canonical(actor.handoff) || cursorReworkId(current) !== (actor.reworkId || '')) fail('CURSOR_ROLE_CONFLICT', 'CI handoff changed during reservation');
           const prior = state.bindings[bindingKey(this.repositoryId, actor.session.id)];
           if (prior && (prior.deviceId !== this.ownerId || prior.agentId !== actor.session.id || prior.worktreeId !== actor.worktreeId)) fail('CURSOR_ROLE_CONFLICT', 'Preserve the existing Tester binding');
         },
@@ -174,7 +175,7 @@ export class CursorRoleFactory {
     if (!executor || canonical(session) !== canonical(executor.session)) return false;
     const tasks = Object.values(state.tasks || {}).filter(task => task.repositoryId === this.repositoryId && canonical(task.session) === canonical(session) && ['awaiting-ci', 'testing'].includes(task.stage));
     if (tasks.length !== 1) return false;
-    const task = tasks[0], actor = await readJSON(this.ciFile(session, task.id, task.sourceSha), null);
+    const task = tasks[0], actor = await readJSON(this.ciFile(session, task.id, task.sourceSha, cursorReworkId(task)), null);
     if (!actor || actor.kind !== 'ci' || actor.executorNativeAgentId !== executor.nativeAgentId || actor.nativeAgentId === executor.nativeAgentId || actor.worktreeId === executor.worktreeId || actor.sourceSha !== task.handoff?.sourceSha || canonical(actor.handoff) !== canonical(task.handoff)) return false;
     try { this.requireActor(state, executor); this.requireActor(state, actor); return true; } catch { return false; }
   }
@@ -187,13 +188,14 @@ export class CursorRoleFactory {
       ...(attempt ? { attempt } : {}),
       ...(createAttempt ? { createAttempt } : {}),
       ...(ciAttempt ? { ciAttempt } : {}),
+      ...(cursorReworkId(task) ? { reworkId: cursorReworkId(task) } : {}),
       ...(this.ciPolicyHash ? { ciPolicyHash: this.ciPolicyHash } : {}),
-      sourceSha: phase === 'plan' ? actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
+      sourceSha: phase === 'plan' ? task.rework?.sourceSha || actor.sourceSha : task.sourceSha, ...(phase === 'execution' ? { plan: task.plan } : {}) };
   }
   async authorizeLaunch(state, actor, taskId, phase) {
     const task = this.currentTask(state, actor, taskId);
-    if (phase === 'plan' && task.stage !== 'assigned' || phase === 'execution' && (task.stage !== 'executing' || task.planReview?.decision !== 'approved' || task.sourceSha !== actor.sourceSha) ||
-        phase === 'ci' && (actor.kind !== 'ci' || task.stage !== 'testing' || task.sourceSha !== actor.sourceSha || canonical(task.handoff) !== canonical(actor.handoff))) fail('CURSOR_ROLE_CONFLICT', 'Cursor launch does not match the current approved stage and revision');
+    if (phase === 'plan' && !['assigned', 'plan-rejected', 'rework'].includes(task.stage) || phase === 'execution' && (task.stage !== 'executing' || task.planReview?.decision !== 'approved' || task.sourceSha !== (task.rework?.sourceSha || actor.sourceSha)) ||
+        phase === 'ci' && (actor.kind !== 'ci' || task.stage !== 'testing' || task.sourceSha !== actor.sourceSha || canonical(task.handoff) !== canonical(actor.handoff) || cursorReworkId(task) !== (actor.reworkId || ''))) fail('CURSOR_ROLE_CONFLICT', 'Cursor launch does not match the current approved stage and revision');
     if (!await this.authorizeSource({ state, actor: structuredClone(actor), task: structuredClone(task) })) fail('CURSOR_ROLE_CONFLICT', 'Approved source or template access changed');
     return task;
   }
@@ -202,6 +204,7 @@ export class CursorRoleFactory {
     const common = `You are the ${scope.phase === 'ci' ? 'independent Tester' : 'Executor'} of the original Context Guard Coordinator task ${scope.taskId}. Never start a separate user chat, approve a requirement or Plan, or write Main. Use context_guard_context, then context_guard_exchange object.read for immutable references. When testPolicy is present, include its fixed todoId/testId/argv mapping in your Plan; write CI TODO items as {id: check.todoId, testId: check.testId, argv: check.argv} copied exactly from the same policy check. Use canonical id for new TODOs; number is only a display label, never identity. Never invent coverage or replace an immutable handoff to repair a mapping. Identity is fixed by MCP, never include Session/principal fields. Use the returned writePrefix and stable message IDs. If ROLE_UNAVAILABLE appears during native startup, retry the SAME MCP operation, do not create a new task. Source revision: ${scope.sourceSha}.`;
     const mapGuidance = this.channel.readMapSnapshot ? ' Use context_guard_map_read with {} for assigned-node navigation, then nodeId for on-demand context. This grants read-only task scope, not approval or Main writes.' : '';
     if (scope.phase === 'plan') return common + mapGuidance +
+      (scope.reworkId ? ' Coordinator rework: read context.rework and the immutable CI result/reproduction references. Continue the SAME Task and Executor branch from the specified failed source revision. Preserve old failed results; use NEW stable message IDs containing the NEW writePrefix, never reuse old IDs. Write a NEW Plan under that prefix and stop for Coordinator review before changing code. This is not approval or a new task.' : '') +
       (scope.attempt ? ` The previous saved Run terminated without submitting the original Task Plan. This is continuation ${scope.attempt} on the SAME Agent and Task, not a new task or an approval. Read current context and tools/list again; use the NEW returned writePrefix and never reuse an old draft ref or capability.` : '') +
       ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance. First object.put requires payload {kind:"plan",ref:<writePrefix plus suffix>,baseVersion:"",content:<Plan object>}; do not omit baseVersion or send null. Use the exact returned ref/version in task.report payload {taskId:<original task>,stage:"planReady",data:{planRef:<ref>,planVersion:<version>,sourceSha:<specified source SHA>}}. Stop after that; Coordinator must review the exact Plan before implementation.';
     if (scope.phase === 'ci') return common + mapGuidance +
@@ -347,7 +350,7 @@ export class CursorRoleFactory {
     const executor = await readJSON(this.executorFile(session.id), null);
     if (!executor || canonical(executor.session) !== canonical(session)) fail('CURSOR_ROLE_CONFLICT', 'Use the original Executor binding');
     const task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
-    const file = this.ciFile(session, taskId, task.sourceSha), actor = await readJSON(file, null), original = actor?.invocations.at(-1);
+    const file = this.ciFile(session, taskId, task.sourceSha, cursorReworkId(task)), actor = await readJSON(file, null), original = actor?.invocations.at(-1);
     if (!actor || actor.kind !== 'ci') fail('CURSOR_ROLE_CONFLICT', 'Use the existing independent Tester');
     if (original?.scope.ciAttempt) {
       if (actor.ciCorrection?.previousRunId !== expectedRunId) fail('CURSOR_ROLE_CONFLICT', 'Recovery belongs to another original CI Run');
@@ -621,7 +624,7 @@ export class CursorRoleFactory {
       task = await this.store.transaction(state => this.currentTask(state, executor, taskId), { readOnly: true });
       if (task.stage === 'executing') return result;
     }
-    const ciFile = this.ciFile(session, taskId, task.sourceSha), ci = await readJSON(ciFile, null);
+    const ciFile = this.ciFile(session, taskId, task.sourceSha, cursorReworkId(task)), ci = await readJSON(ciFile, null);
     if (ci?.invocations.at(-1)?.ciProposal) {
       let result;
       try { result = await this.verifyCi(ciFile); }
@@ -634,9 +637,9 @@ export class CursorRoleFactory {
       if (task.stage === 'testing') return result;
     }
     if (task.stage === 'awaiting-ci') return this.reserveCi(session, taskId);
-    const phase = task.stage === 'assigned' ? 'plan' : task.stage === 'executing' ? 'execution' : task.stage === 'testing' ? 'ci' : null;
+    const phase = ['assigned', 'plan-rejected', 'rework'].includes(task.stage) ? 'plan' : task.stage === 'executing' ? 'execution' : task.stage === 'testing' ? 'ci' : null;
     if (!phase) return null;
-    const file = phase === 'ci' ? this.ciFile(session, taskId, task.sourceSha) : executorFile;
+    const file = phase === 'ci' ? this.ciFile(session, taskId, task.sourceSha, cursorReworkId(task)) : executorFile;
     if (phase === 'ci' && this.ciPolicy) await this.prepareCi(file);
     return withFileLock(file + '.lock', async () => {
       const actor = await readJSON(file, null);
@@ -685,7 +688,7 @@ export class CursorRoleFactory {
 
   async stopTask(file, executor, task) {
     const stopped = await this.stopActor(file, executor, task);
-    const ciFile = this.ciFile(executor.session, task.id, task.sourceSha);
+    const ciFile = this.ciFile(executor.session, task.id, task.sourceSha, cursorReworkId(task));
     const ci = await readJSON(ciFile, null);
     const ciStopped = !ci || await this.stopActor(ciFile, ci, task);
     if (!stopped || !ciStopped) return { state: 'stopping' };

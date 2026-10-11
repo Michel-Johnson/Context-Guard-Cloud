@@ -14,9 +14,12 @@ const bounded = value => typeof value === 'string' && value.length > 0 && value.
 const fail = (code, message) => { throw Object.assign(new Error(message), { code, status: code === 'INVALID_ARGUMENT' ? 400 : code === 'ROLE_UNAVAILABLE' ? 503 : code === 'ID_REUSED' ? 409 : 403 }); };
 const bindingKey = (scope, session) => hash(canonical([scope.repositoryId, session.id]));
 export const CURSOR_PLAN_CONTINUATIONS = 2;
+// Only the Coordinator-owned, Core-validated rework receipt selects a cycle.
+// A repeated pump/message must not manufacture another paid attempt.
+export const cursorReworkId = task => task.rework ? hash(canonical(task.rework)) : '';
 
 function validateScope(scope) {
-  const fields = ['projectId', 'repositoryId', 'ownerId', 'session', 'actor', 'worktreeId', 'actorWorktreeId', 'nativeAgentId', 'taskId', 'phase', 'sourceSha', 'plan', 'ciPolicyHash', 'attempt', 'createAttempt', 'ciAttempt'];
+  const fields = ['projectId', 'repositoryId', 'ownerId', 'session', 'actor', 'worktreeId', 'actorWorktreeId', 'nativeAgentId', 'taskId', 'phase', 'sourceSha', 'plan', 'ciPolicyHash', 'attempt', 'createAttempt', 'ciAttempt', 'reworkId'];
   const validSession = session => record(session) && Object.keys(session).every(key => ['id', 'generation'].includes(key)) && uuid.test(session.id || '') && Number.isSafeInteger(session.generation) && session.generation > 0;
   if (!record(scope) || Object.keys(scope).some(key => !fields.includes(key)) ||
       ['projectId', 'repositoryId', 'ownerId', 'worktreeId', 'actorWorktreeId', 'taskId'].some(key => !bounded(scope[key])) ||
@@ -25,6 +28,7 @@ function validateScope(scope) {
       scope.createAttempt !== undefined && (scope.phase !== 'ci' || ![1, 2].includes(scope.createAttempt) || scope.attempt !== undefined) ||
       scope.ciAttempt !== undefined && (scope.phase !== 'ci' || scope.ciAttempt !== 1 || scope.createAttempt !== undefined || scope.attempt !== undefined) ||
       !nativeId(scope.nativeAgentId) || !sha.test(scope.sourceSha || '') ||
+      scope.reworkId !== undefined && !/^[a-f0-9]{64}$/.test(scope.reworkId) ||
       scope.phase === 'ci' && (scope.actor.id === scope.session.id || scope.actorWorktreeId === scope.worktreeId) ||
       scope.phase !== 'ci' && (canonical(scope.actor) !== canonical(scope.session) || scope.actorWorktreeId !== scope.worktreeId) ||
       scope.phase === 'execution' && (!record(scope.plan) || Object.keys(scope.plan).some(key => !['ref', 'version'].includes(key)) || !bounded(scope.plan.ref) || !bounded(scope.plan.version)) ||
@@ -147,6 +151,7 @@ export class CursorRoleChannel {
         actor.agentId !== scope.actor.id || actor.worktreeId !== scope.actorWorktreeId) fail('ROLE_FORBIDDEN', 'Cursor Session or worktree binding changed');
     const task = state.tasks[scopedObjectKey(principal, scope.session, 'task:' + scope.taskId)];
     if (!task || task.repositoryId !== scope.repositoryId || canonical(task.session) !== canonical(scope.session) || task.briefReview?.decision !== 'approved') fail('ROLE_FORBIDDEN', 'Cursor task does not have the original approved requirement');
+    if (cursorReworkId(task) !== (scope.reworkId || '')) fail('ROLE_FORBIDDEN', 'Cursor capability belongs to another Coordinator rework cycle');
     if (scope.phase === 'plan') {
       if (!['assigned', 'plan-ready', 'plan-rejected', 'rework'].includes(task.stage)) fail('ROLE_FORBIDDEN', 'Cursor Plan phase ended');
     } else if (scope.phase === 'execution') {
@@ -155,12 +160,16 @@ export class CursorRoleChannel {
     return task;
   }
 
-  refs(task, scope) {
-    return [task.brief, task.plan, ...(scope.phase === 'ci' ? Object.entries(task.references || {}).map(([ref, version]) => ({ ref, version })) : [])].filter(Boolean);
+  refs(task, scope, state) {
+    const failed = scope.reworkId && scope.phase !== 'ci' && task.ci?.ref === task.rework?.ciResultRef ? task.ci : null;
+    const result = failed && state?.objects[scopedObjectKey(this.principal(scope), scope.session, failed.ref)]?.versions?.[failed.version];
+    return [task.brief, task.plan, ...(failed ? [{ ref: failed.ref, version: failed.version }] : []),
+      ...(scope.phase === 'ci' ? Object.entries(task.references || {}).map(([ref, version]) => ({ ref, version })) : []),
+      ...Object.entries(result?.content.references || {}).map(([ref, version]) => ({ ref, version }))].filter(Boolean);
   }
   // Task IDs may themselves contain separators. Fixed hashing of the tuple
   // prevents a "task" delegation from owning objects for "task:other".
-  prefix(scope) { return `${scope.phase === 'ci' ? 'ci' : 'cursor'}:${hash(canonical([scope.actor.id, scope.taskId]))}:${scope.attempt ? `attempt-${scope.attempt}:` : ''}${scope.createAttempt ? `create-attempt-${scope.createAttempt}:` : ''}${scope.ciAttempt ? `ci-result-attempt-${scope.ciAttempt}:` : ''}`; }
+  prefix(scope) { return `${scope.phase === 'ci' ? 'ci' : 'cursor'}:${hash(canonical([scope.actor.id, scope.taskId, ...(scope.reworkId ? [scope.reworkId] : [])]))}:${scope.attempt ? `attempt-${scope.attempt}:` : ''}${scope.createAttempt ? `create-attempt-${scope.createAttempt}:` : ''}${scope.ciAttempt ? `ci-result-attempt-${scope.ciAttempt}:` : ''}`; }
 
   authorize(state, principal, message, lease, receiver) {
     if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired while waiting for the task transaction');
@@ -168,7 +177,7 @@ export class CursorRoleChannel {
     const own = ref => typeof ref === 'string' && ref.startsWith(this.prefix(scope)) && ref.length > this.prefix(scope).length;
     if (message.type === 'object.read') {
       const object = state.objects[scopedObjectKey(principal, scope.session, p.ref)]?.versions?.[p.version];
-      if (!this.refs(task, scope).some(ref => ref.ref === p.ref && ref.version === p.version) && !(own(p.ref) && object)) fail('ROLE_FORBIDDEN', 'Read only this task\'s immutable references and own objects');
+      if (!this.refs(task, scope, state).some(ref => ref.ref === p.ref && ref.version === p.version) && !(own(p.ref) && object)) fail('ROLE_FORBIDDEN', 'Read only this task\'s immutable references and own objects');
       return;
     }
     if (message.type === 'object.put') {
@@ -242,7 +251,8 @@ export class CursorRoleChannel {
         const receiver = await this.receiver(lease, state);
         if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired');
         return { taskId: task.id, actor: scope.actor, session: scope.session, phase: scope.phase, stage: task.stage,
-          sourceSha: scope.sourceSha, writePrefix: this.prefix(scope), brief: task.brief, assignment: task.assignment, plan: task.plan, references: this.refs(task, scope),
+          sourceSha: scope.sourceSha, writePrefix: this.prefix(scope), brief: task.brief, assignment: task.assignment, plan: task.plan, references: this.refs(task, scope, state),
+          ...(scope.reworkId ? { rework: structuredClone(task.rework) } : {}),
           ...(receiver.testPolicy ? { testPolicy: receiver.testPolicy } : {}) };
       }, { readOnly: true });
     });
