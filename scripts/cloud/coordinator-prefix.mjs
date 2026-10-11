@@ -50,7 +50,10 @@ export function coordinatorInputContext(context, source) {
   // Called only at durable acceptance, never reconstructed using the latest
   // activeContext while replaying an older message or retrying a failed turn.
   return { format: 2, text: context?.format === 2 ? context.dynamicText : '',
-    source, version: context?.version || null };
+    source, version: context?.version || null,
+    ...(context?.bindingReceipt && typeof context.bindingReceipt.id === 'string' &&
+      ['绑定已保存，可以继续讨论。', '暂不绑定，继续讨论。'].includes(context.bindingReceipt.text)
+      ? { bindingReceipt: { id: context.bindingReceipt.id, text: context.bindingReceipt.text } } : {}) };
 }
 export function coordinatorContextMessage(message) {
   if (message.role !== 'user' || message.serverContext?.format !== 2) return message;

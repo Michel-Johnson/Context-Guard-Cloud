@@ -210,10 +210,12 @@ test('Manual role is selected explicitly without changing legacy execution instr
   const document = (await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8')).replace(/\r\n/g, '\n');
   const automatic = coordinatorRolePrompt(document), manual = coordinatorRolePrompt(document, { manual: true });
   assert.equal(automatic, document.slice(0, document.indexOf('\n## 人工对话模式\n')));
-  assert.match(automatic, /系统为新任务创建独立执行 Session/);
-  assert.doesNotMatch(manual, /系统为新任务创建独立执行 Session|审核 Plan|自动发起中断恢复/);
+  // The approved shared role was compacted in Skill ac9880d. Keep the same
+  // authorization/order contract, not the obsolete sentence spelling.
+  assert.match(automatic, /prepare_task 提 brief，等待需求审批回执；批准后由系统创建独立执行 Session\/worktree、绑定派发/);
+  assert.doesNotMatch(manual, /系统(?:为新任务)?创建独立执行 Session|审核 Plan|自动发起中断恢复/);
   assert.match(manual, /不创建、派发或恢复执行 Session/);
-  for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史摘要不是当前事实或授权']) {
+  for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史非事实/授权', 'Main状态非完成证据', '权限不扩大']) {
     assert.ok(manual.includes(invariant), `Manual role preserves ${invariant}`);
   }
   assert.doesNotMatch(manual, /自动发起中断恢复|审核 Plan/, '人工讨论提示词不包含执行调度规则');
@@ -300,12 +302,10 @@ test('Manual memory tool describes read-before-write and scoped full-document re
 test('Manual role limits memory editing to requested sections and reads the target first', async () => {
   const document = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
   const manual = coordinatorRolePrompt(document, {manual:true});
-  assert.match(manual, /先用 read_map 读取目标节点/);
-  assert.match(manual, /只修改用户指定的部分/);
-  assert.match(manual, /没有记忆文档时.*只写适用且已确认的章节/);
-  assert.match(manual, /不为凑齐六部分补写/);
-  assert.match(manual, /其他章节保持原文/);
-  assert.doesNotMatch(coordinatorRolePrompt(document), /先用 read_map 读取目标节点/);
+  assert.match(manual, /首次改Map先 read_reference 读 memory-definition\.md\/map-mount\.md，再 read_map 当前全文\/版本；只改指定内容，其他保原文/);
+  assert.match(manual, /无文档仅已确认适用章节，不凑六部分，memoryDocument全文，不用文件名字段，任务要求留事项/);
+  assert.match(manual, /prepare_task提出brief，等待人对指定版本确认；确认回执后才保存 Main TODO\/Bug 和执行提示/);
+  assert.doesNotMatch(coordinatorRolePrompt(document), /首次改Map先 read_reference/);
 });
 const input = (id, type, payload = {}, extra = {}) => ({ id, type, teamId, userId, projectId, conversationId: 'chat-fixture', payload, ...extra });
 async function call(gateway, body, credential = token) {
@@ -983,6 +983,31 @@ async function manualFixture(t) {
 const brief = version => ({ text: 'Correct token renewal', acceptance: 'Expired tokens are refreshed once', nodeIds: ['LOGIN'], mainVersion: version });
 const review = (proposal, decision = 'approved') => ({ proposalId: proposal.id, version: proposal.version, decision, reason: 'Human reviewed this exact brief' });
 const context = (operationId = 'review-first') => ({ operationId, conversationId: 'chat-fixture', actor });
+
+test('取消派发只在可信服务确认任务释放后复用，审核提交前再次核验', async t => {
+  const f = await manualFixture(t), original = await f.readMain();
+  original.document.root.children[0].bugs[0].dispatch = { session_id: 'old-session', task_id: 'old-task', status: 'cancelled' };
+  const binding = { nodeId: 'LOGIN', kind: 'bug', bindingApproval: 'confirmed-login' };
+  let released = true, checks = 0;
+  const options = { ...f.options, readMain: async () => structuredClone(original), readBinding: async () => binding };
+  const input = { ...brief(original.version), itemId: 'B1', nodeId: 'LOGIN', kind: 'bug' };
+  const unverified = new CoordinatorManualBriefs(options);
+  await assert.rejects(unverified.prepare(input, context('unknown')), { code: 'EXECUTION_NOT_RELEASED' });
+  const service = new CoordinatorManualBriefs({ ...options, canReuseCancelledExecution: async (item, routing) => {
+    checks++; assert.equal(item.dispatch.task_id, 'old-task'); assert.equal(routing.itemId, 'B1'); return released;
+  } });
+  const proposal = await service.prepare(input, context('cancelled'));
+  assert.equal(proposal.pending, true); assert.equal(checks, 1); assert.equal(f.commits, 0);
+  assert.ok((await service.prepare(input, context('cancelled'))).pending); assert.equal(checks, 1, '幂等读取不制造新提案');
+  released = false;
+  await assert.rejects(service.review(review(proposal), context('reject-live')), { code: 'EXECUTION_NOT_RELEASED' });
+  assert.equal(f.commits, 0);
+  original.document.root.children[0].bugs[0].dispatch.status = 'running';
+  await assert.rejects(service.prepare(input, context('running')), { code: 'ACTIVE_EXECUTION' });
+  original.document.root.children[0].bugs[0].status = 'processing';
+  await assert.rejects(service.prepare(input, context('busy')), { code: 'ACTIVE_EXECUTION' });
+  assert.equal(f.commits, 0);
+});
 
 test('新 TODO 和 Bug 只在已确认主节点形成 brief，审批后各存一份正确类型的事项', async t => {
   for (const kind of ['todo', 'bug']) {
