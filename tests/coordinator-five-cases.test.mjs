@@ -51,7 +51,7 @@ async function fixture(t, model, execute, options = {}) {
 async function run(service, id = 'input', text = '讨论原事项') {
   await service.submit({ id, text }); await service.close(); return service.state();
 }
-for (const [name, invalid] of [['身份', '归属 node-private'], ['长文', '中'.repeat(61)], ['问句', '你想核对哪部分？']]) {
+for (const [name, invalid] of [['身份', '归属 node-private'], ['问句', '你想核对哪部分？']]) {
   test(`卡片${name}未展示未执行，纠正后只产生一份正确节点入口`, async t => {
     let rounds = 0, shown = 0;
     const service = await fixture(t, async () => {
@@ -67,6 +67,16 @@ for (const [name, invalid] of [['身份', '归属 node-private'], ['长文', '�
     assert.ok(!JSON.stringify(state.messages).includes(invalid));
   });
 }
+test('节点卡片长文完整展示一次，长度不触发纠正或遮住质量记录', async t => {
+  let rounds = 0, shown = 0; const message = '中'.repeat(100);
+  const service = await fixture(t, async () => ++rounds === 1
+    ? call('show_nodes', { message, nodeIds: ['TESTS'] }, 'show') : reply('可以继续讨论。'),
+  async (name, input) => { shown++; return { kind: 'node-references', message: input.message, nodes: [{ id: 'TESTS', title: '测试' }] }; });
+  const state = await run(service);
+  assert.equal(state.status, 'waiting-for-user'); assert.equal(rounds, 2); assert.equal(shown, 1);
+  assert.deepEqual(state.messages.flatMap(value => value.actions || []).map(value => value.message), [message]);
+  assert.match(JSON.stringify((await service.readConversation()).performance), /REPLY_PARAGRAPH_LONG/);
+});
 test('两次相同展示回执保留，公开卡片只有一张；新轮允许重新展示', async t => {
   let rounds = 0, executions = 0;
   const service = await fixture(t, async () => ++rounds % 3 === 0 ? reply('继续讨论。')
@@ -93,7 +103,7 @@ test('一次问题只能在问答入口出现，正文重复问句纠正后不�
   const service = await fixture(t, async () => {
     rounds++;
     const result = call('ask_user', { question: '选择哪个范围？', options: ['公开文章', '当前文章'] }, 'ask-' + rounds);
-    if (rounds === 1) result.content.unshift({ type: 'text', text: '选择哪个范围？' });
+    if (rounds === 1) result.content.unshift({ type: 'text', text: '当前资料。'.repeat(30) + '选择哪个范围？' });
     return result;
   }, async (name, input) => { asked++; return { question: input.question, options: input.options, approval: 'not-granted' }; });
   const state = await run(service);

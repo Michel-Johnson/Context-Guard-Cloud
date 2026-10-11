@@ -61,7 +61,7 @@ export async function buildRuntime({ experimentalCore = null } = {}) {
         throw new Error('Experimental Core artifact or installed package does not match its fixed checksum');
       }
       const archive = path.resolve(experimentalCore.artifact), installedFiles = await walk(source);
-      const packedFiles = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', windowsHide: true }).trim().split('\n');
+      const packedFiles = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', windowsHide: true }).trim().split(/\r?\n/);
       if (JSON.stringify(packedFiles.sort()) !== JSON.stringify(installedFiles.map(file => 'package/' + file).sort())) {
         throw new Error('Experimental Core archive and installation file sets differ');
       }

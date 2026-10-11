@@ -92,31 +92,28 @@ for (const bad of [text('[CG_REPLY]\n旧答复'), reply('空白不允许', false
     assert.deepEqual(f.calls, []); assert.ok(f.snapshots.every(snapshot => !snapshot.streaming?.text));
   });
 }
-test('native reply still rejects internal IDs and paragraphs longer than 60 characters before display', async t => {
+test('native reply rejects internal IDs but delivers the subsequent long answer in full', async t => {
   let count = 0;
   const f = await fixture(t, async () => reply(++count === 1 ? '绑定 node-private' : count === 2 ? '长'.repeat(61) : '建议挂到阅读助手。'),
     { context: async () => ({ internalIds: ['node-private'] }) });
   await submit(f.service, '应该挂哪里？'); await f.service.close();
-  assert.equal(count, 3); assert.equal((await f.service.state()).messages.at(-1).text, '建议挂到阅读助手。');
+  assert.equal(count, 2); assert.equal((await f.service.state()).messages.at(-1).text, '长'.repeat(61));
   assert.deepEqual(f.calls, []);
 });
-for (const source of ['human', 'slack']) test(`${source}: repeated length corrections keep the original context until a short reply succeeds`, { timeout: 10000 }, async t => {
+for (const source of ['human', 'slack']) test(`${source}: native long replies are delivered once without length repair`, { timeout: 10000 }, async t => {
   let count = 0;
   const f = await fixture(t, async request => {
     count++;
     assert.match(JSON.stringify(request.messages), /简短总结需求/);
-    if (count > 1) {
-      assert.match(request.system, /重新表达/);
-      assert.match(JSON.stringify(request.messages), /REPLY_PARAGRAPH_LONG/);
-      assert.match(JSON.stringify(request.messages), /paragraphLengths/);
-    }
+    assert.doesNotMatch(JSON.stringify(request.messages), /rejectedText|paragraphLengths/);
     return reply(count <= 4 ? '长'.repeat(61) : '已定文章页问答，引用可点回原文。');
   }, { maxSteps: 1 });
   await submit(f.service, '简短总结需求', source); await f.service.close();
   const state = await f.service.state(), stored = await f.service.readConversation();
-  assert.equal(count, 5); assert.equal(state.status, 'waiting-for-user'); assert.equal(state.error, null);
+  assert.equal(count, 1); assert.equal(state.status, 'waiting-for-user'); assert.equal(state.error, null);
   assert.equal(state.messages.filter(m => m.role === 'assistant').length, 1);
-  assert.equal(state.messages.at(-1).text, '已定文章页问答，引用可点回原文。');
+  assert.equal(state.messages.at(-1).text, '长'.repeat(61));
+  assert.match(JSON.stringify(stored.performance), /REPLY_PARAGRAPH_LONG/);
   assert.equal(stored.messages.filter(m => m.role === 'user').length, 2); // Original input and respond receipt only.
   assert.ok(!JSON.stringify(stored.messages).includes('rejectedText'));
   assert.ok(f.snapshots.every(s => s.status !== 'error'));
@@ -125,35 +122,39 @@ for (const source of ['human', 'slack']) test(`${source}: repeated length correc
 for (const [name, outputProtocol, bad] of [
   ['paragraph count', protocol, '入口在文章页。\n\n仅检索公开文章。\n\n引用点回原文。'],
   ['legacy plain reply', null, '长'.repeat(61)],
-]) test(`${name}: length correction is not limited by the ordinary model retry budget`, { timeout: 10000 }, async t => {
+]) test(`${name}: valid long output needs no model retry budget`, { timeout: 10000 }, async t => {
   let count = 0;
   const f = await fixture(t, async () => {
     const value = ++count <= 4 ? bad : '只保留两个重点。';
     return outputProtocol ? reply(value) : text(value);
   }, { outputProtocol, maxModelRetries: 0 });
   await submit(f.service, '简短总结需求'); await f.service.close();
-  assert.equal(count, 5); assert.equal((await f.service.state()).status, 'waiting-for-user');
-  assert.equal((await f.service.state()).messages.at(-1).text, '只保留两个重点。');
+  assert.equal(count, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal((await f.service.state()).messages.at(-1).text, bad);
 });
-test('length corrections do not consume retries for a later transient model failure', { timeout: 10000 }, async t => {
+test('native transient failures remain bounded and the recovered long answer is delivered once', { timeout: 10000 }, async t => {
   let count = 0;
   const f = await fixture(t, async () => {
     count++;
-    if (count <= 4) return reply('长'.repeat(61));
-    if (count <= 6) throw Object.assign(new Error('synthetic timeout'), { code: 'MODEL_TIMEOUT' });
-    return reply('已继续。');
+    if (count <= 2) throw Object.assign(new Error('synthetic timeout'), { code: 'MODEL_TIMEOUT' });
+    return reply('长'.repeat(100));
   });
   await submit(f.service, '简短总结需求'); await f.service.close();
-  assert.equal(count, 7); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal(count, 3); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal((await f.service.state()).messages.at(-1).text, '长'.repeat(100));
 });
-test('human can interrupt continuing length corrections without publishing a rejected reply', { timeout: 10000 }, async t => {
-  let count = 0;
+test('human can interrupt native long generation without executing its response', { timeout: 10000 }, async t => {
+  let count = 0, reached, release;
+  const ready = new Promise(resolve => { reached = resolve; });
+  const paused = new Promise(resolve => { release = resolve; });
   const f = await fixture(t, async () => {
-    if (++count === 4) await f.service.interrupt({ id: 'stop', expectedTurnId: 'input' });
+    count++; reached(); await paused;
     return reply('长'.repeat(61));
   });
-  await submit(f.service, '简短总结需求'); await f.service.close();
-  assert.equal(count, 4); assert.equal((await f.service.state()).status, 'interrupted');
+  t.after(() => release());
+  await submit(f.service, '简短总结需求'); await ready;
+  await f.service.interrupt({ id: 'stop', expectedTurnId: 'input' }); release(); await f.service.close();
+  assert.equal(count, 1); assert.equal((await f.service.state()).status, 'interrupted');
   assert.equal((await f.service.state()).messages.filter(m => m.role === 'assistant' && !m.partial).length, 0);
   assert.deepEqual(f.calls, []);
 });
@@ -169,31 +170,32 @@ test('restart resumes an old length failure without widening other failure recov
   assert.equal(coordinatorCanAutoResume({ ...failed, error: { ...failed.error, diagnostic: { validationCode: 'OUTPUT_TOOL_ARGUMENT_INVALID' } } }), false);
   let count = 0;
   const f = await fixture(t, async request => {
-    count++; assert.match(JSON.stringify(request.messages), /rejectedText/); return reply('已压缩。');
+    count++; assert.doesNotMatch(JSON.stringify(request.messages), /rejectedText|paragraphLengths/); return reply('已压缩。');
   });
   await f.service.saveState(failed); f.service.kick(); await f.service.close();
   assert.equal(count, 1); assert.equal((await f.service.state()).messages.at(-1).text, '已压缩。');
   assert.equal((await f.service.state()).status, 'waiting-for-user');
 });
-test('shutdown stops length correction and restart continues the saved original turn', { timeout: 10000 }, async t => {
-  let count = 0, reachedFourth, release;
-  const ready = new Promise(resolve => { reachedFourth = resolve; });
+test('shutdown drains the native long reply and restart does not generate it again', { timeout: 10000 }, async t => {
+  let count = 0, reached, release;
+  const ready = new Promise(resolve => { reached = resolve; });
   const paused = new Promise(resolve => { release = resolve; });
   const f = await fixture(t, async () => {
-    if (++count === 4) { reachedFourth(); await paused; }
-    return reply(count <= 4 ? '长'.repeat(61) : '已压缩。');
+    if (++count === 1) { reached(); await paused; }
+    return reply('长'.repeat(61));
   });
   t.after(() => release());
   await submit(f.service, '简短总结需求'); await ready;
   const closing = f.service.close({ stop: true }); release(); await closing;
   const pausedState = await f.service.readConversation();
-  assert.equal(count, 4); assert.equal(pausedState.status, 'running'); assert.equal(pausedState.activeTurnId, 'input');
-  assert.equal(pausedState.modelRepairCode, 'REPLY_PARAGRAPH_LONG');
+  assert.equal(count, 1); assert.equal(pausedState.status, 'waiting-for-user');
+  assert.equal(pausedState.modelRepairCode, undefined);
+  assert.equal(pausedState.activeOutputProtocol.protocol, protocol);
   const restarted = new CoordinatorService(f.settings);
   t.after(() => restarted.close({ stop: true }));
   restarted.kick(); await restarted.close();
-  assert.equal(count, 5); assert.equal((await restarted.state()).status, 'waiting-for-user');
-  assert.equal((await restarted.state()).messages.at(-1).text, '已压缩。');
+  assert.equal(count, 1); assert.equal((await restarted.state()).status, 'waiting-for-user');
+  assert.equal((await restarted.state()).messages.at(-1).text, '长'.repeat(61));
   assert.deepEqual(f.calls, []);
 });
 test('ask_user retains one question and options without an extra model summary', async t => {
@@ -254,11 +256,12 @@ test('native continuation retry keeps a completed write receipt and does not wri
   let count = 0;
   const f = await fixture(t, async () => {
     count++;
-    if (count === 1 || count === 6) return tools(use('edit_map', { mainVersion: 'version', actions: [{ op: 'update', id: 'node', title: '阅读助手' }] }, 'write-' + count));
-    return text(count <= 5 ? '长'.repeat(61) : '已保存。');
+    if (count === 1 || count === 3) return tools(use('edit_map', { mainVersion: 'version', actions: [{ op: 'update', id: 'node', title: '阅读助手' }] }, 'write-' + count));
+    return text(count === 2 ? '当前节点 node-private' : '已保存。'.repeat(30));
   });
   await submit(f.service, '更新名称'); await f.service.close();
-  assert.equal(count, 7); assert.equal(f.calls.length, 1);
+  assert.equal(count, 4); assert.equal(f.calls.length, 1);
+  assert.equal((await f.service.state()).messages.at(-1).text, '已保存。'.repeat(30));
   assert.ok(Object.values((await f.service.readConversation()).toolReceipts).some(receipt => receipt.replayedFrom));
 });
 test('native corrected input invalidates the old decision and cancels unexecuted tools', async t => {
