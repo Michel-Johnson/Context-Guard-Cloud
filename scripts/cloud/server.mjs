@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap as commitStoredMainMemoryMap, readMainMemoryReceipt, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap as commitStoredMainMemoryMap, readMainMemoryReceipt, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, readMemoryProject as readStoredMemoryHistory, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -39,6 +39,7 @@ import { MapProjects, isMapProject } from './map-projects.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
 import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
+import { cursorTaskMainScopeUnchanged } from './cursor-task-main-scope.mjs';
 import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
 import { CursorGitProof } from './cursor-git-proof.mjs';
 import { authorizeCursorCiTask, parseCursorCiTaskHeader, authorizeCursorCiHostEvidence, parseCursorCiEvidenceHeader } from './cursor-ci-task-authority.mjs';
@@ -660,8 +661,18 @@ export async function startCloudServer({
             if (original?.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation);
             const template = state.bindings[digest(JSON.stringify([repository.repositoryId, roles.templateSessionId]))];
             if (!template || template.deviceId !== 'cloud-cursor:' + project.id || template.worktreeId !== coordinator.bindings[roles.templateSessionId]) return false;
-            const memory = await readMemoryProject(configuredMemory, project.id), document = memory.main?.memory?.map;
-            if (!document?.root || memory.main.version !== task.assignment?.mainVersion) return false;
+            let memory = await readMemoryProject(configuredMemory, project.id);
+            if (memory.main?.version !== task.assignment?.mainVersion) {
+              // The hot read deliberately omits history. Load the authoritative
+              // old baseline only on drift, and reject an intervening Main edit.
+              const historical = await readStoredMemoryHistory(configuredMemory, project.id);
+              if (historical.main?.version !== memory.main?.version) return false;
+              memory = historical;
+            }
+            const document = memory.main?.memory?.map;
+            const sourceItem = ['todo', 'bug'].includes(original?.kind) && original.itemId ?
+              { kind: original.kind, nodeId: original.nodeId, itemId: original.itemId } : undefined;
+            if (!cursorTaskMainScopeUnchanged(memory, task, { sourceItem })) return false;
             const readable = filterNodeAccess(document, [...entries(document.root).keys()], task.session.id, 'read');
             return task.assignment.nodeIds.every(id => readable.includes(id));
           } });
