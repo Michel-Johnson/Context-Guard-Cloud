@@ -2062,3 +2062,16 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - 新写提示明确 canonical id；格式发现不把私有策略 20 项上限强加给无策略清单，testId/argv 成对，argv 不隐式 trim。命令合法不等于授权或通过。
 - [ ] 准确新字节全量、独立 Review、安全/Required、合并后固定制品及当前 native-json 实验兼容组合；旧 Core 或单个 helper 通过不替代原流程回传。
 - [ ] 原 Task/Tester/源码上真正启动、执行、提交并接受 CI 结果，旧 TODO 版本及原回执保留。专用检查通过但整个 workflow 失败时必须如实失败，不改机器门禁制造绿色；三路径业务验收仍待。
+
+## SLACK-LIVE-RELIABILITY-01 · 纠正接续、交流幂等与目标覆盖（2026-10-11）
+
+- 已观察：多批次补充发生在旧答复显示前却逐条回答；单次握手＋文字出现8次相同工具调用、2个intent后6个额度错误，第9次模型才给正文。初始简短验收方案还遗漏明确目标，追问才纠正。真实记录仅在本机私有证据中保存，不将私有线程、身份、提示或回执正文提交源码。
+- [x] Executor开发：同输入／版本／操作者／表情的新工具ID复用原intent及原动作ID，仍保存本次原生配对；额度按不同表情计，失败、旧输入、换人、未授权、额外目标字段与Steer不借回执。成功intent后的动态提示明确后台核验、继续正文，不谎称已送达，不取消纯表情或业务安全边界。
+- [x] 已绑定、首次历史已完成、同操作者且无其他原生受众的续话走原实时授权conversation.state，避免平台历史IO延迟Steer；首次历史／换人／其他受众仍实际读取，工作流资料不成为Slack受众上下文。原镜像版本、停止／恢复和历史保留规则不移除。
+- [x] 原位呈现提示只改为来源以服务器为准、先覆盖当前明确目标再精简；不加业务专用清单、额外分类模型或输出长度硬拒绝，不编辑共享生成物。
+- [x] Executor首次窄批Node22.18.0：22项中21通过、1文件加载失败，896.7878ms。Slack固定依赖缺失，不冒充产品失败或22全过；恢复原锁17包，保留Node低于SDK最低版本警告。随后Node24.18.0仅补原未执行Slack10目标，10/10，4642.5308ms。此时根Core仍灰度2.4.3-native-json.0，旧结果不冒充正式发布包通过。
+- [x] 正式Main依赖重新按原lock安装、原构建器生成Core2.4.3/UI1.5.2后，最终Node24.18.0单批31/31、0失败／跳过／取消，1838.1638ms；测试清单静态验证56自动／5独立／2helper，差异格式通过。不拼此前批次为一次全过，不运行本地整仓全量或新付费模型。
+- 命令：`npx --yes --package=node@24.18.0 node --test --test-reporter=spec --test-name-pattern "^(Repeated reaction|Reaction replay|Slack reaction|Merged reaction|Owned thread followups|Thread history boundaries|Concise reply policy|Main version and task|Main overview purpose|Prompt upgrades|Partial emphasis|own native mention|identity cache is bounded)" tests/cloud-coordinator.test.mjs tests/coordinator-cache-prefix.test.mjs plugins/slack/test/plugin.test.mjs`。
+- 最终SHA256：coordinator-model.mjs `ca9d78e9b97519ffb39deb62879f6dbb210937585c9afc1968020db0e6bb9d8d`；coordinator-prefix.mjs `048daf37d5c0f1058cc46de968cf025af674b735ed67c53eb14d8eddc52af549`；plugin.mjs `e8b32531cb2ca7ef25dc0339b73430c5255e64c2c5a9235c8d5a12016bc44356`；cloud-coordinator.test.mjs `7d8436626a0a7646b31c341fdd03ae7192d8ff62fbff2316e563db0471aefb60`；cache test `0f852a14ca989bc3c75821b2710702c68cf5c98f50517be24be8c5454b043acd`；plugin test `534a2ce6d81e061a21cea175a287ad9634de2a72c2b7d74998f40d869300c0d6`。
+- [ ] 独立Tester：按上述准确产品／测试字节验证同表情新ID、default/false标志、两个不同表情及第三个拒绝、原生配对重启／失回、当前actor／输入版本／namespace／权限／目标字段／Steer隔离。原位慢历史HTTP入口不得阻止已建立同用户对话接续；首次／其他作者／其他原生受众仍保原平台读取，撤权／换项目／晚到SSE与旧工具回执不放宽。当前用户要求不调用subagent，自检和CI不代签Tester。
+- [ ] 正式交付与真实验收：准确Required和发布门禁、现有原生JSON实验的独立兼容组合、相同修订部署及原生Slack少量对照仍待。需多批次纠正只输出最新有效答复、混合表情文字没有重复无进展续轮、初始方案覆盖明确目标；不能由窄模块通过或一次中途取消证明上述语义和速度已解决。不更换当前模型、不扩大灰度权限、不删历史或原失败。

@@ -344,6 +344,55 @@ async function fixture(t, options = {}) {
 }
 function event(overrides = {}) { return { type: 'message', user, channel, ts: '123.001', text: `<@${bot}> hello`, ...overrides }; }
 
+test('Owned thread followups submit durable steer without waiting for platform history', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one',
+    userId: user, ownRequests: [], historyAccepted: true });
+  const call = f.io.call;
+  f.io.call = async (method, args) => {
+    if (['conversations.history', 'conversations.replies'].includes(method)) assert.fail('Platform history cannot delay this known conversation continuation');
+    return call(method, args);
+  };
+  const command = f.gateway.command;
+  f.gateway.command = async (type, args) => type === 'conversation.state' ? {
+    conversationId: 'chat-one', status: 'running', activeTurnId: 'old', messages: [
+      { role: 'user', source: 'slack', actor: { kind: 'human', userId: user }, text: '旧问题' },
+      { role: 'assistant', text: '正在解释旧问题' },
+      { role: 'user', source: 'workflow', text: 'private workflow details' },
+    ], approvals: [],
+  } : command(type, args);
+  for (const [id, ts, text] of [['change', '124.001', '先别展开，改问收到不等于完成'], ['short', '125.001', '最终只要一句话']]) {
+    await f.plugin.message(id, event({ ts, thread_ts: '123.001', text }));
+  }
+  const submissions = f.calls.filter(item => item.type === 'conversation.submit');
+  assert.equal(submissions.length, 2);
+  assert.ok(submissions.every(item => item.payload.followup === 'steer' && item.conversationId === 'chat-one'));
+  assert.deepEqual(submissions[0].payload.participation.context, [
+    { speaker: user, text: '旧问题' }, { speaker: bot, text: '正在解释旧问题' },
+  ]);
+  assert.ok(!JSON.stringify(submissions).includes('private workflow details'));
+  assert.equal(submissions[0].payload.history, undefined, 'Do not pretend to re-read platform history');
+});
+
+test('Thread history boundaries retain real platform reads for first input other authors and other recipients', async t => {
+  for (const boundary of ['first', 'author', 'recipient']) {
+    const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+    await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one',
+      userId: user, ownRequests: [], ...(boundary !== 'first' ? { historyAccepted: true } : {}) });
+    let reads = 0; const call = f.io.call;
+    f.io.call = async (method, args) => {
+      if (['conversations.history', 'conversations.replies'].includes(method)) { reads++; return { messages: [] }; }
+      return call(method, args);
+    };
+    await f.plugin.message(boundary, event({ ts: '124.001', thread_ts: '123.001',
+      ...(boundary === 'author' ? { user: 'UOTHER' } : {}),
+      text: boundary === 'recipient' ? '<@UOTHER> 请先看，谁能帮忙把关' : '帮我继续讨论',
+    }));
+    assert.ok(reads > 0, boundary);
+    assert.equal(f.calls.filter(item => item.type === 'conversation.submit').length, 1, boundary);
+  }
+});
+
 test('Cursor offer defaults to silence despite project permission and retained historical cards', async t => {
   const f = await fixture(t);
   f.gateway.command = async () => ({ status: 'idle', messages: [], approvals: [], cursorAvailable: true });

@@ -3,12 +3,21 @@ import { canonical } from '../shared/protocol.mjs';
 import { coordinatorReplyIssue, coordinatorTurnReplyIssue, coordinatorToolReplyTexts, coordinatorReplyProfile, replyRepairInstruction, visibleCharacters } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { canUseSlackProjectTool } from './coordinator-tools.mjs';
+import { slackReactionEmojis } from './slack-reactions.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
 const problem = (code, message) => Object.assign(new Error(message), { code });
 const diagnosticCodes = new Set(['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'MODEL_INVALID_RESPONSE', 'MODEL_OUTPUT_TRUNCATED', 'MODEL_INTERRUPTED', 'MODEL_STEERED', 'MODEL_RESPONSE_TOO_LARGE', 'CONTEXT_TOO_LARGE', 'UNKNOWN_MODEL_ERROR']);
 const replyLengthIssues = new Set(['REPLY_PARAGRAPH_LONG', 'REPLY_TOO_MANY_PARAGRAPHS']);
 const REPLY_POLICY = '\n[普通回复建议]\n用中文，先回答当前问题，简洁并自然分段，不倾倒无关清单；需要说明的事实完整保留。不为凑字数删内容，字数和段落数不是拒绝条件。普通正文不展示内部编号、哈希或测试标签；需要定位时用名称或宿主入口。工具权限、审批与必要风险说明不因简洁而省略。';
+function currentReactionReceipts(state, turnId, actor) {
+  if (!actor) return [];
+  return Object.entries(state.toolReceipts).filter(([, item]) =>
+    item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
+    item.result?.kind === 'slack-reaction' && item.result.status === 'intent' &&
+    slackReactionEmojis.includes(item.result.emoji) && item.result.requestId === state.activeInput.id &&
+    item.result.actor && canonical(item.result.actor) === canonical(actor));
+}
 // 完整正文先检查标识和质量；仅问句信号交给共享轮次校验，避免长度
 // 先返回而遮住跨正文/卡片/历史的重复提问。此视图不用于展示或工具执行。
 const questionSignals = text => (String(text || '').replace(/```[^\n]*\n[\s\S]*?(?:```|$)/gu, '')
@@ -552,8 +561,11 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       (validateReplies && workflowNotice ? '\n[服务器确认回执]\n这不是新的需求。只用一段短话说明实际确认结果，不重新输出brief或执行提示，不追问新事项。宿主已有审批结果卡和完整执行提示导出入口。' : '') +
       (repairCode ? '\n[服务器格式纠正，不改变输入、工具权限或审批]\n' + replyRepairInstruction(repairCode, { ...profile, detailed: true }) : '') +
       (state.modelRepairTools?.length ? '\n上一份违规正文伴随的审批/提问动作尚未执行。重新生成必要工具调用：' + state.modelRepairTools.join('、') + '。不能仅用文字声称已提出建议或生成审批卡；工具参数仍依据原输入和真实上下文。' : '');
-    const generationSystem = needsGate ? baseSystem + MERGED_PARTICIPATION_POLICY : alreadyAllowed
-      ? baseSystem + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : baseSystem;
+    const reacted = trustedSlackInput ? [...new Set(currentReactionReceipts(state, turnId, slackActor).map(([, item]) => item.result.emoji))] : [];
+    const generationSystem = (needsGate ? baseSystem + MERGED_PARTICIPATION_POLICY : alreadyAllowed
+      ? baseSystem + '\n本轮已确认需要接话，直接继续正文和允许的工具，不再输出内部接话标识。' : baseSystem) +
+      (reacted.length ? '\n[服务器交流回执]\n本输入的表情 ' + reacted.join('、') +
+        ' 已受理。intent 是宿主后台核验的持久意图，不是工具失败；勿重复调用同一表情或等待模型确认送达。继续完成用户所需文字，只有明确仅要表情才可省略。' : '');
     const systemHash = hash(generationSystem), toolsHash = hash(JSON.stringify(modelTools));
     const measurement = state.performance && { startedAt: new Date().toISOString(), firstTextMs: null,
       prefix: { systemHash, toolsHash, envelopeHash: hash(JSON.stringify([systemHash, toolsHash])),
@@ -725,9 +737,22 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     const name = toolName(call);
     let receipt = state.toolReceipts[operationId];
     if (receipt && receipt.fingerprint !== fingerprint) throw problem('TOOL_ID_REUSED', 'Coordinator reused a tool identifier with different input');
+    // 新原生调用 ID 不代表新表情；同输入、代次和操作者复用原意图。
+    // 原生工具配对仍保存新的调用 ID，不借用失败、旧输入或未授权回执。
+    const reactionReceipts = trustedSlackInput ? currentReactionReceipts(state, turnId, slackActor) : [];
+    if (!receipt && name === 'react_to_user' && executableTools.some(tool => tool.name === name) &&
+        !changed.steered && !changed.interrupted && !failed && !transferred &&
+        Object.keys(call.input).every(key => ['emoji', 'replyComplete'].includes(key)) &&
+        (call.input.replyComplete === undefined || typeof call.input.replyComplete === 'boolean')) {
+      const completed = reactionReceipts.find(([, item]) => item.result.emoji === call.input.emoji);
+      if (completed) {
+        receipt = { ...completed[1], fingerprint, replayedFrom: completed[0] };
+        state.toolReceipts[operationId] = receipt; await save(state);
+      }
+    }
     // 回复纠正可换调用ID，已完成写入复用本轮成功回执。
     // 新读取重新授权取当前状态；节点卡片仅在展示层去重。
-    if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
+    if (!receipt && ((state.modelRetries || 0) > 0 || state.modelRepairCode) && !['react_to_user', 'list_projects', 'list_tasks', 'list_sessions', 'list_conversations',
       'read_map', 'read_reference', 'read_task', 'read_object', 'show_model_menu', 'show_nodes'].includes(name)) {
       const businessFingerprint = hash(canonical({ name, input: call.input }));
       const completed = Object.entries(state.toolReceipts).find(([, item]) => item.turnId === turnId && item.inputRevision === state.consumedInputRevision && !item.isError &&
@@ -742,8 +767,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       else if (failed || transferred) receipt = { fingerprint, ...failedTool('NOT_EXECUTED') };
       else if (!executableTools.some(tool => tool.name === name)) receipt = { fingerprint,
         ...failedTool('TOOL_FORBIDDEN', '工具名未注册；只能使用本轮提供的工具，不得猜测接口。') };
-      else if (name === 'react_to_user' && Object.values(state.toolReceipts).filter(item => !item.isError &&
-        item.result?.kind === 'slack-reaction' && item.result.requestId === state.activeInput.id).length >= 2) {
+      else if (name === 'react_to_user' && new Set(reactionReceipts.map(([, item]) => item.result.emoji)).size >= 2) {
         receipt = { fingerprint, ...failedTool('INVALID_ARGUMENT', '本条消息已使用两个交流表情，请继续必要正文，不再添加表情。') };
       }
       else {

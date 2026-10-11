@@ -21,6 +21,59 @@ const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKS
 function reactionState(source = 'slack', actor = reactionActor) {
   return { activeInput: { id: 'original-human-input', source, actor }, messages: [], toolReceipts: {} };
 }
+
+test('Repeated reaction native IDs reuse the same scoped intent and preserve two distinct emoji slots', async () => {
+  let state = reactionState(), executions = 0;
+  const native = createCoordinatorExecutor({});
+  const step = { turnId: 'reaction-dedup', system: 'role', tools: coordinatorTools, save: async () => {},
+    execute: async (...args) => { executions++; return native(...args); } };
+  for (let index = 0; index < 5; index++) {
+    await coordinatorStep({ ...step, state, model: { next: async ({ system }) => {
+      if (index) assert.match(system, /handshake 已受理.*勿重复调用同一表情/s);
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'handshake-' + index,
+        name: 'react_to_user', input: { emoji: 'handshake', ...(index === 3 ? { replyComplete: false } : {}) } }] };
+    } } });
+    state = structuredClone(state); // Pending/native receipt identity survives a process restart.
+    assert.equal(state.messages.at(-1).content[0].is_error, undefined);
+    assert.equal(state.messages.at(-1).content[0].tool_use_id, 'handshake-' + index);
+  }
+  assert.equal(executions, 1);
+  assert.equal(new Set(Object.values(state.toolReceipts).map(receipt => receipt.result.actionId)).size, 1);
+  for (const emoji of ['clap', 'wave']) {
+    await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: emoji, name: 'react_to_user', input: { emoji } },
+    ] }) } });
+  }
+  assert.equal(executions, 2, 'Only two distinct reactions execute; the third retains the quota error');
+  assert.equal(state.messages.at(-1).content[0].is_error, true);
+  await coordinatorStep({ ...step, state, model: { next: async () => ({ stop: 'end_turn',
+    content: [{ type: 'text', text: '收到，谢谢。' }] }) } });
+  assert.equal(state.status, 'waiting-for-user');
+  assert.equal(state.messages.at(-1).content[0].text, '收到，谢谢。');
+});
+
+test('Reaction replay cannot borrow another input actor generation or malformed target', async () => {
+  for (const boundary of ['input', 'actor', 'revision', 'target', 'steer', 'source']) {
+    const state = reactionState(); let executions = 0;
+    const native = createCoordinatorExecutor({}), step = { turnId: 'scoped-reaction', system: 'role', tools: coordinatorTools,
+      save: async () => {}, execute: async (...args) => { executions++; return native(...args); } };
+    const call = (id, input = { emoji: 'handshake' }) => ({ stop: 'tool_use', content: [{ type: 'tool_use', id, name: 'react_to_user', input }] });
+    await coordinatorStep({ ...step, state, model: { next: async () => call('first') } });
+    if (boundary === 'input') state.activeInput.id = 'another-input';
+    if (boundary === 'actor') state.activeInput.actor = { ...reactionActor, userId: 'UOTHER', sessionId: `slack:${reactionActor.teamId}:UOTHER` };
+    if (boundary === 'revision') state.consumedInputRevision = 2;
+    if (boundary === 'source') state.activeInput.source = 'human';
+    await coordinatorStep({ ...step, state, ...(boundary === 'steer' ? { checkpoint: async () => ({ steered: true, interrupted: false }) } : {}),
+      model: { next: async ({ system }) => {
+        if (boundary !== 'target' && boundary !== 'steer') assert.doesNotMatch(system, /handshake 已受理/);
+        return call('second', boundary === 'target' ? { emoji: 'handshake', channel: 'COTHER' } : undefined);
+      } } });
+    const latest = Object.values(state.toolReceipts).at(-1);
+    assert.equal(latest.replayedFrom, undefined, boundary);
+    if (['target', 'steer', 'source'].includes(boundary)) assert.equal(state.messages.at(-1).content[0].is_error, true, boundary);
+    else assert.equal(executions, 2, boundary);
+  }
+});
 test('Slack reaction intent binds server actor and input and preserves the following text or emoji-only completion', async () => {
   for (const text of ['已收到。', '']) {
     const execute = createCoordinatorExecutor({}), state = reactionState(); let calls = 0;
