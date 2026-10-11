@@ -749,6 +749,66 @@ test('Independent Cursor CI original proposal reaches the original task only wit
   assert.equal(f.workflowCalls.length, 2); assert.equal(f.workflowCalls.every(call => call.sourceSha === handoffSha && call.branch === 'cursor/task'), true);
   await reopened.pump(f.reserved.session, 'task'); assert.equal(f.calls.length, 3); assert.equal(f.workflowCalls.length, 2);
 });
+test('Host verifies an original finished CI proposal after delegate expiry without renewing or exposing its capability', async t => {
+  const f = await ciFixture(t), p = await ciProposal(f);
+  await f.factory.channel.exchange(p.invocation.token, p.input);
+  const leaseFile = path.join(f.factory.channel.directory, 'operations', hash(p.invocation.id) + '.json');
+  const originalLease = await fs.readFile(leaseFile, 'utf8');
+  f.factory.channel.now = () => Date.now() + 7200000;
+  await assert.rejects(f.factory.channel.context(p.invocation.token), { code: 'ROLE_EXPIRED' });
+  await assert.rejects(f.factory.channel.exchange(p.invocation.token, p.input), { code: 'ROLE_EXPIRED' });
+  await f.factory.pump(f.reserved.session, 'task');
+  const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+  assert.equal(task.stage, 'awaiting-merge'); assert.equal(task.ci.verdict, 'passed');
+  assert.equal(task.acceptanceReview, undefined); assert.equal(f.calls.length, 3);
+  assert.equal(await fs.readFile(leaseFile, 'utf8'), originalLease, 'Original expired delegation must remain byte-identical');
+  await assert.rejects(f.factory.channel.context(p.invocation.token), { code: 'ROLE_EXPIRED' });
+  await f.factory.pump(f.reserved.session, 'task'); assert.equal(f.calls.length, 3);
+});
+
+test('Expired delegate host verification retains current revocation, source access and aggregate CI gates', async t => {
+  for (const change of ['revoked', 'source-access', 'aggregate-failed']) await t.test(change, async child => {
+    const f = await ciFixture(child, { aggregateFailed: change === 'aggregate-failed' }), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    if (change === 'revoked') await f.factory.channel.revoke(p.invocation.token);
+    if (change === 'source-access') f.setAllowed(false);
+    f.factory.channel.now = () => Date.now() + 7200000;
+    await assert.rejects(f.factory.pump(f.reserved.session, 'task'), change === 'aggregate-failed'
+      ? { code: 'SOURCE_UNVERIFIED' }
+      : error => ['ROLE_EXPIRED', 'ROLE_UNAVAILABLE', 'CURSOR_ROLE_CONFLICT'].includes(error.code));
+    const task = await f.store.taskRecord(f.human, f.reserved.session, 'task');
+    assert.equal(task.stage, 'testing'); assert.equal(task.ci, undefined); assert.equal(f.calls.length, 3);
+  });
+});
+
+test('Host completion rejects missing proof, another message and binding migration after native observation', async t => {
+  for (const change of ['no-proof', 'another-message', 'migrated-executor']) await t.test(change, async child => {
+    const f = await ciFixture(child), p = await ciProposal(f);
+    await f.factory.channel.exchange(p.invocation.token, p.input);
+    f.factory.channel.now = () => Date.now() + 7200000;
+    const actor = JSON.parse(await fs.readFile(f.file, 'utf8')), invocation = actor.invocations.at(-1);
+    if (change === 'no-proof') await assert.rejects(f.factory.channel.hostCiExchange(invocation, p.input), { code: 'SOURCE_UNVERIFIED' });
+    if (change === 'another-message') await assert.rejects(f.factory.channel.hostCiExchange(invocation, { ...p.input, id: 'another-message' }), { code: 'ROLE_FORBIDDEN' });
+    if (change === 'migrated-executor') {
+      const original = f.provider.readRunEvents;
+      f.provider.readRunEvents = async (...args) => {
+        const observed = await original(...args);
+        const principal = f.factory.principal(f.reserved.session.id);
+        const binding = await f.store.registeredBinding(principal, f.reserved.session.id);
+        await f.store.handle(principal, { v: 2, id: 'move-executor-after-native-read', type: 'session.bind', payload: {
+          sessionId: f.reserved.session.id, agentId: f.reserved.session.id, worktreeId: 'another-worktree', expectedBindingVersion: binding.version,
+        } }, { allowMigration: true, verifyBinding: () => true });
+        return observed;
+      };
+      await assert.rejects(f.factory.pump(f.reserved.session, 'task'), error => ['ROLE_FORBIDDEN', 'ROLE_UNAVAILABLE', 'CURSOR_ROLE_CONFLICT'].includes(error.code));
+    }
+    const state = await f.store.transaction(value => value, { readOnly: true });
+    const task = state.tasks[scopedObjectKey(f.human, f.reserved.session, 'task:task')];
+    assert.equal(task.stage, 'testing'); assert.equal(task.ci, undefined); assert.equal(f.calls.length, 3);
+    assert.equal(Object.keys(state.cursorRoleCiResults || {}).length, 0);
+  });
+});
+
 test('CI cannot invent numbered coverage, reuse another message ID or replace the saved native proposal', async t => {
   const f = await ciFixture(t), p = await ciProposal(f);
   await assert.rejects(f.factory.channel.exchange(p.invocation.token, { ...p.input, id: 'ci-evidence' }), { code: 'ID_REUSED' });

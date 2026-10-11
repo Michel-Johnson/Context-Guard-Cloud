@@ -279,7 +279,7 @@ export class CursorRoleFactory {
       return owned?.id === invocation.id && await this.acceptedCi(latest, owned);
     };
     let current;
-    try { current = await this.channel.ciSnapshot(invocation.token, snapshot.input); }
+    try { current = await this.channel.hostCiSnapshot(invocation, snapshot.input); }
     catch (cause) { if (await observedAccepted()) return { state: 'ci-accepted' }; throw cause; }
     if (this.handoffIdentity(current) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original CI evidence or task changed');
     const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
@@ -310,14 +310,14 @@ export class CursorRoleFactory {
       if (!owned || owned.id !== invocation.id || owned.runId !== invocation.runId || owned.token !== invocation.token || owned.state !== 'confirmed' || owned.ciProposal?.fingerprint !== pending.fingerprint) fail('CURSOR_ROLE_CONFLICT', 'Original CI invocation changed');
       if (await this.acceptedCi(latest, owned)) return false;
       let rechecked;
-      try { rechecked = await this.channel.ciSnapshot(invocation.token, snapshot.input); }
+      try { rechecked = await this.channel.hostCiSnapshot(owned, snapshot.input); }
       catch (cause) { if (await this.acceptedCi(latest, owned)) return false; throw cause; }
       if (this.handoffIdentity(rechecked) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original CI changed during verification');
       owned.ciProposal.proof = proof; owned.ciProposal.observation = native; owned.ciProposal.machineFacts = facts;
       await atomicWrite(file, encode(latest)); return true;
     });
     if (!ready) return { state: 'ci-accepted' };
-    try { return (await this.channel.exchange(invocation.token, snapshot.input)).data; }
+    try { return (await this.channel.hostCiExchange(invocation, snapshot.input)).data; }
     catch (cause) { if (await observedAccepted()) return { state: 'ci-accepted' }; throw cause; }
   }
 
