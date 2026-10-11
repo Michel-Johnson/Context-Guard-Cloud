@@ -53,6 +53,7 @@
     }
   ],
   "productFiles": [
+    "tests/cursor-task-map.test.mjs",
     "tests/cursor-task-main-scope.test.mjs",
     "tests/cursor-owning-backend.test.mjs",
     "tests/cursor-ci-task-authority.test.mjs",

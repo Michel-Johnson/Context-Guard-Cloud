@@ -478,6 +478,15 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   await f.openMcp(authorization);
   const context = await f.context(authorization);
   assert.equal(context.taskId, taskId); assert.equal(context.stage, 'assigned'); assert.notEqual(context.session.id, templateId);
+  const navigation = await f.call(authorization, 'context_guard_map_read', {});
+  assert.equal(navigation.isError, undefined);
+  assert.equal(navigation.structuredContent.taskId, taskId);
+  assert.deepEqual(navigation.structuredContent.nodes.map(node => node.nodeId), ['T0']);
+  const body = await f.call(authorization, 'context_guard_map_read', { nodeId: 'T0', expectedVersion: navigation.structuredContent.version });
+  assert.equal(body.isError, undefined); assert.equal(body.structuredContent.node.title, 'Synthetic project');
+  const foreignMap = await f.call(authorization, 'context_guard_map_read', { nodeId: 'foreign' });
+  assert.equal(foreignMap.isError, true);
+  assert.equal(JSON.parse(foreignMap.content[0].text).error.code, 'ROLE_FORBIDDEN');
   const exchange = async (id, type, payload) => f.call(authorization, 'context_guard_exchange', { id, type, payload });
   const object = await exchange('plan-object', 'object.put', { kind: 'plan', ref: context.writePrefix + 'plan', baseVersion: '',
     content: { steps: ['Implement fixture', 'Run formal test'], paths: ['src/fixture.mjs'] } });
@@ -502,6 +511,7 @@ for (const slack of [false, true]) test(slack ? 'Slack Cursor original task reac
   await f.openMcp(nextAuthorization);
   const current = await f.context(nextAuthorization);
   assert.deepEqual(current.session, context.session); assert.equal(current.stage, 'executing'); assert.deepEqual(current.plan, { ref: plan.ref, version: plan.version });
+  assert.equal((await f.call(nextAuthorization, 'context_guard_map_read', { nodeId: 'T0' })).isError, undefined);
   const unverified = await f.call(nextAuthorization, 'context_guard_exchange', { id: 'unverified-handoff', type: 'task.report',
     payload: { taskId, stage: 'handoff', data: { sourceSha: 'b'.repeat(40), ciTodoRef: current.writePrefix + 'todo', unitTestRefs: [], experienceRefs: [] } } });
   assert.equal(unverified.isError, true);

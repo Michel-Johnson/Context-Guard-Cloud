@@ -23,7 +23,7 @@ export const cursorTemplateWorktree = id => `cursor-cloud-template:${id}`;
 // Cursor remains the harness; business tasks and approvals stay in ProtocolStore.
 export class CursorRoleFactory {
   constructor({ directory, projectId, repositoryId, templateSessionId, repositoryUrl, startingRef, model,
-    endpoint, store, provider, authorizeSource, gitProof, githubTokenFile, ciPolicy, allowLoopback = false }) {
+    endpoint, store, provider, authorizeSource, readMapSnapshot, gitProof, githubTokenFile, ciPolicy, allowLoopback = false }) {
     validateCursorSource({ repositoryUrl, startingRef, model });
     let url;
     try { url = new URL(endpoint); } catch { fail('INVALID_CURSOR_ROLES', 'Configure a fixed role MCP endpoint'); }
@@ -38,6 +38,7 @@ export class CursorRoleFactory {
     if (this.ciPolicy && (typeof this.gitProof.trustedChecks !== 'function' || typeof provider.readRunEvents !== 'function')) fail('INVALID_CURSOR_ROLES', 'CI policy requires trusted workflow reads and scoped native observations');
     this.ownerId = 'cloud-cursor:' + projectId;
     this.channel = new CursorRoleChannel({ directory: path.join(directory, 'capabilities'), store,
+      ...(readMapSnapshot ? { readMapSnapshot } : {}),
       resolveReceiver: (scope, state) => this.resolveReceiver(scope, state), deferHandoff: (token, snapshot) => this.deferHandoff(token, snapshot),
       ...(this.ciPolicy ? { deferCi: (token, snapshot) => this.deferCi(token, snapshot) } : {}) });
   }
@@ -199,14 +200,15 @@ export class CursorRoleFactory {
 
   prompt(scope, actor) {
     const common = `You are the ${scope.phase === 'ci' ? 'independent Tester' : 'Executor'} of the original Context Guard Coordinator task ${scope.taskId}. Never start a separate user chat, approve a requirement or Plan, or write Main. Use context_guard_context, then context_guard_exchange object.read for immutable references. When testPolicy is present, include its fixed todoId/testId/argv mapping in your Plan; write CI TODO items as {id: check.todoId, testId: check.testId, argv: check.argv} copied exactly from the same policy check. Use canonical id for new TODOs; number is only a display label, never identity. Never invent coverage or replace an immutable handoff to repair a mapping. Identity is fixed by MCP, never include Session/principal fields. Use the returned writePrefix and stable message IDs. If ROLE_UNAVAILABLE appears during native startup, retry the SAME MCP operation, do not create a new task. Source revision: ${scope.sourceSha}.`;
-    if (scope.phase === 'plan') return common +
+    const mapGuidance = this.channel.readMapSnapshot ? ' Use context_guard_map_read with {} for assigned-node navigation, then nodeId for on-demand context. This grants read-only task scope, not approval or Main writes.' : '';
+    if (scope.phase === 'plan') return common + mapGuidance +
       (scope.attempt ? ` The previous saved Run terminated without submitting the original Task Plan. This is continuation ${scope.attempt} on the SAME Agent and Task, not a new task or an approval. Read current context and tools/list again; use the NEW returned writePrefix and never reuse an old draft ref or capability.` : '') +
       ' This Run is Plan-only. Do not modify source. Write one own kind:plan object with steps, paths, validation and acceptance. First object.put requires payload {kind:"plan",ref:<writePrefix plus suffix>,baseVersion:"",content:<Plan object>}; do not omit baseVersion or send null. Use the exact returned ref/version in task.report payload {taskId:<original task>,stage:"planReady",data:{planRef:<ref>,planVersion:<version>,sourceSha:<specified source SHA>}}. Stop after that; Coordinator must review the exact Plan before implementation.';
-    if (scope.phase === 'ci') return common +
+    if (scope.phase === 'ci') return common + mapGuidance +
       (scope.ciAttempt ? ' CI result correction: the original saved proposal contradicted verified native execution or trusted workflow facts. Continue the SAME Agent, Task and source; this is not approval or a new task. Preserve old evidence and use the NEW writePrefix and new stable message IDs. Read each current testPolicy machineStatus; a passing native command does not override a failed workflow. For every failed check, write own reproduction evidence describing the actual native result and the trusted machineStatus. Submit only your own truthful result, never infer user acceptance.' : '') +
       ' Read the handed-off CI TODO and test evidence. Test only this exact source in this independent environment; do not change business source. Write own evidence objects and submit ci.result with sourceSha, verdict and numbered checks. A proof-pending response saves only that original CI proposal: end this Run for host verification, never replace the ID or claim acceptance. A success statement or FINISHED is not business acceptance; unverifiable evidence must remain incomplete.' +
       (this.ciPolicy ? ' Execute each exact host command once with run_terminal_cmd (not backgrounded), keeping its nonce and actual result. Never alter business source or command argv. Preserve failed reproduction evidence and use the fixed todoId/testId mapping. Commands: ' + JSON.stringify(actor.commands.map(({ todoId, testId, command }) => ({ todoId, testId, command }))) : '');
-    return common + ' Read only the approved Plan version before implementation. Implement and run module tests, commit and push only your own Cursor branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. A proof-pending response saves only that original proposal: stop this Run so the host can verify it, do not send a replacement ID or claim completion. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
+    return common + mapGuidance + ' Read only the approved Plan version before implementation. Implement and run module tests, commit and push only your own Cursor branch (never main), then read the actual commit SHA. Write own kind:ciTodo with uniquely numbered items and kind:evidence/experience objects. Submit task.report stage:handoff with the actual sourceSha, ciTodoRef, unitTestRefs and experienceRefs. A proof-pending response saves only that original proposal: stop this Run so the host can verify it, do not send a replacement ID or claim completion. This is not human acceptance. SOURCE_UNVERIFIED means the evidence is not yet verified; do not report task completion.';
   }
 
   async ciFacts(actor) {
@@ -284,7 +286,7 @@ export class CursorRoleFactory {
       return owned?.id === invocation.id && await this.acceptedCi(latest, owned);
     };
     let current;
-    try { current = await this.channel.ciSnapshot(invocation.token, snapshot.input); }
+    try { current = await this.channel.hostCiSnapshot(invocation, snapshot.input); }
     catch (cause) { if (await observedAccepted()) return { state: 'ci-accepted' }; throw cause; }
     if (this.handoffIdentity(current) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original CI evidence or task changed');
     const run = await this.provider.getRun(actor.nativeAgentId, invocation.runId);
@@ -320,14 +322,14 @@ export class CursorRoleFactory {
       if (!owned || owned.id !== invocation.id || owned.runId !== invocation.runId || owned.token !== invocation.token || owned.state !== 'confirmed' || owned.ciProposal?.fingerprint !== pending.fingerprint) fail('CURSOR_ROLE_CONFLICT', 'Original CI invocation changed');
       if (await this.acceptedCi(latest, owned)) return false;
       let rechecked;
-      try { rechecked = await this.channel.ciSnapshot(invocation.token, snapshot.input); }
+      try { rechecked = await this.channel.hostCiSnapshot(owned, snapshot.input); }
       catch (cause) { if (await this.acceptedCi(latest, owned)) return false; throw cause; }
       if (this.handoffIdentity(rechecked) !== pending.fingerprint) fail('SOURCE_UNVERIFIED', 'Original CI changed during verification');
       owned.ciProposal.proof = proof; owned.ciProposal.observation = native; owned.ciProposal.machineFacts = facts;
       await atomicWrite(file, encode(latest)); return true;
     });
     if (!ready) return { state: 'ci-accepted' };
-    try { return (await this.channel.exchange(invocation.token, snapshot.input)).data; }
+    try { return (await this.channel.hostCiExchange(invocation, snapshot.input)).data; }
     catch (cause) { if (await observedAccepted()) return { state: 'ci-accepted' }; throw cause; }
   }
 

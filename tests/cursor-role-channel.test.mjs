@@ -92,6 +92,22 @@ async function fixture(t) {
 }
 const briefFields = value => ({ ref: value.ref, version: value.version });
 
+test('task Map reads preserve protocol state and recheck expiry and receiver authorization after memory access', async t => {
+  const f = await fixture(t), lease = await f.issue('plan');
+  const before = await f.store.transaction(state => canonical(state), { readOnly: true });
+  f.channel.readMapSnapshot = async ({ task, scope, input }) => {
+    assert.equal(task.id, 'task'); assert.equal(scope.session.id, executorId); assert.deepEqual(input, {});
+    return { taskId: task.id, version: 'main-1', nodes: [{ nodeId: 'node', title: 'Assigned' }] };
+  };
+  assert.equal((await f.channel.mapRead(lease.token, {})).nodes[0].nodeId, 'node');
+  assert.equal(await f.store.transaction(state => canonical(state), { readOnly: true }), before);
+  f.channel.readMapSnapshot = async () => { lease.receiver.active = false; return { secret: 'must not return' }; };
+  await assert.rejects(f.channel.mapRead(lease.token, {}), { code: 'ROLE_UNAVAILABLE' });
+  lease.receiver.active = true;
+  f.channel.readMapSnapshot = async () => { f.setClock(1700003600001); return { secret: 'must not return' }; };
+  await assert.rejects(f.channel.mapRead(lease.token, {}), { code: 'ROLE_EXPIRED' });
+});
+
 test('Cursor role leases start dormant; concurrent issuance and restart preserve scope, expiry and revocation', async t => {
   const f = await fixture(t), scope = { ...f.base, phase: 'plan' };
   const request = { operationId: 'stable', scope, ttlMs: 60000 };

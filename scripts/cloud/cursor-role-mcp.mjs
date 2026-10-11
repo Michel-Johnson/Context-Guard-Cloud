@@ -92,7 +92,10 @@ function toolError(cause, type, phase) {
     : { message: 'Role operation denied or unavailable; keep the original task and request ID' }) } };
 }
 
-const tools = phase => [
+const tools = (phase, mapEnabled = false) => [
+  ...(mapEnabled ? [{ name: 'context_guard_map_read', description: 'Read assigned task Map navigation with {}, or one node with nodeId. Identity and read-only authority come from this task delegation.',
+    inputSchema: { type: 'object', properties: { nodeId: string(), expectedVersion: string() }, additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false } }] : []),
   { name: 'context_guard_context', description: 'Read the fixed task identity, phase, source revision and immutable object references. Use writePrefix for own objects.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false } },
   { name: 'context_guard_exchange', description: 'Exchange a stable-ID message with the original Coordinator task. The credential fixes identity and permissions; approval is never an agent operation.',
@@ -186,18 +189,19 @@ export function createCursorRoleMcpHandler({ channel, projectId, endpoint, allow
       }
       if (input.method === 'tools/list') {
         if (!emptyParams(input.params)) invalid('This fixed tool list has no pagination');
-        return send(200, { jsonrpc: '2.0', id: input.id, result: { tools: tools(state.phase) } });
+        return send(200, { jsonrpc: '2.0', id: input.id, result: { tools: tools(state.phase, typeof channel.readMapSnapshot === 'function') } });
       }
       if (input.method !== 'tools/call') invalid('Method not found', -32601, 200);
       const p = input.params;
       if (!record(p) || Object.keys(p).some(key => !['name', 'arguments', '_meta'].includes(key)) ||
-          !tools(state.phase).some(tool => tool.name === p.name) || !record(p.arguments)) invalid('Unknown tool or invalid arguments');
+          !tools(state.phase, typeof channel.readMapSnapshot === 'function').some(tool => tool.name === p.name) || !record(p.arguments)) invalid('Unknown tool or invalid arguments');
       if (p.name === 'context_guard_context' && Object.keys(p.arguments).length) invalid('Context has no caller-selected identity');
       let result;
       try {
         if (p.name === 'context_guard_context') {
           result = await channel.context(token);
-        } else result = await channel.exchange(token, p.arguments);
+        } else if (p.name === 'context_guard_map_read') result = await channel.mapRead(token, p.arguments);
+        else result = await channel.exchange(token, p.arguments);
       } catch (cause) {
         const error = toolError(cause, p.name === 'context_guard_exchange' ? p.arguments.type : undefined, state.phase);
         return send(200, { jsonrpc: '2.0', id: input.id, result: { isError: true, content: [{ type: 'text',

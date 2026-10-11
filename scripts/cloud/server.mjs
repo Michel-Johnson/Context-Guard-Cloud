@@ -41,6 +41,7 @@ import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
 import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
 import { cursorTaskMainScopeUnchanged } from './cursor-task-main-scope.mjs';
+import { cursorTaskMapRead } from './cursor-task-map.mjs';
 import { createCursorRoleMcpHandler } from './cursor-role-mcp.mjs';
 import { CursorGitProof } from './cursor-git-proof.mjs';
 import { authorizeCursorCiTask, parseCursorCiTaskHeader, authorizeCursorCiHostEvidence, parseCursorCiEvidenceHeader } from './cursor-ci-task-authority.mjs';
@@ -657,6 +658,13 @@ export async function startCloudServer({
           ...(roles.ciPolicy ? { ciPolicy: roles.ciPolicy } : {}),
           endpoint: allowedOrigin + `/api/workbench/projects/${project.id}/api/cursor-role-mcp`,
           allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
+          readMapSnapshot: async ({ task, input }) => {
+            const memory = await readMemoryProject(configuredMemory, project.id);
+            const slice = cursorTaskMapRead(memory.main, task, input);
+            const latest = await readMemoryProject(configuredMemory, project.id);
+            if (latest.main?.version !== memory.main?.version) protocolFail('CONFLICT', 'Map changed during the task context read');
+            return slice;
+          },
           authorizeSource: async ({ state, task }) => {
             const original = Object.values(state.projectTasks || {}).find(item => item.repositoryId === repository.repositoryId && item.taskId === task.id && item.sessionId === task.session.id);
             if (original?.cursorDelegation || original?.zcodeDelegation) await requireExecutionGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation || original.zcodeDelegation);

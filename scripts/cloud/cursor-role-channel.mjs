@@ -36,12 +36,13 @@ function validateScope(scope) {
 // schedule agents, approve plans or infer task success from native Run status.
 // resolveReceiver must read the private provider ledger, not agent arguments.
 export class CursorRoleChannel {
-  constructor({ directory, store, resolveReceiver, deferHandoff, deferCi, now = Date.now }) {
+  constructor({ directory, store, resolveReceiver, deferHandoff, deferCi, readMapSnapshot, now = Date.now }) {
     if (!path.isAbsolute(directory || '') || !store || typeof resolveReceiver !== 'function' || typeof now !== 'function' ||
-        [deferHandoff, deferCi].some(fn => fn !== undefined && typeof fn !== 'function')) fail('INVALID_ARGUMENT', 'Use private role storage and a trusted receiver resolver');
+        [deferHandoff, deferCi, readMapSnapshot].some(fn => fn !== undefined && typeof fn !== 'function')) fail('INVALID_ARGUMENT', 'Use private role storage and a trusted receiver resolver');
     this.directory = directory; this.store = store; this.resolveReceiver = resolveReceiver; this.now = now;
     this.deferHandoff = deferHandoff;
     this.deferCi = deferCi;
+    this.readMapSnapshot = readMapSnapshot;
   }
 
   async issue({ operationId, scope, ttlMs = 3600000 }) {
@@ -220,6 +221,19 @@ export class CursorRoleChannel {
     if (Object.values(expected).some(version => !bounded(version)) || !record(proof.references) || canonical(proof.references) !== canonical(expected)) fail('SOURCE_UNVERIFIED', 'Evidence changed after the trusted revision and test verification');
   }
 
+  async mapRead(token, input) {
+    return this.withLease(token, lease => this.store.transaction(async state => {
+      const scope = lease.scope, task = this.task(state, scope, this.principal(scope));
+      await this.receiver(lease, state);
+      if (!this.readMapSnapshot) fail('ROLE_UNAVAILABLE', 'Task Map reading is not configured');
+      const result = await this.readMapSnapshot({ task: structuredClone(task), scope: structuredClone(scope), input });
+      await this.receiver(lease, state);
+      if (this.now() >= lease.expiresAt) fail('ROLE_EXPIRED', 'Cursor delegation expired during Map read');
+      if (Buffer.byteLength(JSON.stringify(result), 'utf8') > 65536) fail('TOO_LARGE', 'Task Map slice exceeds the read limit');
+      return result;
+    }, { readOnly: true }));
+  }
+
   async context(token) {
     return this.withLease(token, async lease => {
       const scope = lease.scope, principal = this.principal(scope);
@@ -289,7 +303,52 @@ export class CursorRoleChannel {
   }
 
   async ciSnapshot(token, input) {
-    return this.withLease(token, async lease => {
+    return this.withLease(token, lease => this.#ciSnapshotForLease(lease, input));
+  }
+
+  // Host-only completion of the original saved proposal, not a public renewal.
+  // Expiry ends Agent access; explicit revocation still blocks host completion.
+  async #withHostCi(invocation, input, action) {
+    if (!invocation || invocation.state !== 'confirmed' || invocation.scope?.phase !== 'ci' ||
+        invocation.id !== hash(canonical(invocation.scope)) || !bounded(invocation.runId) ||
+        !invocation.ciProposal?.snapshot || canonical(invocation.ciProposal.snapshot.input) !== canonical(input) ||
+        canonical(invocation.ciProposal.snapshot.scope) !== canonical(invocation.scope) ||
+        invocation.ciProposal.snapshot.runId !== invocation.runId) fail('ROLE_FORBIDDEN', 'Host completion requires the original saved independent CI proposal');
+    const file = path.join(this.directory, 'operations', hash(invocation.id) + '.json');
+    return withFileLock(file + '.lock', async () => {
+      const original = await readJSON(file, null);
+      if (!original || original.format !== 1 || original.token !== invocation.token ||
+          original.scopeHash !== invocation.id || canonical(original.scope) !== canonical(invocation.scope) ||
+          original.runId !== invocation.runId) fail('ROLE_FORBIDDEN', 'Original CI delegation changed');
+      if (original.state === 'revoked') fail('ROLE_EXPIRED', 'Explicitly revoked delegation cannot be completed by the host');
+      if (original.state !== 'active' || !Number.isSafeInteger(original.expiresAt)) fail('ROLE_UNAVAILABLE', 'Original CI receiver was never activated');
+      // Internal transaction window, never persisted or given to the Agent.
+      return action({ ...original, expiresAt: this.now() + 60000 });
+    });
+  }
+
+  async hostCiSnapshot(invocation, input) {
+    return this.#withHostCi(invocation, input, lease => this.#ciSnapshotForLease(lease, input));
+  }
+
+  async hostCiExchange(invocation, input) {
+    return this.#withHostCi(invocation, input, async lease => {
+      const scope = lease.scope;
+      const message = validateMessage({ v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) });
+      if (message.type !== 'ci.result' || message.payload.taskId !== scope.taskId || message.payload.sourceSha !== scope.sourceSha)
+        fail('ROLE_FORBIDDEN', 'Host completion cannot write evidence, approve or control tasks');
+      return this.store.handle(this.principal(scope), message, {
+        authorize: async (state, principal, message) => {
+          this.task(state, scope, principal);
+          const receiver = await this.receiver(lease, state);
+          if (!receiver.verifiedCi) fail('SOURCE_UNVERIFIED', 'Host completion requires the actual verified native and machine result');
+          this.authorize(state, principal, message, lease, receiver);
+        },
+      });
+    });
+  }
+
+  async #ciSnapshotForLease(lease, input) {
       const scope = lease.scope, principal = this.principal(scope);
       const message = validateMessage({ v: 2, id: input.id, type: input.type, session: scope.session, payload: structuredClone(input.payload) });
       if (scope.phase !== 'ci' || message.type !== 'ci.result' || message.payload.taskId !== scope.taskId || message.payload.sourceSha !== scope.sourceSha) fail('ROLE_FORBIDDEN', 'Defer only the original independent CI result');
@@ -307,6 +366,5 @@ export class CursorRoleChannel {
           todoVersion: todo.latest, items: todo.versions[todo.latest].content.items,
           references: Object.fromEntries(refs.map(ref => [ref, state.objects[scopedObjectKey(principal, scope.session, ref)].latest])), verified: !!receiver.verifiedCi };
       }, { readOnly: true });
-    });
   }
 }
