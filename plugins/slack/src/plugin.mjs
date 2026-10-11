@@ -1501,6 +1501,19 @@ export class SlackPlugin {
       const stream = Number.isSafeInteger(state.consumedInputRevision) || thread.liveStream?.slotId === slotId && thread.liveStream.turnId === state.activeTurnId
         ? streamFor(state.activeTurnId, false, slotId) : null;
       const partial = state.streamingText || state.partialText || stream?.text;
+      // 首次轮询可能直接读到供应商截断终态，尚未分配任何流式槽。
+      // 只投影已核纯文字的原轮次，用原 stream 操作编号持久去重。
+      if (!stream && partial && state.error?.code === 'MODEL_OUTPUT_TRUNCATED' && !thread.mirrored[slotId]) {
+        const text = `Coordinator 部分回复（供应商截断，非最终答案）：\n${partial}`;
+        const ts = await this.io.post({ id: operationId(`${key}:${slotId}`, 'stream'), channel: binding.channel,
+          threadTs: binding.threadTs, text, blocks: messageBlocks({ text, partial: true }, key, { cloudOrigin: this.cloudOrigin, projectId: binding.projectId }) });
+        const failedHash = digest({ partialProjection: 1, text: partial, code: state.error.code });
+        await this.store.update(data => {
+          const slot = { ts, failedHash, turnId: state.activeTurnId, revision: state.consumedInputRevision, text: partial };
+          data.threads[key].mirrored[slotId] = slot;
+          data.threads[key].liveStream = { ...slot, slotId };
+        });
+      }
       if (stream && partial) {
         const failedHash = digest({ partialProjection: 1, text: partial, code: state.error?.code || 'UNKNOWN' });
         if (stream.failedHash !== failedHash) {

@@ -1990,6 +1990,17 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [x] 正式原插件回归：默认不发；指定频道幂等；旧频道卡片保留且不更新；范围外旧按钮在网关调用前拒绝。旧逻辑三项实际 0/3，正确断言复现；修后 3/3，最终四项 4/4，Slack 全量 322/322。首次 Cloud 全量原 HTTP 卡片夹具因未显式测试频道失败，保留原日志；随后按新契约显式配置 CTEST，并修正独立 Review 指出的只读调用 Oracle，须对新字节补验。
 - [ ] 最终单测、独立 Review、Required CI、合并与准确部署；部署仅配置指定测试频道，不扩大项目/用户授权。完整真实 Cursor 三路径业务闭环仍未验收。
 
+## COORDINATOR-LENGTH-SOFT-01 · 长回复不得变成无回复（2026-10-11）
+
+- [x] 代码确认：共享展示长度检查被 Cloud 当作拒绝条件，长度纠正不消耗重试预算，可持续重写；默认1024 token及供应商截断拒绝、Slack首次轮询已失败却没有旧消息槽，另有正文不可见风险。以上为代码机制，不断言解释了近期所有真实报错。
+- [x] 开发：Cloud将字数/段数改为软建议，完整长正文直接交付，私有performance只记质量码与字符数，不存原文；明确要求详细内容不记普通简洁BadCase。移除长度专属无界重试及旧长度反馈，非长度校验和重试预算保留；共享生成源码未改。
+- [x] 传输：OpenAI默认不再附1024输出预算，显式预算保留；Anthropic必填预算默认4096。只有模型匹配、协议闭合、无工具的已核纯文字截断保留可见正文，标MODEL_OUTPUT_TRUNCATED且不记完成历史、不自动重调或执行工具。Slack首次轮询直接失败也沿原操作编号持久展示部分回复，重复/重启不另发；新用户输入可续接，旧失败和未知回执不清除。平台载荷上限仍复用原分段，不硬裁切正文。
+- [x] Executor集中自检（Node22.18.0）：长度/接话两个模块actual5530b2首次65项63通过2失败，3307.8416ms；原传输/私有思考/模型安全七目标actuald6bdcd为7/7，423.1864ms。两个失败分别为测试过早停服和从公开状态读隐藏诊断；仅修夹具等待及私有读取，业务代码与断言意义不变，原两个目标actual7d7821为2/2，334.2203ms。首次失败保留，不称一次72/72，不重跑已通过目标、不跑整仓全量、不付费调用模型。
+- 命令：`node --test --test-reporter=spec tests/coordinator-length-correction.test.mjs tests/merged-participation-independent.test.mjs`；原失败最小复验：`node --test --test-reporter=spec --test-name-pattern "^(long answer and its quality record|long replies cannot bypass)" tests/coordinator-length-correction.test.mjs`。安全七目标使用cloud-coordinator.test.mjs的终止诊断、私有指标、SSE不完整工具、私有思考与模型替换过滤，不将未匹配名称算作通过。差异格式及测试清单静态核验通过（55自动测试、5独立套件、2辅助文件）。
+- 最终SHA256：coordinator-model.mjs `67b4115a13672ce792c7d1db94038c1916737073e6751ab3026ca4436896930a`；coordinator-service.mjs `9fad5372bedf1788b476c2e84bbf9babc71f980f74ebc0220176c78061a16647`；Slack plugin.mjs `fae0905ec43bb3c6b90020a8760dda1773ca7f78d7c449d0b18296c67bba035e`；length测试 `b0f87ec2b3c35fc9d808413f2693b3320c07e8e660347f53c63b27452645d698`；participation测试 `6270764e260eded28da0371bb5755589008f25f8aa915d0aa050bbc3c8870e6b`；cloud-coordinator测试 `23814b61b0fe02e534d99e820aaf5ccd4881ebdc10d8b0202101121b70ab8286`。
+- [ ] 独立Tester：按最终准确修订核验HTTP到SlackIO的长正文分段、尾部/表情、原编号回复丢失恢复、重复与重启、首次poll直接截断失败及后续新输入；检查完整长工具结果仍只生效一次，内部ID/多工具问题/错模型/未闭合流/截断工具仍拒绝，思考与私有诊断不曝光。开发者及自动CI不是独立Tester，本轮不调用subagent；真实供应商和真人Slack验收另列，传输替身不作上线证据。
+- [ ] 交付：本轮未提交、推送、远端CI或上线，未改真实模型与生产配置，未重放旧失败。后续正常Required、合并及同修订部署完成后，才能称生产修复生效。
+- [x] 发布整合：首版提交35e586b后正常合入Main f57e224；两处冲突保留双方台账及Main新增轮次提问/节点卡片校验，完整正文先检查内部标识和私有质量，问句只读投影复用共享轮次规则，不裁切展示或实际工具参数。原卡片长文拒绝目标改为全文一次展示，并加长正文与ask_user重复问句仍拒绝的反例。最终本地仅长度/五反馈两个相关模块actual206d97/bd9c00，33/33、0失败/跳过/取消，38227.5137ms；不重复旧全量、无供应商调用。上列六个哈希仅首版开发证据，不能套给整合后字节；准确整合提交另由Required核验。生产尚未改变，独立Tester不由开发者代签。
 ## COORDINATOR-FIVE-CASE-01 · 五项反馈统一回归（2026-10-11）
 
 - [x] 正式回归覆盖：取消派发的权威槽释放证据、业务拒绝后继续聊天及绑定回执、卡片内部标识和段落长度、同轮重复展示与重复问句；包含实际 HTTP、鉴权和 ProtocolStore，模型使用受控替身，不冒充真实对话验收。

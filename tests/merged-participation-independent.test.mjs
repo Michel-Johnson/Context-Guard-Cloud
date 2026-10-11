@@ -34,7 +34,7 @@ async function submit(service, text, options = {}) {
 }
 const streamed = snapshots => snapshots.map(state => state.streaming?.text || '').filter(Boolean);
 
-test('格式错误自动恢复两次内成功，原始输入不变且坏正文不展示', async t => {
+test('格式错误恢复后长回复直接交付，原始输入不变且坏控制头不展示', async t => {
   let calls = 0;
   const f = await fixture(t, async request => {
     calls++;
@@ -45,11 +45,12 @@ test('格式错误自动恢复两次内成功，原始输入不变且坏正文�
   }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
   await submit(f.service, '你好'); await f.service.close();
   const state = await f.service.state(), privateState = await f.service.readConversation();
-  assert.equal(calls, 3); assert.equal(state.status, 'waiting-for-user');
-  assert.equal(state.messages.filter(message => message.role === 'assistant').at(-1).text, '你好，想讨论什么？');
-  assert.ok(streamed(f.snapshots).every(text => !text.includes('缺少接话声明') && !text.includes('长')));
+  assert.equal(calls, 2); assert.equal(state.status, 'waiting-for-user');
+  assert.equal(state.messages.filter(message => message.role === 'assistant').at(-1).text, '长'.repeat(61));
+  assert.ok(streamed(f.snapshots).every(text => !text.includes('缺少接话声明')));
   assert.deepEqual(privateState.performance.models.filter(item => item.errorCode).map(item => item.diagnostic.validationCode),
-    ['PARTICIPATION_HEADER_INVALID', 'REPLY_PARAGRAPH_LONG']);
+    ['PARTICIPATION_HEADER_INVALID']);
+  assert.equal(privateState.performance.models.at(-1).replyWarnings[0].code, 'REPLY_PARAGRAPH_LONG');
 });
 for (const [code, recovered] of [['MODEL_HTTP_503', true], ['MODEL_HTTP_401', false], ['MODEL_HTTP_402', false]])
 test(`供应商 ${code} 的恢复边界：临时失败恢复，权限或支付错误不盲重试`, async t => {
@@ -102,7 +103,7 @@ test('本轮已执行写入的回执在后续回复重试中保留，不重复�
   ] } : calls === 2 ? answer('长'.repeat(61)) : answer('已保存。'),
   { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
   await submit(f.service, '请保存'); await f.service.close();
-  assert.equal(calls, 3); assert.equal(f.writes.length, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal(calls, 2); assert.equal(f.writes.length, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
 });
 
 test('回复重试生成新的工具ID也复用同轮相同写入回执', async t => {
@@ -113,7 +114,7 @@ test('回复重试生成新的工具ID也复用同轮相同写入回执', async 
       { type: 'tool_use', id: 'write-' + calls, name: calls === 1 ? 'reply_write' : 'write', input: calls === 1
         ? { id: 'one-value', details: { first: 1, second: 2 } } : { details: { second: 2, first: 1 }, id: 'one-value' } },
     ] };
-    return answer(calls === 2 ? '长'.repeat(61) : '已保存。');
+    return answer(calls === 2 ? 'E2E Repeat TODO 123' : '已保存。');
   }, { maxModelRetries: 2, retryDelayMs: 0, validateReplies: true });
   await submit(f.service, '请保存'); await f.service.close();
   assert.equal(f.writes.length, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
@@ -149,7 +150,7 @@ test('新问题替代旧问题：历史保留，不虚构答案，过期答题�
   assert.equal(Object.keys((await f.service.readConversation()).answers).length, 1);
 });
 
-test('长回复纠正不能丢失尚未执行的绑定动作，成功后只保存一次', async t => {
+test('长回复不阻止绑定动作，正文完整交付且审批只保存一次', async t => {
   let calls = 0, saved = 0;
   const f = await fixture(t, async () => {
     calls++;
@@ -159,7 +160,7 @@ test('长回复纠正不能丢失尚未执行的绑定动作，成功后只保�
   }, { tools: [{ name: 'mount_conversation' }], validateReplies: true, maxModelRetries: 2, retryDelayMs: 0,
     execute: async () => { saved++; return { kind: 'binding-proposal', pending: true }; } });
   await submit(f.service, '给博客增加阅读助手'); await f.service.close();
-  assert.equal(calls, 3); assert.equal(saved, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
+  assert.equal(calls, 1); assert.equal(saved, 1); assert.equal((await f.service.state()).status, 'waiting-for-user');
 });
 
 test('完整人工brief审批卡成功后直接等待确认，不追加模型复述', async t => {
