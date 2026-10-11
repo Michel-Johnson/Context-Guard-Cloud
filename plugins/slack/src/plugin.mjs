@@ -997,7 +997,11 @@ export class SlackPlugin {
     // 只复用真人已建立的项目线程；Bot不能创建绑定或借真人身份。
     if (!grant || !binding || event.user === this.botUserId || !/^\d+\.\d+$/.test(event.ts || '') ||
         typeof event.text !== 'string' || !event.text.trim() || event.text.length > 8000) return;
-    let intent = this.store.data.inbox[id]?.botDiscussion;
+    // app_mention与message可对应同一原生消息；运输事件ID不同不代表新输入。
+    const nativeId = operationId(JSON.stringify([this.teamId, event.channel, event.ts, event.user, botId]), 'bot-message');
+    const inputId = operationId(nativeId, 'bot-input');
+    const previousIntent = state => Object.values(state.inbox).find(entry => entry.botDiscussion?.inputId === inputId)?.botDiscussion;
+    let intent = this.store.data.inbox[id]?.botDiscussion || previousIntent(this.store.data);
     if (!intent) {
       let anchor = null;
       const history = await readSlackHistory(this.io, event, { accept: message => {
@@ -1005,23 +1009,29 @@ export class SlackPlugin {
         return true;
       } });
       if (!anchor) return; // 必须有原生真人输入，不由Bot自己刷新对话预算。
-      const inputId = operationId(id, 'bot-input'), inputs = [{ id: inputId, text: event.text }];
+      const inputs = [{ id: inputId, text: event.text }];
       const context = history.slice(-6).map(x => ({ speaker: x.speaker, text: x.text.slice(0, 800) }));
       const routing = await this.mentionRoute(id, event); routing.replyToCoordinator = context.at(-1)?.speaker === this.botUserId;
-      intent = { key, anchor, inputId, payload: { inputs, participation: { text: event.text, inputs, context, routing } } };
+      intent = { key, anchor, inputId, submitId: operationId(nativeId, 'bot-submit'), projectId: binding.projectId,
+        conversationId: binding.conversationId, payload: { inputs, participation: { text: event.text, inputs, context, routing } } };
       const saved = await this.store.update(state => {
         const current = state.threads[key]; if (!current || current.projectId !== binding.projectId || current.conversationId !== binding.conversationId) return false;
+        const previous = previousIntent(state);
+        if (previous) return structuredClone(previous);
         const budget = (state.botDiscussionBudgets ||= {})[key];
         if (budget?.anchor === anchor && budget.count >= 3) return false;
         state.botDiscussionBudgets[key] = { anchor, count: budget?.anchor === anchor ? budget.count + 1 : 1 };
         state.inbox[id].botDiscussion = intent;
         current.ownRequests ||= []; if (!current.ownRequests.includes(inputId)) current.ownRequests.push(inputId);
-        return true;
+        return structuredClone(intent);
       });
       if (!saved) return;
+      intent = saved;
     }
-    if (intent.key !== key || this.store.data.threads[key]?.conversationId !== binding.conversationId) throw Object.assign(new Error('Bot讨论线程已变化'), { code: 'CONFLICT' });
-    await this.gateway.command('conversation.discuss', { id: operationId(id, 'bot-submit'), userId: event.user, botId,
+    if (intent.key !== key || this.store.data.threads[key]?.conversationId !== binding.conversationId ||
+        intent.conversationId && (intent.conversationId !== binding.conversationId || intent.projectId !== binding.projectId)) throw Object.assign(new Error('Bot讨论线程已变化'), { code: 'CONFLICT' });
+    if (intent.payload.inputs[0].text !== event.text) throw Object.assign(new Error('同一Bot消息内容已变化'), { code: 'ID_REUSED' });
+    await this.gateway.command('conversation.discuss', { id: intent.submitId || operationId(id, 'bot-submit'), userId: event.user, botId,
       channelId: event.channel, projectId: binding.projectId, conversationId: binding.conversationId, payload: intent.payload });
     await this.store.updateThread(key, current => { current.awaitingReplyId = intent.inputId; current.nextPoll = 0; });
   }
