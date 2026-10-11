@@ -736,7 +736,7 @@ try {
   const reconciled = await request(`${service.url}/v1/projects/context-guard/sessions/session-one`, { headers: headers('project-memory-token') });
   assert.equal(reconciled.body.snapshot.memory.map.root.title, 'Unsaved browser conflict draft');
   assert.equal(reconciled.body.snapshot.memory.map.root.purpose, 'concurrent server edit');
-  assert.equal(await page.evaluate(() => localStorage.getItem('cg-sync-draft:cloud:context-guard:session:session-one')), null);
+  assert.equal(await page.evaluate(() => localStorage.getItem(workbenchSync.captureKey)), null);
   record('Refresh safely merges disjoint browser draft and Cloud changes');
 
   const overlapBase = await syncVersion();
@@ -762,10 +762,10 @@ try {
   await page.reload();
   await page.waitForFunction(() => document.querySelector('#cg-sync')?.dataset.status === 'conflict');
   assert.equal((await request(`${service.url}/v1/projects/context-guard/sessions/session-one`, { headers: headers('project-memory-token') })).body.snapshot.memory.map.root.title, 'Overlapping remote title');
-  assert.match(await page.evaluate(() => localStorage.getItem('cg-sync-draft:cloud:context-guard:session:session-one')), /Overlapping local title/);
+  assert.match(await page.evaluate(() => localStorage.getItem(workbenchSync.captureKey)), /Overlapping local title/);
   record('Overlapping browser draft remains preserved without overwriting Cloud');
 
-  await page.evaluate(() => localStorage.removeItem('cg-sync-draft:cloud:context-guard:session:session-one'));
+  await page.evaluate(() => localStorage.removeItem(workbenchSync.captureKey));
   await page.reload();
   await synchronized();
   const restoreTitleBase = await syncVersion();
@@ -776,13 +776,13 @@ try {
   assert.equal(restoredTitle.response.status, 200, JSON.stringify(restoredTitle.body));
   await synchronizedAfter(restoreTitleBase);
   await page.evaluate(() => {
-    const key = 'cg-sync-draft:cloud:context-guard:session:session-one';
+    const key = workbenchSync.captureKey;
     localStorage.setItem(key, JSON.stringify({ baseVersion: 'stale-browser-version', baseTree: structuredClone(workbenchSync.baseTree),
       doc: { ...workbenchSync.doc, root: structuredClone(workbenchSync.baseTree) } }));
   });
   await page.reload();
   await synchronized();
-  assert.equal(await page.evaluate(() => localStorage.getItem('cg-sync-draft:cloud:context-guard:session:session-one')), null);
+  assert.equal(await page.evaluate(() => localStorage.getItem(workbenchSync.captureKey)), null);
   record('Stale browser cache with no unsaved changes is cleared on open');
 
   const replayBase = await syncVersion();
@@ -803,14 +803,14 @@ try {
   const replayDraftRoot = structuredClone(replayBaseTree);
   replayDraftRoot.children[0].purpose = 'saved despite lost acknowledgement';
   await page.evaluate(({ baseVersion, baseTree, root, pendingRequest }) => {
-    localStorage.setItem('cg-sync-draft:cloud:context-guard:session:session-one', JSON.stringify({ baseVersion, baseTree, doc: { root }, pendingRequest }));
+    localStorage.setItem(workbenchSync.captureKey, JSON.stringify({ baseVersion, baseTree, doc: { root }, pendingRequest }));
   }, { baseVersion: replayBase, baseTree: replayBaseTree, root: replayDraftRoot, pendingRequest: replayRequest });
   await page.reload();
   await synchronized();
   const replayed = await request(`${service.url}/v1/projects/context-guard/sessions/session-one`, { headers: headers('project-memory-token') });
   assert.equal(replayed.body.snapshot.memory.map.root.children[0].purpose, 'saved despite lost acknowledgement');
   assert.equal(replayed.body.snapshot.memory.map.root.children[1].purpose, 'separate later Cloud update');
-  assert.equal(await page.evaluate(() => localStorage.getItem('cg-sync-draft:cloud:context-guard:session:session-one')), null);
+  assert.equal(await page.evaluate(() => localStorage.getItem(workbenchSync.captureKey)), null);
   record('Lost acknowledgement replays its original request before clearing stale browser cache');
 
   await page.locator('#session-chip').click();
