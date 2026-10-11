@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { startIntegrationGateway, validateIntegrationConfig, classifyIntegrationMessage, relevanceInput } from '../scripts/cloud/integration-gateway.mjs';
+import { startIntegrationGateway, validateIntegrationConfig, validateIntegrationCommand, classifyIntegrationMessage, relevanceInput } from '../scripts/cloud/integration-gateway.mjs';
 import { IntegrationAttachmentStore } from '../scripts/cloud/integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from '../scripts/cloud/coordinator-manual.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
@@ -19,6 +19,29 @@ const teamId = 'TTESTWORKSPACE', userId = 'UTESTUSER', projectId = 'fixture-proj
 const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
+
+test('Bot讨论网关核身份和项目频道，不能借真人审批或旧权限重放', async t => {
+  const discussionBots = [{ userId: 'UBOTUSER', botId: 'BAUTHBOT', projectIds: [projectId], channelIds: ['CROOM'] }];
+  const scoped = validateIntegrationConfig({ ...config, discussionBots });
+  const input = { id: 'bot-discussion', teamId, userId: 'UBOTUSER', botId: 'BAUTHBOT', channelId: 'CROOM', projectId,
+    conversationId: 'chat-bot-test', type: 'conversation.discuss', payload: { inputs: [{ id: 'bot-input', text: '请回复' }] } };
+  assert.equal(validateIntegrationCommand(scoped, input).actor.kind, 'bot');
+  assert.equal(validateIntegrationCommand(scoped, input).actor.sessionId, `slack-bot:${teamId}:UBOTUSER`);
+  for (const fields of [{ botId: 'BOTHER' }, { channelId: 'COTHER' }, { projectId: 'other-project' },
+    { type: 'brief.review' }, { type: 'conversation.submit' }, { type: 'models.select' }, { botId: undefined }]) {
+    assert.throws(() => validateIntegrationCommand(scoped, { ...input, ...fields }), { code: 'FORBIDDEN' });
+  }
+  assert.throws(() => validateIntegrationCommand(validateIntegrationConfig({ ...config }), input), { code: 'FORBIDDEN' });
+  let calls = 0;
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-bot-gateway-'));
+  const gateway = await startIntegrationGateway({ config: scoped, stateDir,
+    state: async () => ({}), command: async (_input, { actor }) => { calls++; assert.equal(actor.kind, 'bot'); return { accepted: true }; } });
+  t.after(async () => { await gateway.close(); await fs.rm(stateDir, { recursive: true, force: true }); });
+  const client = new Gateway({ url: gateway.url, token, teamId });
+  const { type, teamId: _team, ...request } = input;
+  await client.command(type, request); await client.command(type, request);
+  assert.equal(calls, 1, '真实HTTP投影保Bot身份且重复交付只生效一次');
+});
 
 test('私有 Cursor 授权保留 Map 用户范围，不要求向整个 workspace 开放项目', () => {
   const privateProject = 'private-cursor-repository';
@@ -213,12 +236,13 @@ test('Manual role is selected explicitly without changing legacy execution instr
   // The approved shared role was compacted in Skill ac9880d. Keep the same
   // authorization/order contract, not the obsolete sentence spelling.
   assert.match(automatic, /prepare_task 提 brief，等待需求审批回执；批准后由系统创建独立执行 Session\/worktree、绑定派发/);
-  assert.doesNotMatch(manual, /系统(?:为新任务)?创建独立执行 Session|审核 Plan|自动发起中断恢复/);
-  assert.match(manual, /不创建、派发或恢复执行 Session/);
+  assert.doesNotMatch(manual, /系统(?:为新任务)?创建独立执行 Session|自动发起中断恢复/);
+  assert.match(manual, /协调 Executor 和独立 Tester/, '人工模式仍保留协调职责');
+  assert.match(manual, /不创建、派发或恢复(?:执行)? Session/);
   for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史非事实/授权', 'Main状态非完成证据', '权限不扩大']) {
     assert.ok(manual.includes(invariant), `Manual role preserves ${invariant}`);
   }
-  assert.doesNotMatch(manual, /自动发起中断恢复|审核 Plan/, '人工讨论提示词不包含执行调度规则');
+  assert.doesNotMatch(manual, /自动发起中断恢复/, '人工讨论不自动恢复执行端');
   const windows = document.replace(/\n/g, '\r\n');
   assert.equal(coordinatorRolePrompt(windows, { manual: true }).replace(/\r\n/g, '\n'), manual);
   assert.equal(coordinatorRolePrompt('custom legacy guide'), 'custom legacy guide');

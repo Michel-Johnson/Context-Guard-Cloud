@@ -1,4 +1,5 @@
 import { relevanceInput } from './integration-gateway.mjs';
+import { isVerifiedSlackBot } from './slack-bot-identity.mjs';
 
 const invalid = (validationCode = 'PARTICIPATION_HEADER_INVALID') => Object.assign(new Error('接话决定缺失或不完整，未执行工具'), {
   code: 'MODEL_INVALID_RESPONSE', modelTermination: { validationCode }, retryableModelResponse: true,
@@ -25,9 +26,10 @@ export const MERGED_PARTICIPATION_POLICY = '\n[Slack 合并接话协议]\n同一
 
 export function validateMergedParticipation(value, inputs, { source, actor } = {}) {
   if (value === undefined) return undefined;
-  if (source !== 'slack' || actor?.kind !== 'human' || actor.integration !== 'slack' ||
+  const botDiscussion = source === 'slack-bot' && isVerifiedSlackBot(actor);
+  if (!botDiscussion && (source !== 'slack' || actor?.kind !== 'human' || actor.integration !== 'slack' ||
       !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
-      actor.sessionId !== `slack:${actor.teamId}:${actor.userId}` || !Array.isArray(inputs)) {
+      actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`) || !Array.isArray(inputs)) {
     throw Object.assign(new Error('接话上下文只接受已鉴权的 Slack 批次'), { code: 'INVALID_INPUT' });
   }
   const verified = relevanceInput(value);
@@ -40,14 +42,14 @@ export function validateMergedParticipation(value, inputs, { source, actor } = {
 }
 
 export function mergedParticipationInput(state) {
-  if (state.activeInput?.source !== 'slack') return null;
-  return state.messages?.findLast(message => message.role === 'user' && message.source === 'slack' &&
+  if (!['slack', 'slack-bot'].includes(state.activeInput?.source)) return null;
+  return state.messages?.findLast(message => message.role === 'user' && message.source === state.activeInput.source &&
     message.serverContext?.participation &&
     (state.activeRequestIds || [state.activeInput.id]).includes(message.requestId)) || null;
 }
 
 // onText 接收累计文本；半个控制头永远不进入用户可见流。
-export function createParticipationGate(onText, { continuation = false, reactionOnlyCompletion = false, replyToolNames = [] } = {}) {
+export function createParticipationGate(onText, { continuation = false, reactionOnlyCompletion = false, replyToolNames = [], allowUnmarkedReply = false } = {}) {
   const declaredNames = new Set(replyToolNames);
   let decision = continuation ? 'reply' : null, visible = '', lastText = '', toolFirstPending = false, declaredByTool = false;
   const consume = async (text, final = false, toolBoundary = false) => {
@@ -72,10 +74,16 @@ export function createParticipationGate(onText, { continuation = false, reaction
       decision = 'silent'; return '';
     }
     if (!final && (REPLY_HEADER.startsWith(text) || SILENT_HEADER.startsWith(text))) return '';
+    // 已确认静默不可被后续无标记正文覆盖，包括流与最终响应不一致时。
+    if (decision === 'silent') throw invalid('PARTICIPATION_SILENT_CONFLICT');
     if ((continuation || declaredByTool) && !text.startsWith('[CG_')) {
       visible = text;
       if (visible) await onText?.(visible);
       return visible;
+    }
+    if (!text.startsWith('[CG_') && (allowUnmarkedReply || !final)) {
+      if (!final) return '';
+      if (allowUnmarkedReply && text.trim()) { decision = 'reply'; visible = text; await onText?.(visible); return visible; }
     }
     throw invalid();
   };
@@ -85,12 +93,14 @@ export function createParticipationGate(onText, { continuation = false, reaction
     get visible() { return visible; },
     toolStart() {
       if (!decision && lastText === REPLY_MARKER) decision = 'reply';
-      if (!decision && !lastText) { toolFirstPending = true; return; }
+      if (!decision && (!lastText || !lastText.startsWith('[CG_'))) { toolFirstPending = true; return; }
       if (decision !== 'reply') throw invalid();
     },
     async finish(next) {
       const first = next.content.find(block => ['text', 'tool_use'].includes(block.type));
-      if (!continuation && first?.type === 'tool_use') {
+      const declaresReply = next.content.some(block => block.type === 'tool_use') &&
+        (first?.type === 'tool_use' || first?.type === 'text' && !first.text.startsWith('[CG_'));
+      if (!continuation && declaresReply) {
         if (decision === 'silent' || next.content.some(block => block.type === 'tool_use' && !declaredNames.has(block.name))) throw invalid('PARTICIPATION_TOOL_UNDECLARED');
         decision = 'reply'; declaredByTool = true;
       } else if (!continuation && first?.type !== 'text') throw invalid();

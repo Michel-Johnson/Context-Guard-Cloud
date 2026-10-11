@@ -34,6 +34,7 @@ import { startIntegrationGateway, validateIntegrationConfig, validateIntegration
 import { recoveryScope, requireEmptyRecoveryState } from './slack-recovery.mjs';
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
+import { isVerifiedSlackBot, BOT_DISCUSSION_TOOLS } from './slack-bot-identity.mjs';
 import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
@@ -940,7 +941,9 @@ export async function startCloudServer({
           return caller.role === 'device' ? { ...caller, role: 'coordinator', bindings: { [id]: binding.worktreeId } } : caller;
         };
         const execute = createCoordinatorExecutor({
-          authorizeTool: async (name, input, { caller }) => {
+          authorizeTool: async (name, input, { caller, actor, source }) => {
+            if (actor?.kind === 'bot' && (source !== 'slack-bot' || !isVerifiedSlackBot(actor) || !BOT_DISCUSSION_TOOLS.includes(name))) protocolFail('FORBIDDEN', 'Bot讨论不授予业务操作或人审权限');
+            if (actor?.kind === 'bot') await authorizeIntegrationProject(project.id, actor);
             const liveConversation = await conversations.get(conversationId);
             // A live counted tool makes retireIdle reject the transition.
             // Do not abort that step merely because an enable attempt is busy.
@@ -1028,6 +1031,23 @@ export async function startCloudServer({
             const catalog = await (await modelSettingsFor(project)).state(), route = (await service.state()).modelRoute;
             return { ...catalog, ...(route ? { currentRoute: { kind: route.kind, model: route.model,
               ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
+          },
+          executionCapabilities: async ({ actor }) => {
+            const current = await conversations.get(conversationId);
+            const providers = [];
+            for (const [id, check] of [['cursor', cursorExecutionScope], ['zcode', zcodeExecutionScope]]) {
+              let allowed = false, grant;
+              try { grant = await check(project, actor || { kind: 'human', sessionId: 'browser-human', integration: 'browser' }); allowed = true; }
+              catch (error) { if (error.code !== 'FORBIDDEN') throw error; }
+              const enabled = !!current[id === 'zcode' ? 'zcodeExecution' : 'cursorExecution'];
+              const heartbeat = allowed && id === 'zcode' && interfacePresence.get(presenceKey(grant.repositoryId, grant.templateSessionId))?.lastHeartbeatAt;
+              const availability = !allowed ? 'not-authorized' : heartbeat ? cloudSessionPresence(heartbeat) : 'unknown';
+              providers.push({ id, authorized: allowed, enabled, availability, ...(heartbeat ? { lastHeartbeatAt: heartbeat } : {}),
+                nextStep: !allowed ? '当前身份未获该执行能力' : availability === 'offline' ? '先恢复已注册本机连接，保留原任务'
+                  : enabled ? '先确认brief，再按原任务跟进；未知在线状态不能保证启动' : '在当前对话启用该执行端；启用不批准任务' });
+            }
+            return { kind: 'execution-capabilities', executionMode: current.executionMode || 'automatic',
+              responsibility: '继续协调Executor、独立Tester、阻塞和收工；模式限制不代表职责止于brief', providers };
           },
           listProjects: async ({ operationId, actor }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持查询 Slack 项目');
@@ -1471,7 +1491,7 @@ export async function startCloudServer({
     if (!input || Object.keys(input).some(key => !['id', 'text', 'inputs', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
       protocolFail('INVALID_ARGUMENT', 'Provide a message, stable ID and optional attachment references');
     }
-    if (input.inputs !== undefined && (options.source !== 'slack' || input.retry ||
+    if (input.inputs !== undefined && (!['slack', 'slack-bot'].includes(options.source) || input.retry ||
         ['text', 'attachments', 'answerTo'].some(key => Object.hasOwn(input, key)))) {
       protocolFail('INVALID_ARGUMENT', 'Only verified Slack batches may supply ordered inputs without replacing retry data');
     }
@@ -1508,6 +1528,11 @@ export async function startCloudServer({
     return project;
   };
   const authorizeIntegrationProject = async (id, actor, input) => {
+    if (actor?.kind === 'bot') {
+      const grant = integrations.discussionBots?.find(x => x.userId === actor.userId && x.botId === actor.botId);
+      if (!isVerifiedSlackBot(actor) || !grant?.projectIds.includes(id) || !grant.channelIds.includes(actor.channelId)) protocolFail('FORBIDDEN', 'Bot讨论授权已撤销或不属于当前项目');
+      return;
+    }
     if (mapProjects.allowed(actor)) await mapProjects.get(id);
     else if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
     if (input?.type === 'conversation.cursor') cursorExecutionScope(await integrationProject(id), actor);
@@ -1521,7 +1546,7 @@ export async function startCloudServer({
   const requireIntegrationConversation = async (project, id, actor) => {
     if (typeof id !== 'string') protocolFail('INVALID_ARGUMENT', 'Select a linked conversation');
     const conversation = await conversationsFor(project).get(id);
-    if (conversation.executionMode !== 'manual') await requireExecutionGrant(project, conversation, actor);
+    if (conversation.executionMode !== 'manual') await requireExecutionGrant(project, conversation, actor?.kind === 'bot' ? null : actor);
     return conversation;
   };
   const integrationPublicState = async (project, id, actor) => {
@@ -1676,6 +1701,11 @@ export async function startCloudServer({
     }
     const integrationConversation = await requireIntegrationConversation(project, conversationId, actor);
     if (type === 'conversation.state') return integrationPublicState(project, conversationId, actor);
+    if (type === 'conversation.discuss') {
+      if (!isVerifiedSlackBot(actor)) protocolFail('FORBIDDEN', 'Bot讨论身份必须由网关验证');
+      return submitCoordinator(project, conversationId, { id: operationId, inputs: payload.inputs, followup: 'queue' },
+        { source: 'slack-bot', actor, history: payload.history, participation: payload.participation });
+    }
     if (type === 'conversation.submit') {
       const { history, participation, recovery, slackChannelId: _deliveryChannel, ...input } = payload;
       const recoveryOptions = recovery ? { operatorRecovery: recovery.operationId, recoveryGuard: async (state, journal) => {

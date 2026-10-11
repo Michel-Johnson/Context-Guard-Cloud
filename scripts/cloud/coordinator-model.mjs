@@ -3,6 +3,7 @@ import { canonical } from '../shared/protocol.mjs';
 import { coordinatorReplyIssue, coordinatorTurnReplyIssue, coordinatorToolReplyTexts, coordinatorReplyProfile, replyRepairInstruction, visibleCharacters } from '../shared/coordinator-reply.mjs';
 import { coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { canUseSlackProjectTool } from './coordinator-tools.mjs';
+import { isVerifiedSlackBot, discussionTools } from './slack-bot-identity.mjs';
 import { slackReactionEmojis } from './slack-reactions.mjs';
 import { createParticipationGate, mergedParticipationInput, mergedParticipationMessages, mergedParticipationTools, businessToolName, MERGED_PARTICIPATION_POLICY } from './merged-participation.mjs';
 
@@ -520,6 +521,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   state.messages ||= []; state.toolReceipts ||= {};
   // Source belongs to the accepted server input, never to message text or model
   // tool parameters. Other clients already have their own model settings UI.
+  tools = discussionTools(tools, state.activeInput?.actor);
   const sourceTools = tools.filter(tool => tool.name !== 'show_model_menu' || state.activeInput?.source === 'slack');
   const slackActor = state.activeInput?.actor;
   const trustedSlackInput = state.activeInput?.source === 'slack' && !!state.activeInput.id && slackActor?.kind === 'human' &&
@@ -540,7 +542,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   };
   if (!state.pending) {
     const messages = materializeMessages ? await materializeMessages(state) : coordinatorModelMessages(state);
-    const participationInput = trustedSlackInput && mergedParticipationInput(state);
+    const participationInput = (trustedSlackInput || state.activeInput?.source === 'slack-bot' && isVerifiedSlackBot(slackActor)) && mergedParticipationInput(state);
     const gateKey = participationInput?.requestId;
     const alreadyAllowed = gateKey && state.slackParticipation?.requestId === gateKey && state.slackParticipation.decision === 'reply';
     const needsGate = gateKey && !alreadyAllowed;
@@ -583,7 +585,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
         await onText?.(text);
       }
     }, { continuation: !!alreadyAllowed, reactionOnlyCompletion,
-      replyToolNames: needsGate ? modelTools.map(tool => tool.name) : [] }) : null;
+      replyToolNames: needsGate ? modelTools.map(tool => tool.name) : [],
+      allowUnmarkedReply: !!participationInput && (() => { const route = participationInput.serverContext.participation.routing;
+        return Array.isArray(route?.mentionedUsers) && (route.mentionedUsers.some(x => x.id === route.coordinatorUserId) || route.replyToCoordinator === true && !route.mentionedUsers.length);
+      })() }) : null;
     const publishDecision = async () => {
       if (gate?.decision && (state.slackParticipation?.requestId !== gateKey || state.slackParticipation.decision !== gate.decision)) {
         state.slackParticipation = { requestId: gateKey, decision: gate.decision };
@@ -721,7 +726,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
     await save(state);
   }
   const next = state.pending, toolAssistant = state.messages.at(-1);
-  const mergedReplyAllowed = trustedSlackInput && state.slackParticipation?.decision === 'reply' &&
+  const mergedReplyAllowed = (trustedSlackInput || state.activeInput?.source === 'slack-bot' && isVerifiedSlackBot(slackActor)) && state.slackParticipation?.decision === 'reply' &&
     (state.activeRequestIds || [state.activeInput.id]).includes(state.slackParticipation.requestId);
   const toolName = call => mergedReplyAllowed ? businessToolName(call.name) : call.name;
   let changed = checkpoint ? await checkpoint() : { steered: false, interrupted: false };
@@ -779,6 +784,10 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           // the original native tool receipt keeps its unchanged identity.
           const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}`
             : repeatedReaction ? repeatedReaction[0] : operationId,
+            ...(state.activeInput?.actor ? { source: state.activeInput.source, actor: state.activeInput.actor } : {}),
+            ...(name === 'get_execution_capabilities' && projectReadInput ? {
+              source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id,
+            } : {}),
             ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(readProjectTools.includes(name) ? { source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id }

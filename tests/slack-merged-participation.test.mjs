@@ -8,12 +8,14 @@ import { startCloudServer } from '../scripts/cloud/server.mjs';
 import { legacyProjectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { validateIntegrationCommand } from '../scripts/cloud/integration-gateway.mjs';
-import { validateMergedParticipation, mergedParticipationMessages, MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
+import { validateMergedParticipation, mergedParticipationMessages, createParticipationGate, MERGED_PARTICIPATION_POLICY } from '../scripts/cloud/merged-participation.mjs';
 import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { Store } from '../plugins/slack/src/store.mjs';
 import { slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
 import { hash } from '../scripts/shared/io.mjs';
+import { coordinatorStep } from '../scripts/cloud/coordinator-model.mjs';
+import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
 
 // 真实插件、HTTP 网关、持久化和工具；模型及 Slack 平台 IO 为替身。
 // 不使用生产数据、账号或凭据，不把此测试称为真实 Slack 验收。
@@ -24,7 +26,73 @@ const participation = (id, text) => ({ text, inputs: [{ id, text }], files: [], 
   routing: { coordinatorUserId: botUserId, mentionedUsers: [], replyToCoordinator: false } });
 const result = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
 
-async function fixture(t, next) {
+test('静默决定不被不一致的最终正文或后续流覆写', async () => {
+  for (const final of [true, false]) {
+    const displayed = [], gate = createParticipationGate(text => displayed.push(text), { allowUnmarkedReply: true });
+    await gate.consume('[CG_SILENT]');
+    const action = final ? gate.finish(result('不应发布的最终正文')) : gate.consume('不应发布的后续正文');
+    await assert.rejects(action, error => error.code === 'MODEL_INVALID_RESPONSE' &&
+      error.modelTermination.validationCode === 'PARTICIPATION_SILENT_CONFLICT');
+    assert.equal(gate.decision, 'silent'); assert.deepEqual(displayed, []);
+  }
+});
+
+test('Steer后执行能力读取核最新已消费身份，不借原操作者权限', async () => {
+  const actor = userId => ({ kind: 'human', integration: 'slack', teamId: 'TTEST', userId, sessionId: `slack:TTEST:${userId}` });
+  const initial = actor('UAUTHORIZED'), latest = actor('UNOTAUTHORIZED');
+  const call = { type: 'tool_use', id: 'capabilities', name: 'get_execution_capabilities', input: {} };
+  const state = { activeTurnId: 'first', activeInput: { id: 'first', source: 'slack', actor: initial },
+    activeRequestIds: ['first', 'steer'], consumedInputRevision: 2,
+    messages: [{ role: 'user', requestId: 'first', source: 'slack', actor: initial, content: '原问题' },
+      { role: 'user', requestId: 'steer', source: 'slack', actor: latest, content: '查我当前的执行权限' },
+      { role: 'assistant', content: [call] }], pending: { stop: 'tool_use', content: [call] } };
+  let seen;
+  await coordinatorStep({ turnId: 'first', state, model: {}, system: 'fixture', tools: coordinatorTools,
+    save: async () => {}, execute: async (name, input, options) => {
+      seen = options; return { kind: 'execution-capabilities', authorized: false };
+    } });
+  assert.equal(seen.source, 'slack'); assert.deepEqual(seen.actor, latest); assert.equal(seen.requestId, 'steer');
+  assert.deepEqual(state.activeInput.actor, initial, '读取身份切换不篡改原轮次身份');
+});
+
+test('明确续话遗漏展示标记仍保正文，未确定受众不猜测，静默和权限边界不放松', async () => {
+  const displayed = [], gate = createParticipationGate(text => displayed.push(text), { allowUnmarkedReply: true });
+  await gate.consume('可'); await gate.consume('可以查询执行端能力。');
+  assert.deepEqual(displayed, [], '未完成输出只缓冲，不将半个决定外发');
+  assert.equal((await gate.finish(result('可以查询执行端能力。'))).content[0].text, '可以查询执行端能力。');
+  assert.deepEqual(displayed, ['可以查询执行端能力。']);
+  const ambiguous = createParticipationGate(); await ambiguous.consume('不带标记');
+  await assert.rejects(ambiguous.finish(result('不带标记')), error => error.code === 'MODEL_INVALID_RESPONSE');
+  const silent = createParticipationGate(undefined, { allowUnmarkedReply: true });
+  assert.deepEqual((await silent.finish(result('[CG_SILENT]'))).content, []);
+  await assert.rejects(createParticipationGate(undefined, { allowUnmarkedReply: true }).finish({ stop: 'tool_use', content: [
+    { type: 'tool_use', id: 'bad', name: 'reply_write_file', input: {} }] }), error => error.code === 'MODEL_INVALID_RESPONSE');
+});
+
+test('获准Bot从原生事件到HTTP/模型/原线程回传，真实身份不变且只有讨论工具', async t => {
+  const discussionBots = [{ userId: 'UMICHAEL', botId: 'BMICHAEL', projectIds: [projectId], channelIds: ['CTEST'] }];
+  const f = await fixture(t, async (request, number) => {
+    if (number === 1) return result('[CG_REPLY]\n真人线程已建立。');
+    assert.match(JSON.stringify(request.messages), /slack-bot|Bot讨论/);
+    assert.ok(request.tools.every(tool => ['reply_read_map', 'reply_read_reference', 'reply_get_execution_capabilities'].includes(tool.name)));
+    return result('[CG_REPLY]\n收到 michael 的测试。');
+  }, { discussionBots });
+  const before = await f.main();
+  await f.send('请在本线程讨论。'); await f.wait(s => !s.activeTurnId && f.posts.some(p => p.text.includes('真人线程已建立')));
+  const original = f.plugin.io.call;
+  f.plugin.io.call = async (method, input) => method === 'conversations.replies'
+    ? { messages: [{ ts: '100.001', user: userId, text: '请michael与Coordinator讨论。' }] } : original(method, input);
+  await f.send(`<@${botUserId}> 请确认收到。`, '101.001', { user: 'UMICHAEL', bot_id: 'BMICHAEL', thread_ts: '100.001' });
+  const state = await f.wait(s => !s.activeTurnId && f.posts.some(p => p.text.includes('收到 michael')));
+  const input = state.messages.findLast(m => m.role === 'user');
+  assert.equal(input.source, 'slack-bot'); assert.equal(input.actor.kind, 'bot');
+  assert.equal(input.actor.sessionId, `slack-bot:${teamId}:UMICHAEL`);
+  assert.equal(f.commands.filter(x => x.type === 'conversation.discuss').length, 1);
+  assert.deepEqual(await f.main(), before, '讨论不会写Main或代签审批');
+  assert.doesNotMatch(JSON.stringify(f.posts), /CG_REPLY|CG_SILENT/);
+});
+
+async function fixture(t, next, { discussionBots = [] } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-merged-'));
   const providerFile = path.join(directory, 'provider.json');
   await fs.writeFile(providerFile, JSON.stringify({ token: 'synthetic', baseUrl: 'https://fixture.invalid', model: 'fixture-model' }));
@@ -42,7 +110,7 @@ async function fixture(t, next) {
   const cloudOptions = { dataDir: directory, host: '127.0.0.1', port: 0, privateAccess: true,
     browserToken: 'synthetic-browser', adminToken: 'synthetic-server', memoryConfig,
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/fixture' }] },
-    integrationConfig: { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] },
+    integrationConfig: { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId], discussionBots },
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push(request); return next(request, modelCalls.length);
     } }),
@@ -53,7 +121,7 @@ async function fixture(t, next) {
   const gateway = new Gateway({ url: cloud.integrationUrl, token, teamId });
   const command = gateway.command.bind(gateway);
   gateway.command = async (type, args) => { commands.push({ type, ...structuredClone(args) }); return command(type, args); };
-  const plugin = new SlackPlugin({ store, gateway, teamId, botUserId, cloudOrigin: cloud.url, collectMs: 0, maxCollectMs: 0,
+  const plugin = new SlackPlugin({ store, gateway, teamId, botUserId, cloudOrigin: cloud.url, collectMs: 0, maxCollectMs: 0, discussionBots,
     logger: { warn() {}, error() {} }, io: {
       post: async input => { posts.push(input); return `${1000 + posts.length}.001`; },
       update: async (_channel, _ts, text, blocks) => { posts.push({ text, blocks, updated: true }); },
