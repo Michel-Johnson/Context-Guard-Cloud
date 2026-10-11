@@ -24,7 +24,7 @@ function settleFailedSlackGeneration(state, journal) {
   // 402 是明确的供应商拒绝，不是运行中或结果未知的工具调用。
   // 旧 Slack 对话可能没有 merged 元数据；只让新消息接续，不重试旧轮。
   const knownFailure = state.error?.code === 'MODEL_INVALID_RESPONSE' && mergedParticipationInput(state) ||
-    state.error?.code === 'MODEL_HTTP_402' && state.activeInput?.source === 'slack';
+    ['MODEL_HTTP_402', 'MODEL_OUTPUT_TRUNCATED'].includes(state.error?.code) && state.activeInput?.source === 'slack';
   if (state.status !== 'error' || !knownFailure || state.pending ||
       Object.values(journal.requests).some(item => item.revision > (state.consumedInputRevision || 0)) ||
       Object.values(journal.interrupts).some(item => item.turnId === state.activeTurnId && !state.resumedInterrupts?.includes(item.id))) return false;
@@ -1194,12 +1194,10 @@ export class CoordinatorService {
               continue;
             }
             const validationCode = coordinatorFailureDiagnostic(cause)?.validationCode;
-            const lengthCorrection = isReplyLengthCorrection(cause.code, validationCode);
-            // 展示长度不合格继续用原上下文纠正，不耗尽模型故障预算或业务步骤。
-            // 下一轮仍检查中止、追加输入及停服；已保存的工具回执不重做。
-            if (recoverableModelFailure(cause) && (lengthCorrection || (state.modelRetries || 0) < this.maxModelRetries) && !state.pending &&
+            // 质量长度不触发重写；真正模型/格式故障仍使用原有有界预算。
+            if (recoverableModelFailure(cause) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
                 !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
-              if (!lengthCorrection) state.modelRetries = (state.modelRetries || 0) + 1;
+              state.modelRetries = (state.modelRetries || 0) + 1;
               state.modelRepairCode = validationCode || null;
               state.modelRepairText = typeof cause.repairText === 'string' ? cause.repairText : null;
               state.modelRepairTools = Array.isArray(cause.repairTools) ? cause.repairTools : state.modelRepairTools || [];
@@ -1231,7 +1229,8 @@ export class CoordinatorService {
       } catch (cause) {
         state.status = 'error'; state.activity = null; state.error = { code: cause.code || 'COORDINATOR_FAILED',
           recoverable: recoverableModelFailure(cause), diagnostic: coordinatorFailureDiagnostic(cause),
-          message: (state.modelRetries || 0) > 0 ? '自动恢复未成功，原消息与已完成操作已保留。' : '处理已停止，原消息与已完成操作已保留。' };
+          message: cause.code === 'MODEL_OUTPUT_TRUNCATED' ? '供应商截断了回复，已有正文保留为未完成内容。可继续提问；没有执行不完整工具。'
+            : (state.modelRetries || 0) > 0 ? '自动恢复未成功，原消息与已完成操作已保留。' : '处理已停止，原消息与已完成操作已保留。' };
         await save(state);
       }
       if (state.status === 'interrupted') { state.streaming = null; state.activity = null; await save(state); }

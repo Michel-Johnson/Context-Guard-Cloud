@@ -1326,7 +1326,7 @@ test('Failed stream termination diagnostics preserve only known reasons and nume
   const block = { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'visible incomplete explanation' } };
   const close = { type: 'content_block_stop', index: 0 }, end = { type: 'message_stop' };
   for (const fixture of [
-    { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 256, cache_read_input_tokens: -1 } }, end], code: 'STOP_REASON_INVALID', reason: 'max_tokens', open: 0, terminal: true, output: 256 },
+    { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 256, cache_read_input_tokens: -1 } }, end], code: 'STOP_REASON_INVALID', errorCode: 'MODEL_OUTPUT_TRUNCATED', reason: 'max_tokens', open: 0, terminal: true, output: 256 },
     { events: [start, block, { type: 'message_delta', delta: { stop_reason: 'end_turn' } }, end], code: 'OPEN_BLOCKS', reason: 'end_turn', open: 1, terminal: true },
     { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'end_turn' } }], code: 'MISSING_TERMINAL', reason: 'end_turn', open: 0, terminal: false },
     { events: [start, block, close, { type: 'message_delta', delta: { stop_reason: 'diagnostic-secret' }, usage: { output_tokens: 'diagnostic-secret' } }, end], code: 'STOP_REASON_INVALID', open: 0, terminal: true },
@@ -1338,7 +1338,7 @@ test('Failed stream termination diagnostics preserve only known reasons and nume
     } });
     await assert.rejects(model.next({ system: 'diagnostic-secret', messages: [] }), error => {
       const diagnostic = error.modelDiagnostic;
-      assert.equal(error.code, 'MODEL_INVALID_RESPONSE'); assert.equal(diagnostic.phase, 'response-stream');
+      assert.equal(error.code, fixture.errorCode || 'MODEL_INVALID_RESPONSE'); assert.equal(diagnostic.phase, 'response-stream');
       assert.equal(diagnostic.termination.validationCode, fixture.code);
       assert.equal(diagnostic.termination.failureOrigin, undefined);
       assert.equal(diagnostic.termination.callbackBoundary, undefined);
@@ -1371,20 +1371,20 @@ test('Failed stream private performance survives restart without becoming comple
   const service = new CoordinatorService(options);
   await service.submit({ id: 'failure-turn', text: 'diagnostic-hidden-body' }); await service.close();
   const raw = JSON.parse(await fs.readFile(path.join(directory, 'conversation.json'), 'utf8'));
-  assert.equal(raw.status, 'error'); assert.equal(raw.error.code, 'MODEL_INVALID_RESPONSE');
-  assert.equal(raw.performance.models.length, 3); assert.equal(raw.performance.models[0].diagnostic.phase, 'response-stream');
+  assert.equal(raw.status, 'error'); assert.equal(raw.error.code, 'MODEL_OUTPUT_TRUNCATED');
+  assert.equal(raw.performance.models.length, 1); assert.equal(raw.performance.models[0].diagnostic.phase, 'response-stream');
   assert.equal(raw.performance.models[0].diagnostic.validationCode, 'STOP_REASON_INVALID');
   assert.equal(raw.performance.models[0].diagnostic.stopReason, 'max_tokens');
   assert.deepEqual(raw.performance.models[0].diagnostic.usage, { input_tokens: 21, output_tokens: 100 });
   assert.doesNotMatch(JSON.stringify(raw.performance), /diagnostic-hidden-body|diagnostic-visible-partial|privatePrompt|synthetic/);
   assert.equal(raw.pending, undefined); assert.equal(raw.messages.filter(message => message.role === 'assistant').length, 0);
-  assert.equal(raw.toolReceipts && Object.keys(raw.toolReceipts).length || 0, 0); assert.equal(calls, 3); assert.equal(tools, 0);
+  assert.equal(raw.toolReceipts && Object.keys(raw.toolReceipts).length || 0, 0); assert.equal(calls, 1); assert.equal(tools, 0);
   const restarted = new CoordinatorService(options), publicState = await restarted.state();
   assert.equal(publicState.status, 'error'); assert.equal(publicState.performance, undefined);
   assert.equal(publicState.consumedInputRevision, 0, 'Public initial revision normalizes the absent private field');
   assert.equal(Object.hasOwn(raw, 'consumedInputRevision'), false);
   assert.doesNotMatch(JSON.stringify(publicState), /STOP_REASON_INVALID|messageStopSeen|output_tokens|diagnostic\.phase/);
-  assert.equal(calls, 3); await restarted.close();
+  assert.equal(calls, 1); await restarted.close();
 });
 
 test('Failed stream metrics reject forged diagnostic values and never invoke diagnostic getters', async () => {
@@ -2971,7 +2971,7 @@ test('Coordinator rejects model substitution, partial output, duplicate calls, a
     { ...text, stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'same', name: 'read_map', input: {} }, { type: 'tool_use', id: 'same', name: 'read_map', input: {} }] },
   ]) {
     const model = new CoordinatorModel({ ...config, fetch: async () => Response.json(body) });
-    await assert.rejects(model.next({ system: '', messages: [] }), { code: 'MODEL_INVALID_RESPONSE' });
+    await assert.rejects(model.next({ system: '', messages: [] }), { code: body.stop_reason === 'max_tokens' && body.model === config.model ? 'MODEL_OUTPUT_TRUNCATED' : 'MODEL_INVALID_RESPONSE' });
   }
   const large = new CoordinatorModel({ ...config, fetch: async () => new Response('x'.repeat(4 * 1024 * 1024 + 1)) });
   await assert.rejects(large.next({ system: '', messages: [] }), { code: 'MODEL_RESPONSE_TOO_LARGE' });

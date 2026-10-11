@@ -139,6 +139,10 @@ changes require fresh held-out evidence, not relabelling or discarding failures.
 
 NAT-19 的新模型 HTTP 402 通知明确提示检查账户可用额度或选择已配置模型，不将它称为 Cloud 断连，不建议反复刷新或自动换模型。新提示复用原发送编号；升级后已发送的旧通知不改写，未知发送只核对原消息，无法核对的记录保留待处理。不展示供应商错误正文、凭据或私有余额，不改变重试预算。真实模型可用性与源测试分开验收。
 
+回复长度验收：普通长正文和多段回复一次完整交付，仅记私有质量告警；不得因字数/段数自动重写、报无效或裁掉结尾。明确要求完整内容不作为简洁失败。已执行写入不重做，原消息重投和重启不重复发送。平台载荷按原 UTF-8/转义预算拆分。
+
+供应商截断验收：OpenAI length、Anthropic max_tokens 的已核纯文字要显示“部分回复，非最终答案”，包括首次轮询已是错误终态、没有旧消息槽的情况；原编号重投/重启只核对或更新同一槽。不得保存成完成的助手轮次或执行截断工具；模型错配、开放块、空输出和错误接话标识仍拒绝。下一条真实用户消息能接续，原失败和工具回执保留。
+
 Tester labels expected participation before model calls and keeps explicit,
 indirect, clear-negative and ambiguous cases separate. Include both mentioned
 and unmentioned inputs, with and without another Bot, and different histories
