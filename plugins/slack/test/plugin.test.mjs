@@ -451,6 +451,27 @@ test('Cursor offer configuration is explicit, copied and rejects wildcard or pri
   }
 });
 
+test('ZCode offer and enable stay in one explicit channel without dispatching work', async t => {
+  const f = await fixture(t, { zcodeOfferChannels: [channel] });
+  f.gateway.command = async (type, args) => {
+    f.calls.push({ type, args });
+    return type === 'conversation.state'
+      ? { status: 'idle', messages: [], approvals: [], zcodeAvailable: true }
+      : { executionMode: 'automatic', executionProvider: 'zcode' };
+  };
+  const allowed = threadKey(teamId, channel, '123.001'), other = threadKey(teamId, 'COTHER', '123.001');
+  for (const [key, target] of [[allowed, channel], [other, 'COTHER']]) {
+    await f.store.bind(key, { channel: target, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-'+target, userId: user, ownRequests: [] });
+    await f.plugin.mirror(key); await f.plugin.mirror(key);
+  }
+  assert.equal(f.sent.length, 1);
+  assert.match(JSON.stringify(f.sent[0].blocks), /enable_zcode/);
+  await assert.rejects(f.plugin.enableZCode('wrong', user, { key: other }), { code: 'FORBIDDEN' });
+  await f.plugin.enableZCode('enable', user, { key: allowed });
+  assert.deepEqual(f.calls.map(item => item.type), ['conversation.state', 'conversation.state', 'conversation.state', 'conversation.state', 'conversation.zcode']);
+  assert.equal(f.calls.some(item => ['brief.review', 'task.assign'].includes(item.type)), false);
+});
+
 async function projectSwitchFixture(t, dm = 'D000001') {
   const f = await fixture(t), key = threadKey(teamId, dm, '100.001'), requestId = 'switch-request';
   const actor = { kind: 'human', integration: 'slack', teamId, userId: user, channelId: dm, sessionId: `slack:${teamId}:${user}` };

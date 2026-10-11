@@ -77,11 +77,15 @@ function safeEnvelope(type, body) {
 function contextFrom(binding, userId, id) { return { id, userId, projectId: binding.projectId, conversationId: binding.conversationId }; }
 
 export class SlackPlugin {
-  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [] }) {
+  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [], zcodeOfferChannels = [] }) {
     if (!Array.isArray(cursorOfferChannels) || cursorOfferChannels.length > 20 ||
         cursorOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
         new Set(cursorOfferChannels).size !== cursorOfferChannels.length) throw new TypeError('Configure explicit Cursor offer channel IDs');
     this.cursorOfferChannels = Object.freeze([...cursorOfferChannels]);
+    if (!Array.isArray(zcodeOfferChannels) || zcodeOfferChannels.length > 20 ||
+        zcodeOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
+        new Set(zcodeOfferChannels).size !== zcodeOfferChannels.length) throw new TypeError('Configure explicit ZCode offer channel IDs');
+    this.zcodeOfferChannels = Object.freeze([...zcodeOfferChannels]);
     this.store = store; this.gateway = gateway; this.io = io; this.teamId = teamId; this.cloudOrigin = new URL(cloudOrigin).origin; this.botUserId = botUserId;
     this.pollMs = Math.max(1000, pollMs); this.logger = logger; this.projects = new Map(); this.maps = new Map(); this.stopped = true; this.active = null;
     this.collectMs = collectMs; this.maxCollectMs = maxCollectMs;
@@ -505,6 +509,7 @@ export class SlackPlugin {
       else if (action.action_id === 'approve_binding') await this.reviewBinding(id, userId, value, 'approved');
       else if (action.action_id === 'reject_binding') await this.reviewBinding(id, userId, value, 'rejected');
       else if (action.action_id === 'enable_cursor') await this.enableCursor(id, userId, value);
+      else if (action.action_id === 'enable_zcode') await this.enableZCode(id, userId, value);
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
@@ -1295,7 +1300,7 @@ export class SlackPlugin {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     const result = await this.command('brief.review', binding, userId, operationId(id, 'review'), { proposalId: value.proposalId, decision, reason, version: value.version });
     const automatic = result.executionMode === 'automatic';
-    const confirmed = automatic ? 'brief 已确认，已进入 Cursor 执行队列。Plan 和结果会回到这个线程；排队不代表执行完成。' :
+    const confirmed = automatic ? `brief 已确认，已进入 ${result.executionProvider === 'zcode' ? '本地 ZCode' : 'Cursor'} 执行队列。Plan 和结果会回到这个线程；排队不代表执行完成。` :
       'brief 已确认，Main 事项已保存。请将执行提示粘贴到 Claude Code CLI 或 Cursor；开发记录只保存在本地。';
     await this.io.post({ id: operationId(id, 'review-result'), channel: binding.channel, threadTs: binding.threadTs, text: decision === 'approved' ? confirmed : 'brief 已退回。直接在这个线程告诉我你想怎么修改。',
       ...(decision === 'approved' && !automatic ? { blocks: [section(confirmed), { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: '导出执行提示' }, action_id: 'export_prompt', value: JSON.stringify({ key: value.key, proposalId: value.proposalId }) }] }] } : {}) });
@@ -1313,6 +1318,15 @@ export class SlackPlugin {
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     await this.io.post({ id: operationId(id, 'cursor-enabled'), channel: binding.channel, threadTs: binding.threadTs,
       text: '已启用当前对话的 Cursor 执行能力。请继续说明任务；每份 brief 仍需确认，启用本身没有派发任务。' });
+    return result;
+  }
+  async enableZCode(id, userId, value) {
+    const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
+    if (!this.zcodeOfferChannels.includes(binding.channel)) throw Object.assign(new Error('ZCode 启用入口仅在指定频道开放。'), { code: 'FORBIDDEN' });
+    const result = await this.command('conversation.zcode', binding, userId, operationId(id, 'enable-zcode'), { expectedMode: 'manual' });
+    await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
+    await this.io.post({ id: operationId(id, 'zcode-enabled'), channel: binding.channel, threadTs: binding.threadTs,
+      text: '已启用本地 ZCode。请继续说明任务；brief 仍需逐项确认。' });
     return result;
   }
   async reviewBinding(id, userId, value, decision) {
@@ -1581,7 +1595,7 @@ export class SlackPlugin {
         await this.store.update(data => { data.threads[key].mirrored[id] = { ts, hash }; });
         continue;
       }
-      if (approval.manual !== true && !(approval.projectTask && approval.executionProvider === 'cursor')) continue;
+      if (approval.manual !== true && !(approval.projectTask && ['cursor', 'zcode'].includes(approval.executionProvider))) continue;
       const id = `approval:${approval.id}`, hash = digest(approval), prior = this.store.data.threads[key].mirrored[id];
       if (prior?.hash === hash) continue;
       if (approval.pending === false && !prior) continue;
@@ -1607,6 +1621,18 @@ export class SlackPlugin {
         const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
           await this.io.post({ id: operationId(`${key}:cursor-execution`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
         await this.store.update(data => { data.threads[key].mirrored['cursor-execution'] = { ts, hash: content }; });
+      }
+    }
+    if (this.zcodeOfferChannels.includes(binding.channel) && (state.zcodeAvailable || this.store.data.threads[key].mirrored['zcode-execution'])) {
+      const active = state.executionProvider === 'zcode', text = active ? '已启用本地 ZCode；任务仍须确认 brief。' :
+        state.zcodeAvailable ? '可以在当前对话启用本地 ZCode。' : '当前对话未获得 ZCode 执行权限。';
+      const blocks = [section(text), ...(!active && state.zcodeAvailable ? [{ type: 'actions', elements: [{ type: 'button', action_id: 'enable_zcode',
+        text: { type: 'plain_text', text: '启用本地 ZCode' }, value: JSON.stringify({ key }) }] }] : [])];
+      const content = digest(blocks), prior = this.store.data.threads[key].mirrored['zcode-execution'];
+      if (prior?.hash !== content) {
+        const ts = prior?.ts ? (await this.io.update(binding.channel, prior.ts, text, blocks), prior.ts) :
+          await this.io.post({ id: operationId(`${key}:zcode-execution`, 'card'), channel: binding.channel, threadTs: binding.threadTs, text, blocks });
+        await this.store.update(data => { data.threads[key].mirrored['zcode-execution'] = { ts, hash: content }; });
       }
     }
     if (Object.keys(this.store.data.threads[key].watchedItems || {}).length && (this.store.data.threads[key].nextItemPoll || 0) <= Date.now()) await this.notifyItemChanges(key);

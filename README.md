@@ -8,6 +8,8 @@
 
 Slack 对话支持人工确认切换已配置的项目默认文字模型，以及仅对当前可信真人消息添加原生表情回应；表情不代替业务回执、风险说明或人工审批。
 
+本地 ZCode 派单是显式可选能力：先由已连接的 Skill 后端注册 ZCode 模板，再把同一模板写入项目 Coordinator 的 `sessionTemplates`/`bindings`，在私有 Slack 集成配置中仅为授权项目与真人设置 `zcodeExecution`，并显式开放 `conversation.zcode`；Slack 插件仅在 `CONTEXT_GUARD_SLACK_ZCODE_OFFER_CHANNELS` 指定频道展示启用按钮。启用不批准 brief；仍须人工确认 brief、审核 Plan，再由独立 Tester 验证。Cloud 必须消费含 ZCode 按钮的固定 Workbench 版本，不能直接修改生成的 UI。
+
 ## 开发
 
 使用 `npm ci --ignore-scripts` 安装，`npm run build:runtime` 生成固定 Skill 包的消费副本，`npm start` 验证构建后启动 Cloud。Slack 是独立服务，单独安装依赖。配置、凭据、地图、回执和附件放在源码检出目录之外，见 [部署手册](references/cloud-deployment.md)。
