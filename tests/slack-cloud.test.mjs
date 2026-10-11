@@ -830,7 +830,9 @@ test('Public manual conversation uses lean role and unchanged native schemas wit
   assert.equal((await f.gateway('conversation.submit', { text: 'role-first' }, { id: 'role-first', conversationId: conversation })).status, 200);
   await f.wait(conversation, value => value.status === 'waiting-for-user' && !value.activeTurnId);
   const manualCall = f.modelCalls.at(-1);
-  assert.match(manualCall.system, /不创建、派发或恢复执行 Session/);
+  assert.match(manualCall.system, /未启用自动执行时不创建、派发或恢复 Session/);
+  assert.match(manualCall.system, /跟进 Executor、独立 Tester、阻塞与收工/);
+  assert.match(manualCall.system, /不说职责止于brief/);
   assert.doesNotMatch(manualCall.system, /系统(?:为新任务)?创建独立执行 Session|自动发起中断恢复/);
   assert.match(manualCall.system, /Current project facts/);
   assert.match(manualCall.system, /本轮答复发往 Slack/);

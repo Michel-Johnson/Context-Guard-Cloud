@@ -139,7 +139,8 @@ test('Slack reaction tools reject untrusted source and actor even when a model g
     const state = reactionState(source, actor);
     await coordinatorStep({ turnId: 'untrusted', state, system: 'role', tools: coordinatorTools, save: async () => {},
       execute: () => assert.fail('Untrusted tool must never execute'), model: { next: async ({ tools }) => {
-        assert.equal(tools.some(tool => tool.name === 'react_to_user'), true, 'Catalog is stable; server execution remains forbidden');
+        assert.equal(tools.some(tool => tool.name === 'react_to_user'), actor?.kind !== 'bot',
+          'Bot catalog is discussion-only; guessed reactions remain forbidden for every untrusted source');
         return { stop: 'tool_use', content: [{ type: 'tool_use', id: 'forged', name: 'react_to_user', input: { emoji: 'heart' } }] };
       } } });
     assert.equal(Object.values(state.toolReceipts)[0].result.error.code, 'TOOL_FORBIDDEN'); assert.equal(state.messages[0].actions, undefined);
@@ -1405,7 +1406,7 @@ test('Stream callback failures retain the original boundary in private performan
   ]) {
     const tool = fixture.boundary === 'onToolStart', controller = new AbortController();
     const block = tool ? { type: 'tool_use', id: 'callback-tool', name: 'read', input: { privateArgument: secret } }
-      : { type: 'text', text: fixture.delta ? '' : secret };
+      : { type: 'text', text: fixture.gate ? '[CG_INVALID]\n' + secret : fixture.delta ? '' : secret };
     const events = [
       { type: 'message_start', message: { model: config.model, usage: { input_tokens: 12 } } },
       { type: 'content_block_start', index: 0, content_block: block },
@@ -1413,7 +1414,7 @@ test('Stream callback failures retain the original boundary in private performan
       { type: 'content_block_stop', index: 0 },
       { type: 'message_delta', delta: { stop_reason: tool ? 'tool_use' : 'end_turn' } }, { type: 'message_stop' },
     ];
-    let requests = 0, executions = 0;
+    let requests = 0, executions = 0, callbackCalls = 0;
     const model = new CoordinatorModel({ ...config, maxTokens: 256, timeoutMs: 12000, fetch: async (_url, options) => {
       requests++; assert.equal(JSON.parse(options.body).max_tokens, 256);
       return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
@@ -1423,6 +1424,7 @@ test('Stream callback failures retain the original boundary in private performan
     const state = { activeTurnId: 'callback-turn', messages: [input],
       ...(fixture.gate ? { activeInput: { id: 'callback-turn', source: 'slack', actor: reactionActor } } : {}) };
     const callback = async () => {
+      callbackCalls++;
       if (fixture.cancel) controller.abort(Object.assign(new Error(secret), fixture.cancel === 'human' ? {} : { code: fixture.cancel }));
       throw fixture.plainError ? new Error(secret) : Object.assign(new Error(secret), { code: 'MODEL_INVALID_RESPONSE', privateBody: secret });
     };
@@ -1442,6 +1444,7 @@ test('Stream callback failures retain the original boundary in private performan
     assert.equal(diagnostic.messageStopSeen, false); assert.equal(diagnostic.usage.input_tokens, 12);
     assert.doesNotMatch(JSON.stringify(state.performance), /callback-private|privateBody|privateArgument|synthetic-private/);
     assert.equal(requests, 1); assert.equal(executions, 0); assert.equal(state.pending, undefined);
+    assert.equal(callbackCalls, fixture.gate ? 0 : 1, 'Malformed control header fails inside stream before invoking the visible callback');
     assert.equal(state.messages.filter(message => message.role === 'assistant').length, 0);
     assert.deepEqual(state.toolReceipts, {});
   }
