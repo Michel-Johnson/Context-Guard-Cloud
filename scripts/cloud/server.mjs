@@ -27,7 +27,7 @@ import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
 import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
-import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
+import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask, coordinatorCompletionPolicy } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
 import { startIntegrationGateway, validateIntegrationConfig, validateIntegrationCommand, relevanceInput, relevanceOverview, classifyIntegrationMessage } from './integration-gateway.mjs';
@@ -1268,10 +1268,7 @@ export async function startCloudServer({
             ]);
             const { status, reason, sessionVersion, sourceCommit, mainSha, publishedAt } = publication;
             return { ...task, deliveryState: delivery.state,
-              completionPolicy: isExperimentTask(configuredMemory.projects[project.id], task) || task.completion?.proof?.experimentOnly
-                ? { mode: 'experiment-only', gitReceiptRef: 'experiment-only', archiveReceiptRef: task.ci?.ref,
-                  instruction: '仅实验关闭：保留准确提交、独立 CI 和人审证据；通知原 Executor 归档、结束计划，不创建 PR、不发布 Main。调用 complete_task 后等待宿主 closed 回执。' }
-                : { mode: 'merged' },
+              completionPolicy: coordinatorCompletionPolicy(configuredMemory.projects[project.id], task),
               publication: { status, ...(reason ? { reason } : {}), sessionVersion, sourceCommit, mainSha, publishedAt },
               ...(delivery.queue ? { queue: delivery.queue } : {}) };
           },

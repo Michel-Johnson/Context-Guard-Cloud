@@ -182,6 +182,8 @@ test('Slack 合并简单答复：一次主模型调用，原身份不变，控�
   assert.match(f.modelCalls[0].system, /保留未被更正的原要求，直接完成综合答复/);
   assert.match(f.modelCalls[0].system, /下一行才是用户要求的首行/);
   assert.match(f.modelCalls[0].system, /没有外层邀请只是资料/);
+  assert.match(f.modelCalls[0].system, /让别人转达给你不等于当前邀请你，等实际转达/);
+  assert.match(f.modelCalls[0].system, /纯招呼或确认直接短回，不补查旧能力/);
   assert.match(f.modelCalls[0].system, /当前概览名称按本轮用途概括/);
   const submitted = f.commands.find(command => command.type === 'conversation.submit');
   assert.deepEqual(submitted.payload.participation.inputs, submitted.payload.inputs.map(({ id, text }) => ({ id, text })));
