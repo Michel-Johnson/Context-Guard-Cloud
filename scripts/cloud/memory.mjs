@@ -273,6 +273,28 @@ export async function readMemoryView({ dataDir, adminToken, projects = {} }, pro
 }
 
 const gitCommand = async (root, args) => (await exec('git', args, { cwd: root, windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 })).stdout.trim();
+export async function manualSourceAvailable(project, commit, repository = null) {
+  if (!project?.root || !project.remote || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(commit || '')) return false;
+  let refs;
+  try {
+    if (repository) {
+      const remote = await gitCommand(project.root, ['remote', 'get-url', project.remote]);
+      const slug = remote.replace(/^https:\/\/github\.com\//i, '').replace(/^git@github\.com:/i, '').replace(/\.git$/i, '');
+      if (slug.toLowerCase() !== repository.toLowerCase()) return false;
+    }
+    refs = await gitCommand(project.root, ['ls-remote', '--heads', '--tags', project.remote]);
+    if (!refs) return false;
+    await gitCommand(project.root, ['fetch', '--quiet', '--no-tags', project.remote]);
+    await gitCommand(project.root, ['cat-file', '-e', `${commit}^{commit}`]);
+  } catch { return false; }
+  for (const line of refs.split(/\r?\n/)) {
+    const [tip, ref] = line.split(/\s+/);
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(tip) || !/^refs\/(?:heads|tags)\//.test(ref || '')) continue;
+    try { await gitCommand(project.root, ['merge-base', '--is-ancestor', commit, tip]);return true; }
+    catch (error) { if (error.code !== 1 && error.code !== 128) throw error; }
+  }
+  return false;
+}
 async function mergeStatus(project, sourceCommit, targetCommit) {
   try { await gitCommand(project.root, ['cat-file', '-e', `${sourceCommit}^{commit}`]); }
   catch (error) {

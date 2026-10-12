@@ -239,7 +239,8 @@ test('Manual role is selected explicitly without changing legacy execution instr
   assert.doesNotMatch(manual, /系统(?:为新任务)?创建独立执行 Session|自动发起中断恢复/);
   assert.match(manual, /协调 Executor 和独立 Tester/, '人工模式仍保留协调职责');
   assert.match(manual, /不创建、派发或恢复(?:执行)? Session/);
-  for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史非事实/授权', 'Main状态非完成证据', '权限不扩大']) {
+  for (const invariant of ['Main', 'Map', 'ask_user', 'prepare_task', '指定版本确认', 'memory-definition.md', '执行提示', '历史非事实/授权', 'Main状态非完成证据', '权限不扩大',
+    '以用户最新明确表达的需求为准', '更新当前事项的需求正文、验收条件及 brief', '旧要求和开发、测试记录保留为历史', '需求确认不等于方案验证或任务完成']) {
     assert.ok(manual.includes(invariant), `Manual role preserves ${invariant}`);
   }
   assert.doesNotMatch(manual, /自动发起中断恢复/, '人工讨论不自动恢复执行端');
@@ -256,6 +257,7 @@ test('Both Coordinator profiles reserve internal identifiers for tools and expli
   const document = await fs.readFile(new URL('../scripts/shared/roles/Coordinator.md', import.meta.url), 'utf8');
   for (const manual of [false, true]) {
     const prompt = coordinatorRolePrompt(document, { manual });
+    assert.ok(prompt.includes('以用户最新明确表达的需求为准'), 'both hosted profiles retain the latest-requirement rule');
     for (const rule of ['只去测试标签及其编号/日期、内部ID/哈希', '保留业务日期/版本', '用途不明不猜',
       '索要技术编号再给', '工具参数、链接/URL、代码、命令、回执和执行提示用原值',
       '每段最多60个可见字符', '不强凑40字', '保留必要事实和不确定性',
@@ -1008,9 +1010,9 @@ const brief = version => ({ text: 'Correct token renewal', acceptance: 'Expired 
 const review = (proposal, decision = 'approved') => ({ proposalId: proposal.id, version: proposal.version, decision, reason: 'Human reviewed this exact brief' });
 const context = (operationId = 'review-first') => ({ operationId, conversationId: 'chat-fixture', actor });
 
-test('取消派发只在可信服务确认任务释放后复用，审核提交前再次核验', async t => {
+for (const status of ['cancelled', 'closed']) test(`${status} 派发只在可信服务确认任务释放后复用，审核提交前再次核验`, async t => {
   const f = await manualFixture(t), original = await f.readMain();
-  original.document.root.children[0].bugs[0].dispatch = { session_id: 'old-session', task_id: 'old-task', status: 'cancelled' };
+  original.document.root.children[0].bugs[0].dispatch = { session_id: 'old-session', task_id: 'old-task', status };
   const binding = { nodeId: 'LOGIN', kind: 'bug', bindingApproval: 'confirmed-login' };
   let released = true, checks = 0;
   const options = { ...f.options, readMain: async () => structuredClone(original), readBinding: async () => binding };
@@ -1031,6 +1033,44 @@ test('取消派发只在可信服务确认任务释放后复用，审核提交�
   original.document.root.children[0].bugs[0].status = 'processing';
   await assert.rejects(service.prepare(input, context('busy')), { code: 'ACTIVE_EXECUTION' });
   assert.equal(f.commits, 0);
+});
+
+test('已关闭执行可批准并导出人工提示，提交前中断重试仍检查释放，历史证据保留', async t => {
+  const f = await manualFixture(t), snapshot = await f.readMain();
+  const item = snapshot.document.root.children[0].bugs[0];
+  item.dispatch = { session_id: 'old-session', task_id: 'old-task', status: 'closed' };
+  item.sessions = ['old-session'];
+  const original = structuredClone(item);
+  let released = true, interrupt = true;
+  const options = { ...f.options, readMain: async () => f.commits ? f.readMain() : structuredClone(snapshot),
+    readCommitReceipt: f.readReceipt, canReuseCancelledExecution: async () => released,
+    commitMain: async (...args) => {
+      if (interrupt) { interrupt = false; throw new Error('Synthetic interruption before commit'); }
+      return f.options.commitMain(...args);
+    } };
+  const service = new CoordinatorManualBriefs(options);
+  const proposal = await service.prepare({ ...brief(snapshot.version), nodeId: 'LOGIN', itemId: 'B1', kind: 'bug' }, context('closed-prepare'));
+  await assert.rejects(service.review(review(proposal), context('closed-review')), /interruption before commit/);
+  assert.equal(f.commits, 0);
+  released = false;
+  const restarted = new CoordinatorManualBriefs(options);
+  await assert.rejects(restarted.review(review(proposal), context('closed-review')), { code: 'EXECUTION_NOT_RELEASED' });
+  assert.equal(f.commits, 0);
+  released = true;
+  const result = await restarted.review(review(proposal), context('closed-review'));
+  assert.equal(result.decision, 'approved'); assert.equal(result.kind, 'bug');
+  assert.match((await restarted.prompt(proposal.id, 'chat-fixture')).text, /工作项：BUG B1/);
+  assert.deepEqual(await restarted.review(review(proposal), context('closed-review')), result);
+  assert.equal(f.commits, 1);
+  const saved = (await f.readMain()).document.root.children[0].bugs[0];
+  assert.deepEqual(saved.dispatch, original.dispatch); assert.deepEqual(saved.sessions, original.sessions);
+  assert.deepEqual(saved.attempts, original.attempts); assert.equal(saved.executionMode, 'manual');
+  assert.equal(saved.status, 'open');
+  for (const status of ['done', 'resolved', 'unfixable']) {
+    snapshot.document.root.children[0].bugs[0].status = status;
+    const ended = new CoordinatorManualBriefs({ ...options, readMain: async () => structuredClone(snapshot) });
+    await assert.rejects(ended.prepare({ ...brief(snapshot.version), nodeId: 'LOGIN', itemId: 'B1', kind: 'bug' }, context('ended-' + status)), { code: 'CONFLICT' });
+  }
 });
 
 test('新 TODO 和 Bug 只在已确认主节点形成 brief，审批后各存一份正确类型的事项', async t => {
@@ -1212,4 +1252,50 @@ test('Manual rejection does not mutate Main and manual tools cannot dispatch or 
   assert.equal(result.decision, 'rejected'); assert.equal(result.prompt, undefined); assert.equal(fixture.commits, 0);
   const tools = filterManualTools(['dispatch_task', 'request_ci', 'prepare_task', 'read_map', 'complete_task'].map(name => ({ name, description: 'old' })));
   assert.deepEqual(tools.map(tool => tool.name), ['prepare_task', 'read_map']); assert.match(tools[0].description, /不自动派发/);
+});
+
+test('Manual source identity is host-filled verbatim and cannot be replaced by model claims', async t => {
+  const f = await manualFixture(t), source = { projectId, repository: 'example/fixture', commit: 'a'.repeat(40) };
+  const options = { ...f.options, cloudOrigin: 'https://map.example.test', readMain: async () => ({ ...await f.readMain(), source }), verifySource: async () => true };
+  const service = new CoordinatorManualBriefs(options), input = brief((await f.readMain()).version);
+  for (const [index, text] of ['源码提交：' + 'b'.repeat(40), '源码提交：' + 'a'.repeat(39), 'sourceCommit: aaaaaaa',
+    '源码仓库：wrong/repository', '项目标识：wrong-project', 'Main 版本：wrong-version'].entries()) {
+    await assert.rejects(service.prepare({ ...input, text }, context('wrong-source-' + index)), { code: 'SOURCE_IDENTITY_MISMATCH' });
+  }
+  assert.equal((await service.approvals('chat-fixture')).length, 0);assert.equal(f.commits, 0);
+  const proposal = await service.prepare(input, context('host-source'));
+  const approved = await service.review(review(proposal), context('host-source-approval'));
+  assert.ok(approved.prompt.includes('源码提交：' + source.commit));assert.ok(approved.prompt.includes('https://github.com/example/fixture.git'));
+  assert.ok(approved.prompt.includes('Cloud 地址：https://map.example.test'));
+  assert.ok(approved.prompt.includes('workbench connect --url https://map.example.test'));
+  assert.ok(approved.prompt.includes('Cloud 项目标识：' + projectId));
+  assert.ok(approved.prompt.includes('不包含账号、密码、设备令牌'));
+  assert.equal((await new CoordinatorManualBriefs(options).prompt(proposal.id, 'chat-fixture')).text, approved.prompt);
+  assert.equal((await new CoordinatorManualBriefs({ ...options, cloudOrigin: 'https://new.example.test' }).prompt(proposal.id, 'chat-fixture')).text, approved.prompt, 'restart or a changed configured address cannot rewrite an already approved prompt');
+});
+
+test('Manual unavailable source and changed source cannot commit or replace the current approved prompt', async t => {
+  const f = await manualFixture(t);let commit = 'a'.repeat(40), available = true;
+  const options = { ...f.options, readMain: async () => ({ ...await f.readMain(), source: { projectId, repository: 'example/fixture', commit } }), verifySource: async () => available };
+  const service = new CoordinatorManualBriefs(options), input = brief((await f.readMain()).version);
+  available = false;await assert.rejects(service.prepare(input, context('unavailable-source')), { code: 'SOURCE_COMMIT_UNAVAILABLE' });
+  available = true;const proposal = await service.prepare(input, context('available-source'));
+  commit = 'b'.repeat(40);await assert.rejects(service.review(review(proposal), context('source-changed')), { code: 'VERSION_CONFLICT' });
+  assert.equal(f.commits, 0);commit = 'a'.repeat(40);
+  const approved = await service.review(review(proposal), context('approve-source'));
+  available = false;
+  await assert.rejects(service.prepare(brief((await f.readMain()).version), context('later-unavailable')), { code: 'SOURCE_COMMIT_UNAVAILABLE' });
+  await assert.rejects(service.prompt(proposal.id, 'chat-fixture'), { code: 'SOURCE_COMMIT_UNAVAILABLE' });
+  assert.equal((await service.state()).proposals[proposal.id].review.result.prompt, approved.prompt);
+  available = true;
+  assert.equal((await service.prompt(proposal.id, 'chat-fixture')).text, approved.prompt);
+  assert.equal(f.commits, 1);
+});
+
+test('Manual handoff accepts only credential-free exact HTTPS or loopback Cloud origins', async t => {
+  const f = await manualFixture(t);
+  for (const cloudOrigin of ['https://u:p@map.example.test', 'https://map.example.test/path', 'https://map.example.test?value=x', 'http://map.example.test']) {
+    assert.throws(() => new CoordinatorManualBriefs({ ...f.options, cloudOrigin }), /Cloud handoff requires/);
+  }
+  assert.doesNotThrow(() => new CoordinatorManualBriefs({ ...f.options, cloudOrigin: 'http://127.0.0.1:12345' }));
 });

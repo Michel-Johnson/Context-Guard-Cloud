@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { applyOperations, entries, validate, MapError, scopeDocumentToSession, filterNodeAccess, isClosedBugStatus } from '../shared/map-model.mjs';
 import { atomicWrite, readJSON, withFileLock } from '../shared/io.mjs';
-import { commitMainMemoryMap as commitStoredMainMemoryMap, readMainMemoryReceipt, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub } from './memory.mjs';
+import { commitMainMemoryMap as commitStoredMainMemoryMap, readMainMemoryReceipt, commitSessionMap, completeSessionMemory, createMemoryHandler, enforceMainHistoryRetention, memoryPublicationStatus, publishSessionMemory, readMemoryView as readStoredMemoryProject, sessionCompletionMatches, memoryHeads, memoryHub, manualSourceAvailable } from './memory.mjs';
 import { projectMemoryFile } from './memory-filesystem.mjs';
 import { WorkbenchSnapshots } from '../shared/protocol-snapshots.mjs';
 import { verifyChangeReferences } from '../shared/protocol-map.mjs';
@@ -565,18 +565,27 @@ export async function startCloudServer({
   const manualBriefsFor = project => {
     if (!manualBriefStores.has(project.id)) manualBriefStores.set(project.id, new CoordinatorManualBriefs({
       directory: path.join(dataDir, 'manual-briefs', project.id), projectId: project.id,
+      cloudOrigin: allowedOrigin || null,
       ...(isMapProject(project) ? { mapOnly: true } : {}),
-      readMain: async () => { const { main } = await readMemoryProject(configuredMemory, project.id); return { version: main?.version, document: main?.memory?.map }; },
+      readMain: async () => {
+        const { main } = await readMemoryProject(configuredMemory, project.id);
+        const repository = interfaceConfig?.repositories?.find(value => value.projectId === project.id);
+        const commit = main?.mainSha || main?.sourceCommit;
+        return { version: main?.version, document: main?.memory?.map,
+          ...(!isMapProject(project) && commit && repository?.slug ? { source: { projectId: project.id, repository: repository.slug, commit } } : {}) };
+      },
+      verifySource: source => manualSourceAvailable(configuredMemory.projects[project.id], source.commit, source.repository),
       readBinding: conversationId => conversationsFor(project).get(conversationId),
       canReuseCancelledExecution: async (item, routing) => {
         const dispatch = item.dispatch;
-        if (!dispatch?.task_id || !dispatch.session_id || dispatch.status !== 'cancelled') return false;
+        if (!dispatch?.task_id || !dispatch.session_id || !['cancelled', 'closed'].includes(dispatch.status)) return false;
         try {
           const { store, principal } = interfaceProject(project);
           const binding = await store.registeredBinding(principal, dispatch.session_id);
           if (!binding) return false;
           const task = await store.taskRecord(principal, { id: dispatch.session_id, generation: binding.generation }, dispatch.task_id);
           if (task.busy !== false || !['cancelled', 'closed'].includes(task.stage)) return false;
+          if (dispatch.status === 'closed' && task.stage !== 'closed') return false;
           if (task.stage === 'cancelled' && task.control?.action !== 'cancel') return false;
           if (task.stage === 'closed' && !task.completion) return false;
           return !(await store.projectTaskStatuses(principal)).some(value => value.itemId === item.id &&
@@ -3021,6 +3030,10 @@ export async function startCloudServer({
           const result = await bindingsFor(project).review(input, { conversationId,
             actor: { kind: 'human', sessionId: 'browser-human' } });
           return send(res, 200, { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) });
+        }
+        if (action === '/api/coordinator/prompt' && project && req.method === 'GET') {
+          requireHumanWorkbench(req);
+          return send(res, 200, await manualBriefsFor(project).prompt(url.searchParams.get('proposalId'), conversationId));
         }
         if (action === '/api/coordinator/approval' && project && req.method === 'POST') {
           const input = await requestBody(req), coordinator = await coordinatorFor(project, conversationId);

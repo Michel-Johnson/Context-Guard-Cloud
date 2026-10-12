@@ -57,6 +57,23 @@ const publicProposal = proposal => ({ id: proposal.id, version: proposal.version
   ...(proposal.review ? { decision: proposal.review.decision, review: { ...proposal.review,
     result: Object.fromEntries(Object.entries(proposal.review.result).filter(([key]) => key !== 'prompt')) } } : {}) });
 
+function verifiedBriefSource(snapshot, projectId, input) {
+  const source = snapshot.source || null;
+  if (source && (source.projectId !== projectId || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(source.repository || '') || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(source.commit || ''))) {
+    fail('SOURCE_IDENTITY_INVALID', '服务器源码身份不完整，请先核对仓库及完整提交号。', 409);
+  }
+  const text = input.text + '\n' + input.acceptance;
+  const claims = [...text.matchAll(/(?:sourceCommit|sourceSha|mainSha|源码提交|基线提交|代码提交|完整提交号|commit\s+SHA)\s*["'`]*\s*[:：=]\s*["'`]*([^\s"'`]+)/giu)];
+  if (claims.some(match => !source || match[1] !== source.commit)) fail('SOURCE_IDENTITY_MISMATCH', 'Brief 的源码提交与服务器核验值不一致；请删除手抄值，由宿主填入完整源码身份。', 409);
+  for (const [labels, expected] of [
+    ['源码仓库|repository', source?.repository], ['项目标识|projectId', projectId], ['Main 版本|Map 版本|mainVersion', snapshot.version],
+  ]) {
+    const pattern = new RegExp('(?:' + labels + ')["\x27`]*\\s*[:：=]\\s*["\x27`]*([^\\s"\x27`]+)', 'giu');
+    if ([...text.matchAll(pattern)].some(match => !expected || match[1] !== expected)) fail('SOURCE_IDENTITY_MISMATCH', 'Brief 的项目、仓库或 Map 版本与当前服务器身份不一致。', 409);
+  }
+  return source && structuredClone(source);
+}
+
 export function manualBriefInput(input, { allowNewBug = false } = {}) {
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
       typeof input.text !== 'string' || !input.text.trim() || input.text.length > 8000 ||
@@ -85,27 +102,38 @@ export function manualExecutionPrompt({ projectId, proposal, document, version, 
       ...(node.owns?.length ? [`代码范围：${node.owns.join(', ')}`] : [])].filter(Boolean).join('\n\n');
   }).join('\n\n');
   const itemFile = navigation.nodes.find(node => node.id === proposal.nodeId)?.path.replace(/index\.md$/, `${proposal.kind === 'bug' ? 'bugs' : 'todos'}/${proposal.itemId}.md`);
+  const connectionText = proposal.cloudOrigin ? `\n\n## Cloud 连接\n\nCloud 地址：${proposal.cloudOrigin}\nCloud 项目标识：${projectId}\n\n在实际代码仓库中，用宿主提供的真实 Session ID，按已安装 Skill 的 workbench connect --url ${proposal.cloudOrigin} --root <实际仓库根目录> --session <真实SessionID> --wait 流程申请连接，由用户打开验证地址并登录、授权。这里只提供公开入口，不包含账号、密码、设备令牌，也不代表已经授权；回读确认已连接的项目标识及 Main 版本后再开始开发。` : '\n\n## Cloud 连接\n\n服务器未配置公开连接地址。交给新会话前由用户确认 Cloud 地址并按 Skill 的正常连接流程完成授权；不猜地址、不索要密码，也不把本地空 Map 当作 Cloud 基线。';
+  const sourceText = proposal.source ? `\n\n## 已核验源码\n\n源码仓库：${proposal.source.repository}\n源码提交：${proposal.source.commit}\n\n克隆 https://github.com/${proposal.source.repository}.git 后，先用 git cat-file -e ${proposal.source.commit}^{commit} 核对提交可用，再核对本地 HEAD。源码或 Map 基线不一致时停止准备，按现有基线确认流程由用户决定，不忽略差异、不覆盖未提交改动，也不自行发布分支。` : '\n\n## 源码准备\n\n当前没有已核验的源码提交。交给新 Agent 前先确认代码仓库、可获取的完整提交号及 Map 基线；确认前不把任何手抄提交号当作权威，不开始代码开发。';
   if (mapOnly) return `# 执行需求\n\n项目：${document.project}\n工作项：${proposal.kind.toUpperCase()} ${proposal.itemId}\nMap 版本：${version}\n\n## 目标\n\n${proposal.text}\n\n## 验收\n\n${proposal.acceptance}\n\n## Map 切片\n\n${selected}\n\n## 执行边界\n\n这是 Map 项目的需求交接，不代表已经关联代码仓库或执行 Session。以上格式路径仅说明切片结构，不能作为此项目已接通的 CLI/API 读取入口。请由用户确定实际代码仓库后，在该仓库使用已安装的 Skill 确认项目与 Session 绑定；绑定前不写入其他项目的 Session，不自动派发。收工时核对 Map 总览中此项目的最新内容。\n`;
-  return `# 执行需求\n\n项目：${projectId}\n工作项：${proposal.kind.toUpperCase()} ${proposal.itemId}\nMain 版本：${version}\n\n## 目标\n\n${proposal.text}\n\n## 验收\n\n${proposal.acceptance}\n\n## Map 切片\n\n${selected}\n\n## 读写路径\n\n- 阅读 Main 的 map.json、上述节点 index.md，以及工作项 ${itemFile}。这些是 fs-v2.1 scope-relative 读取路径，通过 Context Guard 的按版本单文件读取入口使用，不能当作宿主的绝对磁盘路径。\n- 在用户当前打开的项目根目录调用已安装的 Context Guard Skill；Codex、Cursor、Claude 使用同一个工作项 ID。按现有绑定流程确认自己的 Session 身份及最新 Main 版本，不能把 Coordinator 对话 ID 当作执行 Session ID。\n- 若 Main 版本变化，刷新相关切片并核对需求；无法核对时报告冲突，不覆盖新内容。\n- 只把代码结果、attempt 结论、验收证据和受影响节点写入自己的 Session；使用现有 Skill/hooks 的 Session 写回入口，不直接覆盖 Main。\n- 执行结束后汇报工作项 ID、Session ID、改动和验收证据，交由用户在工作台审核后进入 Main。\n`;
+  return `# 执行需求\n\n项目：${projectId}\n工作项：${proposal.kind.toUpperCase()} ${proposal.itemId}\nMain 版本：${version}${sourceText}${connectionText}\n\n## 目标\n\n${proposal.text}\n\n## 验收\n\n${proposal.acceptance}\n\n## Map 切片\n\n${selected}\n\n## 读写路径\n\n- 阅读 Main 的 map.json、上述节点 index.md，以及工作项 ${itemFile}。这些是 fs-v2.1 scope-relative 读取路径，通过 Context Guard 的按版本单文件读取入口使用，不能当作宿主的绝对磁盘路径。\n- 在用户当前打开的项目根目录调用已安装的 Context Guard Skill；Codex、Cursor、Claude 使用同一个工作项 ID。按现有绑定流程确认自己的 Session 身份及最新 Main 版本，不能把 Coordinator 对话 ID 当作执行 Session ID。\n- 若 Main 版本变化，刷新相关切片并核对需求；无法核对时报告冲突，不覆盖新内容。\n- 只把代码结果、attempt 结论、验收证据和受影响节点写入自己的 Session；使用现有 Skill/hooks 的 Session 写回入口，不直接覆盖 Main。\n- 执行结束后汇报工作项 ID、Session ID、改动和验收证据，交由用户在工作台审核后进入 Main。\n`;
 }
 
 // Proposals are conversational state, not a second Task system. Approval uses
 // the same Main CAS callback as the workbench and never creates an Agent Session.
 export class CoordinatorManualBriefs {
-  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null, canReuseCancelledExecution = null }) {
+  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null, canReuseCancelledExecution = null, verifySource = null, cloudOrigin = null }) {
     if (!path.isAbsolute(directory || '') || !identifier(projectId) || typeof readMain !== 'function' || typeof commitMain !== 'function') throw new Error('Manual brief storage and Main services are required');
     if (canReuseCancelledExecution !== null && typeof canReuseCancelledExecution !== 'function') throw new Error('Execution verification must be a function');
-    Object.assign(this, { projectId, readMain, commitMain, mapOnly, readBinding, readCommitReceipt, canReuseCancelledExecution });
+    if (verifySource !== null && typeof verifySource !== 'function') throw new Error('Source verification must be a function');
+    if (cloudOrigin !== null) {
+      const url = new URL(cloudOrigin);
+      if (url.origin !== cloudOrigin || url.protocol !== 'https:' && !(url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))) throw new Error('Cloud handoff requires an exact HTTPS or loopback origin without credentials');
+    }
+    Object.assign(this, { projectId, readMain, commitMain, mapOnly, readBinding, readCommitReceipt, canReuseCancelledExecution, verifySource, cloudOrigin });
     this.file = path.join(directory, 'manual-briefs.json');
   }
   async state() { return readJSON(this.file, { proposals: {}, operations: {}, reviews: {} }); }
   async approvals(conversationId) {
     const binding = this.readBinding ? await this.readBinding(conversationId) : null;
+    const snapshot = await this.readMain(), nodes = entries(snapshotDocument(snapshot).root);
     return Object.values((await this.state()).proposals).filter(proposal => proposal.conversationId === conversationId).map(proposal => {
       const value = publicProposal(proposal);
       const stale = proposal.bindingApproval && (proposal.bindingApproval !== binding?.bindingApproval ||
         proposal.nodeId !== binding?.nodeId || proposal.kind !== binding?.kind);
-      return stale && value.pending ? { ...value, pending: false, stale: true } : value;
+      const item = nodes.get(proposal.nodeId)?.node?.[proposal.kind === 'bug' ? 'bugs' : 'todos']?.find(item => item.id === proposal.itemId);
+      const superseded = value.decision === 'approved' && (item?.approvedBrief?.proposalId !== proposal.id || item.approvedBrief.version !== proposal.version ||
+        proposal.source && JSON.stringify(proposal.source) !== JSON.stringify(snapshot.source));
+      return stale && value.pending || superseded ? { ...value, pending: false, stale: true } : value;
     });
   }
   async acknowledgeNotification(proposalId, conversationId) {
@@ -120,10 +148,10 @@ export class CoordinatorManualBriefs {
     if (item.status === 'processing') fail('ACTIVE_EXECUTION', '该事项正在执行，不能转入人工执行。', 409);
     if (['done', 'resolved', 'unfixable'].includes(item.status)) fail('CONFLICT', '该事项已结束，请先核对原事项状态。', 409);
     if (!item.dispatch?.session_id) return;
-    if (item.dispatch.status !== 'cancelled') fail('ACTIVE_EXECUTION', '该事项仍有执行任务，不能转入人工执行。', 409);
-    // Map 中的取消标签不足以释放任务；可信服务须核对取消回执及执行槽。
+    if (!['cancelled', 'closed'].includes(item.dispatch.status)) fail('ACTIVE_EXECUTION', '该事项仍有执行任务，不能转入人工执行。', 409);
+    // Map 中的结束标签不足以释放任务；可信服务须核对权威任务及执行槽。
     if (!this.canReuseCancelledExecution || await this.canReuseCancelledExecution(item, routing) !== true) {
-      fail('EXECUTION_NOT_RELEASED', '旧派发已取消，但尚不能确认执行任务已释放。', 409);
+      fail('EXECUTION_NOT_RELEASED', '尚不能确认旧执行任务已释放。', 409);
     }
   }
   async prepare(input, { operationId, conversationId, actor } = {}) {
@@ -143,6 +171,8 @@ export class CoordinatorManualBriefs {
       }
       const snapshot = await this.readMain(), document = snapshotDocument(snapshot);
       if (snapshot.version !== value.mainVersion) fail('VERSION_CONFLICT', 'Main changed; refresh the brief before proposing', 409);
+      const source = this.mapOnly ? null : verifiedBriefSource(snapshot, this.projectId, value);
+      if (source && this.verifySource && await this.verifySource(source) !== true) fail('SOURCE_COMMIT_UNAVAILABLE', '源码提交无法从已配置远端取得；先由用户确认可获取的源码基线，再准备交接。', 409);
       const index = entries(document.root);
       if ([...value.nodeIds, value.nodeId].some(nodeId => !index.has(nodeId))) fail('NOT_FOUND', 'A brief node is missing', 404);
       if (!value.nodeIds.includes(value.nodeId)) fail('INVALID_ARGUMENT', 'The work-item node must be included in the brief scope');
@@ -155,11 +185,13 @@ export class CoordinatorManualBriefs {
         identity = workItemIdentity(item);
       }
       const proposal = { id, fingerprint, projectId: this.projectId, conversationId, operationId, ...value,
+        ...(source ? { source } : {}),
+        ...(this.cloudOrigin ? { cloudOrigin: this.cloudOrigin } : {}),
         itemId: value.itemId || `${value.kind === 'bug' ? 'B' : 'TD'}${hash(id).slice(0, 24)}`, itemIdentity: identity,
         ...(binding ? { bindingApproval: binding.bindingApproval } : {}),
         pathText: coordinatorPathText(coordinatorNodePath(document.root, value.nodeId)),
         createdAt: new Date().toISOString(), ...(actor ? { actor: structuredClone(actor) } : {}) };
-      proposal.version = hash(JSON.stringify({ ...value, itemId: proposal.itemId, itemIdentity: identity, bindingApproval: proposal.bindingApproval }));
+      proposal.version = hash(JSON.stringify({ ...value, itemId: proposal.itemId, itemIdentity: identity, bindingApproval: proposal.bindingApproval, ...(source ? { source } : {}), ...(proposal.cloudOrigin ? { cloudOrigin: proposal.cloudOrigin } : {}) }));
       state.proposals[id] = proposal;
       await atomicWrite(this.file, encode(state));
       return publicProposal(proposal);
@@ -195,6 +227,11 @@ export class CoordinatorManualBriefs {
           }
           const snapshot = await this.readMain(), document = snapshotDocument(snapshot);
           if (snapshot.version !== proposal.mainVersion) fail('VERSION_CONFLICT', 'Main changed after the brief; refresh before confirming', 409);
+          if (!this.mapOnly) {
+            const source = verifiedBriefSource(snapshot, this.projectId, proposal);
+            if (JSON.stringify(source) !== JSON.stringify(proposal.source || null)) fail('VERSION_CONFLICT', '源码基线已变化，请重新整理并确认 brief。', 409);
+            if (source && this.verifySource && await this.verifySource(source) !== true) fail('SOURCE_COMMIT_UNAVAILABLE', '源码提交已无法从远端取得，保留原提案并先确认基线。', 409);
+          }
           const node = entries(document.root).get(proposal.nodeId)?.node;
           if (!node) fail('VERSION_CONFLICT', 'The brief node was removed', 409);
           const field = proposal.kind === 'bug' ? 'bugs' : 'todos', list = node[field] || [];
@@ -258,6 +295,10 @@ export class CoordinatorManualBriefs {
     const snapshot = await this.readMain(), node = entries(snapshotDocument(snapshot).root).get(proposal.nodeId)?.node;
     const item = node?.[proposal.kind === 'bug' ? 'bugs' : 'todos']?.find(value => value.id === proposal.itemId);
     if (item?.approvedBrief?.proposalId !== proposal.id || item.approvedBrief.version !== proposal.version) fail('VERSION_CONFLICT', 'This execution prompt is no longer the current approved brief', 409);
+    if (proposal.source) {
+      if (JSON.stringify(proposal.source) !== JSON.stringify(snapshot.source)) fail('VERSION_CONFLICT', '源码基线已变化，旧执行提示保留为历史；请重新确认当前需求。', 409);
+      if (this.verifySource && await this.verifySource(proposal.source) !== true) fail('SOURCE_COMMIT_UNAVAILABLE', '批准版本的源码提交已不可获取；先确认可获取的基线，原提示保持不变。', 409);
+    }
     return { text: proposal.review.result.prompt, filename: `context-guard-${proposal.kind}-${proposal.itemId}.md` };
   }
 }
