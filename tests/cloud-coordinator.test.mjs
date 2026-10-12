@@ -3499,10 +3499,11 @@ test('Coordinator guides the existing execution Session without changing its Pla
     exchange: async (sessionId, id, type, payload) => { calls.push({ sessionId, id, type, payload }); return { notificationId: 'note-1' }; },
   });
   const result = await execute('guide_task', { executionSessionId: 'session-1', taskId: 'task-1', message: 'Commit and hand off' }, { operationId: 'guide-op' });
-  assert.deepEqual(result, { notificationId: 'note-1' });
+  assert.deepEqual(result, { notificationId: 'note-1', deliveryState: 'queued', executionConfirmed: false });
   assert.deepEqual(calls, [{ sessionId: 'session-1', id: 'guide-op', type: 'task.message', payload: {
     taskId: 'task-1', text: 'Commit and hand off', planRef: 'plan-1', planVersion: 'plan-v1',
   } }]);
+  assert.deepEqual(current, { version: 'v7', stage: 'executing', plan: { ref: 'plan-1', version: 'plan-v1' } });
 });
 
 test('Coordinator inbox automatically resumes an interrupted notification without a user turn', async () => {

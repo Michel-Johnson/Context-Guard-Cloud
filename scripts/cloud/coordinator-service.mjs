@@ -1,10 +1,11 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
-import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools, coordinatorFailureDiagnostic, recoverableModelFailure } from './coordinator-model.mjs';
+import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools, coordinatorFailureDiagnostic, recoverableModelFailure, coordinatorRetryDelay } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
+import { outputProtocolRecord, nativeOutputEnabled } from './coordinator-output.mjs';
 import { coordinatorPresentationKey } from '../shared/coordinator-reply.mjs';
 import { isVerifiedSlackBot, discussionTools } from './slack-bot-identity.mjs';
 
@@ -142,7 +143,8 @@ export function publicMessages(state) {
     // Exposing it now creates a duplicate row that is later replaced by a card.
     if (state.pending && index === state.messages.length - 1 && message.role === 'assistant') return null;
     const blocks = Array.isArray(message.content) ? message.content : [];
-    const sourceText = typeof message.content === 'string' ? message.content : blocks.filter(block => block.type === 'text').map(block => block.text).join('');
+    const sourceText = message.output?.protocol === 'native-json-v1' ? message.output.text
+      : typeof message.content === 'string' ? message.content : blocks.filter(block => block.type === 'text').map(block => block.text).join('');
     const questions = questionsAt(state, index);
     const actions = message.actions || [];
     const answer = message.answerTo ? state.answers?.[message.answerTo] : null;
@@ -158,7 +160,7 @@ export function publicMessages(state) {
       ...(answer?.requestId ? { requestId: answer.requestId } : {}),
       ...(questions.length ? { questions } : {}),
       ...(actions.length ? { actions } : {}),
-      tools: blocks.filter(block => block.type === 'tool_use').map(block => ({ id: block.id, name: block.name })) };
+      tools: blocks.filter(block => block.type === 'tool_use' && !(message.output?.protocol === 'native-json-v1' && block.name === 'respond')).map(block => ({ id: block.id, name: block.name })) };
   }).flatMap((message, index) => {
     const receipt = state.messages[index]?.serverContext?.bindingReceipt;
     const displayReceipt = message?.role === 'user' && receipt && !bindingReceipts.has(receipt.id);
@@ -424,7 +426,7 @@ export class CoordinatorMapIntake {
 export class CoordinatorService {
   constructor({ directory, model, system, tools, execute, context = null, maxSteps = 12, maxModelRetries = 2, retryDelayMs = 250,
     compactAtTokens = COORDINATOR_COMPACT_AT_TOKENS, compactMinTurns = 1, simulated = false, namespace = '', visionModel = null, resolveAttachment = null, completePresentations = false, validateReplies = false, onStateChange = null,
-    textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null }) {
+    textModels = null, selectTextModel = null, steerSettleMs = 80, beforeAcceptHumanInput = null, outputProtocol = null }) {
     if (!Number.isSafeInteger(compactMinTurns) || compactMinTurns < 1) throw error('INVALID_ARGUMENT', 'Compaction requires a positive completed-turn interval');
     if (onStateChange !== null && typeof onStateChange !== 'function') throw error('INVALID_ARGUMENT', 'State observer must be a function');
     if (beforeAcceptHumanInput !== null && typeof beforeAcceptHumanInput !== 'function') throw error('INVALID_ARGUMENT', 'Human input handler must be a function');
@@ -449,6 +451,7 @@ export class CoordinatorService {
     this.namespace = namespace;
     this.completePresentations = completePresentations;
     this.validateReplies = validateReplies;
+    this.outputProtocol = outputProtocolRecord(outputProtocol);
     this.visionModel = visionModel; this.resolveAttachment = resolveAttachment;
     this.onStateChange = onStateChange;
     this.beforeAcceptHumanInput = beforeAcceptHumanInput;
@@ -802,6 +805,8 @@ export class CoordinatorService {
           state.activeContext = nextContext;
           state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs: contextCompletedAt - contextStartedAt };
           state.activeTurnId = id; state.steps = 0; state.modelRetries = 0;
+          state.activeOutputProtocol = this.outputProtocol && structuredClone(this.outputProtocol);
+          delete state.outputDecision;
           delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
           state.activeRequestIds = [id];
           state.partialText = '';
@@ -946,6 +951,8 @@ export class CoordinatorService {
         state.activeModelRoute = route; state.activeContext = nextContext;
         state.activeTiming = { receivedAt: new Date(receivedAt).toISOString(), contextMs };
         state.activeTurnId = first.id; state.steps = 0; state.modelRetries = 0;
+        state.activeOutputProtocol = this.outputProtocol && structuredClone(this.outputProtocol);
+        delete state.outputDecision;
         delete state.modelRepairCode; delete state.modelRepairText; delete state.modelRepairTools;
         if (operatorRecovery) state.operatorRecovery = { id: operatorRecovery, initialAttempted: false, initialAccepted: false };
         else delete state.operatorRecovery;
@@ -1185,6 +1192,7 @@ export class CoordinatorService {
               state.operatorRecovery.initialAttempted = true;
               await save(state);
             }
+            if (nativeOutputEnabled(state.activeOutputProtocol) && !this.outputProtocol) throw error('OUTPUT_PROTOCOL_DISABLED', 'Experimental native turn is paused; do not resume it with the legacy protocol');
             state = await coordinatorStep({ turnId: this.namespace ? `${this.namespace}:${state.activeTurnId}` : state.activeTurnId, state, model,
               materializeMessages: value => this.materializeMessages(value, { currentImages: value.activeModelRoute?.kind === 'vision' }),
               system: prefix.system, promptVersion: hash(this.system), tools: prefix.tools, save, execute: (...args) => {
@@ -1236,6 +1244,8 @@ export class CoordinatorService {
             // 质量长度不触发重写；真正模型/格式故障仍使用原有有界预算。
             if (recoverableModelFailure(cause) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
                 !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
+              const retryDelay = coordinatorRetryDelay(cause, (state.modelRetries || 0) + 1, this.retryDelayMs);
+              if (retryDelay === null) throw cause;
               state.modelRetries = (state.modelRetries || 0) + 1;
               state.modelRepairCode = validationCode || null;
               state.modelRepairText = typeof cause.repairText === 'string' ? cause.repairText : null;
@@ -1243,7 +1253,7 @@ export class CoordinatorService {
               state.steps--; state.streaming = null; state.activity = null;
               state.activeTiming.modelRetryAt = new Date().toISOString();
               await save(state);
-              if (this.retryDelayMs) await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+              if (retryDelay) await new Promise(resolve => setTimeout(resolve, retryDelay));
               continue;
             }
             throw cause;
@@ -1373,15 +1383,18 @@ export class CoordinatorInbox {
             const summary = type === 'review.result' ? payload : { taskId: payload.taskId, stage: payload.stage, verdict: payload.verdict };
             if (actionable) {
               const target = this.routeEvent ? await this.routeEvent(type, payload, session) : this.service;
+              let recovery;
               if (type === 'task.report' && payload.stage === 'interrupted' && this.autoResume) {
-                await this.autoResume({ session, taskId: payload.taskId, messageId: item.message.id, reason: payload.data?.reason, occurredAt: payload.data?.occurredAt });
+                recovery = await this.autoResume({ session, taskId: payload.taskId, messageId: item.message.id, reason: payload.data?.reason, occurredAt: payload.data?.occurredAt });
               }
               // Leave this event unacknowledged, but allow other conversations to
               // progress. The existing contiguous cursor replays the gap later.
               if (!await available(target)) continue;
               await target.submit({ id: `event:${item.message.id}`, text: JSON.stringify({ session, type, payload: summary,
                 instruction: type === 'task.report' && payload.stage === 'interrupted' && this.autoResume
-                  ? '系统已自动提交恢复控制；读取当前任务和引用证据，等待执行端 resumed 回执，不要再次创建任务或重复调用恢复。'
+                  ? recovery?.skipped
+                    ? '系统没有提交自动恢复控制。读取原任务的真实中断原因并告知用户；供应商冷却时不自行反复重试，用户明确确认服务恢复后才恢复原任务。不要创建新任务或声称已经恢复。'
+                    : '系统已自动提交恢复控制；读取当前任务和引用证据，等待执行端 resumed 回执，不要再次创建任务或重复调用恢复。'
                   : type === 'review.result' && payload.kind === 'acceptance' && payload.decision === 'approved'
                     ? '人工验收已通过。读取原任务及 completionPolicy，用 guide_task 通知原 Executor 归档、结束计划。仅服务端指定的 experiment-only 任务不创建 PR、不发布 Main，按返回的回执调用 complete_task；正式任务创建 PR，Required 全绿且合并、Session 记忆发布后调用 complete_task。两者都须等待宿主 closed 回执，不得提前收工或请人联系执行端。'
                     : '读取当前任务和引用证据后推进；事件本身不授予额外权限。' }) }, { source: 'workflow' });

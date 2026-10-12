@@ -66,7 +66,7 @@ export const coordinatorTools = [
   definition('request_ci', 'Request CI for the developer handoff and exact source SHA.', task),
   definition('request_rework', 'Return failed CI to the original task and developer.', task),
   definition('resume_task', 'Resume an interrupted task in its original execution Session.', { ...task, reason: string }),
-  definition('guide_task', 'Send guidance to the existing execution Session without changing task stage.', { ...task, message: { ...string, maxLength: 2000 } }),
+  definition('guide_task', 'Queue guidance for the existing execution Session. This does not interrupt an active native turn or confirm it applied the guidance; do not claim it has stopped or changed behavior until a native receipt confirms that.', { ...task, message: { ...string, maxLength: 2000 } }),
   definition('complete_task', 'Request closure after human acceptance; first read completionPolicy via read_task.', { ...task, gitReceiptRef: string, archiveReceiptRef: string }),
   definition('edit_map', 'Create, update, move or delete Main nodes and TODO/Bug records; update project or node memoryDocument at mainVersion.', {
     mainVersion: string, actions: { type: 'array', minItems: 1, maxItems: 30, items: { type: 'object', properties: {
@@ -96,7 +96,7 @@ export function canUseSlackProjectTool(name, { source, actor } = {}) {
     channelPattern.test(actor.channelId || '');
 }
 
-function validateInput(tool, input) {
+export function validateCoordinatorToolInput(tool, input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('Tool input must be an object');
   const { properties, required } = tool.input_schema;
   if (Object.keys(input).some(key => !Object.hasOwn(properties, key)) || required.some(key => !Object.hasOwn(input, key))) fail('Tool fields differ from its schema');
@@ -122,7 +122,7 @@ export function createCoordinatorExecutor(ctx) {
     if (!tool) fail('Tool is not registered');
     if (name === 'read_reference' && typeof input?.name === 'string') input = { ...input,
       name: input.name.replace(/^references\//, '').replace(/\.md$/, '') + '.md' };
-    validateInput(tool, input);
+    validateCoordinatorToolInput(tool, input);
     await ctx.authorizeTool?.(name, input, options);
     if (['list_projects', 'read_project_map', 'switch_project'].includes(name)) {
       if (!canUseSlackProjectTool(name, options)) {
@@ -188,8 +188,11 @@ export function createCoordinatorExecutor(ctx) {
         nodeIds: input.nodeIds, mainVersion: input.mainVersion, brief, requiresHumanApproval: true };
     }
     const current = await ctx.readTask(input.executionSessionId, input.taskId, options);
-    if (name === 'guide_task') return exchange('task.message', { taskId: input.taskId, text: input.message,
-      ...(current.plan ? { planRef: current.plan.ref, planVersion: current.plan.version } : {}) });
+    if (name === 'guide_task') {
+      const receipt = await exchange('task.message', { taskId: input.taskId, text: input.message,
+        ...(current.plan ? { planRef: current.plan.ref, planVersion: current.plan.version } : {}) });
+      return { ...receipt, deliveryState: 'queued', executionConfirmed: false };
+    }
     if (name === 'resume_task') return exchange('task.control', { taskId: input.taskId, action: 'resume', expectedVersion: current.version,
       data: { reason: input.reason } });
     if (name === 'complete_task') return exchange('task.control', { taskId: input.taskId, action: 'complete', expectedVersion: current.version,

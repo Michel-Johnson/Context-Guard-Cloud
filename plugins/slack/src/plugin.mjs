@@ -5,7 +5,7 @@ import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { SlackFeedback } from './feedback.mjs';
 import { validateDiscussionBots, isSlackBotMessage } from '../../../scripts/cloud/slack-bot-identity.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
-import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
+import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, acceptanceBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
 function modelFailureText(code, ownsFeedback, outgoing, message) {
   const owned = 'Coordinator 当前处理失败，请稍后重试。原消息与已完成操作仍保留。';
@@ -515,6 +515,8 @@ export class SlackPlugin {
       else if (action.action_id === 'reject_binding') await this.reviewBinding(id, userId, value, 'rejected');
       else if (action.action_id === 'enable_cursor') await this.enableCursor(id, userId, value);
       else if (action.action_id === 'enable_zcode') await this.enableZCode(id, userId, value);
+      else if (action.action_id === 'approve_acceptance') await this.reviewAcceptance(id,userId,value,'approved');
+      else if (action.action_id === 'reject_acceptance') await this.reviewAcceptance(id,userId,value,'rejected');
       else if (action.action_id === 'export_prompt') await this.exportPrompt(id, userId, value);
     }
   }
@@ -1044,6 +1046,79 @@ export class SlackPlugin {
     if (text.length > 8000 && !synthetic) throw Object.assign(new Error('每批消息正文最多 8000 字符'), { code: 'RELEVANCE_INPUT_LIMIT', silent: !direct && !explicit });
     const inputIds = events.map(item => events.length === 1 ? operationId(id, 'submit') : operationId(envelopeId('events_api', { team_id: this.teamId, event: item }), 'submit'));
     const batchInputs = events.map((item, index) => ({ id: inputIds[index], text: String(item.text || '') }));
+    // Explicit human control is not a model instruction. Reuse the same scoped
+    // gateway as the button; quoted, mixed or Bot messages cannot enable work.
+    const enableText = text.replace(/\s+\*Sent using\* <@[UW][A-Z0-9]+(?:\|[^>\r\n]+)?>\s*$/, '')
+      .replace(new RegExp(`^\\s*<@${this.botUserId}(?:\\|[^>]+)?>\\s*`), '').trim();
+    if(!recovery&&!synthetic&&events.length===1&&isMessage(event)&&!event.files?.length&&/^(?:重试|恢复)刚才的请求[。！!]?$/u.test(enableText)){
+      const key=this.routedThreadKey(event),binding=this.store.data.threads[key];
+      if(binding){
+        if(expectedProjectId&&binding.projectId!==expectedProjectId)throw Object.assign(new Error('Project changed before retry'),{code:'CONFLICT'});
+        await this.resumeChat(id,{channel_id:event.channel,text:'resume '+binding.conversationId},event.user,key);
+        await this.io.post({id:operationId(id,'retry-result'),channel:binding.channel,threadTs:binding.threadTs,text:'已恢复原请求，保留已完成操作，等待实际结果。'});
+        await this.feedback.decide(id,'completed');return;
+      }
+    }
+    const briefDecision = /^(?:确认|同意)(?:这份)?(?:brief|需求|方案)[。！!]?$/i.test(enableText) ? 'approved' :
+      /^(?:退回|拒绝)(?:这份)?(?:brief|需求|方案)[。！!]?$/i.test(enableText) ? 'rejected' : null;
+    const acceptanceDecision=/^(?:确认)?验收通过[。！!]?$/u.test(enableText)?'approved':/^验收不通过[。！!]?$/u.test(enableText)?'rejected':null;
+    if(!recovery&&!synthetic&&events.length===1&&isMessage(event)&&!event.files?.length&&acceptanceDecision){
+      const key=this.routedThreadKey(event),binding=this.store.data.threads[key];
+      if(binding){
+        if(expectedProjectId&&binding.projectId!==expectedProjectId)throw Object.assign(new Error('Project changed before acceptance'),{code:'CONFLICT'});
+        let intent=this.store.data.inbox[id]?.acceptanceReviewIntent;
+        if(intent&&(intent.key!==key||intent.projectId!==binding.projectId||intent.conversationId!==binding.conversationId||intent.userId!==event.user||intent.text!==text||intent.decision!==acceptanceDecision))throw Object.assign(new Error('Acceptance input changed'),{code:'ID_REUSED'});
+        if(!intent){
+          const current=await this.command('conversation.state',binding,event.user,operationId(id,'acceptance-control-state'));
+          const pending=current.acceptances||[];
+          if(pending.length!==1||binding.mirrored[`acceptance:${pending[0].taskId}:${pending[0].ci.ref}:${pending[0].ci.version}`]?.hash!==digest(pending[0]))throw Object.assign(new Error('Review the current unique acceptance card'),{code:'APPROVAL_REQUIRED'});
+          const p=pending[0];intent={key,projectId:binding.projectId,conversationId:binding.conversationId,userId:event.user,text,decision:acceptanceDecision,taskId:p.taskId,sessionId:p.sessionId,generation:p.generation,ref:p.ci.ref,version:p.ci.version};
+          await this.store.update(state=>{state.inbox[id]||={status:'pending',attempts:0,at:Date.now(),next:0};state.inbox[id].acceptanceReviewIntent||=intent;});
+        }
+        await this.reviewAcceptance(id,event.user,intent,acceptanceDecision);
+        await this.feedback.decide(id,'completed');return;
+      }
+    }
+    if (!recovery && !synthetic && events.length === 1 && isMessage(event) && !event.files?.length && briefDecision) {
+      const key = this.routedThreadKey(event), binding = this.store.data.threads[key];
+      if (binding) {
+        if (expectedProjectId && binding.projectId !== expectedProjectId) throw Object.assign(new Error('Project changed before reviewing brief'), { code: 'CONFLICT' });
+        let intent = this.store.data.inbox[id]?.briefReviewIntent;
+        if (intent && (intent.key !== key || intent.projectId !== binding.projectId || intent.conversationId !== binding.conversationId || intent.userId !== event.user || intent.text !== text || intent.decision !== briefDecision)) {
+          throw Object.assign(new Error('Brief review input changed'), { code:'ID_REUSED' });
+        }
+        if (!intent) {
+          const current = await this.command('conversation.state', binding, event.user, operationId(id, 'brief-control-state'));
+          const pending = (current.approvals || []).filter(p => p.pending && !p.stale && (p.manual === true || p.projectTask));
+          if (pending.length !== 1 || binding.mirrored[`approval:${pending[0].id}`]?.hash !== digest(pending[0])) {
+            throw Object.assign(new Error('Confirm the currently displayed unique brief card'), { code:'APPROVAL_REQUIRED' });
+          }
+          intent = { key, projectId:binding.projectId, conversationId:binding.conversationId, userId:event.user, text, decision:briefDecision,
+            proposalId:pending[0].id, version:pending[0].projectTask ? pending[0].brief?.version : pending[0].version };
+          if (typeof intent.version !== 'string' || !intent.version) throw Object.assign(new Error('Displayed brief version is unavailable'), { code:'APPROVAL_REQUIRED' });
+          await this.store.update(state => { state.inbox[id] ||= {status:'pending',attempts:0,at:Date.now(),next:0}; state.inbox[id].briefReviewIntent ||= intent; });
+        }
+        await this.review(id, event.user, intent, briefDecision, briefDecision === 'approved' ? '用户在 Slack 中明确确认本卡 brief' : '用户在 Slack 中退回本卡 brief');
+        await this.feedback.decide(id, 'completed');
+        return;
+      }
+    }
+    if (!recovery && !synthetic && events.length === 1 && isMessage(event) && !event.files?.length &&
+        /^(?:请|我同意)?(?:为当前对话|在当前对话)?启用(?:本地)?\s*zcode[。！!]?$/i.test(enableText)) {
+      const key = this.routedThreadKey(event), binding = this.store.data.threads[key];
+      if (binding) {
+        if (expectedProjectId && binding.projectId !== expectedProjectId) throw Object.assign(new Error('Project changed before enabling ZCode'), { code: 'CONFLICT' });
+        const intent = { key, projectId: binding.projectId, conversationId: binding.conversationId, userId: event.user, text };
+        await this.store.update(state => {
+          const entry = state.inbox[id] ||= { status: 'pending', attempts: 0, at: Date.now(), next: 0 };
+          if (entry.zcodeEnableIntent && digest(entry.zcodeEnableIntent) !== digest(intent)) throw Object.assign(new Error('ZCode enable input changed'), { code: 'ID_REUSED' });
+          entry.zcodeEnableIntent ||= intent;
+        });
+        await this.enableZCode(id, event.user, { key });
+        await this.feedback.decide(id, 'completed');
+        return;
+      }
+    }
     if (!recovery && !synthetic) {
       const currentKey = event.thread_ts ? this.routedThreadKey(event) :
         direct ? this.store.data.directThreads?.[digest([this.teamId, event.channel, event.user, this.store.data.preferences[event.user]])] : this.routedThreadKey(event);
@@ -1295,11 +1370,11 @@ export class SlackPlugin {
     await this.command('conversation.interrupt', binding, userId, operationId(id, 'interrupt'), { expectedTurnId: target.expectedTurnId });
     await this.store.update(data => { data.threads[target.key].nextPoll = 0; });
   }
-  async resumeChat(id, body, userId) {
+  async resumeChat(id, body, userId, requestedKey = null) {
     let target = this.store.data.inbox[id]?.resumeTarget;
     if (!target) {
       const conversationId = body.text.trim().split(/\s+/)[1];
-      const candidates = Object.entries(this.store.data.threads).filter(([, binding]) =>
+      const candidates = Object.entries(this.store.data.threads).filter(([key, binding]) => (!requestedKey || key===requestedKey) &&
         binding.channel === body.channel_id && binding.userId === userId &&
         (conversationId ? binding.conversationId === conversationId : ['interrupted', 'error'].includes(binding.status)));
       if (candidates.length !== 1) throw Object.assign(new Error(candidates.length ? '当前频道有多个对话，请使用 /cg resume <对话ID>' : '当前频道没有可恢复的已关联对话'), { code: 'AMBIGUOUS_CONVERSATION' });
@@ -1377,10 +1452,23 @@ export class SlackPlugin {
       text: '已启用当前对话的 Cursor 执行能力。请继续说明任务；每份 brief 仍需确认，启用本身没有派发任务。' });
     return result;
   }
+  async reviewAcceptance(id,userId,value,decision){
+    const binding=this.store.data.threads[value.key];if(!binding)throw Error('Unknown Slack thread');
+    const {taskId,sessionId,generation,ref,version}=value;
+    const result=await this.command('acceptance.review',binding,userId,operationId(id,'acceptance-review'),{taskId,sessionId,generation,ref,version,decision,reason:decision==='approved'?'用户通过 Slack 确认本次隔离实验验收':'用户通过 Slack 拒绝本次验收，需原任务返工'});
+    const text=decision==='approved'?'验收已记录，等待执行端归档与真正收工。':'验收已退回，保留原任务和证据。';
+    const prior=binding.mirrored[`acceptance:${taskId}:${ref}:${version}`];
+    if(prior?.ts)await this.io.update(binding.channel,prior.ts,text,[section(text)]);
+    await this.io.post({id:operationId(id,'acceptance-result'),channel:binding.channel,threadTs:binding.threadTs,text});
+    await this.store.update(state=>{state.threads[value.key].nextPoll=0;});return result;
+  }
   async enableZCode(id, userId, value) {
     const binding = this.store.data.threads[value.key]; if (!binding) throw new Error('Unknown Slack thread');
     if (!this.zcodeOfferChannels.includes(binding.channel)) throw Object.assign(new Error('ZCode 启用入口仅在指定频道开放。'), { code: 'FORBIDDEN' });
-    const result = await this.command('conversation.zcode', binding, userId, operationId(id, 'enable-zcode'), { expectedMode: 'manual' });
+    const current = await this.command('conversation.state', binding, userId, operationId(id, 'enable-zcode-state'));
+    const result = current.executionProvider === 'zcode' ? current :
+      await this.command('conversation.zcode', binding, userId, operationId(id, 'enable-zcode'), { expectedMode: 'manual' });
+    if (result.executionProvider !== 'zcode') throw Object.assign(new Error('ZCode enable result was not confirmed'), { code: 'GATEWAY_BAD_RESPONSE' });
     await this.store.update(state => { state.threads[value.key].nextPoll = 0; });
     await this.io.post({ id: operationId(id, 'zcode-enabled'), channel: binding.channel, threadTs: binding.threadTs,
       text: '已启用本地 ZCode。请继续说明任务；brief 仍需逐项确认。' });
@@ -1667,6 +1755,13 @@ export class SlackPlugin {
       });
     }
     // Execution permission is not consent to advertise in every saved thread.
+    for(const review of state.acceptances||[]){
+      const id=`acceptance:${review.taskId}:${review.ci.ref}:${review.ci.version}`,hash=digest(review),prior=this.store.data.threads[key].mirrored[id];
+      if(prior?.hash===hash)continue;
+      const blocks=acceptanceBlocks(review,key),text='独立验证已通过，请在此线程验收。';
+      const ts=prior?.ts?(await this.io.update(binding.channel,prior.ts,text,blocks),prior.ts):await this.io.post({id:operationId(`${key}:${id}`,'acceptance-card'),channel:binding.channel,threadTs:binding.threadTs,text,blocks});
+      await this.store.update(data=>{data.threads[key].mirrored[id]={ts,hash};});
+    }
     // Preserve old cards outside this explicit operator-owned UI scope silently.
     if (this.cursorOfferChannels.includes(binding.channel) && (state.cursorAvailable || this.store.data.threads[key].mirrored['cursor-execution'])) {
       const active = state.executionProvider === 'cursor', text = active ? '已启用当前对话的 Cursor 执行能力，任务仍须确认 brief。' :

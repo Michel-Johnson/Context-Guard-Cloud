@@ -18,6 +18,7 @@ import { reviewInput, reviewOperations, pendingReviewFeedback } from './task-rev
 import { ProtocolBlobs, serveBlob } from '../shared/protocol-blobs.mjs';
 import { canonical, validateMessage, errorReply, fail as protocolFail, MAX_MESSAGE_BYTES } from '../shared/protocol.mjs';
 import { CoordinatorModel } from './coordinator-model.mjs';
+import { configuredOutputProtocol } from './coordinator-output.mjs';
 import { CoordinatorModelSettings } from './coordinator-model-settings.mjs';
 import { MapTranslations, translationInput } from './map-translations.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
@@ -26,6 +27,7 @@ import { coordinatorTools, coordinatorReferences, readCoordinatorReferenceFile, 
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
+import { reviewCoordinatorAcceptance } from './coordinator-acceptance.mjs';
 import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask, coordinatorCompletionPolicy } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
@@ -1341,6 +1343,7 @@ export async function startCloudServer({
           model: settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile)), system, tools, execute,
           ...(settings ? { textModels: settings.models, selectTextModel: () => settings.selection() } : {}),
           ...(manual ? { compactAtTokens: COORDINATOR_MANUAL_COMPACT_AT_TOKENS, compactMinTurns: 8, completePresentations: true, validateReplies: true } : {}),
+          ...(manual ? { outputProtocol: configuredOutputProtocol(config, conversationId) } : {}),
           ...(visionProvider ? { visionModel: coordinatorModelFactory({ ...visionProvider, supportsImages: true }) } : {}),
           ...(integrationAttachments ? { resolveAttachment: (id, options) => integrationAttachments.resolve({ teamId: integrations.teamId, projectId: project.id, id, ...options }) } : {}),
           ...(integrations ? { onStateChange: () => integrationGateway?.notify({ projectId: project.id, conversationId }) } : {}),
@@ -1391,6 +1394,7 @@ export async function startCloudServer({
           autoResume: async ({ session, taskId, messageId, reason }) => {
             const current = await store.taskRecord(principal, session, taskId);
             if (current.stage !== 'interrupted' || !current.busy) return { skipped: true, stage: current.stage };
+            if (reason === 'ZCODE_RATE_LIMIT') return { skipped: true, stage: current.stage, reason: 'provider-cooldown' };
             return (await store.handle(principal, { v: 2, id: `auto-resume:${messageId}`, type: 'task.control', session,
               payload: { taskId, action: 'resume', expectedVersion: current.version,
                 data: { reason: `自动恢复中断任务${reason ? `：${reason}` : ''}` } } }, { workflow: interfaceWorkflow })).data;
@@ -1573,6 +1577,21 @@ export async function startCloudServer({
       try { await zcodeExecutionScope(project, actor); state.zcodeAvailable = true; }
       catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.zcodeAvailable = false; }
     }
+    if (actor.kind === 'human' && state.executionMode === 'automatic') {
+      const coordinator = await coordinatorFor(project,id);
+      await coordinator.refreshBindings();
+      const {store,principal} = interfaceProject(project);
+      state.acceptances=[];
+      for(const sessionId of Object.keys(coordinator.bindings)){
+        const binding=await store.registeredBinding(principal,sessionId);
+        if(!binding)continue;
+        for(const task of await store.workflowTasks(principal,{id:sessionId,generation:binding.generation})){
+          if(task.stage==='awaiting-merge'&&task.ci?.verdict==='passed'&&await conversationsFor(project).owner(sessionId,task.id)===id){
+            state.acceptances.push({taskId:task.id,sessionId,generation:binding.generation,sourceSha:task.sourceSha,ci:task.ci});
+          }
+        }
+      }
+    }
     return state;
   };
   const integrationCommand = async (request, { actor, operationId, recoveryCheck }) => {
@@ -1746,6 +1765,14 @@ export async function startCloudServer({
       const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
       kickTaskScheduler(project);
       return { executionMode: 'automatic', executionProvider: task.zcodeDelegation ? 'zcode' : 'cursor', taskId: result.taskId, stage: result.stage };
+    }
+    if (type === 'acceptance.review') {
+      if (actor.kind !== 'human' || integrationConversation.executionMode === 'manual') protocolFail('FORBIDDEN','Acceptance requires the original enabled human conversation');
+      await requireExecutionGrant(project,integrationConversation,actor);
+      const coordinator=await coordinatorFor(project,conversationId); await coordinator.refreshBindings();
+      const {store,principal}=interfaceProject(project);
+      return reviewCoordinatorAcceptance({input:{...payload,id:operationId},conversationId,bindings:coordinator.bindings,store,principal,actor,
+        owner:(sessionId,taskId)=>conversationsFor(project).owner(sessionId,taskId),simulated:configuredMemory.projects[project.id].coordinator.simulated});
     }
     if (type === 'binding.review') {
       const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
@@ -3071,18 +3098,9 @@ export async function startCloudServer({
           const coordinator = await coordinatorFor(project, conversationId);
           await coordinator.refreshBindings();
           const input = await requestBody(req);
-          if (!input || Object.keys(input).some(key => !['id', 'sessionId', 'taskId', 'ref', 'version', 'decision', 'reason'].includes(key)) ||
-              !Object.hasOwn(coordinator.bindings, input.sessionId)) protocolFail('INVALID_ARGUMENT', 'Select an assigned task and exact CI result');
-          const { store, principal } = interfaceProject(project), binding = await store.registeredBinding(principal, input.sessionId);
-          if (!binding) protocolFail('NOT_FOUND', 'Session is not registered');
-          const session = { id: input.sessionId, generation: binding.generation }, task = await store.taskRecord(principal, session, input.taskId);
-          if (conversationId !== 'main' && await conversationsFor(project).owner(input.sessionId, input.taskId) !== conversationId)
-            protocolFail('FORBIDDEN', 'Task belongs to another conversation');
-          if (task.ci?.ref !== input.ref || task.ci?.version !== input.version || task.ci?.verdict !== 'passed') protocolFail('CONFLICT', 'Acceptance must reference the current passed CI result');
-          if (typeof input.reason !== 'string' || !input.reason.trim()) protocolFail('INVALID_ARGUMENT', 'Record the human acceptance result or rejection reason');
-          const message = validateMessage({ v: 2, id: input.id, type: 'review.result', session, payload: { kind: 'acceptance', ref: input.ref, version: input.version,
-            decision: input.decision, reason: (configuredMemory.projects[project.id].coordinator.simulated ? '[模拟人工验收] ' : '') + input.reason } });
-          const result = (await store.handle(principal, message)).data;
+          const {store,principal}=interfaceProject(project);
+          const result=await reviewCoordinatorAcceptance({input,conversationId,bindings:coordinator.bindings,store,principal,
+            owner:(sessionId,taskId)=>conversationsFor(project).owner(sessionId,taskId),simulated:configuredMemory.projects[project.id].coordinator.simulated});
           // CI acceptance does not attest a Map version that the human has not reviewed.
           // Session completion is a separate, exact-version human action.
           return send(res, 200, result);

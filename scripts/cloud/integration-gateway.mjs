@@ -8,7 +8,7 @@ import { recoveryScope } from './slack-recovery.mjs';
 import { validateDiscussionBots } from './slack-bot-identity.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind', 'conversation.cursor', 'conversation.zcode',
-  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'acceptance.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
@@ -173,7 +173,7 @@ export function validateIntegrationConfig(config) {
     fail('INVALID_INTEGRATION_CONFIG', 'ZCode 执行须明确指定仓库项目、本地模板与 Slack 用户');
   }
   return { ...config, host: config.host ?? '127.0.0.1', port: config.port ?? 8790,
-    actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor', 'conversation.zcode'].includes(type)) };
+    actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor', 'conversation.zcode', 'acceptance.review'].includes(type)) };
 }
 
 export function integrationActor(config, { teamId, userId, botId, channelId }) {
@@ -204,7 +204,7 @@ export function validateIntegrationCommand(config, input) {
     if (!identifier(input.projectId) || !config.projectIds.includes(input.projectId) &&
         !config.mapProjects?.userIds.includes(actor.userId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
-  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'brief.review', 'acceptance.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.type === 'conversation.discuss' && (actor.kind !== 'bot' || Object.keys(input.payload || {}).some(k => !['inputs', 'participation', 'history'].includes(k)))) fail('FORBIDDEN', 'Bot讨论仅接受原始讨论输入', 403);
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');

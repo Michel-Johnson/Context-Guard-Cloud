@@ -316,8 +316,10 @@ export class CursorRoleChannel {
     return this.withLease(token, lease => this.#ciSnapshotForLease(lease, input));
   }
 
-  // Host-only completion of the original saved proposal, not a public renewal.
-  // Expiry ends Agent access; explicit revocation still blocks host completion.
+  // Host-only completion of an already saved proposal. This is not MCP
+  // authentication or a lease renewal: the old operation/token stays expired,
+  // and no new capability or native Run is issued. The private invocation,
+  // current bindings/source authorization and verified result are rechecked.
   async #withHostCi(invocation, input, action) {
     if (!invocation || invocation.state !== 'confirmed' || invocation.scope?.phase !== 'ci' ||
         invocation.id !== hash(canonical(invocation.scope)) || !bounded(invocation.runId) ||
@@ -332,7 +334,8 @@ export class CursorRoleChannel {
           original.runId !== invocation.runId) fail('ROLE_FORBIDDEN', 'Original CI delegation changed');
       if (original.state === 'revoked') fail('ROLE_EXPIRED', 'Explicitly revoked delegation cannot be completed by the host');
       if (original.state !== 'active' || !Number.isSafeInteger(original.expiresAt)) fail('ROLE_UNAVAILABLE', 'Original CI receiver was never activated');
-      // Internal transaction window, never persisted or given to the Agent.
+      // A bounded internal transaction window, never saved or exposed to the
+      // native Agent. All public authentication still reads original.expiresAt.
       return action({ ...original, expiresAt: this.now() + 60000 });
     });
   }
