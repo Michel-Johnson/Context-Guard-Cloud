@@ -16,6 +16,73 @@ import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
 import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, coordinatorCompletionPolicy } from '../scripts/cloud/completion.mjs';
 import { readMemoryView } from '../scripts/cloud/memory.mjs';
 import { SLACK_INTERACTION_POLICY, slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
+import { CoordinatorSlackActions, coordinatorSlackActions } from '../scripts/cloud/coordinator-slack-actions.mjs';
+
+test('Slack operator parity catalogue uses real current buttons and exact versions', () => {
+  const state = { executionMode: 'manual', zcodeAvailable: true, cursorAvailable: false,
+    approvals: [{ id: 'binding', kind: 'binding-proposal', version: 'v1', node: { title: '搜索' }, pending: true },
+      { id: 'brief', version: 'v2', text: '空查询验收\n内容', pending: true },
+      { id: 'stale', version: 'v0', pending: true, stale: true }],
+    acceptances: [{ sessionId: 's', generation: 2, taskId: 't', ci: { ref: 'ci', version: 'v3' } }] };
+  const actions = coordinatorSlackActions(state, { version: 'models', options: [{ id: 'glm', label: 'GLM' }] });
+  assert.equal(actions.length, 8);
+  assert.ok(actions.some(x => x.type === 'conversation.zcode'));
+  assert.ok(!actions.some(x => x.type === 'conversation.cursor' || x.payload.proposalId === 'stale'));
+  assert.equal(actions.find(x => x.type === 'acceptance.review').payload.version, 'v3');
+  assert.deepEqual(coordinatorSlackActions(state), coordinatorSlackActions(state), 'Stable buttons across rereads');
+});
+
+test('Slack operator parity persists delegation without faking a human click and replays once', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'slack-delegation-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const actions = new CoordinatorSlackActions(directory), actor = { ...reactionActor, channelId: 'CTESTCHANNEL' };
+  const input = { id: 'intent', actor, requestId: 'actual-user-request', projectId: 'p', conversationId: 'c',
+    action: { label: '启用本地 ZCode', type: 'conversation.zcode', payload: { expectedMode: 'manual' } } };
+  const receipt = await actions.prepare(input);
+  assert.equal(receipt.status, 'queued');
+  let calls = 0, checks = 0;
+  const options = { id: 'intent', actor: reactionActor, projectId: 'p', conversationId: 'c',
+    authorize: async () => { checks++; }, execute: async (action, delegatedActor) => {
+      assert.equal(delegatedActor.performedBy, 'coordinator'); assert.equal(delegatedActor.sessionId, actor.sessionId);
+      calls++; return { executionProvider: 'zcode' };
+    } };
+  const applied = await actions.apply(options);
+  assert.equal(applied.performedBy, 'coordinator');
+  assert.deepEqual(await new CoordinatorSlackActions(directory).apply(options), applied);
+  assert.equal(calls, 1); assert.equal(checks, 2, 'Replay rechecks current account');
+  await assert.rejects(actions.prepare({ ...input, action: { ...input.action, label: '其他操作' } }), { code: 'ID_REUSED' });
+  await assert.rejects(actions.apply({ ...options, conversationId: 'another' }), { code: 'FORBIDDEN' });
+  await assert.rejects(actions.apply({ ...options, actor: { ...actor, kind: 'bot' } }), { code: 'FORBIDDEN' });
+  await assert.rejects(actions.apply({ ...options, authorize: async () => { throw Object.assign(new Error(), { code: 'FORBIDDEN' }); } }), { code: 'FORBIDDEN' });
+});
+
+test('Slack operator parity native tool transfers durable intent to the host without another model answer', async () => {
+  const state = reactionState('slack', { ...reactionActor, channelId: 'CTESTCHANNEL' });
+  const executor = createCoordinatorExecutor({ performSlackAction: async (input, options) => {
+    assert.equal(options.requestId, state.activeInput.id);
+    return { kind: 'slack-operation', actionId: options.operationId, requestId: options.requestId,
+      actor: options.actor, label: '启用本地 ZCode', status: 'queued' };
+  } });
+  await coordinatorStep({ state, turnId: 'parity', tools: coordinatorTools, system: 'role', save: async () => {},
+    execute: executor, model: { next: async () => ({ stop: 'tool_use', content: [
+      { type: 'tool_use', id: 'button', name: 'perform_slack_action', input: { actionId: 'real-button' } }] }) } });
+  assert.equal(state.status, 'waiting-for-user');
+  assert.equal(state.messages.at(-2).actions[0].kind, 'slack-operation');
+  assert.equal(state.messages.at(-1).content[0].is_error, undefined);
+});
+test('Slack operator parity takes the latest actual input of a merged Slack batch', async () => {
+  const actor = { ...reactionActor, channelId: 'CTESTCHANNEL' }, state = reactionState('slack', actor);
+  state.activeRequestIds = [state.activeInput.id, 'latest-input'];
+  state.messages = [{ role: 'user', source: 'slack', actor, requestId: state.activeInput.id, content: '先查询' },
+    { role: 'user', source: 'slack', actor, requestId: 'latest-input', content: '然后启用' }];
+  const executor = createCoordinatorExecutor({ performSlackAction: async (input, options) => {
+    assert.equal(options.requestId, 'latest-input');
+    return { kind: 'slack-operation', actionId: options.operationId, requestId: options.requestId, actor: options.actor, status: 'queued' };
+  } });
+  await coordinatorStep({ state, turnId: 'batch', tools: coordinatorTools, system: 'role', save: async () => {}, execute: executor,
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'batch-button', name: 'perform_slack_action', input: { actionId: 'current' } }] }) } });
+  assert.equal(state.messages.at(-1).content[0].is_error, undefined);
+});
 
 const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
 function reactionState(source = 'slack', actor = reactionActor) {

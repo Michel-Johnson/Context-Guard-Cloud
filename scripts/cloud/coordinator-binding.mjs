@@ -131,7 +131,8 @@ export class CoordinatorBindings {
         path: proposal.path, pathText: proposal.pathText, conversationId,
         ...(humanInputId ? { humanInputId } : {}),
         message: input.decision === 'approved' ? '已确认绑定到' + coordinatorNodeLabel(proposal.node) : '暂不绑定，继续讨论' };
-      proposal.review = { decision: input.decision, fingerprint, result };
+      proposal.review = { decision: input.decision, fingerprint, result,
+        ...(actor.performedBy === 'coordinator' ? { performedBy: 'coordinator', actor: structuredClone(actor) } : {}) };
       delete state.pending[conversationId]; state.reviews[input.id] = { fingerprint, result };
       await atomicWrite(this.file, encode(state));
       return result;

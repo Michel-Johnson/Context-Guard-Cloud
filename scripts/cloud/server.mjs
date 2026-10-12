@@ -34,6 +34,7 @@ import { startIntegrationGateway, validateIntegrationConfig, validateIntegration
 import { recoveryScope, requireEmptyRecoveryState } from './slack-recovery.mjs';
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
+import { CoordinatorSlackActions, coordinatorSlackActions } from './coordinator-slack-actions.mjs';
 import { isVerifiedSlackBot, BOT_DISCUSSION_TOOLS } from './slack-bot-identity.mjs';
 import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
@@ -753,6 +754,7 @@ export async function startCloudServer({
   const cursorTransitions = new Set();
   const cursorModeEpochs = new Map();
   let integrationGateway = null;
+  const slackActions = new CoordinatorSlackActions(path.join(dataDir, 'coordinator-operator-actions'));
   const conversationsFor = project => new CoordinatorConversations(path.join(dataDir, 'coordinators', project.id));
   const cursorExecutionScope = (project, actor) => {
     const grant = integrations?.cursorExecution?.[project.id], roles = cursorConfiguration?.projects?.[project.id]?.roles;
@@ -940,7 +942,7 @@ export async function startCloudServer({
           // own current worktree. ProtocolStore rechecks this grant on commit.
           return caller.role === 'device' ? { ...caller, role: 'coordinator', bindings: { [id]: binding.worktreeId } } : caller;
         };
-        const execute = createCoordinatorExecutor({
+        const executorContext = {
           authorizeTool: async (name, input, { caller, actor, source }) => {
             if (actor?.kind === 'bot' && (source !== 'slack-bot' || !isVerifiedSlackBot(actor) || !BOT_DISCUSSION_TOOLS.includes(name))) protocolFail('FORBIDDEN', 'Bot讨论不授予业务操作或人审权限');
             if (actor?.kind === 'bot') await authorizeIntegrationProject(project.id, actor);
@@ -1044,10 +1046,32 @@ export async function startCloudServer({
               const availability = !allowed ? 'not-authorized' : heartbeat ? cloudSessionPresence(heartbeat) : 'unknown';
               providers.push({ id, authorized: allowed, enabled, availability, ...(heartbeat ? { lastHeartbeatAt: heartbeat } : {}),
                 nextStep: !allowed ? '当前身份未获该执行能力' : availability === 'offline' ? '先恢复已注册本机连接，保留原任务'
-                  : enabled ? '先确认brief，再按原任务跟进；未知在线状态不能保证启动' : '在当前对话启用该执行端；启用不批准任务' });
+                  : enabled ? '先确认brief，再按原任务跟进；未知在线状态不能保证启动' : 'Coordinator可通过Slack按钮动作直接启用，不需要用户去客户端操作；启用不批准任务' });
             }
             return { kind: 'execution-capabilities', executionMode: current.executionMode || 'automatic',
               responsibility: '继续协调Executor、独立Tester、阻塞和收工；模式限制不代表职责止于brief', providers };
+          },
+          slackActions: async ({ actor }) => {
+            const state = await integrationPublicState(project, conversationId, actor);
+            await service.refreshBindings();
+            state.acceptances = [];
+            for (const sessionId of Object.keys(service.bindings)) {
+              const binding = await store.registeredBinding(principal, sessionId);
+              if (!binding) continue;
+              for (const task of await store.workflowTasks(principal, { id: sessionId, generation: binding.generation })) {
+                if (task.stage === 'awaiting-merge' && task.ci?.verdict === 'passed' &&
+                    await conversations.owner(sessionId, task.id) === conversationId) state.acceptances.push({ sessionId,
+                  generation: binding.generation, taskId: task.id, title: task.title, ci: task.ci });
+              }
+            }
+            const catalog = config.modelProviders ? await (await modelSettingsFor(project)).state() : null;
+            return { actions: coordinatorSlackActions(state, catalog) };
+          },
+          performSlackAction: async ({ actionId }, options) => {
+            const action = (await executorContext.slackActions(options)).actions.find(item => item.id === actionId);
+            if (!action) protocolFail('CONFLICT', 'Button changed; read current Slack actions again');
+            return slackActions.prepare({ id: options.operationId, actor: options.actor, requestId: options.requestId,
+              projectId: project.id, conversationId, action });
           },
           listProjects: async ({ operationId, actor }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持查询 Slack 项目');
@@ -1295,7 +1319,8 @@ export async function startCloudServer({
             if (hosted && await hosted.owns(sessionId)) kickTaskScheduler(project);
             return reply;
           },
-        });
+        };
+        const execute = createCoordinatorExecutor(executorContext);
         const itemScoped = conversationId.startsWith('item-');
         const fileWriteNote = config.fileWrite === true
           ? '\n项目允许 write_file 写入一个仓库相对路径的 UTF-8 文本文件。用户明确要求新建或替换单个文件时使用它，一次一个路径；不提交、不推送、不修改 Main。文件已存在时传入当前内容的 expectedSha。多文件修改和代码开发仍使用 brief。'
@@ -1697,6 +1722,22 @@ export async function startCloudServer({
       return commitMainMemoryMap(configuredMemory, projectId, { operationId, baseVersion: payload.baseVersion, operations }, actor);
     }
     const integrationConversation = await requireIntegrationConversation(project, conversationId, actor);
+    if (type === 'conversation.operator-action') {
+      if (Object.keys(payload).some(key => key !== 'actionId')) protocolFail('INVALID_ARGUMENT', 'Use the saved Coordinator action');
+      return slackActions.apply({ id: payload.actionId, actor, projectId, conversationId,
+        authorize: async item => {
+          await authorizeIntegrationProject(projectId, actor);
+          validateIntegrationCommand(integrations, { id: `delegated-${digest(item.id)}`, teamId: actor.teamId, userId: actor.userId,
+            projectId, conversationId, type: item.action.type, payload: item.action.payload });
+          if (item.status === 'applied') return;
+          const service = await coordinatorFor(project, conversationId), state = await service.state();
+          if (state.activeTurnId || state.status === 'running') protocolFail('COORDINATOR_BUSY', 'Wait for the current Coordinator turn');
+          const latest = state.messages.findLast(message => message.role === 'user' && message.source === 'slack');
+          if (latest?.requestId !== item.requestId) protocolFail('CONFLICT', 'A newer input replaced this action');
+        },
+        execute: (action, originalActor, id) => integrationCommand({ type: action.type, projectId, conversationId,
+          payload: action.payload }, { actor: originalActor, operationId: `delegated-${digest(id)}` }) });
+    }
     if (type === 'conversation.state') return integrationPublicState(project, conversationId, actor);
     if (type === 'conversation.discuss') {
       if (!isVerifiedSlackBot(actor)) protocolFail('FORBIDDEN', 'Bot讨论身份必须由网关验证');
@@ -1724,13 +1765,27 @@ export async function startCloudServer({
       const { store, principal } = interfaceProject(project), task = (await store.projectTasks(principal)).find(item => item.taskId === proposal.taskId && item.conversationId === conversationId);
       if (!task?.cursorDelegation && !task?.zcodeDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
       await requireExecutionGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation || task.zcodeDelegation);
-      const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
+      const result = await store.reviewProjectTask({ ...principal, agentId: actor.performedBy === 'coordinator' ? `coordinator-delegated:${actor.sessionId}` : actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
       kickTaskScheduler(project);
       return { executionMode: 'automatic', executionProvider: task.zcodeDelegation ? 'zcode' : 'cursor', taskId: result.taskId, stage: result.stage };
     }
     if (type === 'binding.review') {
       const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
       return { ...result, notification: await notifyBindingReviews(project, conversationId, await coordinatorFor(project, conversationId)) };
+    }
+    if (type === 'acceptance.review') {
+      if (actor.kind !== 'human') protocolFail('FORBIDDEN', 'Use the current Slack operator');
+      if (Object.keys(payload).some(key => !['sessionId', 'generation', 'taskId', 'ref', 'version', 'decision', 'reason'].includes(key))) protocolFail('INVALID_ARGUMENT', 'Use the exact tested result');
+      const service = await coordinatorFor(project, conversationId); await service.refreshBindings();
+      if (!Object.hasOwn(service.bindings, payload.sessionId)) protocolFail('FORBIDDEN', 'Session is not assigned');
+      const { store, principal } = interfaceProject(project), binding = await store.registeredBinding(principal, payload.sessionId);
+      if (!binding || binding.generation !== payload.generation) protocolFail('CONFLICT', 'Session generation changed');
+      const session = { id: payload.sessionId, generation: binding.generation }, task = await store.taskRecord(principal, session, payload.taskId);
+      if (await conversationsFor(project).owner(payload.sessionId, payload.taskId) !== conversationId ||
+          task.ci?.ref !== payload.ref || task.ci?.version !== payload.version || task.ci?.verdict !== 'passed') protocolFail('CONFLICT', 'Use this conversation current passed CI result');
+      const message = validateMessage({ v: 2, id: operationId, type: 'review.result', session,
+        payload: { kind: 'acceptance', ref: payload.ref, version: payload.version, decision: payload.decision, reason: payload.reason } });
+      return (await store.handle({ ...principal, agentId: actor.performedBy === 'coordinator' ? `coordinator-delegated:${actor.sessionId}` : actor.sessionId }, message)).data;
     }
     if (type === 'prompt.read') return manualBriefsFor(project).prompt(payload.proposalId, conversationId);
     protocolFail('INVALID_ARGUMENT', 'Unsupported integration operation');
