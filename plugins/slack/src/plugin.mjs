@@ -1492,7 +1492,10 @@ export class SlackPlugin {
             if (result.status !== 'applied') throw Object.assign(new Error('Action was not confirmed'), { code: 'GATEWAY_BAD_RESPONSE' });
             await this.store.update(data => { data.threads[key].mirrored[slot] = { status: 'applied', result }; });
           } catch (error) {
-            if (['COORDINATOR_BUSY', 'INTEGRATION_TIMEOUT', 'GATEWAY_TIMEOUT'].includes(error.code)) continue;
+            if (!['FORBIDDEN', 'UNAUTHORIZED', 'CONFLICT', 'VERSION_CONFLICT', 'ID_REUSED', 'INVALID_ARGUMENT', 'NOT_FOUND'].includes(error.code)) {
+              this.logger.warn('Coordinator action outcome unknown; original intent retained', { code: error.code || 'OUTCOME_UNKNOWN' });
+              continue;
+            }
             const ts = await this.io.post({ id: operationId(action.actionId, 'operator-result'), channel: binding.channel,
               threadTs: binding.threadTs, text: `代操作未成功：${action.label}。原请求已保留（${error.code || '通信错误'}）。` });
             await this.store.update(data => { data.threads[key].mirrored[slot] = { ts, status: 'failed', code: error.code }; });
