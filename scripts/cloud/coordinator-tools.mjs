@@ -195,8 +195,12 @@ export function createCoordinatorExecutor(ctx) {
     }
     if (name === 'resume_task') return exchange('task.control', { taskId: input.taskId, action: 'resume', expectedVersion: current.version,
       data: { reason: input.reason } });
-    if (name === 'complete_task') return exchange('task.control', { taskId: input.taskId, action: 'complete', expectedVersion: current.version,
-      data: { gitReceiptRef: input.gitReceiptRef, archiveReceiptRef: input.archiveReceiptRef } });
+    if (name === 'complete_task') {
+      const receipt = await exchange('task.control', { taskId: input.taskId, action: 'complete', expectedVersion: current.version,
+        data: { gitReceiptRef: input.gitReceiptRef, archiveReceiptRef: input.archiveReceiptRef } });
+      return { ...receipt, closureConfirmed: receipt.stage === 'closed',
+        instruction: 'Closure requested, not completed. Wait for the host closed report after local archive and Plan finish; do not say the task is finished yet.' };
+    }
     if (name === 'dispatch_task') {
       if (input.briefRef !== current.brief.ref || input.briefVersion !== current.brief.version) fail('The brief changed after it was read');
       const brief = await exchange('object.read', { ref: current.brief.ref, version: current.brief.version }, ':brief');

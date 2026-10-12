@@ -3506,6 +3506,26 @@ test('Coordinator guides the existing execution Session without changing its Pla
   assert.deepEqual(current, { version: 'v7', stage: 'executing', plan: { ref: 'plan-1', version: 'plan-v1' } });
 });
 
+test('Coordinator closure guidance distinguishes a request from the host closed receipt', async () => {
+  for (const stage of ['closing', 'closed']) {
+    const calls = [], current = { version: 'v7', stage: 'accepted' };
+    const execute = createCoordinatorExecutor({
+      readTask: async () => current,
+      exchange: async (sessionId, id, type, payload) => { calls.push({ sessionId, id, type, payload }); return { taskId: 'task-1', stage }; },
+    });
+    const result = await execute('complete_task', { executionSessionId: 'session-1', taskId: 'task-1',
+      gitReceiptRef: 'git-proof', archiveReceiptRef: 'archive-proof' }, { operationId: 'close-op' });
+    assert.equal(result.closureConfirmed, stage === 'closed');
+    assert.equal(result.stage, stage);
+    assert.match(result.instruction, /Wait for the host closed report/);
+    assert.deepEqual(calls, [{ sessionId: 'session-1', id: 'close-op', type: 'task.control', payload: {
+      taskId: 'task-1', action: 'complete', expectedVersion: 'v7',
+      data: { gitReceiptRef: 'git-proof', archiveReceiptRef: 'archive-proof' },
+    } }]);
+    assert.deepEqual(current, { version: 'v7', stage: 'accepted' });
+  }
+});
+
 test('Coordinator inbox automatically resumes an interrupted notification without a user turn', async () => {
   const session = { id: 'session-1', generation: 1 }, interruption = { v: 2, id: 'interrupt-1', type: 'task.report', session,
     payload: { taskId: 'task-1', stage: 'interrupted', data: { reason: 'timeout', occurredAt: '2026-09-10T00:00:00Z' } } };

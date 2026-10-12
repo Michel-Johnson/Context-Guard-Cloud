@@ -1494,6 +1494,11 @@ export async function startCloudServer({
       await requireExecutionGrant(project, conversation);
       const { store, principal } = interfaceProject(project);
       const tasks = (await store.projectTasks(principal)).filter(task => task.conversationId === conversationId);
+      const taskStatuses = await store.projectTaskStatuses(principal);
+      for (const task of tasks) {
+        const status = taskStatuses.find(item => item.taskId === task.taskId && item.sessionId === task.sessionId);
+        if (status) task.stage = status.state;
+      }
       state.executionMode = 'automatic'; state.executionProvider = conversation.zcodeExecution ? 'zcode' : 'cursor'; state.projectTasks = tasks;
       state.approvals = [...state.approvals.filter(proposal => !proposal.manual), ...await manualBriefsFor(project).approvals(conversationId)];
       state.approvals = state.approvals.map(proposal => {
@@ -1806,7 +1811,7 @@ export async function startCloudServer({
             const progress = await hosted.pump(current.session, current.id);
             await hosted.clearRecoveredError(principal, task, progress);
           }
-          if (current && !current.busy && ['accepted', 'closed', 'finished', 'cancelled'].includes(current.stage)) await store.updateProjectTask(principal, task.taskId, { stage: 'completed' });
+          if (current && !current.busy && ['closed', 'finished', 'cancelled'].includes(current.stage)) await store.updateProjectTask(principal, task.taskId, { stage: 'completed' });
           continue;
         }
         if (task.stage === 'queued') {
