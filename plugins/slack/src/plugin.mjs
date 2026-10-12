@@ -1488,6 +1488,8 @@ export class SlackPlugin {
             const result = await this.command('conversation.operator-action', binding, userId,
               operationId(action.actionId, 'operator-action'), { actionId: action.actionId });
             if (result.status !== 'applied') throw Object.assign(new Error('Action was not confirmed'), { code: 'GATEWAY_BAD_RESPONSE' });
+            if (result.type === 'prompt.read') await this.io.uploadPrompt({ id: operationId(action.actionId, 'operator-export'),
+              channel: binding.channel, threadTs: binding.threadTs, ...result.data });
             const ts = await this.io.post({ id: operationId(action.actionId, 'operator-result'), channel: binding.channel,
               threadTs: binding.threadTs, text: `已代操作：${result.label}。` });
             await this.store.update(data => { data.threads[key].mirrored[slot] = { ts, status: 'applied' }; data.threads[key].nextPoll = 0; });

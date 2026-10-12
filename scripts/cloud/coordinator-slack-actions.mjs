@@ -61,8 +61,8 @@ export class CoordinatorSlackActions {
           item.projectId !== projectId || item.conversationId !== conversationId) fail('FORBIDDEN', 'Action belongs to another operator or conversation');
       await authorize(item);
       if (item.status === 'applied') return item.result;
-      const data = await execute(item.action, item.actor, item.id);
-      const result = { performedBy: 'coordinator', label: item.action.label, status: 'applied', data };
+      const data = await execute(item.action, { ...item.actor, performedBy: 'coordinator', delegationId: item.id }, item.id);
+      const result = { performedBy: 'coordinator', type: item.action.type, label: item.action.label, status: 'applied', data };
       await atomicWrite(file, encode({ ...item, status: 'applied', result, appliedAt: new Date().toISOString() }));
       return result;
     });

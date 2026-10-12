@@ -1765,7 +1765,7 @@ export async function startCloudServer({
       const { store, principal } = interfaceProject(project), task = (await store.projectTasks(principal)).find(item => item.taskId === proposal.taskId && item.conversationId === conversationId);
       if (!task?.cursorDelegation && !task?.zcodeDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
       await requireExecutionGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation || task.zcodeDelegation);
-      const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
+      const result = await store.reviewProjectTask({ ...principal, agentId: actor.performedBy === 'coordinator' ? `coordinator-delegated:${actor.sessionId}` : actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
       kickTaskScheduler(project);
       return { executionMode: 'automatic', executionProvider: task.zcodeDelegation ? 'zcode' : 'cursor', taskId: result.taskId, stage: result.stage };
     }
@@ -1785,7 +1785,7 @@ export async function startCloudServer({
           task.ci?.ref !== payload.ref || task.ci?.version !== payload.version || task.ci?.verdict !== 'passed') protocolFail('CONFLICT', 'Use this conversation current passed CI result');
       const message = validateMessage({ v: 2, id: operationId, type: 'review.result', session,
         payload: { kind: 'acceptance', ref: payload.ref, version: payload.version, decision: payload.decision, reason: payload.reason } });
-      return (await store.handle({ ...principal, agentId: actor.sessionId }, message)).data;
+      return (await store.handle({ ...principal, agentId: actor.performedBy === 'coordinator' ? `coordinator-delegated:${actor.sessionId}` : actor.sessionId }, message)).data;
     }
     if (type === 'prompt.read') return manualBriefsFor(project).prompt(payload.proposalId, conversationId);
     protocolFail('INVALID_ARGUMENT', 'Unsupported integration operation');

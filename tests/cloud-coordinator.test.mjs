@@ -42,7 +42,10 @@ test('Slack operator parity persists delegation without faking a human click and
   assert.equal(receipt.status, 'queued');
   let calls = 0, checks = 0;
   const options = { id: 'intent', actor: reactionActor, projectId: 'p', conversationId: 'c',
-    authorize: async () => { checks++; }, execute: async () => { calls++; return { executionProvider: 'zcode' }; } };
+    authorize: async () => { checks++; }, execute: async (action, delegatedActor) => {
+      assert.equal(delegatedActor.performedBy, 'coordinator'); assert.equal(delegatedActor.sessionId, actor.sessionId);
+      calls++; return { executionProvider: 'zcode' };
+    } };
   const applied = await actions.apply(options);
   assert.equal(applied.performedBy, 'coordinator');
   assert.deepEqual(await new CoordinatorSlackActions(directory).apply(options), applied);

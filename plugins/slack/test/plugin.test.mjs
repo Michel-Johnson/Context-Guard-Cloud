@@ -36,6 +36,16 @@ test('Slack operator parity host executes saved intent once after the model turn
   assert.equal(calls, 1);
   assert.equal(f.sent.filter(x => x.text === '已代操作：启用本地 ZCode。').length, 1);
 });
+test('Slack operator parity prompt export preserves the returned document', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, sessionId: `slack:${teamId}:${user}` };
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: ['r'] });
+  f.gateway.command = async type => type === 'conversation.operator-action' ? { status: 'applied', type: 'prompt.read', label: '导出提示', data: { text: '准确提示正文', filename: 'prompt.md' } } :
+    { status: 'waiting-for-user', activeTurnId: null, approvals: [], messages: [{ id: 'a', role: 'assistant', requestId: 'r', source: 'slack', actor,
+      text: '', actions: [{ kind: 'slack-operation', actionId: 'export', requestId: 'r', actor, label: '导出提示' }] }] };
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(f.sent.filter(x => x.export?.text === '准确提示正文').length, 1);
+});
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
   const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');
