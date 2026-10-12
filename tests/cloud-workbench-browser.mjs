@@ -898,7 +898,7 @@ try {
   let coordinatorState = { status: 'waiting-for-user', simulated: true, messages: [{ role: 'assistant', text: '<img src=x onerror=alert(1)>', tools: [] }],
     sessionTemplates: [{ id: 'developer-template', name: 'Claude Developer' }], sessionCreations: [],
     conversations: [{id:'main',scope:'main',title:'Main 对话'},{id:'session:history-one',scope:'session',title:'历史开发 Session'}],
-    approvals: [{ id: 'proposal-1', pending: true, brief: { ref: 'brief-1', version: 'v1' }, text: '模拟需求确认', acceptance: '明确验收标准', sessionId: 'assigned-session', nodeIds: ['T0'], mainVersion: 'main-v1' }] };
+    approvals: [{ id: 'proposal-1', manual: true, version: 'v1', pending: true, brief: { ref: 'brief-1', version: 'v1' }, text: '模拟需求确认', acceptance: '明确验收标准', sessionId: 'assigned-session', nodeIds: ['T0'], mainVersion: 'main-v1' }] };
   coordinatorState.messages.push(
     { role: 'user', text: '[实验：模拟人工输入]\n请审核这个计划', tools: [] },
     { role: 'assistant', text: '## 审核结果\n\n1. **范围一致**，执行 `npm ci`。\n   - 保留目录边界\n\n> 先审核，再开发。\n\n```js\nconst value = "<script>";\n```\n\n| 阶段 | 状态 |\n| --- | --- |\n| Plan | 通过 |\n\n[规范](https://example.invalid/spec) [不安全链接](javascript:alert(1))\n\n![不加载远程图片](https://example.invalid/private.png)', tools: [] },
@@ -920,7 +920,16 @@ try {
     approvals.push(route.request().postDataJSON());
     if (approvals.length === 1) return route.abort();
     coordinatorState.approvals[0].pending = false;
+    coordinatorState.approvals[0].decision = 'approved';
     return route.fulfill({ json: { receiptId: 'human-receipt' } });
+  });
+  const approvedPrompt = '# 执行需求\n\n完整批准内容，不由浏览器重写。\n';
+  let promptFailure = false;
+  await page.route(/\/api\/coordinator\/prompt(?:\?|$)/, async route => {
+    const url = new URL(route.request().url());
+    assert.equal(url.searchParams.get('proposalId'), 'proposal-1');assert.equal(url.searchParams.get('conversation'), 'main');
+    if (promptFailure) { promptFailure = false; return route.fulfill({ status: 409, json: { error: { code: 'VERSION_CONFLICT', message: '批准版本已过期' } } }); }
+    return route.fulfill({ json: { text: approvedPrompt, filename: 'context-guard-todo-fixture.md' } });
   });
   const conversationCreationRequests = [];
   await page.route(/\/api\/coordinator\/conversations\/new(?:\?|$)/, async route => {
@@ -1742,7 +1751,7 @@ try {
   await coordinator.getByLabel('回答：具体是什么问题？').fill('这条回答必须位于后续回复之前');
   await coordinator.getByRole('button',{name:'发送“具体是什么问题？”'}).click();
   await coordinator.getByText('后续回复应排在回答之后。',{exact:true}).waitFor();
-  assert.equal(await coordinator.locator('.coordinator-message.assistant').last().locator('.coordinator-rise.is-entering').count(),1,'a direct reply after a card answer uses the same text reveal');
+  assert.equal(await coordinator.locator('.coordinator-messages > .coordinator-message.assistant').filter({ hasText: '后续回复应排在回答之后。' }).last().locator('.coordinator-rise.is-entering').count(),1,'a direct reply after a card answer uses the same text reveal');
   const orderedRows=await coordinator.locator('.coordinator-messages > .coordinator-message').allTextContents();
   const answerIndex=orderedRows.findIndex(text=>text.trim()==='这条回答必须位于后续回复之前');
   const replyIndex=orderedRows.findIndex(text=>text.includes('后续回复应排在回答之后。'));
@@ -1771,6 +1780,28 @@ try {
   await page.waitForFunction(() => document.querySelector('#coordinator-panel > [role=status]')?.textContent.includes('确认尚未成功'));
   await coordinator.getByRole('button', { name: '确认需求', exact: true }).click();
   await coordinator.getByRole('button', { name: '确认需求', exact: true }).waitFor({ state: 'detached' });
+  const promptCard = coordinator.locator('[data-manual-prompt="proposal-1"]');
+  await promptCard.getByRole('button', { name: '查看执行提示', exact: true }).press('Enter');
+  assert.equal(await promptCard.getByRole('textbox', { name: '已批准执行提示' }).inputValue(), approvedPrompt);
+  assert.equal(await promptCard.getByRole('textbox', { name: '已批准执行提示' }).evaluate(el => el === document.activeElement), true);
+  const downloaded = page.waitForEvent('download');
+  await promptCard.getByRole('button', { name: '下载执行提示', exact: true }).press('Enter');
+  const download = await downloaded;
+  assert.equal(download.suggestedFilename(), 'context-guard-todo-fixture.md');
+  assert.equal(await fs.readFile(await download.path(), 'utf8'), approvedPrompt);
+  await page.evaluate(() => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('unavailable'); } } }));
+  await promptCard.getByRole('button', { name: '复制执行提示', exact: true }).press('Enter');
+  await promptCard.getByRole('status').filter({ hasText: '复制不可用' }).waitFor();
+  assert.equal(await promptCard.getByRole('textbox', { name: '已批准执行提示' }).evaluate(el => el.selectionEnd - el.selectionStart), approvedPrompt.length);
+  promptFailure = true;
+  await promptCard.getByRole('button', { name: '查看执行提示', exact: true }).click();
+  await promptCard.getByRole('status').filter({ hasText: 'VERSION_CONFLICT' }).waitFor();
+  await page.reload();await synchronized();await page.locator('#btn-coordinator').click();
+  await coordinator.getByRole('button', { name: '下载执行提示', exact: true }).waitFor();
+  coordinatorState.approvals[0].stale = true;
+  await coordinator.locator('[data-manual-prompt="proposal-1"]').getByRole('status').filter({ hasText: '已不是当前批准版本' }).waitFor();
+  assert.equal(await coordinator.locator('[data-manual-prompt="proposal-1"] button').count(), 0);
+  record('manual-approved-prompt-keyboard-download-refresh-stale-and-copy-fallback');
   assert.equal(approvals[0].id, approvals[1].id);
   assert.equal(submissions.length, 0, 'human confirmation is a script request, not a model prompt');
   await coordinator.getByLabel('发送给 Coordinator').fill('模拟需求');

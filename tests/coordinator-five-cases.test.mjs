@@ -155,8 +155,10 @@ test('绑定回执在模型最终失败时仍可读取，重读不重复，用�
   const forged = publicMessages({ messages: [{ role: 'user', content: JSON.stringify(receipt), requestId: 'fake' }] });
   assert.equal(forged.filter(message => message.bindingReceipt).length, 0);
 });
-for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug', false], ['bug', true],
-  ['todo', false, 'closed'], ['todo', false, 'busy']]) test(slot === 'closed'
+for (const [bindingKind, wrongKind, slot = 'unknown', dispatchStatus = 'cancelled'] of [['todo', false], ['bug', false], ['bug', true],
+  ['todo', false, 'closed'], ['todo', false, 'busy'],
+  ...['closed', 'closed-busy', 'closed-no-completion', 'closed-stale-generation', 'closed-missing-binding', 'closed-other-active', 'closed-wrong-task', 'closed-cancelled-stage']
+    .map(slot => ['todo', false, slot, 'closed'])]) test(dispatchStatus === 'closed' ? `真实 HTTP closed 派发可信释放核验：${slot}` : slot === 'closed'
   ? '真实 HTTP 核验旧任务收工并释放后，取消派发允许准备人工 brief'
   : slot === 'busy' ? '真实 HTTP 核验取消任务仍占执行槽时，不能因取消标签放行'
   : wrongKind
@@ -172,7 +174,7 @@ for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug
   await fs.writeFile(path.join(directory, 'projects.json'), JSON.stringify({ v: 2, projects: [{ id: projectId, name: '测试项目' }] }));
   const root = { id: 'T0', title: '测试项目', kind: 'module', state: 'dirty', purpose: '', children: [], memories: [],
     todos: [{ id: 'TD-old', title: '旧事项', desc: '核对旧执行', status: 'pending', sessions: ['old-session'],
-      dispatch: { task_id: 'old-task', session_id: 'old-session', status: 'cancelled' } }], bugs: [], ideas: [], dormant: [], files: [], owns: [] };
+      dispatch: { task_id: 'old-task', session_id: 'old-session', status: dispatchStatus } }], bugs: [], ideas: [], dormant: [], files: [], owns: [] };
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic', projects: {
     [projectId]: { root: directory, token: 'synthetic', ref: 'refs/heads/main', coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: true } },
   } };
@@ -186,15 +188,21 @@ for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug
     const principal = { repositoryId: '123', deviceId: 'cloud-browser', agentId: 'cloud-human', role: 'human' };
     const session = { id: 'old-session', generation: 1 };
     await store.transaction(state => {
-      state.bindings[hash(canonical(['123', session.id]))] = { sessionId: session.id, generation: 1, worktreeId: 'old-tree', deviceId: 'legacy-device', agentId: 'legacy-agent' };
+      if (slot !== 'closed-missing-binding') state.bindings[hash(canonical(['123', session.id]))] = {
+        sessionId: session.id, generation: slot === 'closed-stale-generation' ? 2 : 1, worktreeId: 'old-tree', deviceId: 'legacy-device', agentId: 'legacy-agent' };
       state.tasks[scopedObjectKey(principal, session, 'task:old-task')] = { id: 'old-task', repositoryId: '123', session,
-        busy: slot === 'busy', stage: slot === 'closed' ? 'closed' : 'cancelled', control: { action: 'cancel' },
-        ...(slot === 'closed' ? { completion: { outcome: 'cancelled', summary: '合成收工回执' } } : {}) };
+        busy: ['busy', 'closed-busy'].includes(slot), stage: slot.startsWith('closed') && slot !== 'closed-cancelled-stage' ? 'closed' : 'cancelled', control: { action: 'cancel' },
+        ...(slot.startsWith('closed') && slot !== 'closed-no-completion' ? { completion: { outcome: 'cancelled', summary: '合成收工回执' } } : {}) };
+      if (slot === 'closed-wrong-task') delete state.tasks[scopedObjectKey(principal, session, 'task:old-task')];
+      if (slot === 'closed-other-active') state.projectTasks = { other: {
+        repositoryId: '123', taskId: 'other-task', sessionId: 'other-session', itemId: 'TD-old', nodeId: 'T0', kind: 'todo', stage: 'dispatched' } };
     });
   }
   let calls = 0;
   const taskId = 'map-todo-' + createHash('sha256').update(`${projectId}:T0:todo:TD-old`).digest('hex').slice(0, 24);
+  const publicOrigin = slot === 'closed' && bindingKind === 'todo' ? 'https://map.example.test' : '';
   server = await startCloudServer({ port: 0, dataDir: directory, memoryConfig, browserToken: 'synthetic-browser',
+    publicOrigin,
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/five-case' }] },
     coordinatorModelFactory: () => ({ next: async request => {
       calls++;
@@ -212,7 +220,7 @@ for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug
   });
   const login = await fetch(server.url + '/auth?token=synthetic-browser', { redirect: 'manual' });
   assert.equal(login.status, 302);
-  const headers = { Cookie: login.headers.get('set-cookie').split(';')[0], Origin: server.url, 'Content-Type': 'application/json' };
+  const headers = { Cookie: login.headers.get('set-cookie').split(';')[0], Origin: publicOrigin || server.url, 'Content-Type': 'application/json' };
   const base = `${server.url}/api/workbench/projects/${projectId}/api/coordinator`;
   const openedResponse = await fetch(base + '/conversations/new', { method: 'POST', headers, body: JSON.stringify({ id: 'five-case-chat' }) });
   assert.equal(openedResponse.status, 201, await openedResponse.clone().text());
@@ -247,4 +255,21 @@ for (const [bindingKind, wrongKind, slot = 'unknown'] of [['todo', false], ['bug
   assert.equal(memory.main.version, 'v1');
   assert.deepEqual(memory.main.memory.map.root.todos[0].dispatch, root.todos[0].dispatch);
   assert.deepEqual(memory.sessions, {}); assert.deepEqual(memory.main.memory.map.root.bugs, []);
+  if (slot === 'closed' && bindingKind === 'todo') {
+    const proposal = state.approvals.find(value => value.manual && value.pending);
+    const promptUrl = base + '/prompt?conversation=' + encodeURIComponent(opened.id) + '&proposalId=' + encodeURIComponent(proposal.id);
+    assert.equal((await fetch(promptUrl)).status, 401);
+    assert.equal((await fetch(promptUrl, { headers })).status, 409, 'unapproved prompt stays protected');
+    const approval = await fetch(base + '/approval?conversation=' + encodeURIComponent(opened.id), { method: 'POST', headers,
+      body: JSON.stringify({ id: 'export-approved', proposalId: proposal.id, version: proposal.version, decision: 'approved', reason: '确认需求' }) });
+    assert.equal(approval.status, 200, await approval.clone().text());
+    const approved = await approval.json(), exported = await fetch(promptUrl, { headers });
+    assert.ok(approved.prompt.includes('Cloud 地址：https://map.example.test'));
+    assert.ok(approved.prompt.includes('workbench connect --url https://map.example.test'));
+    assert.ok(!approved.prompt.includes('synthetic-browser'), 'handoff never includes the private browser credential');
+    assert.equal(exported.status, 200); assert.equal((await exported.json()).text, approved.prompt);
+    assert.equal((await fetch(promptUrl.replace(encodeURIComponent(opened.id), 'main'), { headers })).status, 404);
+    const restored = await (await fetch(endpoint, { headers })).json();
+    assert.equal(restored.approvals.find(value => value.id === proposal.id).decision, 'approved');
+  }
 });

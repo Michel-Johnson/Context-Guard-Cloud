@@ -805,7 +805,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           if (!correctableToolError(error.code)) throw error;
           receipt = { fingerprint, ...failedTool(error.code, error.toolHint ||
             (error.code === 'ACTIVE_EXECUTION' ? '该事项仍有执行任务，不能转入人工执行。保留已完成操作，说明限制并继续讨论，不重复准备 brief。'
-              : error.code === 'EXECUTION_NOT_RELEASED' ? '旧派发已取消，但尚不能确认执行任务已释放。保留已完成操作，说明限制并继续讨论，不重复准备 brief。' : undefined)) };
+              : error.code === 'EXECUTION_NOT_RELEASED' ? '尚不能确认旧执行任务已释放。保留已完成操作，说明限制并继续讨论，不重复准备 brief。' : undefined)) };
         } finally {
           if (state.performance) state.performance.tools = [...state.performance.tools,
             { name, durationMs: Date.now() - started, ...(errorCode ? { errorCode } : {}) }].slice(-120);

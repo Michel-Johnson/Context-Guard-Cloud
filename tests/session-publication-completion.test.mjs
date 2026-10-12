@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { runInNewContext } from 'node:vm';
-import { completeSessionMemory, commitSessionMap, memoryPublicationStatus, publishSessionMemory, readMemoryProject, sessionCompletionMatches, startMemoryServer } from '../scripts/cloud/memory.mjs';
+import { completeSessionMemory, commitSessionMap, memoryPublicationStatus, publishSessionMemory, readMemoryProject, sessionCompletionMatches, startMemoryServer, manualSourceAvailable } from '../scripts/cloud/memory.mjs';
 import { projectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { atomicWrite, encode, readJSON, withFileLock } from '../scripts/shared/io.mjs';
 
@@ -32,6 +32,26 @@ async function fixture(t) {
   const publish = snapshot => ({ operationId: `publish-${snapshot.sessionId}-${snapshot.version}`, sessionId: snapshot.sessionId, sessionVersion: snapshot.version, baseVersion: snapshot.baseMainVersion, expectedMainSha: sha });
   return { root, sha, configuration, send, seed, complete, publish };
 }
+
+test('Manual handoff source must be reachable from an advertised remote ref, without changing dirty files', async t => {
+  const f = await fixture(t), remote = path.join(f.root, 'test-remote.git');
+  const git = (...args) => execFileSync('git', args, { cwd: f.root, windowsHide: true, encoding: 'utf8' }).trim();
+  git('init', '--bare', remote);git('remote', 'add', 'origin', remote);git('push', 'origin', 'main');
+  await fs.writeFile(path.join(f.root, 'code.txt'), 'uncommitted user change');
+  const source = { root: f.root, remote: 'origin' };
+  assert.equal(await manualSourceAvailable(source, f.sha), true);
+  assert.equal(await fs.readFile(path.join(f.root, 'code.txt'), 'utf8'), 'uncommitted user change');
+  git('-c', 'core.hooksPath=/dev/null', 'commit', '--allow-empty', '-m', 'private unpublished baseline');
+  const unpublished = git('rev-parse', 'HEAD');
+  assert.equal(await manualSourceAvailable(source, unpublished), false, 'having the object in the mirror does not make it fetchable by a fresh clone');
+  git('push', 'origin', 'HEAD:refs/heads/test-source');
+  assert.equal(await manualSourceAvailable(source, unpublished), true);
+  git('push', 'origin', '--delete', 'test-source');
+  assert.equal(await manualSourceAvailable(source, unpublished), false, 'a deleted source ref is detected at preparation');
+  assert.equal(await manualSourceAvailable(source, f.sha, 'wrong/repository'), false);
+  assert.equal(await manualSourceAvailable(source, 'a'.repeat(39)), false);
+  assert.equal(await fs.readFile(path.join(f.root, 'code.txt'), 'utf8'), 'uncommitted user change');
+});
 
 async function automaticScan(f, overrides = {}) {
   const source = await fs.readFile(new URL('../scripts/cloud/server.mjs', import.meta.url), 'utf8');
