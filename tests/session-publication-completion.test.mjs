@@ -9,6 +9,7 @@ import { runInNewContext } from 'node:vm';
 import { completeSessionMemory, commitSessionMap, memoryPublicationStatus, publishSessionMemory, readMemoryProject, sessionCompletionMatches, startMemoryServer, manualSourceAvailable } from '../scripts/cloud/memory.mjs';
 import { projectMemoryFile } from '../scripts/cloud/memory-filesystem.mjs';
 import { atomicWrite, encode, readJSON, withFileLock } from '../scripts/shared/io.mjs';
+import { testBotGrant } from '../scripts/cloud/slack-bot-identity.mjs';
 
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-reviewed-publication-'));
@@ -32,6 +33,41 @@ async function fixture(t) {
   const publish = snapshot => ({ operationId: `publish-${snapshot.sessionId}-${snapshot.version}`, sessionId: snapshot.sessionId, sessionVersion: snapshot.version, baseVersion: snapshot.baseMainVersion, expectedMainSha: sha });
   return { root, sha, configuration, send, seed, complete, publish };
 }
+
+test('测试委托完成与发布保留Bot审计，版本/合入门禁及撤权重放仍有效', async t => {
+  const f = await fixture(t), snapshot = await f.seed();
+  const grant = { userId: 'UTESTBOT', botId: 'BTESTBOT', projectId: 'project', channelId: 'CTEST', authorizationId: 'human-test-grant', authorizedBy: 'UHUMAN' };
+  const config = { teamId: 'TTEST', testProjectIds: ['project'], testBots: [grant] };
+  const actor = { kind: 'bot', integration: 'slack', teamId: config.teamId, userId: grant.userId, botId: grant.botId, channelId: grant.channelId,
+    sessionId: `slack-bot:${config.teamId}:${grant.userId}`, testProjectId: 'project', testAuthorizationId: grant.authorizationId, testAuthorizedBy: grant.authorizedBy };
+  await assert.rejects(completeSessionMemory(f.configuration, 'project', f.complete(snapshot), actor), { code: 'FORBIDDEN' });
+  f.configuration.authorizeTestBot = (projectId, caller) => !!testBotGrant(config, caller, projectId);
+  await assert.rejects(publishSessionMemory(f.configuration, 'project', f.publish(snapshot), actor), { code: 'SESSION_COMPLETION_REQUIRED' });
+  await assert.rejects(completeSessionMemory(f.configuration, 'project', f.complete(snapshot), { ...actor, testAuthorizationId: 'forged' }), { code: 'FORBIDDEN' });
+  await assert.rejects(completeSessionMemory(f.configuration, 'project', { ...f.complete(snapshot), sessionVersion: 'stale' }, actor), { code: 'VERSION_CONFLICT' });
+  const completed = await completeSessionMemory(f.configuration, 'project', f.complete(snapshot), actor);
+  assert.equal(completed.completion.actor.kind, 'bot'); assert.equal(completed.completion.actor.testAuthorizedBy, 'UHUMAN');
+  config.testBots.splice(0);
+  await assert.rejects(completeSessionMemory(f.configuration, 'project', f.complete(snapshot), actor), { code: 'FORBIDDEN' });
+  await assert.rejects(publishSessionMemory(f.configuration, 'project', f.publish(snapshot), actor), { code: 'FORBIDDEN' });
+  assert.ok((await readMemoryProject(f.configuration, 'project')).sessions.s1, '撤权失败不删除Session');
+  config.testBots.push(grant);
+  const published = await publishSessionMemory(f.configuration, 'project', f.publish(snapshot), actor);
+  assert.equal(published.committed, true); assert.equal(published.snapshot.mainSha, f.sha);
+  const saved = await readMemoryProject(f.configuration, 'project');
+  assert.equal(saved.sessions.s1, undefined); assert.equal(saved.events.at(-1).actor.kind, 'bot');
+  config.testBots.splice(0);
+  await assert.rejects(publishSessionMemory(f.configuration, 'project', f.publish(snapshot), actor), { code: 'FORBIDDEN' });
+});
+
+test('测试委托在完成策略异步检查期间撤销时不保存完成回执', async t => {
+  const f = await fixture(t), snapshot = await f.seed(); let authorized = true;
+  const actor = { kind: 'bot', sessionId: 'isolated-test-bot' };
+  f.configuration.authorizeTestBot = () => authorized;
+  f.configuration.publicationGate = async () => { authorized = false; return true; };
+  await assert.rejects(completeSessionMemory(f.configuration, 'project', f.complete(snapshot), actor), { code: 'FORBIDDEN' });
+  assert.equal((await readMemoryProject(f.configuration, 'project')).sessions.s1.completion, undefined);
+});
 
 test('Manual handoff source must be reachable from an advertised remote ref, without changing dirty files', async t => {
   const f = await fixture(t), remote = path.join(f.root, 'test-remote.git');

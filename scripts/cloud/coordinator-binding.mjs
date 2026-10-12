@@ -23,9 +23,10 @@ const visible = proposal => ({ id: proposal.id, kind: 'binding-proposal', versio
 
 // 这是现有对话的确认记录，不写 Main，也不创建执行 Session。
 export class CoordinatorBindings {
-  constructor({ directory, readMain, conversations, nodeIds = null }) {
+  constructor({ directory, readMain, conversations, nodeIds = null, authorizeTestBot = () => false }) {
     this.file = path.join(directory, 'binding-reviews.json');
     Object.assign(this, { readMain, conversations, nodeIds });
+    this.actorId = actor => actorId(actor) || (authorizeTestBot(actor) ? actor.sessionId : false);
   }
   async state() { return readJSON(this.file, { proposals: {}, reviews: {}, pending: {} }); }
   async withStableConversation(conversationId, action) {
@@ -59,14 +60,14 @@ export class CoordinatorBindings {
   }
   async naturalReview(text, { id, conversationId, actor, reference, slackAttribution = false, allowBareConfirmation = false }) {
     const decision = bindingReplyDecision(text, { slackAttribution, allowBareConfirmation });
-    if (!decision || !actorId(actor)) return null;
+    if (!decision || !this.actorId(actor)) return null;
     const state = await this.state(), proposal = state.proposals[reference?.id || state.pending[conversationId]];
-    if (!proposal || proposal.actorId !== actorId(actor)) return null;
+    if (!proposal || proposal.actorId !== this.actorId(actor)) return null;
     return this.review({ id: 'binding-reply:' + hash(id), proposalId: proposal.id, version: reference?.version || proposal.version, decision }, { conversationId, actor, humanInputId: id });
   }
   async propose(input, { operationId, conversationId, actor }) {
-    if (!actorId(actor)) fail('FORBIDDEN', '仅人类当前对话可以提出绑定', 403);
-    const fingerprint = hash(JSON.stringify({ input, conversationId, actor: actorId(actor) }));
+    if (!this.actorId(actor)) fail('FORBIDDEN', '仅人类或显式测试委托可以提出绑定', 403);
+    const fingerprint = hash(JSON.stringify({ input, conversationId, actor: this.actorId(actor), ...(actor.kind === 'bot' ? { delegation: actor } : {}) }));
     const id = 'binding-' + hash(operationId);
     return withFileLock(this.file + '.lock', async () => {
       const state = await this.state(), previous = state.proposals[id];
@@ -79,11 +80,11 @@ export class CoordinatorBindings {
       const chain = coordinatorNodePath(snapshot.memory.map.root, input.nodeId, { nodeIds: this.nodeIds });
       const node = chain.at(-1), before = await this.conversations.get(conversationId);
       const confirmed = !state.pending[conversationId] && Object.values(state.proposals).find(proposal =>
-        proposal.conversationId === conversationId && proposal.actorId === actorId(actor) && pathIdentity(proposal.path) === pathIdentity(chain) &&
+        proposal.conversationId === conversationId && proposal.actorId === this.actorId(actor) && pathIdentity(proposal.path) === pathIdentity(chain) &&
         proposal.review?.decision === 'approved' && before.bindingApproval === 'binding-confirm:' + proposal.id &&
         before.nodeId === input.nodeId && before.kind === input.kind);
       if (confirmed) return visible(confirmed);
-      const proposal = { id, fingerprint, conversationId, actorId: actorId(actor), input: structuredClone(input),
+      const proposal = { id, fingerprint, conversationId, actorId: this.actorId(actor), actor: structuredClone(actor), input: structuredClone(input),
         before: focus(before), node: { id: node.id, title: node.title, purpose: node.purpose, label: coordinatorNodeLabel(node) },
         path: chain.map(node => ({ id: node.id, title: node.title, purpose: node.purpose, label: coordinatorNodeLabel(node) })),
         pathText: coordinatorPathText(chain) };
@@ -99,10 +100,11 @@ export class CoordinatorBindings {
     if (!input || Object.keys(input).some(key => !['id', 'proposalId', 'version', 'decision'].includes(key)) ||
         typeof input.id !== 'string' || !input.id || input.id.length > 160 || typeof input.proposalId !== 'string' ||
         typeof input.version !== 'string' || !['approved', 'rejected'].includes(input.decision)) fail('INVALID_ARGUMENT', '请确认具体的绑定建议', 400);
-    if (!actorId(actor)) fail('FORBIDDEN', '绑定必须由人类确认', 403);
+    if (!this.actorId(actor)) fail('FORBIDDEN', '绑定必须由人类或显式测试委托确认', 403);
     const fingerprint = hash(JSON.stringify({ proposalId: input.proposalId, version: input.version,
-      decision: input.decision, conversationId, actorId: actorId(actor) }));
+      decision: input.decision, conversationId, actorId: this.actorId(actor), ...(actor.kind === 'bot' ? { actor } : {}) }));
     return withFileLock(this.file + '.lock', async () => {
+      if (!this.actorId(actor)) fail('FORBIDDEN', '绑定授权已撤销', 403);
       const state = await this.state(), previous = state.reviews[input.id];
       if (previous) {
         if (previous.fingerprint !== fingerprint) fail('ID_REUSED', '确认请求已用于其他内容');
@@ -110,7 +112,7 @@ export class CoordinatorBindings {
       }
       const proposal = state.proposals[input.proposalId];
       if (!proposal || proposal.conversationId !== conversationId) fail('NOT_FOUND', '此对话没有该绑定建议', 404);
-      if (proposal.actorId !== actorId(actor)) fail('FORBIDDEN', '只能由提出需求的人确认绑定', 403);
+      if (proposal.actorId !== this.actorId(actor)) fail('FORBIDDEN', '只能由提出需求的操作者确认绑定', 403);
       if (proposal.version !== input.version) fail('VERSION_CONFLICT', '绑定建议已变化');
       if (proposal.review) {
         if (proposal.review.decision !== input.decision || proposal.review.fingerprint !== fingerprint) fail('CONFLICT', '该建议已处理');
@@ -131,7 +133,7 @@ export class CoordinatorBindings {
         path: proposal.path, pathText: proposal.pathText, conversationId,
         ...(humanInputId ? { humanInputId } : {}),
         message: input.decision === 'approved' ? '已确认绑定到' + coordinatorNodeLabel(proposal.node) : '暂不绑定，继续讨论' };
-      proposal.review = { decision: input.decision, fingerprint, result };
+      proposal.review = { decision: input.decision, fingerprint, result, actor: structuredClone(actor) };
       delete state.pending[conversationId]; state.reviews[input.id] = { fingerprint, result };
       await atomicWrite(this.file, encode(state));
       return result;

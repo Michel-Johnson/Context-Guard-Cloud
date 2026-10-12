@@ -3,7 +3,7 @@ import { readSlackHistory } from './history.mjs';
 import { MAX_TOTAL_IMAGE_BYTES } from './slack-io.mjs';
 import { activeMentions, explicitlyAddressed } from './mentions.mjs';
 import { SlackFeedback } from './feedback.mjs';
-import { validateDiscussionBots, isSlackBotMessage } from '../../../scripts/cloud/slack-bot-identity.mjs';
+import { validateDiscussionBots, validateTestBots, isSlackBotMessage } from '../../../scripts/cloud/slack-bot-identity.mjs';
 import { slackReactionEmojis } from '../../../scripts/cloud/slack-reactions.mjs';
 import { homeView, nodesOf, modal, formValues, messageBlocks, approvalBlocks, bindingBlocks, projectChoiceBlocks, projectOptions, modelChoiceBlocks, section, plain, escape } from './views.mjs';
 
@@ -78,8 +78,10 @@ function safeEnvelope(type, body) {
 function contextFrom(binding, userId, id) { return { id, userId, projectId: binding.projectId, conversationId: binding.conversationId }; }
 
 export class SlackPlugin {
-  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [], zcodeOfferChannels = [], discussionBots = [] }) {
+  constructor({ store, gateway, io, teamId, cloudOrigin, botUserId, pollMs = 1000, collectMs = 800, maxCollectMs = 2000, logger = console, cursorOfferChannels = [], zcodeOfferChannels = [], discussionBots = [], testBots = [] }) {
     this.discussionBots = structuredClone(validateDiscussionBots(discussionBots));
+    this.testBots = structuredClone(validateTestBots(testBots));
+    if (this.testBots.some(x => this.discussionBots.some(y => y.userId === x.userId))) throw new TypeError('测试Bot与讨论Bot身份不能重叠');
     if (!Array.isArray(cursorOfferChannels) || cursorOfferChannels.length > 20 ||
         cursorOfferChannels.some(value => typeof value !== 'string' || !/^[CG][A-Z0-9]{1,31}$/.test(value)) ||
         new Set(cursorOfferChannels).size !== cursorOfferChannels.length) throw new TypeError('Configure explicit Cursor offer channel IDs');
@@ -443,7 +445,10 @@ export class SlackPlugin {
       if (!transient && !error.silent && !mergedFailure) await this.reportError(id, entry.envelope.body, error).catch(() => {});
     }
   }
-  async command(type, binding, userId, id, payload = {}) { return this.gateway.command(type, { ...contextFrom(binding, userId, id), payload }); }
+  async command(type, binding, userId, id, payload = {}) {
+    const grant = this.testBots.find(x => x.userId === userId && x.projectId === binding.projectId && x.channelId === binding.channel);
+    return this.gateway.command(type, { ...contextFrom(binding, userId, id), ...(grant ? { botId: grant.botId, channelId: binding.channel } : {}), payload });
+  }
   async process(id, { type, body }) {
     const resumed = this.store.data.inbox[id]?.projectResume;
     if (resumed) return this.store.data.inbox[id]?.modelMenuIntent
@@ -453,7 +458,7 @@ export class SlackPlugin {
       if (body.event?.type === 'app_home_opened') return this.publishHome(userId, id);
       if (body.event?.type === 'link_shared') return this.unfurl(id, body.event);
       if (['message', 'app_mention'].includes(body.event?.type) && !body.event.hidden && body.event.user !== this.botUserId &&
-          this.discussionBots?.some(x => x.userId === body.event.user)) return this.botMessage(id, body.event);
+          (this.discussionBots?.some(x => x.userId === body.event.user) || this.testBots?.some(x => x.userId === body.event.user))) return this.botMessage(id, body.event);
       if (isMessage(body.event) && body.event.user !== this.botUserId) return this.message(id, body.event, this.store.data.inbox[id]?.requestedProjectId || null);
       if (isSlackBotMessage(body.event) && body.event.user !== this.botUserId) return this.botMessage(id, body.event);
       return;
@@ -984,6 +989,7 @@ export class SlackPlugin {
     return structuredClone(metadata);
   }
   async botMessage(id, event) {
+    if (this.testBots.some(x => x.userId === event.user)) return this.testBotMessage(id, event);
     const key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts), binding = this.store.data.threads[key];
     let botId = event.bot_id || event.bot_profile?.id;
     if (!botId) {
@@ -1034,6 +1040,51 @@ export class SlackPlugin {
     await this.gateway.command('conversation.discuss', { id: intent.submitId || operationId(id, 'bot-submit'), userId: event.user, botId,
       channelId: event.channel, projectId: binding.projectId, conversationId: binding.conversationId, payload: intent.payload });
     await this.store.updateThread(key, current => { current.awaitingReplyId = intent.inputId; current.nextPoll = 0; });
+  }
+  async testBotMessage(id, event) {
+    const grant = this.testBots.find(x => x.userId === event.user && x.channelId === event.channel);
+    let botId = event.bot_id || event.bot_profile?.id;
+    if (!grant || event.user === this.botUserId || !/^\d+\.\d+$/.test(event.ts || '') ||
+        typeof event.text !== 'string' || !event.text.trim() || event.text.length > 8000) return;
+    if (!botId) {
+      const identity = (await this.io.call('users.info', { user: event.user }))?.user;
+      if (identity?.id !== event.user || identity.is_bot !== true || identity.profile?.bot_id !== grant.botId) return;
+      botId = identity.profile.bot_id;
+    }
+    if (botId !== grant.botId) return;
+    let command = null;
+    if (event.text.startsWith('CG_TEST_COMMAND ')) {
+      try { command = JSON.parse(event.text.slice('CG_TEST_COMMAND '.length)); }
+      catch { throw Object.assign(new Error('测试命令需要JSON'), { code: 'INVALID_ARGUMENT' }); }
+      const types = ['project.read', 'conversation.state', 'conversation.cursor', 'conversation.zcode', 'conversation.interrupt',
+        'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read',
+        'attachment.upload', 'attachment.read', 'task.acceptance', 'session.complete', 'session.publish'];
+      if (!command || Object.keys(command).some(k => !['type', 'payload'].includes(k)) || !types.includes(command.type) ||
+          !command.payload || typeof command.payload !== 'object' || Array.isArray(command.payload)) throw Object.assign(new Error('测试命令不在当前项目业务范围'), { code: 'FORBIDDEN' });
+    }
+    const key = threadKey(this.teamId, event.channel, event.thread_ts || event.ts);
+    let binding = this.store.data.threads[key];
+    if (binding && binding.projectId !== grant.projectId) return;
+    const nativeId = operationId(JSON.stringify([this.teamId, event.channel, event.ts, event.user, botId]), 'test-bot-message');
+    const metadata = { userId: event.user, botId, channelId: event.channel, projectId: grant.projectId };
+    if (!binding) {
+      const created = await this.gateway.command('conversation.create', { id: operationId(nativeId, 'create'), ...metadata, payload: {} });
+      binding = await this.store.bind(key, { channel: event.channel, threadTs: event.thread_ts || event.ts,
+        projectId: grant.projectId, conversationId: created.conversationId, userId: event.user, ownRequests: [] });
+    }
+    // 审批必须由Bot显式提交准确版本，不让模型从“我同意”等正文猜审批。
+    if (command) {
+      const result = await this.gateway.command(command.type, { id: operationId(nativeId, 'command'), ...metadata,
+        conversationId: binding.conversationId, payload: command.payload });
+      await this.io.post({ id: operationId(nativeId, 'receipt'), channel: event.channel, threadTs: binding.threadTs,
+        text: JSON.stringify({ type: command.type, result }) });
+      return;
+    }
+    const inputId = operationId(nativeId, 'input');
+    await this.store.updateThread(key, current => { current.ownRequests ||= []; if (!current.ownRequests.includes(inputId)) current.ownRequests.push(inputId); });
+    await this.gateway.command('conversation.submit', { id: operationId(nativeId, 'submit'), ...metadata,
+      conversationId: binding.conversationId, payload: { inputs: [{ id: inputId, text: event.text }], followup: 'queue' } });
+    await this.store.updateThread(key, current => { current.awaitingReplyId = inputId; current.nextPoll = 0; });
   }
   async message(id, event, expectedProjectId = null, events = [event], recovery = null) {
     const direct = event.channel_type === 'im' || event.channel?.startsWith('D');

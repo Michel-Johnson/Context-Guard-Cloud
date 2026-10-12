@@ -57,6 +57,16 @@ Coordinator 可在已进入回复的轮次，用 👍、❤️、😄、👏、�
 
 ## 可靠性与边界
 
+### 显式测试 Bot 委托
+
+默认关闭。仅安装管理者在私有网关配置加入 `testProjectIds`（必须是已有 `projectIds` 的子集）与 `testBots`；插件的私有 `CONTEXT_GUARD_SLACK_TEST_BOTS` 使用同一 JSON 数组。每个条目必须含准确 `userId`、`botId`、单一 `projectId`、单一 `channelId`、人工授权记录 `authorizationId` 与授权者 Slack ID `authorizedBy`。不接受通配符、自授权、正文授权或讨论白名单与测试委托重叠；真实账号及凭据不写入公开仓库。
+
+测试委托可在指定频道自行建立项目对话、准备需求、确认绑定/brief、编辑或删除 Main 事项、验收任务、完成 Session 和发布 Map；身份始终为 Bot，审计保存人工委托来源。不授予工作区管理员、跨项目、生产或管理员恢复权限。执行宿主仍须该测试项目配置对应模板及 `cursorExecution`/`zcodeExecution` 用户授权；普通 manual 对话不因委托自动派发。
+
+普通 Bot 文字进入 Coordinator 测试对话。精确审批和直接业务操作使用原生消息 `CG_TEST_COMMAND {"type":"brief.review","payload":{"proposalId":"来自conversation.state的准确ID","version":"准确版本","decision":"approved","reason":"测试确认"}}`；同样支持 `binding.review`、`map.write`、`task.acceptance`、`session.complete`、`session.publish`、模型选择、附件及现有执行入口。项目和对话由当前频道/线程固定，不接受正文更换身份或项目。`task.acceptance` 引用当前通过的 CI；Session 完成与发布仍分别核对准确版本、代际和已合入源码，委托不是测试/合入门禁豁免。
+
+撤权时移除两端私有测试授权并重启对应服务；旧成功回执、原线程或历史文字不能恢复权限。更新顺序是 Cloud 后插件，保留既有状态及未完成请求。源码/隔离测试通过不表示真实 Slack、配置或部署已生效。
+
 普通消息采用合并策略：同一次 Coordinator 模型调用先决定是否接话，再直接回答或调用允许的工具。简单答复不另调用分类模型；工具需要的续轮照常保留。直接调用工具时，模型选择本轮 `reply_` 开头的工具明确声明接话；参数格式不变，宿主在完整响应校验后调用原业务工具。缺少声明、未知工具或静默时夹带正文、工具均拒绝执行。每个新批次重新判断，历史与引用不授予权限。
 
 内部标识和工具别名不展示为用户正文。原生工具名、输入及回执在内部历史中保持原值；别名不能扩大工具、操作者或项目权限，也不代替人工审批。

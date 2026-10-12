@@ -1,5 +1,11 @@
 # Cloud 验证台账
 
+## SLACK-TEST-BOT-DELEGATION-20261012 · 指定测试项目的显式委托
+
+- [ ] 独立 Review/Tester 核准确修订：测试委托默认关闭，固定 workspace/Bot/单项目/单频道/人工授权记录；普通讨论Bot仍只读，禁止正文伪造授权及人类身份，跨项目/频道、版本冲突、撤权与旧回执重放均失败关闭。
+- [ ] 正式包及真实指定测试频道验收：核原生Bot ID与授权者身份，两端私有配置一致，需求讨论、精确绑定/brief审批、既有模板执行、CI验收、Session完成及源码合入后的Map发布均保留Bot审计。隔离HTTP、Core/Git与模型/Slack IO替身通过不能代替线上已生效；不开放生产、跨项目或管理员恢复权限。
+- [ ] 新字节完整门禁须单独收口：Node18完整运行在原挂载事项用例出现fetch失败并超时；Node22复验原owning-backend缺失ACK用例出现“Heartbeat receipt is no longer current”。两域隔离复验分别1/1与4/4通过，首次失败保留，未确定成因，不以重跑通过宣称已修复。源码补丁未提交、发布或部署。
+
 ## MANUAL-HANDOFF-REPAIR-20261012 · 已结束事项与源码交接
 
 - [ ] 独立 Tester 在准确部署修订复验原已结束事项：权威 closed/cancelled、完成回执、busy/generation 与并发门禁正确；可重新准备人工 brief，原事项、attempt 与派发历史保留。合成 HTTP 闭环不代替原真实任务。
