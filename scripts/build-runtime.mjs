@@ -42,34 +42,38 @@ async function walk(directory, prefix = '') {
   return result;
 }
 
-export async function buildRuntime({ experimentalCore = null } = {}) {
+async function verifyExperimental(name, source, descriptor, artifact) {
+  if (!path.isAbsolute(artifact.artifact || '') || !/^[a-f0-9]{64}$/.test(artifact.sha256 || '')) throw new Error('Use an absolute experimental artifact and exact SHA-256');
+  const bytes = await fs.readFile(artifact.artifact);
+  const installed = JSON.parse(await fs.readFile(path.join(root, 'node_modules/.package-lock.json'), 'utf8')).packages?.['node_modules/' + name];
+  if (hash(bytes) !== artifact.sha256 || descriptor.name !== name || !/^\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?$/.test(descriptor.version) ||
+      installed?.version !== descriptor.version || installed?.integrity !== 'sha512-' + createHash('sha512').update(bytes).digest('base64')) {
+    throw new Error('Experimental artifact or installed package does not match its fixed checksum');
+  }
+  const files = await walk(source);
+  const packed = execFileSync('tar', ['-tzf', artifact.artifact], { encoding: 'utf8', windowsHide: true }).trim().split(/\r?\n/);
+  if (JSON.stringify(packed.sort()) !== JSON.stringify(files.map(file => 'package/' + file).sort())) throw new Error('Experimental archive and installed file sets differ');
+  for (const file of files) {
+    const expected = execFileSync('tar', ['-xOf', artifact.artifact, 'package/' + file], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+    if (!expected.equals(await fs.readFile(path.join(source, file)))) throw new Error('Experimental installed bytes differ from the fixed artifact');
+  }
+  return { sha256: artifact.sha256 };
+}
+
+export async function buildRuntime({ experimentalCore = null, experimentalWorkbench = null } = {}) {
   await assertDestination('.runtime-generated.json');
   const packageManifest = JSON.parse(await fs.readFile(path.join(root, 'package.json'), 'utf8'));
-  const outputs = new Map(), packages = {};
+  const outputs = new Map(), packages = {}, verified = new Map();
   for (const [name, destination, accepts, rename = file => file] of mappings) {
     const source = path.dirname(require.resolve(`${name}/package.json`));
     const descriptor = JSON.parse(await fs.readFile(path.join(source, 'package.json'), 'utf8'));
     const expected = packageManifest.dependencies?.[name];
     const releaseURL = `https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/shared-v${descriptor.version}/michelj-${name.split('/')[1]}-${descriptor.version}.tgz`;
+    const artifact = name === '@michelj/context-guard-core' ? experimentalCore : experimentalWorkbench;
     let experimental = null;
-    if (experimentalCore && name === '@michelj/context-guard-core') {
-      const bytes = await fs.readFile(experimentalCore.artifact);
-      const installed = JSON.parse(await fs.readFile(path.join(root, 'node_modules/.package-lock.json'), 'utf8')).packages?.['node_modules/' + name];
-      if (!/^[a-f0-9]{64}$/.test(experimentalCore.sha256 || '') || hash(bytes) !== experimentalCore.sha256 ||
-        !/^\d+\.\d+\.\d+-native-json\.\d+$/.test(descriptor.version) || descriptor.name !== name ||
-        installed?.version !== descriptor.version || installed?.integrity !== 'sha512-' + createHash('sha512').update(bytes).digest('base64')) {
-        throw new Error('Experimental Core artifact or installed package does not match its fixed checksum');
-      }
-      const archive = path.resolve(experimentalCore.artifact), installedFiles = await walk(source);
-      const packedFiles = execFileSync('tar', ['-tzf', archive], { encoding: 'utf8', windowsHide: true }).trim().split(/\r?\n/);
-      if (JSON.stringify(packedFiles.sort()) !== JSON.stringify(installedFiles.map(file => 'package/' + file).sort())) {
-        throw new Error('Experimental Core archive and installation file sets differ');
-      }
-      for (const file of installedFiles) {
-        const packed = execFileSync('tar', ['-xOf', archive, 'package/' + file], { windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
-        if (!packed.equals(await fs.readFile(path.join(source, file)))) throw new Error('Experimental Core installed bytes differ from the fixed artifact');
-      }
-      experimental = { sha256: experimentalCore.sha256 };
+    if (artifact) {
+      if (!verified.has(name)) verified.set(name, await verifyExperimental(name, source, descriptor, artifact));
+      experimental = verified.get(name);
     } else if (descriptor.name !== name || !/^\d+\.\d+\.\d+$/.test(descriptor.version) || expected !== releaseURL) throw new Error(`Unexpected runtime dependency: ${name}`);
     packages[name] = { version: descriptor.version, dependency: expected, ...(experimental ? { experimental } : {}) };
     for (const file of await walk(source)) {
@@ -113,7 +117,11 @@ export async function buildRuntime({ experimentalCore = null } = {}) {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const index = process.argv.indexOf('--experimental-core');
-  const experimentalCore = index < 0 ? null : { artifact: process.argv[index + 1], sha256: process.argv[index + 2] };
-  buildRuntime({ experimentalCore }).catch(error => { console.error(error.message); process.exitCode = 1; });
+  const args = process.argv.slice(2), options = {};
+  for (let i = 0; i < args.length; i += 3) {
+    const name = { '--experimental-core': 'experimentalCore', '--experimental-workbench': 'experimentalWorkbench' }[args[i]];
+    if (!name || options[name] || !args[i + 1] || !args[i + 2]) throw new Error('Use explicit experimental package paths and SHA-256 values');
+    options[name] = { artifact: args[i + 1], sha256: args[i + 2] };
+  }
+  buildRuntime(options).catch(error => { console.error(error.message); process.exitCode = 1; });
 }

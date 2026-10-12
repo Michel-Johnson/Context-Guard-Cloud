@@ -17,7 +17,9 @@ export function configuration(env = process.env) {
   return { appToken: env.SLACK_APP_TOKEN, botToken: env.SLACK_BOT_TOKEN, gatewayToken: env.CONTEXT_GUARD_GATEWAY_TOKEN,
     gatewayUrl: env.CONTEXT_GUARD_GATEWAY_URL || 'http://127.0.0.1:8790', cloudOrigin: env.CONTEXT_GUARD_CLOUD_ORIGIN,
     directory: env.CONTEXT_GUARD_SLACK_STATE_DIR || path.join(os.homedir(), '.local', 'state', 'context-guard-slack'), teamId,
+    discussionBots: env.CONTEXT_GUARD_SLACK_DISCUSSION_BOTS ? JSON.parse(env.CONTEXT_GUARD_SLACK_DISCUSSION_BOTS) : [],
     cursorOfferChannels: env.CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS ? env.CONTEXT_GUARD_SLACK_CURSOR_OFFER_CHANNELS.split(',') : [],
+    zcodeOfferChannels: env.CONTEXT_GUARD_SLACK_ZCODE_OFFER_CHANNELS ? env.CONTEXT_GUARD_SLACK_ZCODE_OFFER_CHANNELS.split(',') : [],
     ...(env.CONTEXT_GUARD_SLACK_OPERATOR_DIR ? { operatorDirectory: env.CONTEXT_GUARD_SLACK_OPERATOR_DIR } : {}) };
 }
 async function lock(directory) {
@@ -50,7 +52,7 @@ export async function start(config = configuration()) {
     const gateway = new Gateway({ url: config.gatewayUrl, token: config.gatewayToken, teamId: config.teamId });
     const io = new SlackIO({ client, store, botUserId: authentication.user_id, botToken: config.botToken });
     plugin = new SlackPlugin({ store, gateway, io, teamId: config.teamId, cloudOrigin: config.cloudOrigin, botUserId: authentication.user_id,
-      cursorOfferChannels: config.cursorOfferChannels });
+      cursorOfferChannels: config.cursorOfferChannels, zcodeOfferChannels: config.zcodeOfferChannels, discussionBots: config.discussionBots });
     if (config.operatorDirectory) {
       await operatorDirectory(config.operatorDirectory, process.getgid());
       const sourceHash = await recoverySourceHash();

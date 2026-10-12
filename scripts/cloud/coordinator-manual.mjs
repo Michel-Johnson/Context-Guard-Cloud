@@ -42,7 +42,8 @@ export function coordinatorRolePrompt(source, { manual = false } = {}) {
     throw new MapError('INVALID_COORDINATOR_PROFILE', 'Coordinator manual role profile is empty or ambiguous', 503);
   }
   const boundary = heading - (source.slice(0, heading).endsWith('\r\n') ? 2 : heading ? 1 : 0);
-  return manual ? `# Coordinator\n\n${profile}\n` : source.slice(0, boundary);
+  const common = source.slice(0, source.indexOf('## 开始工作') >= 0 ? source.indexOf('## 开始工作') : boundary).trim();
+  return manual ? `${common}\n\n${profile}\n` : source.slice(0, boundary);
 }
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);

@@ -9,6 +9,16 @@ export const isExperimentTask = (project, task) => Array.isArray(project?.comple
     Number.isSafeInteger(item.generation) && item.generation > 0 && item.generation === task.session.generation &&
     /^[a-f0-9]{40}$/.test(item.sourceSha || '') && item.sourceSha === task.sourceSha);
 
+// 展示给模型的要求与服务端实验策略一致；发布等待不等于实验收工门禁。
+export function coordinatorCompletionPolicy(project, task) {
+  const proof = task.completion?.proof;
+  if (isExperimentTask(project, task) || proof?.experimentOnly && experimentEvidenceMatches(proof, task)) return {
+    mode: 'experiment-only', requiresPublication: false, gitReceiptRef: 'experiment-only', archiveReceiptRef: task.ci?.ref,
+    instruction: '保留准确提交、独立CI及本轮人审；通知原Executor实际归档、结束本地计划。该实验不创建PR、不发布Main，publication等待不是收工前提。核本地完成后用本回执调用complete_task，等待宿主closed，不能把技术passed或closing说成完成。',
+  };
+  return { mode: 'merged', requiresPublication: true };
+}
+
 const experimentEvidenceMatches = (proof, task) => proof.taskId === task.id && proof.sourceSha === task.sourceSha &&
   proof.sessionId === task.session?.id && proof.generation === task.session?.generation &&
   !!proof.ciRef && !!proof.ciVersion && proof.ciRef === task.ci?.ref && proof.ciVersion === task.ci?.version &&
