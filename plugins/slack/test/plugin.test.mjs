@@ -46,6 +46,65 @@ test('Slack operator parity prompt export preserves the returned document', asyn
   await f.plugin.mirror(key); await f.plugin.mirror(key);
   assert.equal(f.sent.filter(x => x.export?.text === '准确提示正文').length, 1);
 });
+
+async function operatorFixture(t) {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, sessionId: `slack:${teamId}:${user}` };
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: ['r'] });
+  const state = { status: 'waiting-for-user', activeTurnId: null, approvals: [], messages: [
+    { role: 'user', requestId: 'r', source: 'slack', actor, text: '直接启用本地执行' },
+    { id: 'a', role: 'assistant', requestId: 'r', source: 'slack', actor, text: '', actions: [
+      { kind: 'slack-operation', actionId: 'saved', requestId: 'r', actor, label: '启用本地 ZCode' }] }] };
+  const result = { status: 'applied', type: 'conversation.zcode', label: '启用本地 ZCode', performedBy: 'coordinator' };
+  return { ...f, key, state, result };
+}
+
+test('Slack operator parity lost success notice response preserves applied status and same message', async t => {
+  const f = await operatorFixture(t), updates = [];
+  let committed, reads = 0, businessCalls = 0, posts = 0;
+  f.gateway.command = async type => type === 'conversation.state' ? f.state : (businessCalls++, f.result);
+  f.plugin.io = new SlackIO({ store: f.store, botUserId: bot, now: () => 999999, wait: async () => {}, client: {
+    async apiCall(method, input) {
+      if (method === 'chat.postMessage') {
+        posts++; committed = input;
+        throw Object.assign(new Error('Synthetic lost response after platform commit'), { code: 'ECONNRESET' });
+      }
+      if (method === 'conversations.replies') return { messages: ++reads === 1 ? [] : [
+        { user: bot, ts: '999.001', metadata: committed.metadata }] };
+      if (method === 'chat.update') { updates.push(input); return { ok: true }; }
+      return {};
+    },
+  } });
+  await f.plugin.mirror(f.key);
+  assert.equal(f.store.data.threads[f.key].mirrored['operator:saved'].status, 'applied');
+  assert.equal(f.store.data.threads[f.key].mirrored['operator:saved'].ts, undefined);
+  assert.equal(f.store.data.threads[f.key].mirrored['operator:saved'].result.status, 'applied');
+  await f.plugin.mirror(f.key);
+  assert.equal(f.store.data.threads[f.key].mirrored['operator:saved'].ts, '999.001');
+  assert.equal(businessCalls, 1); assert.equal(posts, 1); assert.deepEqual(updates, []);
+  assert.match(committed.text, /^已代操作：/);
+});
+
+test('Slack operator parity lost gateway response retries the same original action ID', async t => {
+  const f = await operatorFixture(t), requests = [];
+  f.plugin.gateway = new Gateway({ url: 'http://127.0.0.1:9876', token: 'synthetic-only', teamId,
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      if (request.type === 'conversation.state') return Response.json({ ok: true, data: f.state });
+      requests.push(request);
+      if (requests.length === 1) throw new TypeError('fetch failed', {
+        cause: Object.assign(new Error('Synthetic lost response after business commit'), { code: 'ECONNRESET' }) });
+      return Response.json({ ok: true, data: f.result });
+    },
+  });
+  await f.plugin.mirror(f.key);
+  assert.notEqual(f.store.data.threads[f.key].mirrored['operator:saved']?.status, 'failed');
+  assert.ok(!f.sent.some(item => item.text?.includes('代操作未成功')));
+  await f.plugin.mirror(f.key);
+  assert.equal(requests.length, 2); assert.deepEqual(requests[1], requests[0]);
+  assert.equal(f.store.data.threads[f.key].mirrored['operator:saved'].status, 'applied');
+  assert.equal(f.sent.filter(item => item.text === '已代操作：启用本地 ZCode。').length, 1);
+});
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
   const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');
