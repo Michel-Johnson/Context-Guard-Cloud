@@ -41,7 +41,7 @@ test('ZCode conversation enable is idempotent and cannot switch an existing Curs
 
 test('ZCode gateway enables only a registered local template and rechecks revoked access', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-zcode-http-'));
-  let cloud;
+  let cloud, delegate = false, delegateCalls = 0;
   t.after(async () => { await cloud?.close(); await fs.rm(directory, { recursive: true, force: true }); });
   const templateId = '11111111-1111-4111-8111-111111111111';
   const providerFile = path.join(directory, 'model.json');
@@ -56,18 +56,24 @@ test('ZCode gateway enables only a registered local template and rechecks revoke
     v: 1, bootstrap: 'ready', root: { id: 'T0', title: 'Synthetic project', kind: 'module', state: 'dirty', owns: [], children: [] },
   } } }, sessions: {}, receipts: {}, history: [], events: [], eventCursors: {}, closedSessions: {} }));
   const integrationConfig = { host: '127.0.0.1', port: 0, token: 'synthetic-slack-integration-credential',
-    teamId: 'TTEST', projectIds: ['context-guard'], actions: ['conversation.create', 'conversation.zcode', 'conversation.state'],
+    teamId: 'TTEST', projectIds: ['context-guard'], actions: ['conversation.create', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.operator-action'],
     zcodeExecution: { 'context-guard': { templateSessionId: templateId, userIds: ['UTEST'] } } };
   cloud = await startCloudServer({ dataDir: directory, port: 0, publicOrigin: 'https://zcode.example',
     memoryConfig, integrationConfig, protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'context-guard', slug: 'example/repo' }] },
-    coordinatorModelFactory: () => ({ next: async () => ({ stop: 'end_turn', content: [{ type: 'text', text: 'Synthetic reply' }] }) }) });
+    coordinatorModelFactory: () => ({ next: async ({ messages }) => {
+      if (!delegate) return { stop: 'end_turn', content: [{ type: 'text', text: 'Synthetic reply' }] };
+      delegateCalls++;
+      const input = delegateCalls === 1 ? {} : { actionId: JSON.parse(messages.at(-1).content[0].content).actions.find(x => x.type === 'conversation.zcode').id };
+      return { stop: 'tool_use', content: [{ type: 'tool_use', id: `delegate-${delegateCalls}`,
+        name: delegateCalls === 1 ? 'get_slack_actions' : 'perform_slack_action', input }] };
+    } }) });
   const store = new ProtocolStore(path.join(directory, 'interface-v2', digest('123')));
   const principal = { repositoryId: '123', deviceId: 'local-device', agentId: templateId, role: 'executor' };
-  const call = async (type, id, conversationId, userId = 'UTEST') => {
+  const call = async (type, id, conversationId, userId = 'UTEST', payload) => {
     const response = await fetch(cloud.integrationUrl + '/v1/command', { method: 'POST',
       headers: { Authorization: 'Bearer ' + integrationConfig.token, 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, teamId: 'TTEST', userId, projectId: 'context-guard', ...(conversationId ? { conversationId } : {}),
-        type, payload: type === 'conversation.zcode' ? { expectedMode: 'manual' } : {} }) });
+        type, payload: payload || (type === 'conversation.zcode' ? { expectedMode: 'manual' } : {}) }) });
     return { status: response.status, body: await response.json() };
   };
   const created = await call('conversation.create', 'new-chat');
@@ -85,4 +91,25 @@ test('ZCode gateway enables only a registered local template and rechecks revoke
   assert.deepEqual((await call('conversation.zcode', 'enable-zcode', conversationId)).body, enabled.body);
   integrationConfig.zcodeExecution['context-guard'].userIds = ['UOTHER'];
   assert.equal((await call('conversation.state', 'revoked-state', conversationId)).status, 403);
+  integrationConfig.zcodeExecution['context-guard'].userIds = ['UTEST'];
+  delegate = true;
+  const delegatedChat = (await call('conversation.create', 'delegated-chat')).body.data.conversationId;
+  const submitted = await call('conversation.submit', 'actual-slack-request', delegatedChat, 'UTEST',
+    { text: '直接启用本地执行，不让我去客户端操作', slackChannelId: 'CTEST' });
+  assert.equal(submitted.status, 200, JSON.stringify(submitted.body));
+  let state;
+  for (let count = 0; count < 50; count++) {
+    state = (await call('conversation.state', 'read-delegated-state', delegatedChat)).body.data;
+    if (!state.activeTurnId && state.status !== 'running') break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(state.status, 'waiting-for-user', JSON.stringify(state.error));
+  const action = state.messages.flatMap(message => message.actions || []).find(item => item.kind === 'slack-operation');
+  assert.ok(action, 'Actual Cloud model tool must create durable host intent');
+  const result = await call('conversation.operator-action', 'host-apply', delegatedChat, 'UTEST', { actionId: action.actionId });
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.data.status, 'applied');
+  assert.equal(result.body.data.performedBy, 'coordinator');
+  assert.equal((await call('conversation.state', 'final-state', delegatedChat)).body.data.executionProvider, 'zcode');
+  assert.deepEqual((await call('conversation.operator-action', 'host-apply', delegatedChat, 'UTEST', { actionId: action.actionId })).body, result.body);
 });

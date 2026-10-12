@@ -52,6 +52,8 @@ export const coordinatorTools = [
   definition('list_sessions', 'List assigned execution Sessions and their exact executionSessionId.', {}),
   definition('get_execution_capabilities', '查询当前项目、本轮身份下ZCode/Cursor执行能力、是否启用和设备状态。它们是执行宿主，不是文字模型；不派发、不切模型、不授权限。以回执解释下一步，未知状态不得说在线。', {}),
   definition('list_conversations', 'List saved Coordinator conversations; their IDs are not executionSessionId.', {}),
+  definition('get_slack_actions', '读取你可以代用户执行的当前Slack按钮动作，名称和编号来自实际状态。无需用户换入口或再次开启；不要把已登录用户的操作能力说成你不能执行。', {}),
+  definition('perform_slack_action', '代当前Slack用户执行get_slack_actions返回的按钮动作，包括执行端启用、方案/挂载确认或退回、验收和模型选择。只传返回的动作编号；请求保存不等于执行成功，等宿主回执。', { actionId: string }),
   definition('read_map', 'Read one published Main node and its direct children; omit nodeId for root.', { nodeId: string }, []),
   definition('show_nodes', 'Show 1–3 Main node recommendation buttons.', { message: string, nodeIds, replyComplete }, ['message', 'nodeIds']),
   definition('open_node', 'Open one Main node in the workbench.', { nodeId: string, replyComplete }, ['nodeId']),
@@ -144,6 +146,10 @@ export function createCoordinatorExecutor(ctx) {
       return ctx.selectModel(input, options);
     }
     if (name === 'list_sessions') return ctx.listSessions();
+    if (['get_slack_actions', 'perform_slack_action'].includes(name)) {
+      if (!canUseSlackProjectTool('list_projects', options)) throw Object.assign(new Error('Use the verified current Slack operator'), { code: 'TOOL_FORBIDDEN' });
+      return name === 'get_slack_actions' ? ctx.slackActions(options) : ctx.performSlackAction(input, options);
+    }
     if (name === 'get_execution_capabilities') return ctx.executionCapabilities(options);
     if (name === 'list_conversations') return ctx.listConversations();
     if (name === 'read_map') return { ...(await ctx.readMap(input.nodeId)), kind: 'map-read', actionId: operationId };

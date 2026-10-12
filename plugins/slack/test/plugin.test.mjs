@@ -20,6 +20,22 @@ import { hash } from '../../../scripts/shared/io.mjs';
 import { configuration as slackConfiguration } from '../src/main.mjs';
 
 const teamId = 'T0BRW7G4Q6P', user = 'U000001', channel = 'C000001', bot = 'U000BOT';
+test('Slack operator parity host executes saved intent once after the model turn settles', async t => {
+  const f = await fixture(t), key = threadKey(teamId, channel, '123.001');
+  const actor = { kind: 'human', integration: 'slack', teamId, userId: user, sessionId: `slack:${teamId}:${user}` };
+  await f.store.bind(key, { channel, threadTs: '123.001', projectId: 'lab', conversationId: 'chat-one', userId: user, ownRequests: ['r'] });
+  const state = { status: 'running', activeTurnId: 'r', approvals: [], messages: [
+    { role: 'user', requestId: 'r', source: 'slack', actor, text: '启用本地执行' },
+    { id: 'a', role: 'assistant', requestId: 'r', source: 'slack', actor, text: '', actions: [
+      { kind: 'slack-operation', actionId: 'saved', requestId: 'r', actor, label: '启用本地 ZCode' }] }] };
+  let calls = 0;
+  f.gateway.command = async type => type === 'conversation.operator-action' ? (calls++, { status: 'applied', label: '启用本地 ZCode' }) : state;
+  await f.plugin.mirror(key); assert.equal(calls, 0);
+  state.status = 'waiting-for-user'; state.activeTurnId = null;
+  await f.plugin.mirror(key); await f.plugin.mirror(key);
+  assert.equal(calls, 1);
+  assert.equal(f.sent.filter(x => x.text === '已代操作：启用本地 ZCode。').length, 1);
+});
 test('绑定确认卡片展示真实名称路径与描述，内部身份仅在按钮载荷中', () => {
   const proposal = { id: 'internal-proposal', version: 'internal-version', pathText: '项目：目标\n└─ 工程：职责\n  └─ 测试：回归', reason: '该需求主要影响测试模块。' };
   const blocks = bindingBlocks(proposal, 'internal-thread');

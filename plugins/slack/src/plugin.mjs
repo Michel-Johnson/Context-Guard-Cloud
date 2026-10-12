@@ -1477,6 +1477,29 @@ export class SlackPlugin {
     const readyReactions = new Set(await this.queueReadReactions(key, state));
     this.drainReactions(readyReactions);
     for (const { message, index, requestId, id, userId } of entries) {
+      const operations = (message.actions || []).filter(action => action.kind === 'slack-operation');
+      if (operations.length && !message.partial && !state.activeTurnId && ['waiting-for-user', 'idle'].includes(state.status)) {
+        for (const action of operations) {
+          const slot = `operator:${action.actionId}`;
+          if (this.store.data.threads[key].mirrored[slot]) continue;
+          if (!userId || !binding.ownRequests?.includes(action.requestId) || action.actor?.userId !== userId ||
+              action.actor?.teamId !== this.teamId || action.actor?.sessionId !== `slack:${this.teamId}:${userId}`) continue;
+          try {
+            const result = await this.command('conversation.operator-action', binding, userId,
+              operationId(action.actionId, 'operator-action'), { actionId: action.actionId });
+            if (result.status !== 'applied') throw Object.assign(new Error('Action was not confirmed'), { code: 'GATEWAY_BAD_RESPONSE' });
+            const ts = await this.io.post({ id: operationId(action.actionId, 'operator-result'), channel: binding.channel,
+              threadTs: binding.threadTs, text: `已代操作：${result.label}。` });
+            await this.store.update(data => { data.threads[key].mirrored[slot] = { ts, status: 'applied' }; data.threads[key].nextPoll = 0; });
+          } catch (error) {
+            if (['COORDINATOR_BUSY', 'INTEGRATION_TIMEOUT', 'GATEWAY_TIMEOUT'].includes(error.code)) continue;
+            const ts = await this.io.post({ id: operationId(action.actionId, 'operator-result'), channel: binding.channel,
+              threadTs: binding.threadTs, text: `代操作未成功：${action.label}。原请求已保留（${error.code || '通信错误'}）。` });
+            await this.store.update(data => { data.threads[key].mirrored[slot] = { ts, status: 'failed', code: error.code }; });
+          }
+        }
+      }
+      if (operations.length) continue;
       if (message.actions?.some(action => action.kind === 'project-switch')) {
         const switched = await this.applyProjectSwitch(key, message, messages, state);
         if (switched) {

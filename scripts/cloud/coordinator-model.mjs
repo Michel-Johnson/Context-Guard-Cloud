@@ -532,7 +532,7 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
   const projectReadInput = currentProjectReadInput(state);
   const executableTools = sourceTools.filter(tool => readProjectTools.includes(tool.name)
     ? !!projectReadInput?.id && canUseSlackProjectTool(tool.name, projectReadInput)
-    : (!['react_to_user', 'select_text_model', 'switch_project'].includes(tool.name) || trustedSlackInput) &&
+      : (!['react_to_user', 'select_text_model', 'switch_project', 'get_slack_actions', 'perform_slack_action'].includes(tool.name) || trustedSlackInput) &&
       (tool.name !== 'switch_project' || canUseSlackProjectTool(tool.name, state.activeInput)));
   const availableModelTools = tools.filter(tool => !projectTools.includes(tool.name) || executableTools.includes(tool));
   // Private operator diagnostics only; public timing and transcript contracts
@@ -791,8 +791,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
             ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(readProjectTools.includes(name) ? { source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id }
-              : ['select_text_model', 'switch_project'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
-                ...(name === 'switch_project' ? { requestId: state.activeInput.id } : {}) } : {}) });
+                : ['select_text_model', 'switch_project', 'get_slack_actions', 'perform_slack_action'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
+                ...(['switch_project', 'get_slack_actions', 'perform_slack_action'].includes(name) ? { requestId: state.activeInput.id } : {}) } : {}) });
           const scopedResult = name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
             ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result;
           if (repeatedReaction && canonical(scopedResult) !== canonical(repeatedReaction[1].result)) {
@@ -822,8 +822,8 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
       kind: 'node-read', actionId: receipt.result.actionId, node: { id: receipt.result.node.id, title: receipt.result.node.title || '' },
     });
     else if (!receipt.isError && name === 'react_to_user' && trustedSlackInput && receipt.result?.kind === 'slack-reaction') visible.push(receipt.result);
-    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'binding-proposal', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch'].includes(receipt.result?.kind)) visible.push(receipt.result);
-    if (!receipt.isError && ['conversation-mounted', 'project-switch'].includes(receipt.result?.kind)) transferred = true;
+    else if (!receipt.isError && ['node-references', 'node-navigation', 'node-tour', 'binding-proposal', 'conversation-mounted', 'map-action', 'model-selection', 'project-switch', 'slack-operation'].includes(receipt.result?.kind)) visible.push(receipt.result);
+    if (!receipt.isError && ['conversation-mounted', 'project-switch', 'slack-operation'].includes(receipt.result?.kind)) transferred = true;
     responses.push(toolReply(call, receipt));
   }
   if (visible.length) state.messages.at(-1).actions = visible;

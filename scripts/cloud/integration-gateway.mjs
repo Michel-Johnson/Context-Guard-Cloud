@@ -8,7 +8,7 @@ import { recoveryScope } from './slack-recovery.mjs';
 import { validateDiscussionBots } from './slack-bot-identity.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind', 'conversation.cursor', 'conversation.zcode',
-  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'conversation.operator-action', 'acceptance.review', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
