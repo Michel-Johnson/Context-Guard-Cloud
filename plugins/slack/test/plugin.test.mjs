@@ -1873,6 +1873,35 @@ test('untracked channel messages and unapproved/self bots cannot start model tur
   await f.plugin.process('E2', { type: 'events_api', body: { event: event({ bot_id: 'B', user: bot }) } }); assert.equal(f.calls.length, 0);
 });
 
+test('测试委托Bot在准确频道可启动及显式审批，未知/跨频道/生产线程不发送业务', async t => {
+  const grant = { userId: 'UMICHAEL', botId: 'BMICHAEL', projectId: 'lab', channelId: channel, authorizationId: 'human-test-grant', authorizedBy: user };
+  const f = await fixture(t, { testBots: [grant] });
+  const input = event({ user: grant.userId, bot_id: grant.botId, text: '请准备测试需求' });
+  await assert.rejects(f.plugin.testBotMessage('malformed', { ...input, text: 'CG_TEST_COMMAND {' }), { code: 'INVALID_ARGUMENT' });
+  await assert.rejects(f.plugin.testBotMessage('administrator', { ...input, text: 'CG_TEST_COMMAND {"type":"recovery.preflight","payload":{}}' }), { code: 'FORBIDDEN' });
+  assert.equal(f.calls.length, 0, '无效命令不能先创建对话或保存业务状态');
+  await f.plugin.testBotMessage('first', input);
+  const submit = f.calls.find(x => x.type === 'conversation.submit');
+  assert.equal(submit.userId, grant.userId); assert.equal(submit.botId, grant.botId); assert.equal(submit.channelId, channel);
+  assert.equal(f.calls.filter(x => x.type === 'conversation.create').length, 1);
+  const review = { ...input, thread_ts: input.ts, ts: '124.001', text: 'CG_TEST_COMMAND ' + JSON.stringify({ type: 'brief.review', payload: { proposalId: 'exact-proposal', version: 'exact-version', decision: 'approved' } }) };
+  await f.plugin.testBotMessage('review', review);
+  const actual = f.calls.find(x => x.type === 'brief.review');
+  assert.equal(actual.userId, grant.userId); assert.equal(actual.botId, grant.botId);
+  assert.equal(actual.payload.version, 'exact-version');
+  await f.plugin.testBotMessage('duplicate', { ...review, type: 'app_mention' });
+  assert.equal(f.calls.filter(x => x.type === 'brief.review')[1].id, actual.id);
+  const before = f.calls.length;
+  for (const changed of [{ channel: 'CPRODUCTION' }, { bot_id: 'BOTHER' }, { user: bot }, { user: 'UUNKNOWN' }]) await f.plugin.testBotMessage('denied', { ...input, ...changed });
+  const foreign = threadKey(teamId, channel, '125.001');
+  await f.store.bind(foreign, { channel, threadTs: '125.001', projectId: 'production', conversationId: 'production-chat', userId: user });
+  await f.plugin.testBotMessage('foreign', { ...input, thread_ts: '125.001', ts: '126.001' });
+  assert.equal(f.calls.length, before);
+  f.io.call = async () => ({ user: { id: grant.userId, is_bot: true, profile: { bot_id: 'BOTHER' } } });
+  await f.plugin.testBotMessage('identity-denied', { ...input, bot_id: undefined });
+  assert.equal(f.calls.length, before);
+});
+
 test('获准Bot进入原线程讨论，重放及双原生事件不重占预算，自消息和未知Bot不接话', async t => {
   const discussionBots = [{ userId: 'UMICHAEL', botId: 'BMICHAEL', projectIds: ['lab'], channelIds: [channel] }];
   const f = await fixture(t, { discussionBots }), key = threadKey(teamId, channel, '123.001');

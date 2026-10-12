@@ -111,7 +111,8 @@ export function manualExecutionPrompt({ projectId, proposal, document, version, 
 // Proposals are conversational state, not a second Task system. Approval uses
 // the same Main CAS callback as the workbench and never creates an Agent Session.
 export class CoordinatorManualBriefs {
-  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null, canReuseCancelledExecution = null, verifySource = null, cloudOrigin = null }) {
+  constructor({ directory, projectId, readMain, commitMain, mapOnly = false, readBinding = null, readCommitReceipt = null, canReuseCancelledExecution = null, verifySource = null, cloudOrigin = null, authorizeTestBot = () => false }) {
+    this.authorizeTestBot = authorizeTestBot;
     if (!path.isAbsolute(directory || '') || !identifier(projectId) || typeof readMain !== 'function' || typeof commitMain !== 'function') throw new Error('Manual brief storage and Main services are required');
     if (canReuseCancelledExecution !== null && typeof canReuseCancelledExecution !== 'function') throw new Error('Execution verification must be a function');
     if (verifySource !== null && typeof verifySource !== 'function') throw new Error('Source verification must be a function');
@@ -198,12 +199,13 @@ export class CoordinatorManualBriefs {
     });
   }
   async review(input, { operationId, conversationId, actor } = {}) {
-    if (!identifier(operationId) || !identifier(conversationId) || !allowedActor(actor) || !input ||
+    if (!identifier(operationId) || !identifier(conversationId) || !(allowedActor(actor) || this.authorizeTestBot(actor)) || !input ||
         !identifier(input.proposalId) || !['approved', 'rejected'].includes(input.decision) || typeof input.version !== 'string' ||
         typeof (input.reason ?? '') !== 'string' || (input.reason || '').length > 2000) fail('INVALID_ARGUMENT', 'Review the exact brief version with a verified human actor');
     const fingerprint = hash(JSON.stringify({ input: { proposalId: input.proposalId, version: input.version, decision: input.decision, reason: input.reason || '' }, conversationId, actor }));
     return withFileLock(this.file + '.lock', async () => {
       const state = await this.state(), proposal = state.proposals[input.proposalId];
+      if (actor.kind === 'bot' && !this.authorizeTestBot(actor)) fail('FORBIDDEN', '测试审批委托已撤销', 403);
       if (!proposal || proposal.conversationId !== conversationId) fail('NOT_FOUND', 'Brief is unavailable in this conversation', 404);
       if (proposal.version !== input.version) fail('VERSION_CONFLICT', 'Review references an old brief version', 409);
       if (state.reviews[operationId]) {

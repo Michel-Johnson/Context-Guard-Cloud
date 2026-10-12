@@ -14,11 +14,50 @@ import { Gateway } from '../plugins/slack/src/gateway.mjs';
 import { Store, threadKey } from '../plugins/slack/src/store.mjs';
 import { SlackPlugin } from '../plugins/slack/src/plugin.mjs';
 import { CoordinatorService } from '../scripts/cloud/coordinator-service.mjs';
+import { testBotGrant, discussionTools } from '../scripts/cloud/slack-bot-identity.mjs';
 
 const teamId = 'TTESTWORKSPACE', userId = 'UTESTUSER', projectId = 'fixture-project';
 const token = 'integration-test-credential-not-an-admin-token';
 const config = { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId] };
 const actor = { kind: 'human', sessionId: `slack:${teamId}:${userId}`, integration: 'slack', teamId, userId };
+
+test('测试委托开放业务操作但保留Bot身份，严格限定单项目/频道/人工授权', async t => {
+  const grant = { userId: 'UTESTBOT', botId: 'BTESTBOT', projectId, channelId: 'CTEST', authorizationId: 'human-test-grant', authorizedBy: userId };
+  const scoped = validateIntegrationConfig({ ...config, testProjectIds: [projectId], testBots: [grant] });
+  const input = { id: 'test-review', teamId, userId: grant.userId, botId: grant.botId, channelId: grant.channelId, projectId,
+    conversationId: 'chat-test', type: 'brief.review', payload: { proposalId: 'brief', version: 'v1', decision: 'approved' } };
+  const actual = validateIntegrationCommand(scoped, input).actor;
+  assert.equal(actual.kind, 'bot'); assert.equal(actual.sessionId, `slack-bot:${teamId}:UTESTBOT`);
+  assert.equal(actual.testAuthorizationId, grant.authorizationId); assert.equal(actual.testAuthorizedBy, userId);
+  assert.equal(testBotGrant(scoped, actual, projectId), grant);
+  assert.ok(discussionTools(coordinatorTools, actual).some(x => x.name === 'edit_map'));
+  assert.ok(!discussionTools(coordinatorTools, actual).some(x => x.name === 'switch_project'));
+  for (const type of ['map.write', 'models.select', 'binding.review', 'conversation.submit', 'task.acceptance', 'session.complete', 'session.publish'])
+    assert.equal(validateIntegrationCommand(scoped, { ...input, type,
+      ...(type === 'models.select' ? { payload: { providerId: 'configured-model', baseVersion: 'a'.repeat(64) } } : {}) }).actor.kind, 'bot');
+  for (const fields of [{ projectId: 'production' }, { channelId: 'CPRODUCTION' }, { botId: 'BOTHER' }, { botId: undefined },
+    { teamId: 'TOTHER' }, { type: 'recovery.preflight' }, { payload: { ...input.payload, actor: { kind: 'human' } } },
+    { type: 'conversation.submit', payload: { slackChannelId: 'COTHER' } }]) {
+    assert.throws(() => validateIntegrationCommand(scoped, { ...input, ...fields }));
+  }
+  for (const changed of [{ ...config, testBots: [grant] }, { ...config, testProjectIds: ['production'], testBots: [grant] },
+    { ...config, testProjectIds: [projectId], testBots: [{ ...grant, authorizedBy: grant.userId }] },
+    { ...config, testProjectIds: [projectId], testBots: [{ ...grant, projectId: '*' }] },
+    { ...config, testProjectIds: [projectId], testBots: [{ ...grant, admin: true }] }]) {
+    assert.throws(() => validateIntegrationConfig(changed), { code: 'INVALID_INTEGRATION_CONFIG' });
+  }
+  const directory = await temporary(t); let calls = 0;
+  const server = await startIntegrationGateway({ config: scoped, stateDir: directory, state: async () => ({}), command: async (_request, { actor: caller }) => {
+    calls++; assert.deepEqual(caller, actual); return { approvedBy: caller };
+  } });
+  t.after(() => server.close());
+  const client = new Gateway({ url: server.url, token, teamId });
+  const { type, teamId: _teamId, ...args } = input;
+  assert.equal((await client.command(type, args)).approvedBy.kind, 'bot');
+  await client.command(type, args); assert.equal(calls, 1);
+  scoped.testProjectIds.splice(0);
+  await assert.rejects(client.command(type, args), { code: 'FORBIDDEN' }); assert.equal(calls, 1);
+});
 
 test('Bot讨论网关核身份和项目频道，不能借真人审批或旧权限重放', async t => {
   const discussionBots = [{ userId: 'UBOTUSER', botId: 'BAUTHBOT', projectIds: [projectId], channelIds: ['CROOM'] }];

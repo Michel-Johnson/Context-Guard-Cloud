@@ -73,6 +73,7 @@ for (const scenario of ['authorized', 'revoked', 'rebound', 'missing-ack']) {
     });
     let local, device, revoke;
     const observations = [], protocolTypes = [], proxyErrors = [];
+    let completedHeartbeats = 0;
     // Control only the external HTTP response/interleaving. Production client,
     // backend factory, authorization, IPC and device outbox are not replaced.
     const proxy = http.createServer(async (req, res) => {
@@ -93,6 +94,7 @@ for (const scenario of ['authorized', 'revoked', 'rebound', 'missing-ack']) {
         }
         delete outgoing['transfer-encoding']; delete outgoing.connection;
         res.writeHead(response.status, outgoing); res.end(reply);
+        if (req.url === '/api/v2/heartbeat' && response.status === 200) completedHeartbeats++;
       } catch (error) { proxyErrors.push(error); res.writeHead(502); res.end(); }
     });
     t.after(async () => {
@@ -162,16 +164,9 @@ for (const scenario of ['authorized', 'revoked', 'rebound', 'missing-ack']) {
     };
     const requested = await send(coordinator, 'ci.request', { taskId: 'task', sourceSha, ciTodoRef: todo.ref, unitTestRefs: [unit.ref] });
     assert.equal(requested.stage, 'testing');
-    // Trigger the existing original device pump through its operator entry.
-    const pulse = async () => {
-      const prepared = await call('/api/device-heartbeat');
-      const response = await fetch(new URL('/api/v2/heartbeat', origin), { method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify([{ credential: prepared.credential, message: prepared.message }]) });
-      assert.equal(response.status, 200); const [reply] = await response.json(); assert.equal(reply.ok, true);
-      await call('/api/device-heartbeat', reply);
-    };
-    await pulse();
+    // startServer already owns a real heartbeat scheduler. A third test-owned
+    // prepare/accept cycle can replace its pending receipt between these calls;
+    // observe the production pump instead of racing its current receipt.
     const deliveries = path.join(project.sharedDir, 'cursor-runtime', testerId, 'deliveries');
     const job = await until(async () => {
       const names = await fs.readdir(deliveries).catch(error => error.code === 'ENOENT' ? [] : Promise.reject(error));
@@ -198,7 +193,11 @@ for (const scenario of ['authorized', 'revoked', 'rebound', 'missing-ack']) {
     const task = await store.taskRecord(coordinator, session, 'task');
     assert.equal(task.stage, scenario === 'revoked' ? 'cancelling' : 'testing');
     assert.equal(task.ci, undefined, 'preparation must not manufacture a CI result or task completion');
-    await pulse();
+    const heartbeatsAfterFailure = completedHeartbeats;
+    await until(() => completedHeartbeats > heartbeatsAfterFailure, 'next production heartbeat after worker failure');
+    const retainedJob = JSON.parse(await fs.readFile(path.join(deliveries, `${digest(job.id)}.json`), 'utf8'));
+    assert.equal(retainedJob.workerPid, job.workerPid, 'the failed owning worker remains the original generation');
+    assert.equal(retainedJob.state, 'failed');
     assert.equal(observations.length, 1, 'transport replay must not start a replacement worker or reauthorize a closed capability');
     assert.equal(protocolTypes.filter(type => ['object.put', 'ci.result'].includes(type)).length, 0,
       'preparation failure must not fall back to an ordinary unscoped CI write or publish a result');

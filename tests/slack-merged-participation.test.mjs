@@ -16,6 +16,8 @@ import { slackStatusEmojis } from '../scripts/cloud/slack-reactions.mjs';
 import { hash } from '../scripts/shared/io.mjs';
 import { coordinatorStep } from '../scripts/cloud/coordinator-model.mjs';
 import { coordinatorTools } from '../scripts/cloud/coordinator-tools.mjs';
+import { ProtocolStore } from '../scripts/shared/protocol-store.mjs';
+import { CoordinatorConversations } from '../scripts/cloud/coordinator-service.mjs';
 
 // 真实插件、HTTP 网关、持久化和工具；模型及 Slack 平台 IO 为替身。
 // 不使用生产数据、账号或凭据，不把此测试称为真实 Slack 验收。
@@ -25,6 +27,99 @@ const botUserId = 'UCOORD';
 const participation = (id, text) => ({ text, inputs: [{ id, text }], files: [], context: [],
   routing: { coordinatorUserId: botUserId, mentionedUsers: [], replyToCoordinator: false } });
 const result = text => ({ stop: 'end_turn', content: [{ type: 'text', text }] });
+
+test('测试委托Bot原生消息→网关→绑定/brief审批→Main保存及删除，审计不伪装人类', async t => {
+  const grant = { userId: 'UMICHAEL', botId: 'BMICHAEL', projectId, channelId: 'CTEST', authorizationId: 'approved-test-delegation', authorizedBy: userId };
+  const testBots = [grant];
+  const f = await fixture(t, async request => {
+    const latest = request.messages.at(-1), text = typeof latest?.content === 'string' ? latest.content : '';
+    const tool = (name, input) => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'test-' + name, name, input }] });
+    if (text.includes('测试绑定需求')) {
+      assert.ok(request.tools.some(x => x.name === 'mount_conversation'));
+      assert.ok(!request.tools.some(x => x.name === 'switch_project'));
+      return tool('mount_conversation', { mainVersion: 'fixture-main', nodeId: 'T0', kind: 'todo', title: '测试委托需求', description: '只在隔离模块测试' });
+    }
+    if (text.includes('整理测试需求')) return tool('prepare_task', { taskId: 'test-task', text: '测试委托需求\n验证Bot审批记录', acceptance: '审计保留真实Bot身份', nodeIds: ['T0'], mainVersion: 'fixture-main' });
+    return result('已保存本次测试结果。');
+  }, { testBots });
+  const send = (text, ts, extra = {}) => f.send(text, ts, { user: grant.userId, bot_id: grant.botId, ...(ts !== '100.001' ? { thread_ts: '100.001' } : {}), ...extra });
+  await send('测试绑定需求', '100.001');
+  const pending = await f.wait(s => !s.activeTurnId && s.approvals?.some(p => p.kind === 'binding-proposal'));
+  const binding = Object.values(f.store.data.threads)[0];
+  assert.equal(binding.userId, grant.userId, '测试Bot可创建本测试项目对话，不需借用真人线程');
+  assert.equal(pending.messages.find(m => m.role === 'user').actor.kind, 'bot');
+  const proposal = pending.approvals.find(p => p.kind === 'binding-proposal');
+  await send('CG_TEST_COMMAND ' + JSON.stringify({ type: 'binding.review', payload: { proposalId: proposal.id, version: proposal.version, decision: 'approved' } }), '101.001');
+  await f.wait(s => !s.activeTurnId && s.focus?.nodeId === 'T0');
+  await send('整理测试需求', '102.001');
+  const ready = await f.wait(s => !s.activeTurnId && s.approvals?.some(p => p.manual && p.pending));
+  const brief = ready.approvals.find(p => p.manual && p.pending);
+  const commandText = 'CG_TEST_COMMAND ' + JSON.stringify({ type: 'brief.review', payload: { proposalId: brief.id, version: brief.version, decision: 'approved', reason: '显式测试委托' } });
+  await send(commandText, '103.001');
+  await f.wait(s => !s.activeTurnId && s.approvals?.some(p => p.id === brief.id && p.decision === 'approved'));
+  const saved = await f.main();
+  assert.equal(saved.main.memory.map.root.todos.length, 1);
+  assert.equal(saved.main.memory.map.root.todos[0].approvedBrief.actor.kind, 'bot');
+  assert.equal(saved.main.memory.map.root.todos[0].approvedBrief.actor.testAuthorizationId, grant.authorizationId);
+  await send(commandText, '103.001', { type: 'app_mention' });
+  assert.equal((await f.main()).main.version, saved.main.version, '双事件及重放不重复审批或建事项');
+  const metadata = { userId: grant.userId, botId: grant.botId, channelId: grant.channelId, projectId, conversationId: binding.conversationId };
+  await assert.rejects(f.gateway.command('map.write', { ...metadata, id: 'wrong-channel', channelId: 'CPRODUCTION', payload: { operations: [] } }), { code: 'FORBIDDEN' });
+  await assert.rejects(f.gateway.command('map.write', { ...metadata, id: 'wrong-project', projectId: 'production', payload: { operations: [] } }), { code: 'FORBIDDEN' });
+  await assert.rejects(f.gateway.command('map.write', { ...metadata, id: 'stale-delete', payload: { baseVersion: 'fixture-main', operations: [{ type: 'delete', id: 'T0' }] } }), { code: 'VERSION_CONFLICT' });
+  await f.gateway.command('map.write', { ...metadata, id: 'test-delete', payload: { baseVersion: saved.main.version,
+    operations: [{ type: 'delete-work-item', nodeId: 'T0', kind: 'todo', itemId: brief.itemId }] } });
+  const deleted = await f.main(); assert.equal(deleted.main.memory.map.root.todos.length, 0);
+  assert.equal(deleted.events.at(-1).actor.kind, 'bot'); assert.equal(deleted.events.at(-1).actor.testAuthorizedBy, userId);
+  const restarted = await f.restartCloud(); f.gateway.url = restarted.integrationUrl;
+  const afterRestart = await f.gateway.command('conversation.state', { ...metadata, id: 'restart-read' });
+  assert.equal(afterRestart.messages.find(m => m.role === 'user').actor.testAuthorizationId, grant.authorizationId);
+  testBots.splice(0);
+  const revoked = await f.restartCloud(); f.gateway.url = revoked.integrationUrl;
+  await assert.rejects(f.gateway.command('conversation.state', { ...metadata, id: 'restart-read' }), { code: 'FORBIDDEN' });
+});
+
+test('测试委托验收通过真实网关/核心工作流，核当前通过CI且保留Bot签署者', async t => {
+  const grant = { userId: 'UMICHAEL', botId: 'BMICHAEL', projectId, channelId: 'CTEST', authorizationId: 'human-test-acceptance', authorizedBy: userId };
+  const f = await fixture(t, async () => result('已收到测试要求。'), { testBots: [grant], bindings: { 'test-executor': 'test-tree' } });
+  await f.send('请开始测试。', '100.001', { user: grant.userId, bot_id: grant.botId });
+  await f.wait(s => !s.activeTurnId && s.messages?.some(m => m.text === '已收到测试要求。'));
+  const binding = Object.values(f.store.data.threads)[0], store = new ProtocolStore(path.join(f.directory, 'interface-v2', hash('123')));
+  // 受控合成前置：使用真实Core协议建立绑定、brief、Plan、交接与CI，不写内部任务JSON。
+  const device = { repositoryId: '123', deviceId: 'fixture-device', agentId: 'fixture-agent', role: 'device' };
+  const human = { ...device, role: 'human' }, coordinator = { ...device, role: 'coordinator', bindings: { 'test-executor': 'test-tree' } }, ci = { ...device, role: 'ci' };
+  const registered = (await store.handle(device, { v: 2, id: 'fixture-bind', type: 'session.bind', payload: {
+    sessionId: 'test-executor', worktreeId: 'test-tree', agentId: device.agentId, expectedBindingVersion: '' } }, { verifyBinding: () => true })).data;
+  const session = registered.session; let sequence = 0;
+  const send = async (principal, type, payload, options) => (await store.handle(principal, { v: 2, id: 'setup-' + ++sequence, type, session, payload }, options)).data;
+  const put = (ref, kind, content) => send(device, 'object.put', { ref, kind, content, baseVersion: '' });
+  const brief = await send(coordinator, 'brief.submit', { taskId: 'test-task', text: '独立合成测试前置' });
+  await send(coordinator, 'review.request', { taskId: 'test-task', kind: 'brief', ref: brief.ref, version: brief.version });
+  await send(human, 'review.result', { kind: 'brief', ref: brief.ref, version: brief.version, decision: 'approved', reason: '合成前置' });
+  await send(coordinator, 'task.assign', { taskId: 'test-task', briefRef: brief.ref, briefVersion: brief.version, sessionId: session.id,
+    nodeIds: ['T0'], mainVersion: 'fixture-main' }, { workflow: { verifyRouting: () => true } });
+  const plan = await put('plan', 'plan', { paths: ['tests'], steps: ['verify'] });
+  await send(device, 'task.report', { taskId: 'test-task', stage: 'planReady', data: { planRef: plan.ref, planVersion: plan.version, sourceSha: 'a'.repeat(40) } });
+  await send(coordinator, 'review.request', { taskId: 'test-task', kind: 'plan', ref: plan.ref, version: plan.version,
+    requirementsRef: brief.ref, requirementsVersion: brief.version, rulesVersion: 'fixture-rules' });
+  await send(coordinator, 'review.result', { kind: 'plan', ref: plan.ref, version: plan.version, decision: 'approved', reason: '合成方案批准' });
+  const todo = await put('todo', 'ciTodo', { items: [{ id: 'CI-1', title: '合成CI前置' }] }), evidence = await put('evidence', 'evidence', { observed: 'passed' });
+  const sourceSha = 'b'.repeat(40);
+  await send(device, 'task.report', { taskId: 'test-task', stage: 'handoff', data: { sourceSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref], experienceRefs: [] } });
+  await send(coordinator, 'ci.request', { taskId: 'test-task', sourceSha, ciTodoRef: todo.ref, unitTestRefs: [evidence.ref] });
+  await send(ci, 'ci.result', { taskId: 'test-task', sourceSha, verdict: 'passed', checks: [{ testId: 'fixture-check', todoId: 'CI-1', status: 'passed', evidenceRef: evidence.ref }] });
+  const task = await store.taskRecord(human, session, 'test-task');
+  await new CoordinatorConversations(path.join(f.directory, 'coordinators', projectId)).bind(binding.conversationId, session.id, 'test-task');
+  const metadata = { userId: grant.userId, botId: grant.botId, channelId: grant.channelId, projectId, conversationId: binding.conversationId };
+  const payload = { sessionId: session.id, taskId: 'test-task', ref: task.ci.ref, version: task.ci.version, decision: 'approved', reason: '测试委托验收通过' };
+  await assert.rejects(f.gateway.command('task.acceptance', { ...metadata, id: 'stale-acceptance', payload: { ...payload, version: 'stale' } }), { code: 'CONFLICT' });
+  const accepted = await f.gateway.command('task.acceptance', { ...metadata, id: 'exact-acceptance', payload });
+  assert.equal(accepted.stage, 'accepted');
+  const final = await store.taskRecord(human, session, 'test-task');
+  assert.match(final.acceptanceReview.reason, /测试Bot委托.*human-test-acceptance/);
+  const receipt = await send(human, 'object.read', { ref: final.acceptanceReview.ref, version: final.acceptanceReview.version });
+  assert.equal(receipt.content.issuer, `slack-bot:${teamId}:${grant.userId}`);
+});
 
 test('静默决定不被不一致的最终正文或后续流覆写', async () => {
   for (const final of [true, false]) {
@@ -92,14 +187,14 @@ test('获准Bot从原生事件到HTTP/模型/原线程回传，真实身份不�
   assert.doesNotMatch(JSON.stringify(f.posts), /CG_REPLY|CG_SILENT/);
 });
 
-async function fixture(t, next, { discussionBots = [] } = {}) {
+async function fixture(t, next, { discussionBots = [], testBots = [], bindings = {} } = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-slack-merged-'));
   const providerFile = path.join(directory, 'provider.json');
   await fs.writeFile(providerFile, JSON.stringify({ token: 'synthetic', baseUrl: 'https://fixture.invalid', model: 'fixture-model' }));
   await fs.writeFile(path.join(directory, 'projects.json'), JSON.stringify({ v: 2,
     projects: [{ id: projectId, name: '测试项目', description: '隔离验收' }] }));
   const memoryConfig = { dataDir: path.join(directory, 'memory'), adminToken: 'synthetic-admin',
-    projects: { [projectId]: { root: directory, ref: 'refs/heads/main', coordinator: { enabled: true, providerFile, bindings: {} } } } };
+    projects: { [projectId]: { root: directory, ref: 'refs/heads/main', coordinator: { enabled: true, providerFile, bindings, ...(testBots.length ? { mapWrite: true } : {}) } } } };
   const file = legacyProjectMemoryFile(memoryConfig.dataDir, projectId);
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, JSON.stringify({ revision: 1, main: { version: 'fixture-main', memory: { records: {}, map: {
@@ -110,7 +205,8 @@ async function fixture(t, next, { discussionBots = [] } = {}) {
   const cloudOptions = { dataDir: directory, host: '127.0.0.1', port: 0, privateAccess: true,
     browserToken: 'synthetic-browser', adminToken: 'synthetic-server', memoryConfig,
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/fixture' }] },
-    integrationConfig: { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId], discussionBots },
+    integrationConfig: { host: '127.0.0.1', port: 0, token, teamId, projectIds: [projectId], discussionBots,
+      ...(testBots.length ? { testProjectIds: [projectId], testBots } : {}) },
     coordinatorModelFactory: () => ({ model: 'fixture-model', next: async request => {
       modelCalls.push(request); return next(request, modelCalls.length);
     } }),
@@ -121,7 +217,7 @@ async function fixture(t, next, { discussionBots = [] } = {}) {
   const gateway = new Gateway({ url: cloud.integrationUrl, token, teamId });
   const command = gateway.command.bind(gateway);
   gateway.command = async (type, args) => { commands.push({ type, ...structuredClone(args) }); return command(type, args); };
-  const plugin = new SlackPlugin({ store, gateway, teamId, botUserId, cloudOrigin: cloud.url, collectMs: 0, maxCollectMs: 0, discussionBots,
+  const plugin = new SlackPlugin({ store, gateway, teamId, botUserId, cloudOrigin: cloud.url, collectMs: 0, maxCollectMs: 0, discussionBots, testBots,
     logger: { warn() {}, error() {} }, io: {
       post: async input => { posts.push(input); return `${1000 + posts.length}.001`; },
       update: async (_channel, _ts, text, blocks) => { posts.push({ text, blocks, updated: true }); },
@@ -133,7 +229,7 @@ async function fixture(t, next, { discussionBots = [] } = {}) {
       },
     } });
   t.after(async () => { await plugin.stop(); await cloud.close(); await fs.rm(directory, { recursive: true, force: true }); });
-  const send = (text, ts = '100.001', extra = {}) => plugin.receive({ type: 'events_api', body: { team_id: teamId,
+  const send = (text, ts = '100.001', extra = {}) => plugin.receive({ type: 'events_api', body: { team_id: teamId, event_id: `fixture-${ts}-${extra.type || 'message'}`,
     event: { type: 'message', channel: 'CTEST', user: userId, ts, text, ...extra } }, ack: async () => {} });
   const wait = async predicate => {
     plugin.stopped = false;
@@ -155,7 +251,7 @@ async function fixture(t, next, { discussionBots = [] } = {}) {
       if (last && predicate(last) && plugin.reactions.size === 0 && feedbackReady) return last;
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    assert.fail(`合并链路未完成：${JSON.stringify(last)}`);
+    assert.fail(`合并链路未完成：${JSON.stringify(last)}；Inbox：${JSON.stringify(Object.values(store.data.inbox).map(({ status, error }) => ({ status, error })))}`);
   };
   return { send, wait, cloud, store, plugin, gateway, directory, modelCalls, commands, posts, reactions,
     restartCloud: async beforeStart => { await cloud.close(); await beforeStart?.(); cloud = await startCloudServer(cloudOptions); return cloud; },

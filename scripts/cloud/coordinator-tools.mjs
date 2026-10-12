@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { slackReactionEmojis } from './slack-reactions.mjs';
+import { isTestBotActor } from './slack-bot-identity.mjs';
 export { slackReactionEmojis } from './slack-reactions.mjs';
 const string = { type: 'string', minLength: 1 };
 const strings = { type: 'array', items: string, minItems: 1 };
@@ -136,9 +137,9 @@ export function createCoordinatorExecutor(ctx) {
     if (name === 'show_model_menu') return { kind: input.display === false ? 'model-catalog' : 'model-selection', actionId: operationId, ...(await ctx.modelSettings()) };
     if (name === 'select_text_model') {
       if (!/^[a-zA-Z0-9_-]{1,128}$/.test(input.providerId) || !/^[a-f0-9]{64}$/.test(input.baseVersion)) fail('Use the configured model ID and current catalog version');
-      if (options.source !== 'slack' || options.actor?.kind !== 'human' || options.actor.integration !== 'slack' ||
+      if (!(options.source === 'slack-bot' && isTestBotActor(options.actor)) && (options.source !== 'slack' || options.actor?.kind !== 'human' || options.actor.integration !== 'slack' ||
           !/^[UW][A-Z0-9]{1,31}$/.test(options.actor.userId || '') || !/^[TE][A-Z0-9]{1,31}$/.test(options.actor.teamId || '') ||
-          options.actor.sessionId !== `slack:${options.actor.teamId}:${options.actor.userId}`) {
+          options.actor.sessionId !== `slack:${options.actor.teamId}:${options.actor.userId}`)) {
         throw Object.assign(new Error('A verified current Slack input is required'), { code: 'TOOL_FORBIDDEN' });
       }
       return ctx.selectModel(input, options);
@@ -158,9 +159,9 @@ export function createCoordinatorExecutor(ctx) {
       return { question: input.question, ...(input.options ? { options: input.options } : {}),
         ...(input.nodeIds ? { nodes: await ctx.resolveNodes(input.nodeIds) } : {}), approval: 'not-granted' };
     }
-    if (name === 'edit_map') return ctx.editMap(input, operationId);
+    if (name === 'edit_map') return ctx.editMap(input, operationId, options);
     if (name === 'mount_conversation') {
-      if (!['human', 'slack'].includes(options.source)) throw Object.assign(new Error('绑定建议需要当前人类输入'), { code: 'TOOL_FORBIDDEN' });
+      if (!['human', 'slack'].includes(options.source) && !(options.source === 'slack-bot' && isTestBotActor(options.actor))) throw Object.assign(new Error('绑定建议需要当前受权输入'), { code: 'TOOL_FORBIDDEN' });
       return ctx.mountConversation(input, operationId, { ...options,
         actor: options.actor || { kind: 'human', sessionId: 'browser-human' } });
     }

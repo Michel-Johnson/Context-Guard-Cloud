@@ -5,10 +5,10 @@ import { timingSafeEqual } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
 import { MapError } from '../shared/map-model.mjs';
 import { recoveryScope } from './slack-recovery.mjs';
-import { validateDiscussionBots } from './slack-bot-identity.mjs';
+import { validateDiscussionBots, validateTestBots, testBotGrant } from './slack-bot-identity.mjs';
 
 export const INTEGRATION_COMMANDS = Object.freeze(['project.list', 'project.read', 'conversation.create', 'conversation.bind', 'conversation.cursor', 'conversation.zcode',
-  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read']);
+  'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'conversation.relevance', 'recovery.preflight', 'models.state', 'models.select', 'map.write', 'brief.review', 'binding.review', 'prompt.read', 'attachment.upload', 'attachment.read', 'task.acceptance', 'session.complete', 'session.publish']);
 const readOnly = new Set(['project.list', 'project.read', 'conversation.state', 'models.state', 'prompt.read', 'attachment.read']);
 const fail = (code, message, status = 400) => { throw new MapError(code, message, status); };
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$/.test(value);
@@ -142,6 +142,7 @@ export async function classifyIntegrationMessage(model, { overview, input, actor
 
 export function validateIntegrationConfig(config) {
   validateDiscussionBots(config?.discussionBots);
+  validateTestBots(config?.testBots);
   if (!object(config) || !['127.0.0.1', '::1'].includes(config.host ?? '127.0.0.1') ||
       !Number.isInteger(config.port ?? 8790) || (config.port ?? 8790) < 0 || (config.port ?? 8790) > 65535 ||
       typeof config.token !== 'string' || Buffer.byteLength(config.token) < 32 || !/^T[A-Z0-9]{1,31}$/.test(config.teamId || '') ||
@@ -149,6 +150,12 @@ export function validateIntegrationConfig(config) {
       config.projectIds.some(id => !identifier(id)) || new Set(config.projectIds).size !== config.projectIds.length ||
       config.actions !== undefined && (!Array.isArray(config.actions) || config.actions.some(type => !INTEGRATION_COMMANDS.includes(type)))) {
     fail('INVALID_INTEGRATION_CONFIG', 'Integration configuration needs loopback host, workspace, projects and independent credential');
+  }
+  if (config.testProjectIds !== undefined && (!Array.isArray(config.testProjectIds) || !config.testProjectIds.length ||
+      config.testProjectIds.some(id => !identifier(id) || !config.projectIds.includes(id)) ||
+      new Set(config.testProjectIds).size !== config.testProjectIds.length) ||
+      config.testBots?.some(x => !config.testProjectIds?.includes(x.projectId) || config.discussionBots?.some(y => y.userId === x.userId))) {
+    fail('INVALID_INTEGRATION_CONFIG', '测试委托必须限定到显式测试项目，且不能与讨论Bot身份重叠');
   }
   const map = config.mapProjects;
   if (map !== undefined && (!object(map) || Object.keys(map).some(key => !['coordinatorProjectId', 'userIds'].includes(key)) ||
@@ -176,8 +183,14 @@ export function validateIntegrationConfig(config) {
     actions: config.actions ?? INTEGRATION_COMMANDS.filter(type => !['recovery.preflight', 'conversation.cursor', 'conversation.zcode'].includes(type)) };
 }
 
-export function integrationActor(config, { teamId, userId, botId, channelId }) {
+export function integrationActor(config, { teamId, userId, botId, channelId, projectId }) {
   if (teamId !== config.teamId || typeof userId !== 'string' || !/^[UW][A-Z0-9]{1,31}$/.test(userId)) fail('FORBIDDEN', 'Workspace or user is not authorized', 403);
+  const test = config.testBots?.find(x => x.userId === userId);
+  if (test) {
+    if (test.botId !== botId || test.channelId !== channelId || test.projectId !== projectId || !config.testProjectIds?.includes(projectId)) fail('FORBIDDEN', '测试Bot身份或项目频道不匹配', 403);
+    return { kind: 'bot', sessionId: `slack-bot:${teamId}:${userId}`, integration: 'slack', teamId, userId, botId, channelId,
+      testProjectId: projectId, testAuthorizationId: test.authorizationId, testAuthorizedBy: test.authorizedBy };
+  }
   const grant = config.discussionBots?.find(x => x.userId === userId);
   if (grant || botId !== undefined) {
     if (!grant || grant.botId !== botId || !grant.channelIds.includes(channelId)) fail('FORBIDDEN', 'Bot身份不能回落为真人身份', 403);
@@ -191,20 +204,23 @@ export function validateIntegrationCommand(config, input) {
       !identifier(input.id) || !INTEGRATION_COMMANDS.includes(input.type) || !object(input.payload ?? {})) fail('INVALID_ARGUMENT', 'Invalid integration command');
   let actor = integrationActor(config, input);
   const botGrant = config.discussionBots?.find(x => x.userId === input.userId);
-  if (input.botId !== undefined || botGrant) {
+  const testGrant = testBotGrant(config, actor, input.projectId);
+  if (testGrant && input.type === 'recovery.preflight') fail('FORBIDDEN', '测试委托不包含管理员恢复入口', 403);
+  if (!testGrant && (input.botId !== undefined || botGrant)) {
     if (!botGrant || botGrant.botId !== input.botId || !botGrant.channelIds.includes(input.channelId) ||
         !botGrant.projectIds.includes(input.projectId) || !['conversation.state', 'conversation.discuss'].includes(input.type)) {
       fail('FORBIDDEN', 'Bot讨论范围不含该操作、项目或频道', 403);
     }
     actor = { kind: 'bot', sessionId: `slack-bot:${input.teamId}:${input.userId}`, integration: 'slack',
       teamId: input.teamId, userId: input.userId, botId: input.botId, channelId: input.channelId };
-  } else if (input.channelId !== undefined) fail('INVALID_ARGUMENT', 'Bot channel metadata requires an authorized Bot');
+  } else if (!testGrant && input.channelId !== undefined) fail('INVALID_ARGUMENT', 'Bot channel metadata requires an authorized Bot');
+  if (['task.acceptance', 'session.complete', 'session.publish'].includes(input.type) && !testGrant) fail('FORBIDDEN', '此入口仅用于显式测试委托', 403);
   if (!config.actions.includes(input.type)) fail('FORBIDDEN', 'Integration action is not enabled', 403);
   if (input.type !== 'project.list' || input.projectId !== undefined) {
     if (!identifier(input.projectId) || !config.projectIds.includes(input.projectId) &&
         !config.mapProjects?.userIds.includes(actor.userId)) fail('FORBIDDEN', 'Project is not enabled for this integration', 403);
   }
-  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
+  if (['conversation.cursor', 'conversation.zcode', 'conversation.state', 'conversation.submit', 'conversation.discuss', 'conversation.interrupt', 'brief.review', 'binding.review', 'prompt.read', 'task.acceptance'].includes(input.type) && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'A conversation is required');
   if (input.type === 'conversation.discuss' && (actor.kind !== 'bot' || Object.keys(input.payload || {}).some(k => !['inputs', 'participation', 'history'].includes(k)))) fail('FORBIDDEN', 'Bot讨论仅接受原始讨论输入', 403);
   if (input.conversationId !== undefined && !identifier(input.conversationId)) fail('INVALID_ARGUMENT', 'Invalid conversation reference');
   if (Object.keys(input.payload || {}).some(key => ['actor', 'role', 'principal', 'teamId', 'userId', 'source'].includes(key))) fail('INVALID_ARGUMENT', 'Actor is assigned by the integration gateway');
@@ -230,6 +246,7 @@ export function validateIntegrationCommand(config, input) {
   }
   if (Object.hasOwn(input.payload || {}, 'slackChannelId')) {
     if (input.type !== 'conversation.submit' || !/^[DCG][A-Z0-9]{1,31}$/.test(input.payload.slackChannelId || '')) fail('INVALID_ARGUMENT', 'Provide the current Slack delivery channel');
+    if (testGrant && input.payload.slackChannelId !== actor.channelId) fail('FORBIDDEN', '测试委托不能更换投递频道', 403);
     actor.channelId = input.payload.slackChannelId;
   }
   if (Object.hasOwn(input.payload || {}, 'history')) {

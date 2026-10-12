@@ -113,11 +113,12 @@ export const sessionCompletionMatches = session => !!session?.completion &&
 // not carry authority, even when their source commit is already on Main.
 export async function completeSessionMemory(configuration, projectId, input, actor) {
   validateOptions(configuration);
-  if (!['human', 'admin', 'coordinator-review'].includes(actor?.kind)) throw new MapError('FORBIDDEN', 'Reviewed completion requires human or trusted review authorization', 403);
+  if (!['human', 'admin', 'coordinator-review'].includes(actor?.kind) && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', 'Reviewed completion requires human or trusted review authorization', 403);
   if (!validSessionId(input?.sessionId) || typeof input?.operationId !== 'string' || !input.operationId || input.operationId.length > 200 ||
       !Number.isSafeInteger(input.generation) || input.generation < 1 || typeof input.sessionVersion !== 'string' || !input.sessionVersion ||
       !/^[a-f0-9]{40,64}$/.test(input.sourceCommit || '')) throw new MapError('INVALID_COMPLETION', 'Exact Session, generation, version and source commit required', 400);
   const committed = await withFileLock(projectMemoryLockFile(configuration.dataDir, projectId), async () => {
+    if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试委托已撤销', 403);
     const state = await readMemoryProject(configuration, projectId);
     const key = hash(`completion:${input.operationId}`), fingerprint = hash(encode(input));
     if (state.receipts[key]) {
@@ -128,6 +129,7 @@ export async function completeSessionMemory(configuration, projectId, input, act
     if (!session || session.version !== input.sessionVersion || (session.generation || 1) !== input.generation || session.sourceCommit !== input.sourceCommit)
       throw new MapError('VERSION_CONFLICT', 'Session changed; review its current generation and version', 409);
     if (configuration.publicationGate && !await configuration.publicationGate(projectId, session)) throw new MapError('TASK_SOURCE_PENDING', 'Task review or experiment policy blocks completion', 409);
+    if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试委托已撤销', 403);
     const at = new Date().toISOString();
     session.completion = { sessionId: input.sessionId, generation: input.generation, sessionVersion: input.sessionVersion, sourceCommit: input.sourceCommit, operationId: input.operationId, actor: structuredClone(actor), completedAt: at };
     state.revision++;
@@ -348,6 +350,7 @@ export async function memoryPublicationStatus(configuration, projectId, sessionI
 
 export async function publishSessionMemory(configuration, projectId, input, actor = { kind: 'agent', sessionId: input?.sessionId || '' }) {
   validateOptions(configuration);
+  if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试发布委托已撤销', 403);
   const project = configuration.projects?.[projectId];
   if (!project) throw new MapError('NOT_FOUND', 'Memory project is not configured', 404);
   if (typeof input?.operationId !== 'string' || !input.operationId || input.operationId.length > 200) throw new MapError('INVALID_OPERATION', 'Stable operationId required');
@@ -355,6 +358,7 @@ export async function publishSessionMemory(configuration, projectId, input, acto
     const state = await readMemoryProject(configuration, projectId);
     state.closedSessions ||= {};
     const key = hash(`publish:${input.operationId}`), fingerprint = hash(encode(input));
+    if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试发布委托已撤销', 403);
     if (state.receipts[key]) {
       if (state.receipts[key].fingerprint !== fingerprint) throw new MapError('ID_REUSED', 'Operation ID reused for different content', 409);
       return { result: receiptResult(state, state.receipts[key]), event: null };
@@ -404,7 +408,10 @@ export async function publishSessionMemory(configuration, projectId, input, acto
     // The memory lock is already held; reverse workflow paths must only read
     // memory and must not attempt a memory transaction while holding that lock.
     let publicationWrite;
-    const write = () => publicationWrite ||= writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
+    const write = () => {
+      if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试发布委托已撤销', 403);
+      return publicationWrite ||= writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
+    };
     if (configuration.commitPublication) {
       await configuration.commitPublication(projectId, structuredClone(session), write);
       if (!publicationWrite) throw new MapError('MEMORY_UNAVAILABLE', 'Publication policy did not commit memory; Session preserved', 503);
@@ -456,6 +463,7 @@ export async function commitMainMemoryMap(configuration, projectId, input, actor
   if (!configuration.projects?.[projectId]) throw new MapError('NOT_FOUND', 'Memory project is not configured', 404);
   if (typeof input?.operationId !== 'string' || !input.operationId || input.operationId.length > 200) throw new MapError('INVALID_OPERATION', 'Stable operationId required');
   const committed = await withFileLock(projectMemoryLockFile(configuration.dataDir, projectId), async () => {
+    if (actor?.kind === 'bot' && !configuration.authorizeTestBot?.(projectId, actor)) throw new MapError('FORBIDDEN', '测试委托已撤销或不属于当前项目', 403);
     const state = await readMemoryProject(configuration, projectId);
     const receiptKey = hash(`main-workbench:${input.operationId}`);
     const fingerprint = hash(encode({ baseVersion: input.baseVersion ?? null, operations: input.operations, actor }));
@@ -467,7 +475,9 @@ export async function commitMainMemoryMap(configuration, projectId, input, actor
     if (!current) throw new MapError('MAIN_UNAVAILABLE', 'Published Main memory is not available', 409);
     if ((input.baseVersion ?? null) !== current.version) throw new MapError('VERSION_CONFLICT', 'Main Map changed; reload before committing', 409, { currentVersion: current.version });
     const operations=preserveStoredDispatch?retainStoredDispatch(current.memory.map,input.operations):input.operations;
-    const applied = applyOperations(current.memory.map, operations, actor);
+    // 由服务端受权Coordinator执行Main操作；历史与回执始终保留原Bot，不能伪装人类。
+    const operationActor = actor.kind === 'bot' ? { kind: 'coordinator', sessionId: actor.sessionId } : actor;
+    const applied = applyOperations(current.memory.map, operations, operationActor);
     validate(applied.doc);
     const updatedAt = new Date().toISOString();
     const reconciled = reconcileBugRecordDeletions(current, { ...current.memory, map: applied.doc }, current.deletedRecordKeys);
