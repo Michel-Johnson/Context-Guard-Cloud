@@ -70,6 +70,19 @@ test('Slack operator parity native tool transfers durable intent to the host wit
   assert.equal(state.messages.at(-2).actions[0].kind, 'slack-operation');
   assert.equal(state.messages.at(-1).content[0].is_error, undefined);
 });
+test('Slack operator parity takes the latest actual input of a merged Slack batch', async () => {
+  const actor = { ...reactionActor, channelId: 'CTESTCHANNEL' }, state = reactionState('slack', actor);
+  state.activeRequestIds = [state.activeInput.id, 'latest-input'];
+  state.messages = [{ role: 'user', source: 'slack', actor, requestId: state.activeInput.id, content: '先查询' },
+    { role: 'user', source: 'slack', actor, requestId: 'latest-input', content: '然后启用' }];
+  const executor = createCoordinatorExecutor({ performSlackAction: async (input, options) => {
+    assert.equal(options.requestId, 'latest-input');
+    return { kind: 'slack-operation', actionId: options.operationId, requestId: options.requestId, actor: options.actor, status: 'queued' };
+  } });
+  await coordinatorStep({ state, turnId: 'batch', tools: coordinatorTools, system: 'role', save: async () => {}, execute: executor,
+    model: { next: async () => ({ stop: 'tool_use', content: [{ type: 'tool_use', id: 'batch-button', name: 'perform_slack_action', input: { actionId: 'current' } }] }) } });
+  assert.equal(state.messages.at(-1).content[0].is_error, undefined);
+});
 
 const reactionActor = { kind: 'human', integration: 'slack', teamId: 'TTESTWORKSPACE', userId: 'UTESTUSER', sessionId: 'slack:TTESTWORKSPACE:UTESTUSER' };
 function reactionState(source = 'slack', actor = reactionActor) {

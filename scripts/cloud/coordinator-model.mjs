@@ -785,14 +785,14 @@ export async function coordinatorStep({ turnId, state, model, system, promptVers
           const result = await execute(name, call.input, { operationId: name === 'select_text_model' ? `model-${hash(operationId)}`
             : repeatedReaction ? repeatedReaction[0] : operationId,
             ...(state.activeInput?.actor ? { source: state.activeInput.source, actor: state.activeInput.actor } : {}),
-            ...(name === 'get_execution_capabilities' && projectReadInput ? {
+            ...(['get_execution_capabilities', 'get_slack_actions', 'perform_slack_action'].includes(name) && projectReadInput ? {
               source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id,
             } : {}),
             ...(name === 'mount_conversation' ? { source: state.activeInput?.source || 'human',
               ...(state.activeInput?.actor ? { actor: state.activeInput.actor } : {}) } : {}),
             ...(readProjectTools.includes(name) ? { source: projectReadInput.source, actor: projectReadInput.actor, requestId: projectReadInput.id }
-                : ['select_text_model', 'switch_project', 'get_slack_actions', 'perform_slack_action'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
-                ...(['switch_project', 'get_slack_actions', 'perform_slack_action'].includes(name) ? { requestId: state.activeInput.id } : {}) } : {}) });
+                : ['select_text_model', 'switch_project'].includes(name) && trustedSlackInput ? { source: 'slack', actor: slackActor,
+                ...(name === 'switch_project' ? { requestId: state.activeInput.id } : {}) } : {}) });
           const scopedResult = name === 'react_to_user' && trustedSlackInput && result?.kind === 'slack-reaction'
             ? { ...result, requestId: state.activeInput.id, actor: slackActor } : result;
           if (repeatedReaction && canonical(scopedResult) !== canonical(repeatedReaction[1].result)) {
