@@ -9,11 +9,11 @@ export class Gateway {
     if (!Number.isSafeInteger(streamIdleMs) || streamIdleMs <= 0) throw new Error('Event idle timeout must be a positive integer');
     this.streamIdleMs = streamIdleMs;
   }
-  async command(type, { id, userId, projectId, conversationId, payload = {}, timeoutMs = 20000 }) {
+  async command(type, { id, userId, botId, channelId, projectId, conversationId, payload = {}, timeoutMs = 20000 }) {
     if (!id || !userId) throw new Error('Stable operation ID and real Slack user are required');
     const response = await this.fetch(`${this.url}/v1/command`, { method: 'POST', signal: AbortSignal.timeout(timeoutMs),
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ id, teamId: this.teamId, userId, ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
+      body: JSON.stringify({ id, teamId: this.teamId, userId, ...(botId ? { botId, channelId } : {}), ...(projectId ? { projectId } : {}), ...(conversationId ? { conversationId } : {}), type, payload }) });
     let body;
     try { body = await response.json(); }
     catch { throw new GatewayError('GATEWAY_BAD_RESPONSE', 'Gateway returned invalid JSON', response.status); }

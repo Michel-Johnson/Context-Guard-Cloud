@@ -1,12 +1,13 @@
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWrite, encode, hash, readJSON, withFileLock } from '../shared/io.mjs';
-import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools, coordinatorFailureDiagnostic, recoverableModelFailure } from './coordinator-model.mjs';
+import { coordinatorModelMessages, coordinatorStep, correctableToolError, settleRejectedTools, coordinatorFailureDiagnostic, recoverableModelFailure, coordinatorRetryDelay } from './coordinator-model.mjs';
 import { coordinatorPrefix, coordinatorInputContext, coordinatorContextMessage } from './coordinator-prefix.mjs';
 import { validateSlackHistory } from './slack-history.mjs';
 import { businessToolName, mergedParticipationInput, validateMergedParticipation } from './merged-participation.mjs';
 import { outputProtocolRecord, nativeOutputEnabled } from './coordinator-output.mjs';
 import { coordinatorPresentationKey } from '../shared/coordinator-reply.mjs';
+import { isVerifiedSlackBot, discussionTools } from './slack-bot-identity.mjs';
 
 const error = (code, message) => Object.assign(new Error(message), { code, status: 409 });
 const workItemIdentity = item => item.instanceId || item.createdAt || item.id;
@@ -53,7 +54,7 @@ function attachmentMetadata(item, id) {
 }
 function trustedActor(actor) {
   if (actor === undefined) return undefined;
-  if (!actor || actor.kind !== 'human' || Object.keys(actor).some(key => !['kind', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration', 'channelId'].includes(key)) ||
+  if (!actor || !(actor.kind === 'human' || isVerifiedSlackBot(actor)) || Object.keys(actor).some(key => !['kind', 'botId', 'source', 'teamId', 'userId', 'id', 'name', 'sessionId', 'integration', 'channelId'].includes(key)) ||
       Object.entries(actor).some(([, value]) => typeof value !== 'string' || !value || value.length > 240)) {
     throw error('INVALID_INPUT', 'Provide verified human actor metadata');
   }
@@ -235,7 +236,7 @@ export class CoordinatorConversations {
       const state = await this.state();
       const item = state.chats?.[id];
       if (!item) throw error('NOT_FOUND', 'Only an independent chat can bind a plugin');
-      if (item.cursorExecution) throw error('FORBIDDEN', 'An explicit Cursor grant cannot be removed by plugin binding');
+       if (item.cursorExecution || item.zcodeExecution) throw error('FORBIDDEN', 'An explicit execution grant cannot be removed by plugin binding');
       item.executionMode = executionMode;
       await atomicWrite(this.file, encode(state));
     });
@@ -250,11 +251,27 @@ export class CoordinatorConversations {
         if (item.cursorExecution.fingerprint !== fingerprint) throw error('ID_REUSED', 'Cursor enable request changed');
         return { conversationId: id, executionMode: 'automatic' };
       }
-      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution) throw error('CONFLICT', 'Conversation execution mode changed');
+       if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution || item.zcodeExecution) throw error('CONFLICT', 'Conversation execution mode changed');
       item.executionMode = 'automatic';
       item.cursorExecution = { ...structuredClone(grant), operationId, fingerprint, enabledAt: new Date().toISOString() };
       await atomicWrite(this.file, encode(state));
       return { conversationId: id, executionMode: 'automatic' };
+    });
+  }
+  async enableZCode(id, { operationId, expectedMode, grant }) {
+    return withFileLock(this.file + '.lock', async () => {
+      const state = await this.state(), item = state.chats?.[id];
+      if (!item) throw error('FORBIDDEN', 'Enable ZCode only in the original registered chat');
+      const fingerprint = hash(encode({ expectedMode, grant }));
+      if (item.zcodeExecution?.operationId === operationId) {
+        if (item.zcodeExecution.fingerprint !== fingerprint) throw error('ID_REUSED', 'ZCode enable request changed');
+        return { conversationId: id, executionMode: 'automatic', executionProvider: 'zcode' };
+      }
+      if (expectedMode !== 'manual' || item.executionMode !== 'manual' || item.cursorExecution || item.zcodeExecution) throw error('CONFLICT', 'Conversation execution mode changed');
+      item.executionMode = 'automatic';
+      item.zcodeExecution = { ...structuredClone(grant), operationId, fingerprint, enabledAt: new Date().toISOString() };
+      await atomicWrite(this.file, encode(state));
+      return { conversationId: id, executionMode: 'automatic', executionProvider: 'zcode' };
     });
   }
   async setFocus(id, { nodeId, kind, itemId, title, expectedFocus, bindingApproval }) {
@@ -625,7 +642,8 @@ export class CoordinatorService {
         !Array.isArray(attachments) || attachments.length > COORDINATOR_MAX_ATTACHMENTS || !text.trim() && !attachments.length ||
         attachments.some(item => !item || Object.keys(item).some(key => key !== 'id') || typeof item.id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.id)) ||
         new Set(attachments.map(item => item.id)).size !== attachments.length) throw error('INVALID_INPUT', 'Provide a bounded message, attachment references and stable request ID');
-    if (!['human', 'slack', 'workflow'].includes(source)) throw error('INVALID_INPUT', 'Unknown verified message source');
+    if (!['human', 'slack', 'slack-bot', 'workflow'].includes(source)) throw error('INVALID_INPUT', 'Unknown verified message source');
+    if (source === 'slack-bot' ? !isVerifiedSlackBot(actor) : actor?.kind === 'bot') throw error('INVALID_INPUT', 'Bot discussion cannot borrow human identity');
     if (source === 'slack' && (!actor?.teamId || !actor?.userId)) throw error('INVALID_INPUT', 'Slack input requires a verified workspace actor');
     if (attachments.length && !isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can attach files');
     if (attachments.length && !this.resolveAttachment) throw error('ATTACHMENTS_UNAVAILABLE', 'Coordinator attachment storage is not configured');
@@ -814,8 +832,10 @@ export class CoordinatorService {
       throw error('INVALID_INPUT', 'Provide a bounded batch of distinct original human inputs');
     }
     actor = trustedActor(actor);
-    if (!isHumanSource(source)) throw error('INVALID_INPUT', 'Only human input can submit a batch');
-    if (history !== undefined && (source !== 'slack' || actor?.integration !== 'slack' || actor.kind !== 'human' ||
+    const botDiscussion = source === 'slack-bot' && isVerifiedSlackBot(actor);
+    if (!isHumanSource(source) && !botDiscussion) throw error('INVALID_INPUT', 'Only verified input can submit a batch');
+    if (botDiscussion && (followup !== 'queue' || expectedTurnId !== undefined || recoveryGuard || operatorRecovery || inputs.some(x => x.answerTo || x.attachments?.length))) throw error('INVALID_INPUT', 'Bot discussion cannot steer, approve or attach files');
+    if (history !== undefined && !botDiscussion && (source !== 'slack' || actor?.integration !== 'slack' || actor.kind !== 'human' ||
         !/^[TE][A-Z0-9]{1,31}$/.test(actor.teamId || '') || !/^[UW][A-Z0-9]{1,31}$/.test(actor.userId || '') ||
         actor.sessionId !== `slack:${actor.teamId}:${actor.userId}`)) throw error('INVALID_INPUT', 'Reference history requires a gateway-bound Slack operator');
     history = validateSlackHistory(history);
@@ -873,7 +893,7 @@ export class CoordinatorService {
           return { id: `message-${hash(`${input.id}:user`)}`, requestId: input.id, source, ...(actor ? { actor } : {}), role: 'user',
             serverContext: { ...coordinatorInputContext(nextContext, source), ...(index === 0 && attachHistory ? { history } : {}),
               ...(index === 0 && participation ? { participation } : {}) },
-            content: (this.simulated ? '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
+            content: (this.simulated ? source === 'slack-bot' ? '[实验：Bot讨论输入]\n' : '[实验：模拟人工输入]\n' : '') + (question ? `针对问题：${question.text}\n\n我的回答：` : '') + input.text,
             ...(input.metadata.length ? { attachments: input.metadata } : {}), ...(question ? { answerTo: input.answerTo } : {}) };
         });
         const active = steering ? state.messages.filter(message => (state.activeRequestIds || [state.activeTurnId]).includes(message.requestId)) : [];
@@ -1161,7 +1181,7 @@ export class CoordinatorService {
           state.activeTiming ||= {};
           state.activeTiming.modelStartedAt ||= new Date().toISOString();
           await save(state);
-          const prefix = coordinatorPrefix(this.system, state.activeContext, this.tools);
+          const prefix = coordinatorPrefix(this.system, state.activeContext, discussionTools(this.tools, state.activeInput?.actor));
           try {
             const model = this.modelForTurn(state);
             this.modelAbort = generation;
@@ -1224,6 +1244,8 @@ export class CoordinatorService {
             // 质量长度不触发重写；真正模型/格式故障仍使用原有有界预算。
             if (recoverableModelFailure(cause) && (state.modelRetries || 0) < this.maxModelRetries && !state.pending &&
                 !(state.operatorRecovery && !state.operatorRecovery.initialAccepted)) {
+              const retryDelay = coordinatorRetryDelay(cause, (state.modelRetries || 0) + 1, this.retryDelayMs);
+              if (retryDelay === null) throw cause;
               state.modelRetries = (state.modelRetries || 0) + 1;
               state.modelRepairCode = validationCode || null;
               state.modelRepairText = typeof cause.repairText === 'string' ? cause.repairText : null;
@@ -1231,7 +1253,7 @@ export class CoordinatorService {
               state.steps--; state.streaming = null; state.activity = null;
               state.activeTiming.modelRetryAt = new Date().toISOString();
               await save(state);
-              if (this.retryDelayMs) await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+              if (retryDelay) await new Promise(resolve => setTimeout(resolve, retryDelay));
               continue;
             }
             throw cause;
@@ -1361,15 +1383,18 @@ export class CoordinatorInbox {
             const summary = type === 'review.result' ? payload : { taskId: payload.taskId, stage: payload.stage, verdict: payload.verdict };
             if (actionable) {
               const target = this.routeEvent ? await this.routeEvent(type, payload, session) : this.service;
+              let recovery;
               if (type === 'task.report' && payload.stage === 'interrupted' && this.autoResume) {
-                await this.autoResume({ session, taskId: payload.taskId, messageId: item.message.id, reason: payload.data?.reason, occurredAt: payload.data?.occurredAt });
+                recovery = await this.autoResume({ session, taskId: payload.taskId, messageId: item.message.id, reason: payload.data?.reason, occurredAt: payload.data?.occurredAt });
               }
               // Leave this event unacknowledged, but allow other conversations to
               // progress. The existing contiguous cursor replays the gap later.
               if (!await available(target)) continue;
               await target.submit({ id: `event:${item.message.id}`, text: JSON.stringify({ session, type, payload: summary,
                 instruction: type === 'task.report' && payload.stage === 'interrupted' && this.autoResume
-                  ? '系统已自动提交恢复控制；读取当前任务和引用证据，等待执行端 resumed 回执，不要再次创建任务或重复调用恢复。'
+                  ? recovery?.skipped
+                    ? '系统没有提交自动恢复控制。读取原任务的真实中断原因并告知用户；供应商冷却时不自行反复重试，用户明确确认服务恢复后才恢复原任务。不要创建新任务或声称已经恢复。'
+                    : '系统已自动提交恢复控制；读取当前任务和引用证据，等待执行端 resumed 回执，不要再次创建任务或重复调用恢复。'
                   : type === 'review.result' && payload.kind === 'acceptance' && payload.decision === 'approved'
                     ? '人工验收已通过。读取原任务及 completionPolicy，用 guide_task 通知原 Executor 归档、结束计划。仅服务端指定的 experiment-only 任务不创建 PR、不发布 Main，按返回的回执调用 complete_task；正式任务创建 PR，Required 全绿且合并、Session 记忆发布后调用 complete_task。两者都须等待宿主 closed 回执，不得提前收工或请人联系执行端。'
                     : '读取当前任务和引用证据后推进；事件本身不授予额外权限。' }) }, { source: 'workflow' });

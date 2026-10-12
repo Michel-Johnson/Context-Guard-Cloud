@@ -27,14 +27,16 @@ import { coordinatorTools, coordinatorReferences, readCoordinatorReferenceFile, 
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
+import { reviewCoordinatorAcceptance } from './coordinator-acceptance.mjs';
 import { coordinatorNodePath, coordinatorPathText, coordinatorNodeLabel } from '../shared/coordinator-path.mjs';
-import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask } from './completion.mjs';
+import { verifyTaskCompletion, verifyTaskClose, taskSessionPublicationReady, isExperimentTask, coordinatorCompletionPolicy } from './completion.mjs';
 import { CloudAttachments, attachmentInput, attachmentPatch } from './attachments.mjs';
 import { createQuarkProvider } from './quark-provider.mjs';
 import { startIntegrationGateway, validateIntegrationConfig, validateIntegrationCommand, relevanceInput, relevanceOverview, classifyIntegrationMessage } from './integration-gateway.mjs';
 import { recoveryScope, requireEmptyRecoveryState } from './slack-recovery.mjs';
 import { IntegrationAttachmentStore } from './integration-attachments.mjs';
 import { CoordinatorManualBriefs, filterManualTools, coordinatorRolePrompt } from './coordinator-manual.mjs';
+import { isVerifiedSlackBot, BOT_DISCUSSION_TOOLS } from './slack-bot-identity.mjs';
 import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
@@ -658,7 +660,7 @@ export async function startCloudServer({
           allowLoopback: allowedOrigin.startsWith('http://127.0.0.1:') || allowedOrigin.startsWith('http://localhost:'),
           authorizeSource: async ({ state, task }) => {
             const original = Object.values(state.projectTasks || {}).find(item => item.repositoryId === repository.repositoryId && item.taskId === task.id && item.sessionId === task.session.id);
-            if (original?.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation);
+            if (original?.cursorDelegation || original?.zcodeDelegation) await requireExecutionGrant(project, await conversationsFor(project).get(original.conversationId), null, original.cursorDelegation || original.zcodeDelegation);
             const template = state.bindings[digest(JSON.stringify([repository.repositoryId, roles.templateSessionId]))];
             if (!template || template.deviceId !== 'cloud-cursor:' + project.id || template.worktreeId !== coordinator.bindings[roles.templateSessionId]) return false;
             const memory = await readMemoryProject(configuredMemory, project.id), document = memory.main?.memory?.map;
@@ -780,6 +782,36 @@ export async function startCloudServer({
     }
     return grant;
   };
+  const zcodeExecutionScope = async (project, actor) => {
+    const grant = integrations?.zcodeExecution?.[project.id], coordinator = configuredMemory?.projects?.[project.id]?.coordinator;
+    const slack = actor?.integration === 'slack' && actor.teamId === integrations?.teamId &&
+      actor.sessionId === `slack:${actor.teamId}:${actor.userId}` && grant?.userIds.includes(actor.userId) &&
+      integrations?.actions.includes('conversation.zcode');
+    const browser = actor?.integration === 'browser' && actor.sessionId === 'browser-human';
+    if (isMapProject(project) || actor?.kind !== 'human' || !grant || !slack && !browser || !coordinator?.enabled ||
+        !coordinator.sessionTemplates?.includes(grant.templateSessionId) || !coordinator.bindings?.[grant.templateSessionId]) {
+      protocolFail('FORBIDDEN', 'ZCode execution requires an authorized repository, local template and Slack user');
+    }
+    const { repository, store, principal } = interfaceProject(project);
+    const binding = await store.registeredBinding(principal, grant.templateSessionId);
+    if (!binding || binding.platform !== 'zcode' || binding.worktreeId !== coordinator.bindings[grant.templateSessionId] ||
+        binding.deviceId?.startsWith('cloud-cursor:')) protocolFail('FORBIDDEN', 'Use a registered local ZCode template');
+    return { projectId: project.id, repositoryId: repository.repositoryId, templateSessionId: grant.templateSessionId,
+      actor: structuredClone(actor), configurationHash: digest(JSON.stringify([grant, repository.repositoryId, binding.worktreeId, binding.deviceId])) };
+  };
+  const requireZCodeGrant = async (project, conversation, actor = null, delegation = null) => {
+    const grant = conversation.zcodeExecution;
+    if (!grant || conversation.executionMode !== 'automatic') protocolFail('FORBIDDEN', 'This conversation has no ZCode execution grant');
+    const current = await zcodeExecutionScope(project, grant.actor);
+    if (actor) await zcodeExecutionScope(project, actor);
+    if (grant.configurationHash !== current.configurationHash || grant.projectId !== current.projectId ||
+        grant.repositoryId !== current.repositoryId || grant.templateSessionId !== current.templateSessionId || delegation &&
+        (delegation.grantId !== grant.operationId || delegation.templateSessionId !== grant.templateSessionId ||
+          delegation.configurationHash !== grant.configurationHash)) protocolFail('FORBIDDEN', 'The original ZCode grant changed');
+    return grant;
+  };
+  const requireExecutionGrant = (project, conversation, actor = null, delegation = null) => conversation.zcodeExecution
+    ? requireZCodeGrant(project, conversation, actor, delegation) : requireCursorGrant(project, conversation, actor, delegation);
   const normalizedSessions = item => (Array.isArray(item?.sessions) ? item.sessions : [])
     .map(value => String(value || '').trim()).filter(Boolean);
   const mapItem = async (project, nodeId, kind, itemId) => {
@@ -851,7 +883,7 @@ export async function startCloudServer({
     // A getter can carry an old registry snapshot across retirement. Reject
     // it before it can occupy or overwrite the new mode's cache slot.
     assertCurrentEpoch();
-    const modeRevision = value => JSON.stringify([value.executionMode || 'automatic', value.cursorExecution || null]);
+    const modeRevision = value => JSON.stringify([value.executionMode || 'automatic', value.cursorExecution || null, value.zcodeExecution || null]);
     const revision = modeRevision(conversation);
     const assertCurrentMode = async () => {
       assertCurrentEpoch();
@@ -911,12 +943,14 @@ export async function startCloudServer({
           return caller.role === 'device' ? { ...caller, role: 'coordinator', bindings: { [id]: binding.worktreeId } } : caller;
         };
         const execute = createCoordinatorExecutor({
-          authorizeTool: async (name, input, { caller }) => {
+          authorizeTool: async (name, input, { caller, actor, source }) => {
+            if (actor?.kind === 'bot' && (source !== 'slack-bot' || !isVerifiedSlackBot(actor) || !BOT_DISCUSSION_TOOLS.includes(name))) protocolFail('FORBIDDEN', 'Bot讨论不授予业务操作或人审权限');
+            if (actor?.kind === 'bot') await authorizeIntegrationProject(project.id, actor);
             const liveConversation = await conversations.get(conversationId);
             // A live counted tool makes retireIdle reject the transition.
             // Do not abort that step merely because an enable attempt is busy.
             if (service.retired || (liveConversation.executionMode === 'manual') !== manual) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode changed', 409);
-            if (liveConversation.cursorExecution) await requireCursorGrant(project, liveConversation);
+            if (liveConversation.cursorExecution || liveConversation.zcodeExecution) await requireExecutionGrant(project, liveConversation);
             Object.assign(conversation, liveConversation);
             for (const field of ['nodeId', 'kind', 'itemId', 'bindingApproval']) if (!Object.hasOwn(liveConversation, field)) delete conversation[field];
             if (!tools.some(tool => tool.name === name)) protocolFail('FORBIDDEN', 'Tool is not enabled for this conversation');
@@ -999,6 +1033,23 @@ export async function startCloudServer({
             const catalog = await (await modelSettingsFor(project)).state(), route = (await service.state()).modelRoute;
             return { ...catalog, ...(route ? { currentRoute: { kind: route.kind, model: route.model,
               ...(route.providerId ? { providerId: route.providerId } : {}) } } : {}) };
+          },
+          executionCapabilities: async ({ actor }) => {
+            const current = await conversations.get(conversationId);
+            const providers = [];
+            for (const [id, check] of [['cursor', cursorExecutionScope], ['zcode', zcodeExecutionScope]]) {
+              let allowed = false, grant;
+              try { grant = await check(project, actor || { kind: 'human', sessionId: 'browser-human', integration: 'browser' }); allowed = true; }
+              catch (error) { if (error.code !== 'FORBIDDEN') throw error; }
+              const enabled = !!current[id === 'zcode' ? 'zcodeExecution' : 'cursorExecution'];
+              const heartbeat = allowed && id === 'zcode' && interfacePresence.get(presenceKey(grant.repositoryId, grant.templateSessionId))?.lastHeartbeatAt;
+              const availability = !allowed ? 'not-authorized' : heartbeat ? cloudSessionPresence(heartbeat) : 'unknown';
+              providers.push({ id, authorized: allowed, enabled, availability, ...(heartbeat ? { lastHeartbeatAt: heartbeat } : {}),
+                nextStep: !allowed ? '当前身份未获该执行能力' : availability === 'offline' ? '先恢复已注册本机连接，保留原任务'
+                  : enabled ? '先确认brief，再按原任务跟进；未知在线状态不能保证启动' : '在当前对话启用该执行端；启用不批准任务' });
+            }
+            return { kind: 'execution-capabilities', executionMode: current.executionMode || 'automatic',
+              responsibility: '继续协调Executor、独立Tester、阻塞和收工；模式限制不代表职责止于brief', providers };
           },
           listProjects: async ({ operationId, actor }) => {
             if (!integrations || !manual) protocolFail('FORBIDDEN', '当前对话不支持查询 Slack 项目');
@@ -1141,9 +1192,9 @@ export async function startCloudServer({
                 if (routedNodes.length > 3) protocolFail('INVALID_ARGUMENT', 'Map TODO/Bug routing exceeds three nodes');
                 requirements.nodeIds = routedNodes;
               }
-              if (conversation.cursorExecution && (await store.projectTasks(human)).some(task => task.itemId === requirements.itemId && task.nodeId === requirements.nodeId && task.kind === requirements.kind &&
+              if ((conversation.cursorExecution || conversation.zcodeExecution) && (await store.projectTasks(human)).some(task => task.itemId === requirements.itemId && task.nodeId === requirements.nodeId && task.kind === requirements.kind &&
                   task.conversationId !== conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'This item already belongs to another active execution');
-              const ownerId = conversation.cursorExecution ? conversationId : await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
+              const ownerId = conversation.cursorExecution || conversation.zcodeExecution ? conversationId : await conversations.ensure({ nodeId: requirements.nodeId, kind: requirements.kind, item });
               if (conversationId !== ownerId) {
                 if (!await readJSON(conversations.conversationFile(ownerId), null)) {
                   await conversations.continueIn(conversationId, ownerId);
@@ -1161,6 +1212,10 @@ export async function startCloudServer({
             if (conversation.cursorExecution) {
               const grant = await requireCursorGrant(project, await conversations.get(conversationId));
               requirements.cursorDelegation = { grantId: grant.operationId, templateSessionId: grant.templateSessionId, configurationHash: grant.configurationHash };
+            }
+            if (conversation.zcodeExecution) {
+              const grant = await requireZCodeGrant(project, await conversations.get(conversationId));
+              requirements.zcodeDelegation = { grantId: grant.operationId, templateSessionId: grant.templateSessionId, configurationHash: grant.configurationHash };
             }
             const task = await store.prepareProjectTask(principal, requirements, operationId, conversationId);
             return { ...task, projectTask: true, requiresHumanApproval: true };
@@ -1215,10 +1270,7 @@ export async function startCloudServer({
             ]);
             const { status, reason, sessionVersion, sourceCommit, mainSha, publishedAt } = publication;
             return { ...task, deliveryState: delivery.state,
-              completionPolicy: isExperimentTask(configuredMemory.projects[project.id], task) || task.completion?.proof?.experimentOnly
-                ? { mode: 'experiment-only', gitReceiptRef: 'experiment-only', archiveReceiptRef: task.ci?.ref,
-                  instruction: '仅实验关闭：保留准确提交、独立 CI 和人审证据；通知原 Executor 归档、结束计划，不创建 PR、不发布 Main。调用 complete_task 后等待宿主 closed 回执。' }
-                : { mode: 'merged' },
+              completionPolicy: coordinatorCompletionPolicy(configuredMemory.projects[project.id], task),
               publication: { status, ...(reason ? { reason } : {}), sessionVersion, sourceCommit, mainSha, publishedAt },
               ...(delivery.queue ? { queue: delivery.queue } : {}) };
           },
@@ -1251,7 +1303,8 @@ export async function startCloudServer({
           ? '\n项目允许 write_file 写入一个仓库相对路径的 UTF-8 文本文件。用户明确要求新建或替换单个文件时使用它，一次一个路径；不提交、不推送、不修改 Main。文件已存在时传入当前内容的 expectedSha。多文件修改和代码开发仍使用 brief。'
           : '';
         const system = coordinatorRolePrompt(await fs.readFile(path.join(root, 'scripts/shared/roles/Coordinator.md'), 'utf8'), { manual }) +
-          (conversation.cursorExecution ? '\n当前对话已由真人启用受限 Cursor Cloud 执行能力，启用不是任务批准。\n新 brief 经人确认后，系统固定 Cursor 模板派发；不要请人另开 Session 或粘贴提示。\nPlan、交接和独立 CI 结果回到原对话，仍走原审核协议；不根据本轮结束判断任务完成。\n' : '') + (!itemScoped ? '' :
+          (conversation.cursorExecution ? '\n当前对话已由真人启用受限 Cursor Cloud 执行能力，启用不是任务批准。\n新 brief 经人确认后，系统固定 Cursor 模板派发；不要请人另开 Session 或粘贴提示。\nPlan、交接和独立 CI 结果回到原对话，仍走原审核协议；不根据本轮结束判断任务完成。\n' :
+            conversation.zcodeExecution ? '\n当前对话已由真人启用本地 ZCode 执行能力；启用不是任务批准。brief 经人确认后才派发到已注册本机模板，Plan、交接和独立 Tester 结果仍回原对话。\n' : '') + (!itemScoped ? '' :
           '\n本对话仅负责下方「当前事项」；先读取其所在节点的最新原文，不处理其他事项。') + fileWriteNote;
         const directory = conversations.conversationDirectory(conversationId);
         const visionProvider = integrations?.visionProviderFile ? await readJson(integrations.visionProviderFile) : null;
@@ -1322,6 +1375,7 @@ export async function startCloudServer({
           autoResume: async ({ session, taskId, messageId, reason }) => {
             const current = await store.taskRecord(principal, session, taskId);
             if (current.stage !== 'interrupted' || !current.busy) return { skipped: true, stage: current.stage };
+            if (reason === 'ZCODE_RATE_LIMIT') return { skipped: true, stage: current.stage, reason: 'provider-cooldown' };
             return (await store.handle(principal, { v: 2, id: `auto-resume:${messageId}`, type: 'task.control', session,
               payload: { taskId, action: 'resume', expectedVersion: current.version,
                 data: { reason: `自动恢复中断任务${reason ? `：${reason}` : ''}` } } }, { workflow: interfaceWorkflow })).data;
@@ -1417,15 +1471,15 @@ export async function startCloudServer({
       state.acceptances = [];
       state.projectTasks = [];
       state.sessionTemplates = [];
-    } else if (conversation.cursorExecution) {
-      await requireCursorGrant(project, conversation);
+    } else if (conversation.cursorExecution || conversation.zcodeExecution) {
+      await requireExecutionGrant(project, conversation);
       const { store, principal } = interfaceProject(project);
       const tasks = (await store.projectTasks(principal)).filter(task => task.conversationId === conversationId);
-      state.executionMode = 'automatic'; state.executionProvider = 'cursor'; state.projectTasks = tasks;
+      state.executionMode = 'automatic'; state.executionProvider = conversation.zcodeExecution ? 'zcode' : 'cursor'; state.projectTasks = tasks;
       state.approvals = [...state.approvals.filter(proposal => !proposal.manual), ...await manualBriefsFor(project).approvals(conversationId)];
       state.approvals = state.approvals.map(proposal => {
         const task = proposal.projectTask && tasks.find(item => item.taskId === proposal.taskId);
-        return task ? { ...proposal, executionProvider: 'cursor', pending: task.stage === 'brief' && task.brief.version === proposal.brief.version,
+        return task ? { ...proposal, executionProvider: task.zcodeDelegation ? 'zcode' : 'cursor', pending: task.stage === 'brief' && task.brief.version === proposal.brief.version,
           ...(task.review ? { decision: task.review.decision } : {}) } : proposal;
       });
     }
@@ -1438,7 +1492,7 @@ export async function startCloudServer({
     if (!input || Object.keys(input).some(key => !['id', 'text', 'inputs', 'retry', 'answerTo', 'attachments', 'followup', 'expectedTurnId'].includes(key))) {
       protocolFail('INVALID_ARGUMENT', 'Provide a message, stable ID and optional attachment references');
     }
-    if (input.inputs !== undefined && (options.source !== 'slack' || input.retry ||
+    if (input.inputs !== undefined && (!['slack', 'slack-bot'].includes(options.source) || input.retry ||
         ['text', 'attachments', 'answerTo'].some(key => Object.hasOwn(input, key)))) {
       protocolFail('INVALID_ARGUMENT', 'Only verified Slack batches may supply ordered inputs without replacing retry data');
     }
@@ -1475,19 +1529,25 @@ export async function startCloudServer({
     return project;
   };
   const authorizeIntegrationProject = async (id, actor, input) => {
+    if (actor?.kind === 'bot') {
+      const grant = integrations.discussionBots?.find(x => x.userId === actor.userId && x.botId === actor.botId);
+      if (!isVerifiedSlackBot(actor) || !grant?.projectIds.includes(id) || !grant.channelIds.includes(actor.channelId)) protocolFail('FORBIDDEN', 'Bot讨论授权已撤销或不属于当前项目');
+      return;
+    }
     if (mapProjects.allowed(actor)) await mapProjects.get(id);
     else if (!integrations.projectIds.includes(id)) protocolFail('FORBIDDEN', '无权访问此项目');
     if (input?.type === 'conversation.cursor') cursorExecutionScope(await integrationProject(id), actor);
+    if (input?.type === 'conversation.zcode') await zcodeExecutionScope(await integrationProject(id), actor);
     const conversationId = input?.conversationId || (input?.type === 'conversation.bind' && input.payload?.conversationId);
     if (conversationId) {
       const project = await integrationProject(id), conversation = await conversationsFor(project).get(conversationId);
-      if (conversation.cursorExecution) await requireCursorGrant(project, conversation, actor);
+      if (conversation.cursorExecution || conversation.zcodeExecution) await requireExecutionGrant(project, conversation, actor);
     }
   };
   const requireIntegrationConversation = async (project, id, actor) => {
     if (typeof id !== 'string') protocolFail('INVALID_ARGUMENT', 'Select a linked conversation');
     const conversation = await conversationsFor(project).get(id);
-    if (conversation.executionMode !== 'manual') await requireCursorGrant(project, conversation, actor);
+    if (conversation.executionMode !== 'manual') await requireExecutionGrant(project, conversation, actor?.kind === 'bot' ? null : actor);
     return conversation;
   };
   const integrationPublicState = async (project, id, actor) => {
@@ -1495,6 +1555,23 @@ export async function startCloudServer({
     if (state.executionMode === 'manual') {
       try { cursorExecutionScope(project, actor); state.cursorAvailable = true; }
       catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.cursorAvailable = false; }
+      try { await zcodeExecutionScope(project, actor); state.zcodeAvailable = true; }
+      catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.zcodeAvailable = false; }
+    }
+    if (actor.kind === 'human' && state.executionMode === 'automatic') {
+      const coordinator = await coordinatorFor(project,id);
+      await coordinator.refreshBindings();
+      const {store,principal} = interfaceProject(project);
+      state.acceptances=[];
+      for(const sessionId of Object.keys(coordinator.bindings)){
+        const binding=await store.registeredBinding(principal,sessionId);
+        if(!binding)continue;
+        for(const task of await store.workflowTasks(principal,{id:sessionId,generation:binding.generation})){
+          if(task.stage==='awaiting-merge'&&task.ci?.verdict==='passed'&&await conversationsFor(project).owner(sessionId,task.id)===id){
+            state.acceptances.push({taskId:task.id,sessionId,generation:binding.generation,sourceSha:task.sourceSha,ci:task.ci});
+          }
+        }
+      }
     }
     return state;
   };
@@ -1565,11 +1642,33 @@ export async function startCloudServer({
         cursorTransitions.delete(key);
       }
     }
+    if (type === 'conversation.zcode') {
+      if (Object.keys(payload).some(key => key !== 'expectedMode') || payload.expectedMode !== 'manual') protocolFail('INVALID_ARGUMENT', 'Confirm the current manual mode explicitly');
+      const grant = await zcodeExecutionScope(project, actor), conversations = conversationsFor(project), before = await conversations.get(conversationId);
+      if (before.zcodeExecution?.operationId === operationId) return conversations.enableZCode(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+      const service = await coordinatorFor(project, conversationId), key = `${project.id}:${conversationId}`;
+      if (cursorTransitions.has(key)) throw new MapError('COORDINATOR_BUSY', 'Conversation execution mode is changing', 409);
+      cursorTransitions.add(key);
+      cursorModeEpochs.set(key, (cursorModeEpochs.get(key) || 0) + 1);
+      try {
+        return await service.retireIdle(() => bindingsFor(project).withStableConversation(conversationId, async () => {
+          if ((await manualBriefsFor(project).approvals(conversationId)).some(proposal => proposal.pending && !proposal.stale) ||
+              (await bindingsFor(project).approvals(conversationId)).some(proposal => proposal.pending)) protocolFail('CONFLICT', 'Resolve pending human approvals before enabling ZCode');
+          const { store, principal } = interfaceProject(project);
+          if ((await store.projectTasks(principal)).some(task => task.conversationId === conversationId && !['completed', 'closed', 'cancelled', 'brief-rejected'].includes(task.stage))) protocolFail('CONFLICT', 'Resolve the original execution before changing its host');
+          await zcodeExecutionScope(project, actor);
+          return conversations.enableZCode(conversationId, { operationId, expectedMode: payload.expectedMode, grant });
+        }));
+      } finally {
+        if (service.retired) { coordinators.delete(key); await service.inbox.close(); await service.close({ stop: true }); }
+        cursorTransitions.delete(key);
+      }
+    }
     if (type === 'conversation.bind') {
       if (isMapProject(project)) protocolFail('FORBIDDEN', 'Map 项目不能关联仓库执行对话');
       const id = payload.conversationId;
       const conversation = await conversationsFor(project).get(id);
-      if (conversation.cursorExecution) { await requireCursorGrant(project, conversation, actor); return { conversationId: id, executionMode: 'automatic' }; }
+      if (conversation.cursorExecution || conversation.zcodeExecution) { await requireExecutionGrant(project, conversation, actor); return { conversationId: id, executionMode: 'automatic' }; }
       const service = await coordinatorFor(project, id), state = await service.state();
       if (state.activeTurnId || state.status === 'running') protocolFail('COORDINATOR_BUSY', 'Wait for the current turn before binding');
       const { store, principal } = interfaceProject(project);
@@ -1618,6 +1717,11 @@ export async function startCloudServer({
     }
     const integrationConversation = await requireIntegrationConversation(project, conversationId, actor);
     if (type === 'conversation.state') return integrationPublicState(project, conversationId, actor);
+    if (type === 'conversation.discuss') {
+      if (!isVerifiedSlackBot(actor)) protocolFail('FORBIDDEN', 'Bot讨论身份必须由网关验证');
+      return submitCoordinator(project, conversationId, { id: operationId, inputs: payload.inputs, followup: 'queue' },
+        { source: 'slack-bot', actor, history: payload.history, participation: payload.participation });
+    }
     if (type === 'conversation.submit') {
       const { history, participation, recovery, slackChannelId: _deliveryChannel, ...input } = payload;
       const recoveryOptions = recovery ? { operatorRecovery: recovery.operationId, recoveryGuard: async (state, journal) => {
@@ -1637,11 +1741,19 @@ export async function startCloudServer({
       const service = await coordinatorFor(project, conversationId), proposal = (await service.state()).approvals.find(value => value.id === payload.proposalId && value.projectTask);
       if (!proposal || proposal.brief.version !== payload.version) protocolFail('CONFLICT', 'The original conversation brief changed');
       const { store, principal } = interfaceProject(project), task = (await store.projectTasks(principal)).find(item => item.taskId === proposal.taskId && item.conversationId === conversationId);
-      if (!task?.cursorDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
-      await requireCursorGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation);
+      if (!task?.cursorDelegation && !task?.zcodeDelegation) protocolFail('FORBIDDEN', 'Brief belongs to another conversation or execution host');
+      await requireExecutionGrant(project, await conversationsFor(project).get(conversationId), actor, task.cursorDelegation || task.zcodeDelegation);
       const result = await store.reviewProjectTask({ ...principal, agentId: actor.sessionId }, task.taskId, proposal.brief, { ...payload, id: operationId });
       kickTaskScheduler(project);
-      return { executionMode: 'automatic', taskId: result.taskId, stage: result.stage };
+      return { executionMode: 'automatic', executionProvider: task.zcodeDelegation ? 'zcode' : 'cursor', taskId: result.taskId, stage: result.stage };
+    }
+    if (type === 'acceptance.review') {
+      if (actor.kind !== 'human' || integrationConversation.executionMode === 'manual') protocolFail('FORBIDDEN','Acceptance requires the original enabled human conversation');
+      await requireExecutionGrant(project,integrationConversation,actor);
+      const coordinator=await coordinatorFor(project,conversationId); await coordinator.refreshBindings();
+      const {store,principal}=interfaceProject(project);
+      return reviewCoordinatorAcceptance({input:{...payload,id:operationId},conversationId,bindings:coordinator.bindings,store,principal,actor,
+        owner:(sessionId,taskId)=>conversationsFor(project).owner(sessionId,taskId),simulated:configuredMemory.projects[project.id].coordinator.simulated});
     }
     if (type === 'binding.review') {
       const result = await bindingsFor(project).review({ ...payload, id: operationId }, { conversationId, actor });
@@ -1666,7 +1778,7 @@ export async function startCloudServer({
         if (stopping) break;
         try {
         let hosted;
-        if (task.cursorDelegation) await requireCursorGrant(project, await conversationsFor(project).get(task.conversationId), null, task.cursorDelegation);
+        if (task.cursorDelegation || task.zcodeDelegation) await requireExecutionGrant(project, await conversationsFor(project).get(task.conversationId), null, task.cursorDelegation || task.zcodeDelegation);
         if (task.stage === 'dispatched') {
           const binding = await store.registeredBinding(human, task.sessionId);
           if (binding?.deviceId === 'cloud-cursor:' + project.id) hosted = await cursorRolesFor(project);
@@ -1677,7 +1789,8 @@ export async function startCloudServer({
         }
         if (task.stage === 'queued') {
             const templates = principal.creationTemplates.filter(id => Object.hasOwn(config.bindings || {}, id) && !config.ciReceivers?.[id] &&
-              (!task.cursorDelegation || id === task.cursorDelegation.templateSessionId && id === hostedTemplateId));
+              (!task.cursorDelegation || id === task.cursorDelegation.templateSessionId && id === hostedTemplateId) &&
+              (!task.zcodeDelegation || id === task.zcodeDelegation.templateSessionId && id !== hostedTemplateId));
             const templateSessionId = templates.find(id => {
               if (hostedTemplateId === id) return true;
               const presence = interfacePresence.get(presenceKey(principal.repositoryId, id));
@@ -2835,11 +2948,22 @@ export async function startCloudServer({
           await coordinatorFor(project, id);
           return send(res, 201, { id });
         }
+        if (action === '/api/coordinator/zcode' && project && req.method === 'POST') {
+          requireHumanWorkbench(req);
+          const input = await requestBody(req);
+          if (!input || Object.keys(input).some(key => !['id', 'expectedMode'].includes(key)) || typeof input.id !== 'string' || !input.id) protocolFail('INVALID_ARGUMENT', 'Use a stable enable request');
+          return send(res, 200, await integrationCommand({ type: 'conversation.zcode', projectId: project.id, conversationId,
+            payload: { expectedMode: input.expectedMode } }, { actor: { kind: 'human', sessionId: 'browser-human', integration: 'browser' }, operationId: input.id }));
+        }
         if (action === '/api/coordinator' && project) {
           const coordinator = await coordinatorFor(project, conversationId);
           if (req.method === 'GET') {
             if ((await conversationsFor(project).get(conversationId)).executionMode === 'manual') {
-              const state = await coordinatorPublicState(project, conversationId);
+               const state = await coordinatorPublicState(project, conversationId);
+               if (browserToken && safeEqual(decodedCookieValue(req), browserToken)) {
+                 try { await zcodeExecutionScope(project, { kind: 'human', sessionId: 'browser-human', integration: 'browser' }); state.zcodeAvailable = true; }
+                 catch (error) { if (error.code !== 'FORBIDDEN') throw error; state.zcodeAvailable = false; }
+               }
               const memory = await readMemoryProject(configuredMemory, project.id);
               state.conversations = await conversationsFor(project).list();
               const allowedNodes = configuredMemory.projects[project.id].coordinator.nodeIds;
@@ -2952,18 +3076,9 @@ export async function startCloudServer({
           const coordinator = await coordinatorFor(project, conversationId);
           await coordinator.refreshBindings();
           const input = await requestBody(req);
-          if (!input || Object.keys(input).some(key => !['id', 'sessionId', 'taskId', 'ref', 'version', 'decision', 'reason'].includes(key)) ||
-              !Object.hasOwn(coordinator.bindings, input.sessionId)) protocolFail('INVALID_ARGUMENT', 'Select an assigned task and exact CI result');
-          const { store, principal } = interfaceProject(project), binding = await store.registeredBinding(principal, input.sessionId);
-          if (!binding) protocolFail('NOT_FOUND', 'Session is not registered');
-          const session = { id: input.sessionId, generation: binding.generation }, task = await store.taskRecord(principal, session, input.taskId);
-          if (conversationId !== 'main' && await conversationsFor(project).owner(input.sessionId, input.taskId) !== conversationId)
-            protocolFail('FORBIDDEN', 'Task belongs to another conversation');
-          if (task.ci?.ref !== input.ref || task.ci?.version !== input.version || task.ci?.verdict !== 'passed') protocolFail('CONFLICT', 'Acceptance must reference the current passed CI result');
-          if (typeof input.reason !== 'string' || !input.reason.trim()) protocolFail('INVALID_ARGUMENT', 'Record the human acceptance result or rejection reason');
-          const message = validateMessage({ v: 2, id: input.id, type: 'review.result', session, payload: { kind: 'acceptance', ref: input.ref, version: input.version,
-            decision: input.decision, reason: (configuredMemory.projects[project.id].coordinator.simulated ? '[模拟人工验收] ' : '') + input.reason } });
-          const result = (await store.handle(principal, message)).data;
+          const {store,principal}=interfaceProject(project);
+          const result=await reviewCoordinatorAcceptance({input,conversationId,bindings:coordinator.bindings,store,principal,
+            owner:(sessionId,taskId)=>conversationsFor(project).owner(sessionId,taskId),simulated:configuredMemory.projects[project.id].coordinator.simulated});
           // CI acceptance does not attest a Map version that the human has not reviewed.
           // Session completion is a separate, exact-version human action.
           return send(res, 200, result);

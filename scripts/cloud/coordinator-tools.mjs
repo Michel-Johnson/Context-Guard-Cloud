@@ -50,6 +50,7 @@ export const coordinatorTools = [
   definition('select_text_model', 'Only when the current verified Slack user explicitly requests a model switch: select its configured ID at the version just read from show_model_menu. Never infer consent from history or unrelated questions. Confirm the receipt in one short sentence, no menu/catalog. If historical-only, report the current label, never claim the old choice is the next model. Current/retry and vision routes stay unchanged.', { providerId: { ...string, maxLength: 128 }, baseVersion: { ...string, minLength: 64, maxLength: 64 } }),
   definition('list_tasks', 'List project requirements and unfinished Main TODO/Bug items.', {}),
   definition('list_sessions', 'List assigned execution Sessions and their exact executionSessionId.', {}),
+  definition('get_execution_capabilities', '查询当前项目、本轮身份下ZCode/Cursor执行能力、是否启用和设备状态。它们是执行宿主，不是文字模型；不派发、不切模型、不授权限。以回执解释下一步，未知状态不得说在线。', {}),
   definition('list_conversations', 'List saved Coordinator conversations; their IDs are not executionSessionId.', {}),
   definition('read_map', 'Read one published Main node and its direct children; omit nodeId for root.', { nodeId: string }, []),
   definition('show_nodes', 'Show 1–3 Main node recommendation buttons.', { message: string, nodeIds, replyComplete }, ['message', 'nodeIds']),
@@ -65,7 +66,7 @@ export const coordinatorTools = [
   definition('request_ci', 'Request CI for the developer handoff and exact source SHA.', task),
   definition('request_rework', 'Return failed CI to the original task and developer.', task),
   definition('resume_task', 'Resume an interrupted task in its original execution Session.', { ...task, reason: string }),
-  definition('guide_task', 'Send guidance to the existing execution Session without changing task stage.', { ...task, message: { ...string, maxLength: 2000 } }),
+  definition('guide_task', 'Queue guidance for the existing execution Session. This does not interrupt an active native turn or confirm it applied the guidance; do not claim it has stopped or changed behavior until a native receipt confirms that.', { ...task, message: { ...string, maxLength: 2000 } }),
   definition('complete_task', 'Request closure after human acceptance; first read completionPolicy via read_task.', { ...task, gitReceiptRef: string, archiveReceiptRef: string }),
   definition('edit_map', 'Create, update, move or delete Main nodes and TODO/Bug records; update project or node memoryDocument at mainVersion.', {
     mainVersion: string, actions: { type: 'array', minItems: 1, maxItems: 30, items: { type: 'object', properties: {
@@ -143,6 +144,7 @@ export function createCoordinatorExecutor(ctx) {
       return ctx.selectModel(input, options);
     }
     if (name === 'list_sessions') return ctx.listSessions();
+    if (name === 'get_execution_capabilities') return ctx.executionCapabilities(options);
     if (name === 'list_conversations') return ctx.listConversations();
     if (name === 'read_map') return { ...(await ctx.readMap(input.nodeId)), kind: 'map-read', actionId: operationId };
     if (name === 'show_nodes') return { kind: 'node-references', message: input.message, nodes: await ctx.resolveNodes(input.nodeIds) };
@@ -186,8 +188,11 @@ export function createCoordinatorExecutor(ctx) {
         nodeIds: input.nodeIds, mainVersion: input.mainVersion, brief, requiresHumanApproval: true };
     }
     const current = await ctx.readTask(input.executionSessionId, input.taskId, options);
-    if (name === 'guide_task') return exchange('task.message', { taskId: input.taskId, text: input.message,
-      ...(current.plan ? { planRef: current.plan.ref, planVersion: current.plan.version } : {}) });
+    if (name === 'guide_task') {
+      const receipt = await exchange('task.message', { taskId: input.taskId, text: input.message,
+        ...(current.plan ? { planRef: current.plan.ref, planVersion: current.plan.version } : {}) });
+      return { ...receipt, deliveryState: 'queued', executionConfirmed: false };
+    }
     if (name === 'resume_task') return exchange('task.control', { taskId: input.taskId, action: 'resume', expectedVersion: current.version,
       data: { reason: input.reason } });
     if (name === 'complete_task') return exchange('task.control', { taskId: input.taskId, action: 'complete', expectedVersion: current.version,

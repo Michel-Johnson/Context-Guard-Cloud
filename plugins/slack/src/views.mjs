@@ -156,7 +156,7 @@ export function messageBlocks(message, key, context) {
 export function approvalBlocks(approval, key) {
   const version = approval.version || approval.brief?.version;
   return [...plainSections(`待确认 brief\n${approval.title || approval.text || approval.brief?.text || approval.brief?.summary || '请查看工作台中的 brief'}\n${approval.pathText ? `主节点路径：\n${approval.pathText}\n` : ''}${Array.isArray(approval.acceptance) ? approval.acceptance.join('\n') : approval.acceptance || ''}`),
-    { type: 'actions', elements: [button(approval.projectTask && approval.executionProvider === 'cursor' ? '确认并交给 Cursor' : '确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
+    { type: 'actions', elements: [button(approval.projectTask && ['cursor','zcode'].includes(approval.executionProvider) ? `确认并交给 ${approval.executionProvider === 'zcode' ? 'ZCode' : 'Cursor'}` : '确认并创建执行提示', 'approve_brief', { key, proposalId: approval.id, version }, 'primary'), button('退回修改', 'reject_brief', { key, proposalId: approval.id, version }, 'danger')] }];
 }
 
 export function bindingBlocks(proposal, key, context) {
@@ -168,4 +168,10 @@ export function bindingBlocks(proposal, key, context) {
       button('暂不绑定', 'reject_binding', { key, proposalId: proposal.id, version: proposal.version }),
       ...(context?.cloudOrigin && context?.projectId && proposal.node?.id ? [{ type: 'button', text: plain('查看节点说明'),
         action_id: 'binding_details', url: new URL(`/projects/${encodeURIComponent(context.projectId)}?relation=${encodeURIComponent(proposal.node.id)}`, context.cloudOrigin).href }] : [])] }];
+}
+
+export function acceptanceBlocks(review,key){
+  const value={key,taskId:review.taskId,sessionId:review.sessionId,generation:review.generation,ref:review.ci.ref,version:review.ci.version};
+  return [section('独立验证已通过。请验收本次任务。\n回复“验收通过”或“验收不通过”，也可点击按钮。'),
+    {type:'actions',elements:[button('验收通过','approve_acceptance',value,'primary'),button('验收不通过','reject_acceptance',value,'danger')]}];
 }
