@@ -1,5 +1,11 @@
 # Cloud 验证台账
 
+## COORDINATOR-SESSION-GRANT-20261013 · 外部真实 Session 的窄 Main 编辑授权
+
+- [x] 已实现管理员版本化 grant/revoke、设备/Session/worktree/代次/绑定版本与到期校验、有效能力查询、节点范围、审计及稳定操作回执；grant 仅赋予 Main 编辑能力，既有独立项目配置的其他工具权限不因本次放宽或撤销。合成 HTTP 六项通过，包含 Main 持久提交与迁移、撤凭据、撤 grant 的确定性交错；正式受影响回归结果另见本次 PR，不替代独立验收。
+- [ ] 独立 Tester 核准确 head 的授予/撤销/到期/跨项目设备会话、scope、CAS、相同与异内容重放、结构/正文写、重启及真实 CLI→Cloud 合成闭环。保留首次失败，不以分层替身测试冒称完整端到端。
+- [ ] Required/合并/生产 dirty 归属与保留方案、准确制品部署、已安装主 Coordinator 的有效 capability 和有限业务进展写入/权威读回；不创建生产测试节点、不绕 Main 人审或启用自动触发。
+
 ## SLACK-OPERATOR-PARITY-20261012 · Coordinator 与用户按钮操作一致
 
 - [x] Executor：当前操作者按钮目录和持久代操作已实现。新增Cloud三个目标、Slack一个目标通过；实际Cloud HTTP/注册模板/模型工具/持久意图/原业务入口/重放目标通过（557ms）。首Slack缺依赖失败保留，安装后目标通过；本机Node22.18低于Slack最低22.19，不据此宣布最低运行时合格。未跑本地全量CI。

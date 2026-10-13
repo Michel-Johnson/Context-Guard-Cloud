@@ -3853,7 +3853,7 @@ test('CI delegation requires server registration, the owning device and an indep
   await assert.rejects(authorizeCiReceiver(options), { code: 'FORBIDDEN' });
 });
 
-test('An external device calls the same Coordinator tools as the built-in Coordinator', async t => {
+test('External devices read Coordinator tools while trusted Coordinator registrations retain privileged tools', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-external-tools-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -3909,9 +3909,9 @@ test('An external device calls the same Coordinator tools as the built-in Coordi
   assert.equal(listed.body.ok, true);
   assert.deepEqual(listed.body.data.tasks, []);
   const invalid = await callTool(deviceHeaders, { operationId: 'external-invalid', name: 'edit_map', input: { unexpected: true } });
-  assert.equal(invalid.status, 400);
-  assert.equal(invalid.body.error.code, 'INVALID_ARGUMENT');
-  const edited = await callTool(deviceHeaders, { operationId: 'external-edit', name: 'edit_map', input: {
+  assert.equal(invalid.status, 403);
+  assert.equal(invalid.body.error.code, 'FORBIDDEN');
+  const edited = await callTool(grantedHeaders, { operationId: 'external-edit', name: 'edit_map', input: {
     mainVersion: 'v1', actions: [{ op: 'create', parentId: 'T0', title: '外部节点', purpose: '同一执行器', owns: ['src/'] }],
   } });
   assert.equal(edited.status, 200, JSON.stringify(edited.body));

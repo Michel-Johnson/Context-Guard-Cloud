@@ -62,7 +62,7 @@ export class ProtocolAuth {
     });
     return { credential, data: { connectionId, repositoryId: principal.repositoryId, expiresAt: new Date(expiresAt).toISOString() } };
   }
-  async authenticate(credential) {
+  async authenticate(credential, { renew = true } = {}) {
     if (typeof credential !== 'string' || !credential) fail('UNAUTHORIZED', 'Connection credential required');
     const time = this.now(), credentialHash = hash(credential);
     const state = await readJSON(this.file, { connections: {} }), entry = state.connections[credentialHash];
@@ -76,7 +76,7 @@ export class ProtocolAuth {
       if (!current || current.repositoryId !== entry.principal.repositoryId || current.deviceId !== entry.principal.deviceId || current.agentId !== entry.principal.agentId) fail('FORBIDDEN', 'Client registration was revoked or changed');
       principal = current;
     }
-    if (entry.expiresAt - time <= this.renewWindowMs) {
+    if (renew && entry.expiresAt - time <= this.renewWindowMs) {
       await withFileLock(`${this.file}.lock`, async () => {
         const latest = await readJSON(this.file, { connections: {} }), current = latest.connections[credentialHash];
         if (!current || current.expiresAt + this.recoveryMs <= time) fail('UNAUTHORIZED', 'Connection expired or was revoked');
@@ -87,6 +87,9 @@ export class ProtocolAuth {
       });
     }
     return principal;
+  }
+  async withAuthenticated(credential, commit) {
+    return withFileLock(`${this.file}.lock`, async () => commit(await this.authenticate(credential, { renew: false })));
   }
   async close(credential) {
     if (typeof credential !== 'string' || !credential) fail('UNAUTHORIZED', 'Connection credential required');

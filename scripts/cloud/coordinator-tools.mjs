@@ -164,7 +164,7 @@ export function createCoordinatorExecutor(ctx) {
       return { question: input.question, ...(input.options ? { options: input.options } : {}),
         ...(input.nodeIds ? { nodes: await ctx.resolveNodes(input.nodeIds) } : {}), approval: 'not-granted' };
     }
-    if (name === 'edit_map') return ctx.editMap(input, operationId);
+    if (name === 'edit_map') return ctx.editMap(input, operationId, options);
     if (name === 'mount_conversation') {
       if (!['human', 'slack'].includes(options.source)) throw Object.assign(new Error('绑定建议需要当前人类输入'), { code: 'TOOL_FORBIDDEN' });
       return ctx.mountConversation(input, operationId, { ...options,
