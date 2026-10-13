@@ -162,12 +162,14 @@ export async function writeFilesystemProjection(dataDir, projectId, state) {
   });
 }
 
-export async function ensureFilesystemProjection(dataDir, projectId, state) {
+export async function ensureFilesystemProjection(dataDir, projectId, state, { readFullState } = {}) {
   const directory = filesystemProjectDirectory(dataDir, projectId);
   if (!fsSync.existsSync(path.join(directory, 'FORMAT'))) return;
   const storage = await readJSON(path.join(directory, 'content', 'storage.json'), null);
   if (storage?.revision === (state.revision || 0) && storage?.mainVersion === (state.main?.version || null)) return;
-  await writeFilesystemProjection(dataDir, projectId, state);
+  // A Main-only selector is sufficient to check freshness, not to reconstruct
+  // Session projections. Repair always uses one complete committed read.
+  await writeFilesystemProjection(dataDir, projectId, readFullState ? await readFullState() : state);
 }
 
 export async function writeProjectMemory(memoryReadViews, dataDir, projectId, state) {
