@@ -13,7 +13,9 @@ import { applyOperations, entries, MapError, validate, restoreSessionWorkItemOpe
 import { translateChanges, operationGrants } from '../shared/protocol-map.mjs';
 import { validateMemory } from '../shared/memory-schema.mjs';
 import { buildFilesystemV2 } from '../shared/filesystem-v2.mjs';
-import { buildContextTree, contextDocument, contextSlice, publicContextTree } from '../shared/context-tree.mjs';
+import * as sharedContext from '../shared/context-tree.mjs';
+import { contextCacheIdentity, createContextGenerationCache } from './context-generation-cache.mjs';
+const { buildContextTree, contextDocument, contextSlice, publicContextTree } = sharedContext;
 import { memoryReadViews } from './memory-read-view.mjs';
 import { ensureFilesystemProjection, projectMemoryFile, projectMemoryLockFile, readFilesystemDocument, writeProjectMemory } from './memory-filesystem.mjs';
 const exec = promisify(execFile);
@@ -272,6 +274,18 @@ export async function readMemoryView({ dataDir, adminToken, projects = {} }, pro
   return state;
 }
 
+async function readMemoryContext(configuration, projectId) {
+  const { dataDir, adminToken, projects = {} } = configuration;
+  validateOptions({ dataDir, adminToken });
+  if (!projects[projectId]) throw new MapError('NOT_FOUND', 'Memory project is not configured', 404);
+  const file = projectMemoryFile(dataDir, projectId);
+  const selected = await memoryReadViews.readMain(file, initialMemoryState());
+  await ensureFilesystemProjection(dataDir, projectId, selected.state, {
+    readFullState: () => memoryReadViews.read(file, initialMemoryState()),
+  });
+  return selected;
+}
+
 const gitCommand = async (root, args) => (await exec('git', args, { cwd: root, windowsHide: true, timeout: 15000, maxBuffer: 1024 * 1024 })).stdout.trim();
 async function mergeStatus(project, sourceCommit, targetCommit) {
   try { await gitCommand(project.root, ['cat-file', '-e', `${sourceCommit}^{commit}`]); }
@@ -518,12 +532,11 @@ export async function commitSessionMap(configuration, projectId, sessionId, inpu
   return committed.result;
 }
 
-export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}) {
+export function createMemoryHandler(configuration = {}, { authorizeDevice, contextCache = createContextGenerationCache() } = {}) {
   const { dataDir, adminToken, projects = {} } = configuration;
   validateOptions({ dataDir, adminToken });
   const hub = memoryHub(configuration);
   const eventClients = new Set();
-  const contextTrees = new Map();
   const handler = async (req, res) => {
     const send = (code, value) => {
       let body = Buffer.from(JSON.stringify(value));
@@ -550,17 +563,39 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
         const binding = !admin && !legacy && await authorizeDevice?.({ credential, projectId, sessionId,
           scope: `sessions/${encodeURIComponent(sessionId)}`, method: 'GET' });
         if (!project || !admin && !legacy && !binding) throw new MapError('UNAUTHORIZED', '需要项目与 Session 的读取权限', 401);
-        const state = await readMemoryView(configuration, projectId);
-        const snapshot = contextDocument(state.main, { sessionId, agentId: binding?.agentId || sessionId });
+        const selected = await readMemoryContext(configuration, projectId);
+        const agentId = binding?.agentId || sessionId;
+        const buildSnapshot = () => contextDocument(selected.state.main, { sessionId, agentId });
         const pinned = url.searchParams.get('version');
-        if (pinned && pinned !== snapshot.version) throw new MapError('VERSION_CONFLICT', '上下文版本已变化，请重新读取', 409);
+        if (pinned && pinned !== selected.state.main?.version) {
+          // Preserve the original root-denial/unavailable precedence over 409.
+          buildSnapshot();
+          throw new MapError('VERSION_CONFLICT', '上下文版本已变化，请重新读取', 409);
+        }
+        // binding.grants is not part of this endpoint's existing shared contract.
+        // Identity only isolates the cache; it does not introduce permissions.
+        const { knownIdentity, scopeKey } = contextCacheIdentity({ projectId, sessionId, agentId, binding, admin, legacy, credential });
+        const sourceStamp = JSON.stringify([selected.stamp, selected.generation]);
+        const record = await contextCache.get({ key: knownIdentity ? JSON.stringify([scopeKey, sourceStamp]) : null,
+          scopeKey, sourceStamp, knownIdentity, isCurrent: selected.isCurrent, build: () => {
+            const snapshot = buildSnapshot();
+            // Fixed core releases without this optional export remain supported.
+            // A preparation-only failure must not turn a valid read into a 500.
+            let lookup = null;
+            if (knownIdentity && typeof sharedContext.prepareContextLookup === 'function') {
+              try { lookup = sharedContext.prepareContextLookup(snapshot); } catch { /* uncached shared slice */ }
+            }
+            return { snapshot, lookup };
+          } });
+        const snapshot = () => record.snapshot || buildSnapshot();
         const node = url.searchParams.get('node');
-        if (node) return send(200, { projectId, sessionId, version: snapshot.version, content: contextSlice(snapshot, node) });
-        const key = `${projectId}\0${sessionId}\0${binding?.agentId || sessionId}`;
-        const tree = buildContextTree(snapshot, contextTrees.get(key));
-        contextTrees.delete(key); contextTrees.set(key, tree);
-        if (contextTrees.size > 16) contextTrees.delete(contextTrees.keys().next().value);
-        return send(200, { projectId, sessionId, tree: publicContextTree(tree) });
+        if (node) {
+          const scoped = snapshot();
+          const content = record.admission !== 'oversized' && record.lookup ? contextSlice(scoped, node, record.lookup) : contextSlice(scoped, node);
+          return send(200, { projectId, sessionId, version: scoped.version, content });
+        }
+        const tree = await contextCache.navigation(record, () => publicContextTree(buildContextTree(snapshot())));
+        return send(200, { projectId, sessionId, tree });
       }
       if (filesystemRoute) {
         const [, projectId, rawScope, rawSession, rawName] = filesystemRoute;
@@ -769,7 +804,7 @@ export function createMemoryHandler(configuration = {}, { authorizeDevice } = {}
     return true;
   };
   handler.onEvent = listener => { hub.on('event', listener); return () => hub.off('event', listener); };
-  handler.close = () => { for (const response of eventClients) response.end(); eventClients.clear(); };
+  handler.close = () => { contextCache.clear(); for (const response of eventClients) response.end(); eventClients.clear(); };
   return handler;
 }
 

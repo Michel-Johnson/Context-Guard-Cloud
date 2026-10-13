@@ -1,5 +1,11 @@
 # Cloud 验证台账
 
+## CONTEXT-READ-CACHE-20261013 · Main 只读视图与授权分代缓存
+
+- [x] 已实现 Main immutable selector、每请求鉴权后的 project/Session/原 agent/permission identity/stamp/generation 缓存、独立 entry/逻辑字节预算与 oversize admission marker；projection 失配仍从完整状态修复，写入事务及固定 Core 2.4.4 / Workbench 1.5.2 不变。未发布 prepared helper 时仍走原共享切片，不维护共享源码副本。
+- [ ] 独立 Tester 核准确 source SHA + 未提交补丁的正式缓存、权限撤销、同版本外部替换、失败/并发、旧代迟到、marker 与资源释放回归；Executor 自检及合成已知 node HTTP 对照不冒充独立验证、真实 Agent 搜索或真实模型性能。
+- [ ] 安全/完整 Required、正常 PR/Main 与精确 Cloud 制品运行验收；未授权生产部署。缓存 bytes 是逻辑 retention 预算，不是 heap/RSS/在途请求硬上限；真实堆/并发和安装后入口需后续合法验收。
+
 ## COORDINATOR-SESSION-GRANT-20261013 · 外部真实 Session 的窄 Main 编辑授权
 
 - [x] 已实现管理员版本化 grant/revoke、设备/Session/worktree/代次/绑定版本与到期校验、有效能力查询、节点范围、审计及稳定操作回执；grant 仅赋予 Main 编辑能力，既有独立项目配置的其他工具权限不因本次放宽或撤销。合成 HTTP 六项通过，包含 Main 持久提交与迁移、撤凭据、撤 grant 的确定性交错；正式受影响回归结果另见本次 PR，不替代独立验收。

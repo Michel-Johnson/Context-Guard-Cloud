@@ -76,6 +76,7 @@
     "tests/cursor-sessions.test.mjs",
     "tests/cursor-workbench.test.mjs",
     "tests/executor-context-api.test.mjs",
+    "tests/executor-context-cache.test.mjs",
     "tests/attachments.test.mjs",
     "tests/authorization-boundary.test.mjs",
     "tests/browser-device-login-runner.mjs",
