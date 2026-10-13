@@ -23,6 +23,7 @@ import { MapTranslations, translationInput } from './map-translations.mjs';
 import { CoordinatorService, CoordinatorInbox, CoordinatorMapIntake, CoordinatorConversations, coordinatorCanAutoResume,
   COORDINATOR_MANUAL_COMPACT_AT_TOKENS } from './coordinator-service.mjs';
 import { coordinatorTools, coordinatorReferences, readCoordinatorReferenceFile, createCoordinatorExecutor, selectCoordinatorTools } from './coordinator-tools.mjs';
+import { CoordinatorSessionGrants } from './coordinator-session-grants.mjs';
 import { writeProjectFile } from './coordinator-file.mjs';
 import { buildCoordinatorContext } from './coordinator-context.mjs';
 import { CoordinatorBindings, bindingReplyDecision } from './coordinator-binding.mjs';
@@ -615,6 +616,12 @@ export async function startCloudServer({
     return ['GET', 'POST'].includes(method) && ['main', 'preferences'].includes(scope) &&
       (method === 'GET' || scope === 'preferences');
   } }) : null;
+  const coordinatorSessionGrants = new Map();
+  const sessionGrantsFor = project => {
+    if (!coordinatorSessionGrants.has(project.id)) coordinatorSessionGrants.set(project.id,
+      new CoordinatorSessionGrants(path.join(dataDir, 'coordinators', project.id)));
+    return coordinatorSessionGrants.get(project.id);
+  };
   const interfaceConfig = protocolConfig || configuredMemory?.interfaceV2;
   const interfaceStores = new Map();
   const interfaceStreams = new Set();
@@ -967,7 +974,8 @@ export async function startCloudServer({
               const ids = [input.nodeId, input.parentId, ...(input.nodeIds || [])].filter(Boolean);
               if (name === 'edit_map') {
                 const snapshot = (await readMemoryProject(configuredMemory, project.id)).main;
-                if (snapshot.version !== input.mainVersion) protocolFail('VERSION_CONFLICT', 'Main changed; read the node again');
+                // The Main transaction resolves historical receipts before rejecting a stale CAS.
+                if (snapshot.version !== input.mainVersion) return;
                 const document = snapshot.memory.map, index = entries(document.root);
                 // Authorize the operations actually committed, not optional
                 // aliases in the model's input. The subsequent CAS prevents a
@@ -1264,16 +1272,21 @@ export async function startCloudServer({
             const text = await readCoordinatorReferenceFile(root, name);
             return { name, version: digest(text), text };
           },
-          editMap: async (input, operationId) => {
+          editMap: async (input, operationId, { caller, session, authorizeCommit, commitGuard, grant } = {}) => {
             if (config.mapWrite !== true) protocolFail('FORBIDDEN', 'Coordinator Map writing is not enabled for this project');
             if (manual && input.actions.some(action => action.op === 'create')) {
               protocolFail('APPROVAL_REQUIRED', '创建新节点请使用 propose_mount，等人类确认后再创建。');
             }
-            const operations = coordinatorStructureOperations(input.actions, operationId);
-            const result = await commitMainMemoryMap(configuredMemory, project.id, { operationId: `coordinator-map:${operationId}`,
-              baseVersion: input.mainVersion, operations }, { kind: 'coordinator', sessionId: '', agentId: principal.agentId });
+            const namespacedOperation = session ? digest(`${session.id}\0${operationId}`) : operationId;
+            const operations = coordinatorStructureOperations(input.actions, namespacedOperation);
+            const actor = { kind: 'coordinator', sessionId: session?.id || '', agentId: session ? caller.agentId : principal.agentId,
+              ...(grant ? { deviceId: caller.deviceId } : {}) };
+            const result = await commitMainMemoryMap(configuredMemory, project.id, { operationId: `coordinator-map:${namespacedOperation}`,
+              baseVersion: input.mainVersion, operations }, actor, { authorize: authorizeCommit, commitGuard,
+              auditActor: grant ? { ...actor, grantOperationId: grant.operationId } : actor });
             const latest = await readMemoryProject(configuredMemory, project.id), index = entries(latest.main.memory.map.root);
-            return { kind: 'map-action', message: 'Map 已更新', version: result.version,
+            return { kind: 'map-action', message: 'Map 已更新', version: result.version, operationId: result.operationId,
+              persistedAt: result.persistedAt, committed: result.committed, clientOperationId: operationId,
               nodes: [...new Set(result.nodeIds)].map(id => index.get(id)?.node).filter(Boolean).map(node => ({ id: node.id, title: node.title, purpose: node.purpose || '' })) };
           },
           mountConversation: async (input, operationId, { actor }) => {
@@ -2639,6 +2652,25 @@ export async function startCloudServer({
           return await serveBlob(req, res, { blobs, principal, session, blobId: binaryRoute[1] });
         } catch (error) { return send(res, error.status || 503, errorReply('', error)); }
       }
+      if (route === '/api/v2/coordinator-capabilities') {
+        if (!interfaceAuth) protocolFail('INVALID_ARGUMENT', 'Interface v2 is not configured');
+        if (req.method !== 'POST') protocolFail('INVALID_ARGUMENT', 'Use POST');
+        if (req.headers.origin && req.headers.origin !== allowedOrigin) protocolFail('FORBIDDEN', 'Untrusted browser origin');
+        const principal = await interfaceAuth.authenticate(bearer(req));
+        if (principal.role !== 'device') protocolFail('FORBIDDEN', 'Use the paired device connection');
+        const input = await requestBody(req, MAX_MESSAGE_BYTES);
+        if (!input || Object.keys(input).some(key => key !== 'session')) protocolFail('INVALID_ARGUMENT', 'Provide the registered Session');
+        const repository = interfaceConfig.repositories.find(item => item.repositoryId === principal.repositoryId);
+        const project = repository?.projectId && projectById(repository.projectId);
+        if (!project) protocolFail('NOT_FOUND', 'Project is not configured');
+        const bindingFor = id => interfaceStorage(principal).store.registeredBinding(principal, id);
+        const grant = await sessionGrantsFor(project).authorize(principal, input.session, bindingFor);
+        const config = coordinatorConfigFor(project);
+        const scopes = [config?.nodeIds, grant.nodeIds].filter(Array.isArray);
+        const nodeIds = scopes.length ? scopes.reduce((ids, scope) => ids.filter(id => scope.includes(id))) : null;
+        return send(res, 200, { ok: true, data: { projectId: project.id, session: input.session,
+          mainWrite: config?.enabled === true && config.mapWrite === true && (nodeIds === null || nodeIds.length > 0), nodeIds, expiresAt: grant.expiresAt, grantOperationId: grant.operationId } });
+      }
       if (route === '/api/v2/coordinator-tools') {
         if (!interfaceAuth) protocolFail('INVALID_ARGUMENT', 'Interface v2 is not configured');
         if (req.method !== 'POST') protocolFail('INVALID_ARGUMENT', 'Use POST');
@@ -2646,7 +2678,7 @@ export async function startCloudServer({
         const principal = await interfaceAuth.authenticate(bearer(req));
         if (principal.role !== 'device' && principal.role !== 'coordinator') protocolFail('FORBIDDEN', 'Coordinator tools use the same device or coordinator credential as the built-in Coordinator');
         const body = await requestBody(req, MAX_MESSAGE_BYTES);
-        const fields = ['conversationId', 'name', 'input', 'operationId'];
+        const fields = ['conversationId', 'name', 'input', 'operationId', 'session'];
         if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !fields.includes(key))) protocolFail('INVALID_ARGUMENT', 'Provide name, input and operationId');
         if (typeof body.name !== 'string' || !body.name || body.name.length > 64) protocolFail('INVALID_ARGUMENT', 'Provide a Coordinator tool name');
         if (typeof body.operationId !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(body.operationId)) protocolFail('INVALID_ARGUMENT', 'Provide a stable operationId');
@@ -2661,7 +2693,29 @@ export async function startCloudServer({
         }
         const service = await coordinatorFor(project, conversationId);
         try {
-          const data = await service.execute(body.name, body.input, { operationId: body.operationId, caller: principal });
+          let data;
+          if (principal.role === 'device' && body.name === 'edit_map') {
+            const store = interfaceStorage(principal).store;
+            const bindingFor = id => store.registeredBinding(principal, id);
+            const grants = sessionGrantsFor(project);
+            const grant = await grants.authorize(principal, body.session, bindingFor);
+            data = await service.execute(body.name, body.input, {
+              operationId: body.operationId, caller: { ...principal, nodeIds: grant.nodeIds }, session: body.session, grant,
+              // Match publication lock order and fence both migration and credential revocation.
+              commitGuard: write => withFileLock(`${store.file}.lock`, () => interfaceAuth.withAuthenticated(bearer(req), () =>
+                grants.withAuthorized(principal, body.session, bindingFor, async current => {
+                  if (current.operationId !== grant.operationId) protocolFail('FORBIDDEN', 'Coordinator grant changed during this edit; retry the same operation');
+                  return write();
+                }))),
+              authorizeCommit: () => grants.authorize(principal, body.session, bindingFor),
+            });
+          } else {
+            if (principal.role === 'device' && !['read_map', 'read_reference', 'list_tasks', 'list_sessions', 'list_conversations',
+              'show_nodes', 'open_node', 'tour_nodes', 'read_task', 'read_object', 'get_execution_capabilities'].includes(body.name)) {
+              protocolFail('FORBIDDEN', 'Device credentials cannot delegate privileged Coordinator tools');
+            }
+            data = await service.execute(body.name, body.input, { operationId: body.operationId, caller: principal });
+          }
           return send(res, 200, { ok: true, data });
         } catch (error) {
           if (error.status && error.code) throw error;
@@ -2942,6 +2996,16 @@ export async function startCloudServer({
           if(viewId.startsWith('session:'))await sessionSnapshot(project,viewId);
           const {providerId,version,model}=await (await modelSettingsFor(project)).selection({timeoutMs:30000});
           return send(res,200,await mapTranslations.translate(input,{providerId,model,scope:JSON.stringify([project.id,viewId,version])}));
+        }
+        if (action === '/api/coordinator/session-grants' && project) {
+          requireAdmin(req);
+          if (req.headers.origin && req.headers.origin !== allowedOrigin) protocolFail('FORBIDDEN', 'Untrusted browser origin');
+          const grants = sessionGrantsFor(project);
+          if (req.method === 'GET') return send(res, 200, await grants.state());
+          if (req.method !== 'POST') protocolFail('INVALID_ARGUMENT', 'Use GET or POST');
+          const { store, principal } = interfaceProject(project);
+          return send(res, 200, await grants.change(await requestBody(req, MAX_MESSAGE_BYTES),
+            id => store.registeredBinding(principal, id), { kind: 'human', sessionId: 'cloud-admin' }));
         }
         if (action === '/api/coordinator/model' && project) {
           const settings = await modelSettingsFor(project);

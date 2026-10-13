@@ -53,6 +53,7 @@
     }
   ],
   "productFiles": [
+    "tests/coordinator-session-grants.test.mjs",
     "tests/cursor-owning-backend.test.mjs",
     "tests/cursor-ci-task-authority.test.mjs",
     "tests/cursor-git-proof.test.mjs",

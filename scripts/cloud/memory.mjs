@@ -429,11 +429,13 @@ export async function readMainMemoryReceipt(configuration, projectId, input, act
   });
 }
 
-export async function commitMainMemoryMap(configuration, projectId, input, actor = { kind: 'human', sessionId: 'cloud-workbench' }, { preserveStoredDispatch = false } = {}) {
+export async function commitMainMemoryMap(configuration, projectId, input, actor = { kind: 'human', sessionId: 'cloud-workbench' }, { preserveStoredDispatch = false, authorize, auditActor = actor, commitGuard } = {}) {
   validateOptions(configuration);
   if (!configuration.projects?.[projectId]) throw new MapError('NOT_FOUND', 'Memory project is not configured', 404);
   if (typeof input?.operationId !== 'string' || !input.operationId || input.operationId.length > 200) throw new MapError('INVALID_OPERATION', 'Stable operationId required');
   const committed = await withFileLock(projectMemoryLockFile(configuration.dataDir, projectId), async () => {
+    const commit = async () => {
+    await authorize?.();
     const state = await readMemoryProject(configuration, projectId);
     const receiptKey = hash(`main-workbench:${input.operationId}`);
     const fingerprint = hash(encode({ baseVersion: input.baseVersion ?? null, operations: input.operations, actor }));
@@ -458,13 +460,15 @@ export async function commitMainMemoryMap(configuration, projectId, input, actor
     validateMemory(snapshot.memory);
     state.main = snapshot;
     state.revision++;
-    appendHistory(state, { scope: 'main', action: 'workbench.commit', snapshot, previousVersion: current.version, actor, at: updatedAt });
+    appendHistory(state, { scope: 'main', action: 'workbench.commit', snapshot, previousVersion: current.version, actor: auditActor, at: updatedAt });
     const result = { committed: true, projectId, operationId: input.operationId, version: snapshot.version, revision: state.revision, nodeIds: applied.resultIds, persistedAt: updatedAt };
     state.receipts[receiptKey] = { fingerprint, result: compactReceiptResult(result) };
-    const event = appendMemoryEvent(state, { projectId, scope: 'main', type: 'main.map.committed', operationId: input.operationId, baseVersion: current.version, version: snapshot.version, operations, actor, at: updatedAt });
+    const event = appendMemoryEvent(state, { projectId, scope: 'main', type: 'main.map.committed', operationId: input.operationId, baseVersion: current.version, version: snapshot.version, operations, actor: auditActor, at: updatedAt });
     result.cursor = event.cursor;
     await writeProjectMemory(memoryReadViews, configuration.dataDir, projectId, state);
     return { result, event };
+    };
+    return commitGuard ? commitGuard(commit) : commit();
   });
   if (committed.event) memoryHub(configuration).emit('event', committed.event);
   return committed.result;

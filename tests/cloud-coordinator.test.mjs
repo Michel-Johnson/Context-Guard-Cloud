@@ -3853,7 +3853,7 @@ test('CI delegation requires server registration, the owning device and an indep
   await assert.rejects(authorizeCiReceiver(options), { code: 'FORBIDDEN' });
 });
 
-test('An external device calls the same Coordinator tools as the built-in Coordinator', async t => {
+test('External devices read Coordinator tools while trusted Coordinator registrations retain privileged tools', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-external-tools-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -3909,9 +3909,9 @@ test('An external device calls the same Coordinator tools as the built-in Coordi
   assert.equal(listed.body.ok, true);
   assert.deepEqual(listed.body.data.tasks, []);
   const invalid = await callTool(deviceHeaders, { operationId: 'external-invalid', name: 'edit_map', input: { unexpected: true } });
-  assert.equal(invalid.status, 400);
-  assert.equal(invalid.body.error.code, 'INVALID_ARGUMENT');
-  const edited = await callTool(deviceHeaders, { operationId: 'external-edit', name: 'edit_map', input: {
+  assert.equal(invalid.status, 403);
+  assert.equal(invalid.body.error.code, 'FORBIDDEN');
+  const edited = await callTool(grantedHeaders, { operationId: 'external-edit', name: 'edit_map', input: {
     mainVersion: 'v1', actions: [{ op: 'create', parentId: 'T0', title: '外部节点', purpose: '同一执行器', owns: ['src/'] }],
   } });
   assert.equal(edited.status, 200, JSON.stringify(edited.body));
@@ -3962,7 +3962,7 @@ test('An external device calls the same Coordinator tools as the built-in Coordi
   assert.equal(anonymous.status, 401);
 });
 
-test('An external device writes one repository file through the Coordinator tool endpoint', async t => {
+test('A trusted external Coordinator writes one repository file through the Coordinator tool endpoint', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-external-file-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -3984,11 +3984,12 @@ test('An external device writes one repository file through the Coordinator tool
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/lab', clients: {
       executor: { deviceId: 'exec-device', agentId: 'exec-agent', role: 'executor' },
+      fileCoordinator: { deviceId: 'file-device', agentId: 'file-agent', role: 'coordinator', bindings: {} },
     } }] },
     coordinatorModelFactory: () => ({ next: async () => { throw new Error('file writes must not start a model turn'); } }),
   });
   const response = await fetch(`${server.url}/api/v2/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-    v: 2, id: 'login-device', type: 'auth.open', payload: { repository: 'https://github.com/example/lab', clientId: 'device', password: 'synthetic-password' },
+    v: 2, id: 'login-coordinator', type: 'auth.open', payload: { repository: 'https://github.com/example/lab', clientId: 'fileCoordinator', password: 'synthetic-password' },
   }) });
   assert.equal(response.status, 200, await response.clone().text());
   const headers = { Authorization: `Bearer ${response.headers.get('x-context-guard-credential')}`, 'Content-Type': 'application/json' };
