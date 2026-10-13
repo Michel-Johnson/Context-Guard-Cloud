@@ -117,17 +117,20 @@ test('authorized Main edits preserve CAS, operation receipts, scope, audit and r
   assert.equal(current.main.memory.map.root.children[1].purpose, '');
   assert.equal((await f.audit()).history.at(-1).actor.sessionId, f.session.id);
   assert.equal((await f.audit()).history.at(-1).actor.grantOperationId, 'grant-1');
-  assert.equal((await f.grant({ operationId: 'grant-renewal' })).status, 200);
+  assert.equal((await f.grant({ operationId: 'grant-renewal', nodeIds: ['ALLOWED', 'DENIED'] })).status, 200);
   assert.equal((await f.tool('update-1', 'v1', actions)).body.data.version, version);
   const maximumId = await f.tool('a'.repeat(128), version, actions);
   assert.equal(maximumId.status, 200, JSON.stringify(maximumId.body));
+  const structural = await f.tool('move-1', maximumId.body.data.version, [{ op: 'move', id: 'ALLOWED', parentId: 'DENIED' }]);
+  assert.equal(structural.status, 200, JSON.stringify(structural.body));
+  assert.equal((await f.memory()).main.memory.map.root.children[0].children[0].id, 'ALLOWED');
   await f.restart();
   assert.equal((await f.tool('update-1', 'v1', actions)).body.data.version, version);
   const revoke = await f.call(f.grantRoute, { operationId: 'revoke-1', baseVersion: (await f.grantStore.state()).version,
     action: 'revoke', sessionId: f.session.id });
   assert.equal(revoke.status, 200);
   assert.equal((await f.tool('after-revoke', version, actions)).status, 403);
-  assert.equal((await f.memory()).main.version, maximumId.body.data.version);
+  assert.equal((await f.memory()).main.version, structural.body.data.version);
 });
 
 test('migration and credential revocation invalidate previously granted Sessions', async t => {

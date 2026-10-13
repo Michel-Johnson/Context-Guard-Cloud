@@ -2710,10 +2710,6 @@ export async function startCloudServer({
               authorizeCommit: () => grants.authorize(principal, body.session, bindingFor),
             });
           } else {
-            if (principal.role === 'device' && !['read_map', 'read_reference', 'list_tasks', 'list_sessions', 'list_conversations',
-              'show_nodes', 'open_node', 'tour_nodes', 'read_task', 'read_object', 'get_execution_capabilities'].includes(body.name)) {
-              protocolFail('FORBIDDEN', 'Device credentials cannot delegate privileged Coordinator tools');
-            }
             data = await service.execute(body.name, body.input, { operationId: body.operationId, caller: principal });
           }
           return send(res, 200, { ok: true, data });

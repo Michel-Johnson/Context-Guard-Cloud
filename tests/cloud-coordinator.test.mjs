@@ -3962,7 +3962,7 @@ test('External devices read Coordinator tools while trusted Coordinator registra
   assert.equal(anonymous.status, 401);
 });
 
-test('A trusted external Coordinator writes one repository file through the Coordinator tool endpoint', async t => {
+test('An external device writes one repository file through the Coordinator tool endpoint', async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'cg-external-file-'));
   let server;
   t.after(async () => { await server?.close(); await fs.rm(directory, { recursive: true, force: true }); });
@@ -3984,12 +3984,11 @@ test('A trusted external Coordinator writes one repository file through the Coor
     browserPasswordHash: await createWorkbenchPasswordHash('synthetic-password'),
     protocolConfig: { repositories: [{ repositoryId: '123', projectId, slug: 'example/lab', clients: {
       executor: { deviceId: 'exec-device', agentId: 'exec-agent', role: 'executor' },
-      fileCoordinator: { deviceId: 'file-device', agentId: 'file-agent', role: 'coordinator', bindings: {} },
     } }] },
     coordinatorModelFactory: () => ({ next: async () => { throw new Error('file writes must not start a model turn'); } }),
   });
   const response = await fetch(`${server.url}/api/v2/messages`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
-    v: 2, id: 'login-coordinator', type: 'auth.open', payload: { repository: 'https://github.com/example/lab', clientId: 'fileCoordinator', password: 'synthetic-password' },
+    v: 2, id: 'login-device', type: 'auth.open', payload: { repository: 'https://github.com/example/lab', clientId: 'device', password: 'synthetic-password' },
   }) });
   assert.equal(response.status, 200, await response.clone().text());
   const headers = { Authorization: `Bearer ${response.headers.get('x-context-guard-credential')}`, 'Content-Type': 'application/json' };
