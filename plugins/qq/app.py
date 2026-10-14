@@ -18,6 +18,8 @@ for key in ("accountId", "backendToken", "onebotToken", "cloudOrigin", "defaultP
         raise ValueError("Incomplete private QQ adapter configuration")
 if len(settings["backendToken"]) < 32 or len(settings["onebotToken"]) < 32 or settings["backendToken"] == settings["onebotToken"]:
     raise ValueError("Use separate bounded QQ adapter credentials")
+if not isinstance(settings.get("friendChat", False), bool):
+    raise ValueError("friendChat must be a boolean")
 nonebot.init(driver="~fastapi", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "18080")),
              log_level="WARNING", onebot_access_token=settings["onebotToken"], api_timeout=15)
 driver = nonebot.get_driver()
@@ -49,13 +51,14 @@ async def receive(bot: Bot, event: MessageEvent):
     if bot.self_id != settings["accountId"]:
         return
     payload = {"self_id": event.self_id, "user_id": event.user_id, "post_type": event.post_type,
-               "message_type": event.message_type, "message_id": event.message_id, "time": event.time,
+               "message_type": event.message_type, "sub_type": event.sub_type, "message_id": event.message_id, "time": event.time,
                "target_id": getattr(event, "target_id", None),
                "message": [{"type": segment.type, "data": segment.data} for segment in event.original_message]}
-    body = route_event(payload, settings["accountId"], settings.get("acceptSince", 0))
+    body = route_event(payload, settings["accountId"], settings.get("acceptSince", 0), settings.get("friendChat", False))
     if not body:
         return
-    body["projectId"] = settings["defaultProjectId"]
+    if body.get("mode") != "chat":
+        body["projectId"] = settings["defaultProjectId"]
     try:
         spool.put(body)
         worker.wakeup.set()

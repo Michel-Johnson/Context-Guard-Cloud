@@ -72,12 +72,12 @@ test('QQ real Cloud HTTP delivers once across a Cloud restart with actual QQ ide
   await fs.writeFile(memoryFile, JSON.stringify({ revision: 1,
     main: { version: 'main-test', memory: { records: {}, map: { project: 'Fixture', root: { id: 'T0', title: 'Fixture', kind: 'module', children: [] } } } },
     sessions: {}, closedSessions: {}, receipts: {}, history: [], events: [], eventCursors: {} }));
-  let modelCalls = 0;
+  let modelCalls = 0; const modelRequests = [];
   const options = { dataDir: directory, host: '127.0.0.1', port: 0, privateAccess: true,
-    adminToken: 'fixture-admin', browserToken: 'fixture-browser', qqConfig: config,
+    adminToken: 'fixture-admin', browserToken: 'fixture-browser', qqConfig: { ...config, friendChat: true },
     protocolConfig: { repositories: [{ repositoryId: '123', projectId: 'fixture', slug: 'example/fixture' }] },
     memoryConfig: { dataDir: memoryDir, adminToken: 'fixture-memory', projects: { fixture: { coordinator: { enabled: true, providerFile, bindings: {}, mapWrite: false } } } },
-    coordinatorModelFactory: () => ({ next: async () => { modelCalls++; return { stop: 'end_turn', content: [{ type: 'text', text: 'QQ 已收到' }] }; } }),
+    coordinatorModelFactory: () => ({ next: async request => { modelCalls++; modelRequests.push(request); return { stop: 'end_turn', content: [{ type: 'text', text: 'QQ 已收到' }] }; } }),
   };
   cloud = await startCloudServer(options);
   const post = async (route, value = input, headers = req.headers) => {
@@ -105,4 +105,38 @@ test('QQ real Cloud HTTP delivers once across a Cloud restart with actual QQ ide
   assert.equal((await post('/api/integrations/qq/submit')).data.complete, true);
   assert.equal(modelCalls, 1);
   assert.equal((await post('/api/integrations/qq/submit', { ...input, text: 'changed' })).data.error.code, 'ID_REUSED');
+  const friend = { id: 'friend-message', text: '你好', scene: { kind: 'private', peerId: '987654321' } };
+  assert.equal((await post('/api/integrations/qq/chat/submit', { ...friend, projectId: 'fixture' })).status, 400);
+  assert.equal((await post('/api/integrations/qq/chat/submit', { ...friend, actor: { userId: config.accountId } })).status, 400);
+  assert.equal((await post('/api/integrations/qq/chat/submit', { ...friend, scene: input.scene })).status, 400);
+  const friendSubmitted = await post('/api/integrations/qq/chat/submit', friend);
+  assert.equal(friendSubmitted.status, 200, JSON.stringify(friendSubmitted.data));
+  const friendState = async scene => post('/api/integrations/qq/chat/state', { id: friend.id, scene });
+  for (let i = 0; i < 100; i++) {
+    result = await friendState(friend.scene);
+    if (result.data.complete) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  assert.equal(result.data.complete, true);
+  assert.equal(modelCalls, 2);
+  assert.deepEqual(modelRequests.at(-1).tools, []);
+  assert.equal(JSON.stringify(modelRequests.at(-1)).includes('Fixture'), false);
+  assert.equal(JSON.stringify(modelRequests.at(-1)).includes('read_project_map'), false);
+  const otherScene = { kind: 'private', peerId: '987654322' };
+  assert.equal((await friendState(otherScene)).data.accepted, false);
+  const guestDirectory = path.join(directory, 'qq-chats');
+  const guestFiles = await fs.readdir(guestDirectory);
+  const transcripts = await Promise.all(guestFiles.map(name => fs.readFile(path.join(guestDirectory, name, 'conversation.json'), 'utf8').then(JSON.parse)));
+  const guest = transcripts.find(value => value.messages.some(message => message.role === 'user'));
+  assert.equal(guest.messages[0].actor.userId, friend.scene.peerId);
+  assert.equal(guest.activeContext, null);
+  await cloud.close(); cloud = await startCloudServer(options);
+  assert.equal((await post('/api/integrations/qq/chat/submit', friend)).data.complete, true);
+  assert.equal(modelCalls, 2);
+});
+
+test('QQ friend access is disabled by default and does not invoke a project service', async () => {
+  const gateway = createQqGateway({ config, friendConversation: () => { throw Error('must not run'); } });
+  await assert.rejects(gateway(req, '/api/integrations/qq/chat/submit', input), { code: 'FORBIDDEN' });
+  assert.throws(() => validateQqConfig({ ...config, friendChat: 'true' }), { code: 'INVALID_QQ_CONFIG' });
 });

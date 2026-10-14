@@ -15,9 +15,9 @@ def stable_id(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
-def route_event(event, account, accept_since=0):
-    """个人账号只接自己的显式命令，不替好友或群员取得项目权限。"""
-    if str(event.get("self_id")) != account or str(event.get("user_id")) != account:
+def route_event(event, account, accept_since=0, friend_chat=False):
+    """本人命令与好友纯聊天分流；好友不取得账号本人的项目身份。"""
+    if str(event.get("self_id")) != account:
         return None
     if event.get("post_type") not in ("message", "message_sent") or event.get("message_type") != "private":
         return None
@@ -27,6 +27,14 @@ def route_event(event, account, accept_since=0):
     if not isinstance(segments, list) or any(item.get("type") != "text" for item in segments):
         return None
     text = "".join(str(item.get("data", {}).get("text", "")) for item in segments).strip()
+    sender = str(event.get("user_id"))
+    if sender != account:
+        if friend_chat is not True or event.get("post_type") != "message" or event.get("sub_type") != "friend" or not text:
+            return None
+        if not sender.isdigit() or int(sender) < 10000 or type(event.get("message_id")) is not int:
+            return None
+        return {"id": stable_id([account, sender, event["message_id"]]), "text": text,
+                "scene": {"kind": "private", "peerId": sender}, "mode": "chat"}
     if text != "/co" and not text.startswith("/co ") and not text.startswith("/co\n"):
         return None
     # NapCat 的 message_sent 包含真正的 target_id；缺失时不能猜接收者。
@@ -132,7 +140,9 @@ class Backend:
                                         timeout=httpx.Timeout(20, connect=5), follow_redirects=False, trust_env=False)
 
     async def request(self, route, body):
-        response = await self.client.post("/api/integrations/qq/" + route, json=body)
+        guest = body.get("mode") == "chat"
+        payload = {key: value for key, value in body.items() if key != "mode"}
+        response = await self.client.post("/api/integrations/qq/" + ("chat/" if guest else "") + route, json=payload)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, dict):
@@ -162,6 +172,15 @@ class Worker:
     async def _process(self, row):
         body = json.loads(row["body"])
         request_id = row["id"]
+        if body.get("mode") == "chat" and row["status"] == "pending":
+            if not self.bot():
+                return
+            friends = await self.bot().call_api("get_friend_list")
+            if not isinstance(friends, list):
+                raise ValueError("FRIEND_LIST_UNAVAILABLE")
+            if not any(str(friend.get("user_id")) == body["scene"]["peerId"] for friend in friends):
+                self.spool.set_status(request_id, "failed", "NOT_A_FRIEND")
+                return
         if len(body["text"]) > 8000 and row["status"] == "pending":
             self.spool.prepare_reply(request_id, ["这条输入超过接口的8000字限制，原文已保留，请分段发送。"], failed=True)
             row = {**dict(row), "status": "reply"}
@@ -197,7 +216,8 @@ class Worker:
             # 先保存结果未知。进程在 API 调用前后崩溃时，不能盲目重复发消息。
             self.spool.mark_part(request_id, part["part"], "unknown")
             try:
-                result = await self.bot().call_api("send_private_msg", user_id=int(self.account),
+                recipient = body["scene"]["peerId"] if body.get("mode") == "chat" else self.account
+                result = await self.bot().call_api("send_private_msg", user_id=int(recipient),
                                                     message=[{"type": "text", "data": {"text": part["text"]}}])
                 if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
                     raise ValueError("SEND_RESULT_UNKNOWN")
