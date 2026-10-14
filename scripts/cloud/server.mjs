@@ -39,6 +39,7 @@ import { CoordinatorSlackActions, coordinatorSlackActions } from './coordinator-
 import { isVerifiedSlackBot, BOT_DISCUSSION_TOOLS } from './slack-bot-identity.mjs';
 import { releaseIdentity } from './release.mjs';
 import { MapProjects, isMapProject } from './map-projects.mjs';
+import { createQqGateway, validateQqConfig } from './qq-gateway.mjs';
 import { CursorCloudProvider } from './cursor-provider.mjs';
 import { CursorCloudSessions } from './cursor-sessions.mjs';
 import { CursorRoleFactory, cursorTemplateWorktree } from './cursor-role-factory.mjs';
@@ -466,6 +467,7 @@ export async function startCloudServer({
   cursorGitProofFactory = config => new CursorGitProof(config),
   coordinatorModelFactory = config => new CoordinatorModel(config),
   integrationConfig,
+  qqConfig,
   attachmentProvider,
   faultInjector = async () => {},
 } = {}) {
@@ -532,6 +534,11 @@ export async function startCloudServer({
   const rawIntegrations = integrationConfig || (process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG
     ? await readJson(path.resolve(process.env.CONTEXT_GUARD_INTEGRATIONS_CONFIG), null) : null);
   const integrations = rawIntegrations ? validateIntegrationConfig(rawIntegrations) : null;
+  const rawQq = qqConfig || (process.env.CONTEXT_GUARD_QQ_CONFIG ? await readJson(process.env.CONTEXT_GUARD_QQ_CONFIG) : null);
+  const qq = rawQq ? validateQqConfig(rawQq) : null;
+  if (qq && [adminToken, browserToken, configuredMemory?.adminToken, integrations?.token].filter(Boolean).includes(qq.token)) {
+    throw new MapError('INVALID_QQ_CONFIG', 'Use a separate QQ adapter credential', 503);
+  }
   const mapProjects = new MapProjects({ config: integrations?.mapProjects,
     readOverview: () => workbenchSnapshot('overview', null), registeredProjects: () => registry.projects, memoryConfig: configuredMemory });
   const mapProjectRefs = new Map();
@@ -2533,10 +2540,35 @@ export async function startCloudServer({
     return reply;
   };
   const activeRequests = new Set();
+  const qqGateway = qq ? createQqGateway({ config: qq,
+    listProjects: async ids => ids.map(id => projectById(id)).filter(project => project && coordinatorConfigFor(project)?.enabled)
+      .map(({ id, name }) => ({ id, name })),
+    createConversation: async target => {
+      const project = projectById(target.projectId);
+      if (!project || !coordinatorConfigFor(project)?.enabled) protocolFail('NOT_FOUND', 'QQ project is unavailable');
+      await conversationsFor(project).createChat(target.conversationOperation, { executionMode: 'manual' });
+    },
+    submit: async (target, text) => {
+      const project = projectById(target.projectId), conversationId = `chat-${digest(target.conversationOperation)}`;
+      return submitCoordinator(project, conversationId, { id: target.id, text }, { source: 'human', actor: target.actor });
+    },
+    state: async target => {
+      const project = projectById(target.projectId);
+      if (!project || !coordinatorConfigFor(project)?.enabled) protocolFail('NOT_FOUND', 'QQ project is unavailable');
+      const conversationId = `chat-${digest(target.conversationOperation)}`;
+      const conversation = await conversationsFor(project).get(conversationId);
+      if (conversation.executionMode !== 'manual') protocolFail('FORBIDDEN', 'QQ conversation execution mode changed');
+      return (await coordinatorFor(project, conversationId)).state();
+    },
+  }) : null;
   const handleRequest = async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const route = url.pathname;
+      if (route.startsWith('/api/integrations/qq/')) {
+        if (!qqGateway) throw new MapError('NOT_FOUND', 'QQ integration is not configured', 404);
+        return send(res, 200, await qqGateway(req, route, req.method === 'POST' ? await requestBody(req) : null));
+      }
       const roleMcp = route.match(/^\/api\/workbench\/projects\/([a-z0-9-]{1,64})\/api\/cursor-role-mcp$/);
       if (roleMcp) {
         // Scoped native bearer authority only; do not apply browser cookie or

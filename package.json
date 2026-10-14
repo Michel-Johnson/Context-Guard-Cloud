@@ -22,6 +22,7 @@
     "start": "node scripts/build-runtime.mjs && node scripts/cloud/server.mjs",
     "test": "node .github/scripts/verify-boundaries.mjs && node .github/scripts/verify-workflows.mjs && node .github/scripts/verify-test-governance.mjs && node .github/scripts/run-node-tests.mjs",
     "test:slack": "npm test --prefix plugins/slack",
+    "test:qq": "python plugins/qq/tests/test_qq.py",
     "test:dialogue:live": "node tests/coordinator-dialogue-live-browser.mjs",
     "test:browser": "node tests/browser-device-login-runner.mjs && node tests/cloud-workbench-browser.mjs && node tests/cloud-sync-browser.mjs",
     "security:setup": "node .github/scripts/security-tool.mjs",
