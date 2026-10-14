@@ -2,25 +2,27 @@
 
 NapCat 登录普通 QQ 账号，独立 NoneBot2 服务通过 OneBot v11 反向 WebSocket 收消息，经认证 HTTP 调用现有 Cloud Coordinator。不是 Insight 问答服务，也不复制一套模型或 Map 后端。
 
-首期只处理账号本人私聊发出的 `/co 问题`；普通聊天、好友/群员消息及机器人自己的回复均不触发。回复统一发送给登录账号本人，不向原好友或群公开项目内容。实际 QQ 客户端能否呈现给自己的消息须真实验收；不能以 SDK 模拟结果宣称可用。
+支持两条严格分开的入口：本人私聊 `/co 问题` 继续访问已配置的项目；管理员显式启用 `friendChat:true` 后，好友发来的普通文字自动聊天并回复原好友。好友入口没有 Map、私人项目、主人历史或操作工具；不同好友的历史隔离。群聊、陌生人、非文字和机器人自己发出的普通回复不触发。
 
 ## 配置
 
 Cloud 通过 `CONTEXT_GUARD_QQ_CONFIG` 指向私有 JSON：
 
 ```json
-{"token":"独立随机凭据，至少32字符","accountId":"你的QQ号","projectIds":["已注册项目"],"defaultProjectId":"已注册项目"}
+{"token":"独立随机凭据，至少32字符","accountId":"你的QQ号","projectIds":["已注册项目"],"defaultProjectId":"已注册项目","friendChat":false}
 ```
 
 适配服务通过 `CONTEXT_GUARD_QQ_ADAPTER_CONFIG` 指向另一个私有 JSON：
 
 ```json
-{"accountId":"你的QQ号","backendToken":"上面Cloud的独立凭据","onebotToken":"另一份独立随机凭据","cloudOrigin":"https://你的Cloud域名","defaultProjectId":"已注册项目","acceptSince":1}
+{"accountId":"你的QQ号","backendToken":"上面Cloud的独立凭据","onebotToken":"另一份独立随机凭据","cloudOrigin":"https://你的Cloud域名","defaultProjectId":"已注册项目","acceptSince":1,"friendChat":false}
 ```
 
 凭据、QQ登录数据和 SQLite 放仓库之外；不要把私有文件提交 Git。NapCat WebUI 和适配服务仅映射回环端口，反向连接配置 `/onebot/v11/ws`、相同 `onebotToken`、`reportSelfMessage:true`。禁用其他不需要的 OneBot 连接。不自动接受好友/群邀请、不抓取历史聊天。
 
 `acceptSince` 用首次启用时的当前 Unix 秒数，重启沿用原值，不自动处理接入前的旧命令。Cloud 地址须 HTTPS；只有真正回环地址可使用明文 HTTP，URL 不得包含凭据或查询参数。
+
+自动回复好友需要两份私有配置都显式启用 `friendChat:true`。适配服务核验实际好友列表，不自动接受好友。好友入口 `/api/integrations/qq/chat/submit`、`chat/state` 仅接受消息编号、正文和私聊场景，不接受项目或操作者字段；只复用已配置的文字模型，不继承项目能力。好友聊天历史保存在独立 `qq-chats` 数据目录。
 
 本机安装使用独立虚拟环境：`pip install -r plugins/qq/requirements.txt`，在该目录运行 `python app.py`。容器构建：`docker build -t context-guard-qq-adapter plugins/qq`；持久挂载 `/state`，只读挂载私有配置，设配置路径。QQ登录需要本人扫码。
 

@@ -2540,7 +2540,35 @@ export async function startCloudServer({
     return reply;
   };
   const activeRequests = new Set();
+  const qqFriendServices = new Map();
+  const qqFriendConversation = async peer => {
+    if (!qqFriendServices.has(peer)) {
+      const creating = (async () => {
+        // Only the provider is reused. Never call coordinatorFor/loadContext or
+        // pass the owner's prompt, history, Map, actor or business tools here.
+        const project = projectById(qq.defaultProjectId), config = project && coordinatorConfigFor(project);
+        if (!config?.enabled) protocolFail('COORDINATOR_DISABLED', 'QQ chat model is unavailable');
+        const system = '你是 Coordinator，在 QQ 和好友聊天。用中文自然、简洁地回复，适当分段。你只能使用当前好友的聊天历史，没有账号主人的私人项目、记忆或操作工具；不要声称已经读取或修改这些内容。';
+        const wrap = model => ({ model: model.model, next: input => model.next({ ...input,
+          system: input.system.startsWith(system) ? system : input.system, tools: [] }) });
+        const settings = config.modelProviders ? await modelSettingsFor(project) : null;
+        const namespace = `qq-friend-${digest(JSON.stringify([qq.accountId, peer]))}`;
+        const service = new CoordinatorService({ directory: path.join(dataDir, 'qq-chats', namespace), namespace, system,
+          model: wrap(settings?.legacyModel || coordinatorModelFactory(await readJson(config.providerFile))), tools: [],
+          execute: async () => protocolFail('TOOL_FORBIDDEN', 'Friend chat has no project tools'),
+          ...(settings ? { textModels: new Map([...settings.models].map(([id, model]) => [id, wrap(model)])),
+            selectTextModel: async () => { const selected = await settings.selection(); return { ...selected, model: wrap(selected.model) }; } } : {}),
+        });
+        if ((await service.state()).activeTurnId) service.kick();
+        return service;
+      })();
+      qqFriendServices.set(peer, creating);
+      creating.catch(() => { if (qqFriendServices.get(peer) === creating) qqFriendServices.delete(peer); });
+    }
+    return qqFriendServices.get(peer);
+  };
   const qqGateway = qq ? createQqGateway({ config: qq,
+    friendConversation: qqFriendConversation,
     listProjects: async ids => ids.map(id => projectById(id)).filter(project => project && coordinatorConfigFor(project)?.enabled)
       .map(({ id, name }) => ({ id, name })),
     createConversation: async target => {
@@ -3580,6 +3608,9 @@ export async function startCloudServer({
       // Retire startup ownership before capturing the instances to drain.
       await Promise.all(coordinatorStartup);
       await Promise.all([...cursorServices.values()].map(service => service.close()));
+      await Promise.all([...qqFriendServices.values()].map(async pending => {
+        const service = await pending.catch(() => null); if (service) await service.close();
+      }));
       await Promise.all([...coordinators.values()].map(async pending => {
         const service = await pending.catch(() => null);
         if (!service) return;

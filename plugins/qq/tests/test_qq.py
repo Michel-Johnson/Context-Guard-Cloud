@@ -42,6 +42,18 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual("".join(part.removeprefix("Coordinator：\n") for part in parts), text)
         self.assertTrue(all(len(part) <= 1613 for part in parts))
 
+    def test_friend_text_is_chat_not_an_owner_command(self):
+        event = message("你好", user_id=987654321, post_type="message", sub_type="friend")
+        self.assertIsNone(route_event(event, ACCOUNT))
+        routed = route_event(event, ACCOUNT, friend_chat=True)
+        self.assertEqual(routed["mode"], "chat")
+        self.assertEqual(routed["scene"]["peerId"], "987654321")
+        self.assertEqual(routed["text"], "你好")
+        self.assertNotIn("projectId", routed)
+        for changed in [dict(post_type="message_sent"), dict(sub_type="group"), dict(message_type="group")]:
+            self.assertIsNone(route_event({**event, **changed}, ACCOUNT, friend_chat=True))
+        self.assertIsNone(route_event(message("Coordinator：回复"), ACCOUNT, friend_chat=True))
+
     def test_nonebot_parses_message_sent_as_its_real_type(self):
         from nonebot.adapters.onebot.v11 import Adapter, PrivateMessageEvent
         from typing import Literal
@@ -102,6 +114,29 @@ class QueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.spool.pending(), [])
         self.assertEqual(bot.call_api.call_count, 1)
         self.assertEqual(self.spool.counts(), {"delivery-unknown": 1})
+
+    async def test_friend_reply_returns_to_friend_with_no_project_or_owner_identity(self):
+        body = route_event(message("你好", user_id=987654321, post_type="message", sub_type="friend"), ACCOUNT, friend_chat=True)
+        self.spool.put(body)
+        backend = AsyncMock()
+        backend.request.return_value = {"accepted": True, "complete": True, "replies": [{"text": "你好呀"}]}
+        bot = AsyncMock()
+        bot.call_api.side_effect = [[{"user_id": 987654321}], {"message_id": 20}]
+        worker = Worker(self.spool, backend, lambda: bot, ACCOUNT)
+        await worker.process(self.spool.pending()[0])
+        self.assertEqual(self.spool.counts(), {"done": 1})
+        self.assertEqual(backend.request.call_args.args[1]["mode"], "chat")
+        self.assertNotIn("projectId", backend.request.call_args.args[1])
+        self.assertEqual(bot.call_api.call_args.kwargs["user_id"], 987654321)
+
+    async def test_stranger_is_not_sent_to_cloud(self):
+        body = route_event(message("你好", user_id=987654321, post_type="message", sub_type="friend"), ACCOUNT, friend_chat=True)
+        self.spool.put(body)
+        backend, bot = AsyncMock(), AsyncMock()
+        bot.call_api.return_value = []
+        await Worker(self.spool, backend, lambda: bot, ACCOUNT).process(self.spool.pending()[0])
+        backend.request.assert_not_called()
+        self.assertEqual(self.spool.counts(), {"failed": 1})
 
     async def test_many_unknown_scenes_do_not_starve_another_scene(self):
         for index in range(35):
