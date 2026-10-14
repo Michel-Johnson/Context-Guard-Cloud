@@ -15,6 +15,7 @@ Cloud 与 Skill 使用相同原则，各自维护符合源码依赖的路径规�
 | README、发布资料及法律声明 | 包检查 |
 | Slack 源码、运行脚本或应用清单 | Cloud 集成测试、最低运行时、Slack、包检查 |
 | 仅 Slack 测试 | Slack |
+| QQ 适配源码、依赖或运行资料 | Cloud 测试、包检查；Cloud 测试 Job 另安装 QQ 固定直接依赖并运行独立 Python 模块测试 |
 | Cloud 源码 | Cloud 测试、最低运行时、浏览器、包检查；与 Slack 交互的源码另含 Slack |
 | 固定共享运行时构建 | 全部功能检查 |
 | Cloud 单元测试 / 浏览器 runner | 对应 Cloud 测试 / 浏览器检查 |

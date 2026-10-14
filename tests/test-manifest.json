@@ -12,6 +12,11 @@
   },
   "standaloneSuites": [
     {
+      "path": "plugins/qq/tests/test_qq.py",
+      "command": "npm run test:qq",
+      "purpose": "QQ账号本人命令、NoneBot message_sent解析、可靠队列、恢复与发送未知回执；不使用真实QQ账号或模型。"
+    },
+    {
       "path": "tests/coordinator-dialogue-live-browser.mjs",
       "command": "npm run test:dialogue:live",
       "purpose": "显式运行真实模型与浏览器的需求、归属确认、改绑和审批闭环；隔离项目数据。"
@@ -53,6 +58,7 @@
     }
   ],
   "productFiles": [
+    "tests/qq-gateway.test.mjs",
     "tests/coordinator-session-grants.test.mjs",
     "tests/cursor-owning-backend.test.mjs",
     "tests/cursor-ci-task-authority.test.mjs",

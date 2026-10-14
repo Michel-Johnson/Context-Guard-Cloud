@@ -59,6 +59,12 @@ test('unit tests, browser runners, helpers and deployment have explicit impact',
   assert.deepEqual(selectedJobs(select(['tests/coordinator-dialogue-live-browser.mjs'])), ['test', 'browser']);
 });
 
+test('QQ adapter selects Cloud tests without pulling in unrelated Slack or browser checks', () => {
+  assert.deepEqual(selectedJobs(select(['plugins/qq/core.py'])), ['test', 'package']);
+  assert.deepEqual(selectedJobs(select(['plugins/qq/README.md'])), ['test', 'package']);
+  assert.equal(select(['plugins/unknown/service.py']).full, true);
+});
+
 test('combined, deleted and renamed paths use the union; paths normalize deterministically', () => {
   const plan = select(['plugins\\slack\\test\\store.test.mjs', 'docs/a.md', 'tests/cloud-sync-browser.mjs', 'docs/a.md']);
   assert.equal(plan.full, false);

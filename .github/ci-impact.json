@@ -48,6 +48,11 @@
       "jobs": ["test", "minimum-runtime", "slack", "browser", "package"]
     },
     {
+      "id": "qq-adapter",
+      "patterns": ["plugins/qq/**"],
+      "jobs": ["test", "package"]
+    },
+    {
       "id": "slack-runtime",
       "patterns": ["plugins/slack/src/**", "plugins/slack/scripts/**", "plugins/slack/app-manifest.json", "plugins/slack/.env.example", "plugins/slack/.gitignore"],
       "jobs": ["test", "minimum-runtime", "slack", "package"]
