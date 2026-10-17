@@ -2128,3 +2128,13 @@ resolved by this repository split. Source tests do not establish real Slack E2E.
 - [ ] 独立Tester按准确修订核验：好友普通私聊入队、真实好友列表校验、回原好友；群/陌生人/自己发出的非命令不触发；本人/co仍原流程。
 - [ ] 验证好友独立HTTP入口不接受项目/操作者注入，真实friend身份、无Map/主人历史/工具、不同好友隔离、原ID重启恢复；模型供应商复用不等于项目授权。
 - [ ] 准确PR/Main门禁及保native基线的兼容组合；两份私有配置显式启用friendChat，保QQ登录/现有队列/Slack。真实好友来信与手机显示需要真实来源，不能用伪造message事件冒充。
+
+# DASHBOARD-SOURCE-01 · Dashboard 源码纳管（2026-10-17）
+
+- [x] Executor：Cloud 维护账号/OAuth/空间模块及独立服务包装；共享源码只从 Skill 完整修订与归档 SHA256 生成至忽略目录。根启动与 Node 18 套件保留，Dashboard 在 Node 24 执行。
+- [x] Executor 模块自检：显式独立 Skill 检出下服务套件 6/6（合成 OAuth、匿名浏览、CSRF、空间隔离、report-only PAT 的上报/禁编辑/禁跨空间/撤销及归档安全）；首次上报 fixture 未满足既有 `session-<sessionId>` taskKey 契约而失败，修正 fixture 后通过，不降低产品校验。归档安全与 CI 影响规则合批 18/18，测试治理与工作流静态检查通过；随后按 Coordinator 指令运行完整根套件，结果另记，未访问真实飞书/模型。
+- [x] 前序本地归档的离线与 HTTPS 下载、首次分发构建及服务套件证据保留在本地；这些结果仅对应当时测试字节，不作为当前消费锁或最终修订通过证明。未发布或覆盖正式 release。
+- [x] 最终消费锁更新为干净单基线 Skill `127bb7eecd34d3fe83f0337ec6ec2938059cd4d8`、真实 codeload SHA256 `3ae820c04e4ddd0d20f363efa2c833b3a640f22f5b9b458456ea746cfe07eea7`，包含身份解析与 CLI 原子性修复；与前次修复源码 tree 相同，新增历史不携带已删除注释。该准确锁从默认 HTTPS 下载并通过 SHA256 验证，首次空目标分发构建通过，无 checkout 变量服务套件 6/6（221ms），包含畸形 Cookie 按匿名处理及服务存活断言。
+- [x] 按 Coordinator 指令完成固定依赖 `npm ci --ignore-scripts`、原构建器 `npm run build:runtime`（51 个生成文件）与 Node 24.18.0 完整根 `npm test`：1072 项，1070 通过、0 失败、2 项既有显式跳过，233689ms。跳过为 BDA-012 真实浏览器验收及真实 Live Coordinator provider，未新增或调整 skip；两项需对应独立显式入口，不冒充真人/模型验收。
+- [ ] 独立 Tester 针对准确最终 Cloud/Skill 修订复验：受控归档来源、哈希/路径穿越/链接拒绝、同修订分发构建、匿名与所有者权限、CSRF、相同对象 ID 空间隔离、PAT 禁 Jerry 编辑；核 Required，保留原 Node 18/22、安全、包检查。
+- [ ] 提交/PR/部署由 Coordinator 按用户授权推进；本次 Executor 未提交、推送或部署，未覆盖既有同版本正式 Skill 分发产物。

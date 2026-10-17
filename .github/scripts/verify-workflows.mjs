@@ -37,6 +37,14 @@ assert.match(source, /npm run security:test/);
 assert.match(source, /npm ci --ignore-scripts --no-audit --no-fund/);
 assert.match(source, /npm ci --prefix plugins\/slack --ignore-scripts/);
 assert.match(source, /npm run test:browser/);
+assert.match(source, /node-version: ['"]24['"]/);
+const testBlock = source.split('  test:\n')[1].split(/\n  [a-z][a-z-]*:\n/)[0];
+assert.match(testBlock, /npm run bootstrap --prefix services\/dashboard/);
+assert.match(testBlock, /npm run build:skills --prefix services\/dashboard -- --base-url https:\/\/dashboard\.example\.test/);
+assert.match(testBlock, /npm run test:dashboard/);
+const minimumBlock = source.split('  minimum-runtime:\n')[1].split(/\n  [a-z][a-z-]*:\n/)[0];
+assert.doesNotMatch(minimumBlock, /test:dashboard|services\/dashboard/);
+
 assert.match(source, /npm run build:runtime/);
 assert.doesNotMatch(source, /pack:shared/);
 assert.match(source, /npm ci --omit=dev --ignore-scripts --no-audit --no-fund/);
