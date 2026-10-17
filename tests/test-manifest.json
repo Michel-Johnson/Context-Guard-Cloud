@@ -55,6 +55,9 @@
   "separatePackages": [
     {
       "root": "plugins/slack"
+    },
+    {
+      "root": "services/dashboard"
     }
   ],
   "productFiles": [

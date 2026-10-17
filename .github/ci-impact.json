@@ -86,6 +86,11 @@
       "id": "deployment",
       "patterns": ["deploy/**"],
       "jobs": ["test", "package"]
+    },
+    {
+      "id": "dashboard-service",
+      "patterns": ["services/dashboard/**"],
+      "jobs": ["test", "package"]
     }
   ]
 }

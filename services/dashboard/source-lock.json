@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/Michel-Johnson/Context-Guard-Skill",
+  "commit": "127bb7eecd34d3fe83f0337ec6ec2938059cd4d8",
+  "archiveUrl": "https://codeload.github.com/Michel-Johnson/Context-Guard-Skill/tar.gz/127bb7eecd34d3fe83f0337ec6ec2938059cd4d8",
+  "archiveSha256": "3ae820c04e4ddd0d20f363efa2c833b3a640f22f5b9b458456ea746cfe07eea7",
+  "modulePath": "packages/dashboard"
+}

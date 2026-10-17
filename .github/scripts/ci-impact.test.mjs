@@ -185,3 +185,12 @@ test('workflow keeps immutable actions, security and strict Required while selec
   });
   assert.equal(result.status, 0, result.stderr);
 });
+
+test('Dashboard service selects Node24 service suite and packaging, with no Node18 SQLite requirement', () => {
+  for (const file of ['services/dashboard/server.mjs', 'services/dashboard/workspaces.mjs', 'services/dashboard/source-lock.json', 'services/dashboard/tests/integration.test.mjs']) {
+    assert.deepEqual(selectedJobs(select([file])), ['test', 'package'], file);
+    assert.equal(select([file]).full, false);
+  }
+  assert.deepEqual(selectedJobs(select(['docs/dashboard-notes.md'])), []);
+  assert.equal(select(['services/unknown/server.mjs']).full, true);
+});

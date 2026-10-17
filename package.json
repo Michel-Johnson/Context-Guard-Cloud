@@ -16,7 +16,11 @@
     "licenses/**",
     "references/**",
     "THIRD_PARTY_NOTICES.md",
-    "scripts/build-runtime.mjs"
+    "scripts/build-runtime.mjs",
+    "services/dashboard/*.mjs",
+    "services/dashboard/package.json",
+    "services/dashboard/source-lock.json",
+    "services/dashboard/README.md"
   ],
   "scripts": {
     "start": "node scripts/build-runtime.mjs && node scripts/cloud/server.mjs",
@@ -27,7 +31,8 @@
     "test:browser": "node tests/browser-device-login-runner.mjs && node tests/cloud-workbench-browser.mjs && node tests/cloud-sync-browser.mjs",
     "security:setup": "node .github/scripts/security-tool.mjs",
     "security:test": "node .github/scripts/security-checks.test.mjs",
-    "build:runtime": "node scripts/build-runtime.mjs"
+    "build:runtime": "node scripts/build-runtime.mjs",
+    "test:dashboard": "npm test --prefix services/dashboard"
   },
   "devDependencies": {
     "@michelj/context-guard": "https://github.com/Michel-Johnson/Context-Guard-Skill/releases/download/split-fixture-dababe445976a2504bc8d02ccc747056bcde30a0/michelj-context-guard-0.11.0.tgz",
